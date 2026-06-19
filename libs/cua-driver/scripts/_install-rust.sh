@@ -497,6 +497,51 @@ for cmd in curl tar; do
     fi
 done
 
+sha256_file() {
+    local file="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | awk '{print $1}'
+    else
+        err "sha256sum or shasum not found on PATH; cannot verify release checksum"
+        return 1
+    fi
+}
+
+verify_release_checksum() {
+    local archive_path="$1"
+    local archive_name="$2"
+    local checksums_url="$3"
+    local checksums_file="$TMP_DIR/checksums.txt"
+    local expected actual
+
+    log "downloading checksums $checksums_url"
+    if ! curl -fsSL -o "$checksums_file" "$checksums_url"; then
+        err "failed to download release checksums from $checksums_url"
+        exit 1
+    fi
+
+    expected=$(awk -v name="$archive_name" '
+        length($1) == 64 && $1 ~ /^[0-9A-Fa-f]+$/ && $2 == name { print tolower($1); found=1; exit }
+        END { if (!found) exit 1 }
+    ' "$checksums_file") || {
+        err "checksum for $archive_name not found in release checksums"
+        err "  expected an entry in $checksums_url"
+        exit 1
+    }
+
+    actual=$(sha256_file "$archive_path") || exit 1
+    if [[ "$actual" != "$expected" ]]; then
+        err "checksum mismatch for $archive_name"
+        err "  expected: $expected"
+        err "  actual:   $actual"
+        exit 1
+    fi
+
+    log "verified SHA256 for $archive_name"
+}
+
 # --- Resolve release tag ------------------------------------------------
 #
 # Version is resolved in priority order:
@@ -562,12 +607,14 @@ case "$LABEL" in
     *)        TARBALL="cua-driver-rs-${VERSION}-${LABEL}-binary.tar.gz" ;;
 esac
 URL="https://github.com/$REPO/releases/download/$TAG/$TARBALL"
+CHECKSUMS_URL="https://github.com/$REPO/releases/download/$TAG/checksums.txt"
 
 log "downloading $URL"
 if ! curl -fsSL -o "$TMP_DIR/$TARBALL" "$URL"; then
     err "download failed; try CUA_DRIVER_RS_VERSION=<version> to pin a specific release"
     exit 1
 fi
+verify_release_checksum "$TMP_DIR/$TARBALL" "$TARBALL" "$CHECKSUMS_URL"
 
 log "extracting"
 tar -xzf "$TMP_DIR/$TARBALL" -C "$TMP_DIR"

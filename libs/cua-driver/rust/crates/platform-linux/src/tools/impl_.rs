@@ -2416,20 +2416,12 @@ impl Tool for GetScreenSizeTool {
     }
     async fn invoke(&self, _args: Value) -> ToolResult {
         let result = tokio::task::spawn_blocking(|| {
-            use x11rb::connection::Connection;
-            use x11rb::rust_connection::RustConnection;
-            let (conn, screen_num) = RustConnection::connect(None)?;
-            let setup = conn.setup();
-            let screen = &setup.roots[screen_num];
+            let (width, height) = crate::x11::screen_size()?;
             // X11 reports pixel dimensions; scale factor on X11 is not
             // well-defined per-monitor, so report 1.0 (matches DPI-unaware
             // assumption).  Wayland/HiDPI X11 callers should query
             // `xrandr --query` for true scale.
-            Ok::<(u32, u32, f64), anyhow::Error>((
-                screen.width_in_pixels as u32,
-                screen.height_in_pixels as u32,
-                1.0,
-            ))
+            Ok::<(u32, u32, f64), anyhow::Error>((width, height, 1.0))
         }).await;
         match result {
             // Matches Swift text format 1:1.
