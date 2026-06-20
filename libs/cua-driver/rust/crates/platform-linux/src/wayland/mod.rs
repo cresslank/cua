@@ -609,13 +609,23 @@ pub fn inject_parallel_drags(drags: &[InjectDrag]) -> anyhow::Result<()> {
     inject_send(&lines)
 }
 
-/// Window-enumeration dispatcher: native Wayland when applicable, else X11.
+/// Window-enumeration dispatcher: keep X11/XWayland as the baseline, then add
+/// opt-in GNOME Shell native-Wayland windows, then add the wlroots native path
+/// when explicitly running in pure/nested Wayland mode.
 pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
+    let mut out = crate::x11::list_windows(filter_pid);
+
+    if crate::gnome::gnome_enabled() {
+        let gnome_windows = crate::gnome::list_windows(filter_pid);
+        crate::gnome::append_deduped(&mut out, gnome_windows);
+    }
+
     if is_wayland() {
         match list_windows() {
-            Ok(ws) => return ws, // foreign-toplevel has no pid, so filter_pid can't apply
+            Ok(ws) => crate::gnome::append_deduped(&mut out, ws), // foreign-toplevel has no pid, so filter_pid can't apply
             Err(e) => tracing::warn!("wayland list_windows failed, falling back to X11: {e}"),
         }
     }
-    crate::x11::list_windows(filter_pid)
+    out.sort_by_key(|w| w.xid);
+    out
 }

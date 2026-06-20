@@ -43,6 +43,9 @@ pub mod a11y;
 #[cfg(target_os = "linux")]
 pub mod wayland;
 
+#[cfg(target_os = "linux")]
+pub mod gnome;
+
 pub fn register_tools() -> ToolRegistry {
     #[cfg(target_os = "linux")]
     wayland::ensure_nested_session();

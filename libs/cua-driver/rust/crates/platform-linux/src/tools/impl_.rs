@@ -96,6 +96,32 @@ impl ToolState {
     }
 }
 
+fn window_backend_label(window_id: u64) -> &'static str {
+    if crate::gnome::is_gnome_window_id(window_id) {
+        "gnome"
+    } else if crate::wayland::is_wayland() {
+        "wayland"
+    } else {
+        "x11"
+    }
+}
+
+fn gnome_input_rejection(tool: &str, window_id: u64) -> Option<ToolResult> {
+    if crate::gnome::is_gnome_window_id(window_id) {
+        Some(
+            ToolResult::error(crate::gnome::unsupported_input_message(tool, window_id))
+                .with_structured(json!({
+                    "code": "gnome_backend_input_not_supported",
+                    "backend": "gnome",
+                    "window_id": window_id,
+                    "tool": tool,
+                })),
+        )
+    } else {
+        None
+    }
+}
+
 // ── list_apps ────────────────────────────────────────────────────────────────
 
 pub struct ListAppsTool;
@@ -302,7 +328,7 @@ impl Tool for ListWindowsTool {
     fn def(&self) -> &ToolDef {
         LIST_WINDOWS_DEF.get_or_init(|| ToolDef {
             name: "list_windows".into(),
-            description: "List top-level X11 windows via _NET_CLIENT_LIST.".into(),
+            description: "List top-level Linux windows. Baseline X11/XWayland enumeration is always used; when CUA_DRIVER_GNOME_SHELL=1 and the local GNOME Shell extension is reachable, native GNOME Wayland windows are included too.".into(),
             input_schema: json!({"type":"object","properties":{
                 "pid":{"type":"integer"},
                 "on_screen_only":{"type":"boolean","description":"When true, filter to visible windows only. Default false."}
@@ -317,11 +343,13 @@ impl Tool for ListWindowsTool {
         let windows = tokio::task::spawn_blocking(move || crate::wayland::list_windows_dispatch(filter_pid)).await.unwrap_or_default();
         let mut lines = vec![format!("Found {} windows:", windows.len())];
         for w in &windows {
-            lines.push(format!("  [xid={}] pid={:?} \"{}\" {}x{}+{}+{}",
+            let backend = window_backend_label(w.xid);
+            lines.push(format!("  [{backend} window_id={}] pid={:?} \"{}\" {}x{}+{}+{}",
                 w.xid, w.pid, w.title, w.width, w.height, w.x, w.y));
         }
         let structured = json!({ "windows": windows.iter().map(|w| json!({
             "window_id": w.xid,
+            "backend": window_backend_label(w.xid),
             "pid": w.pid,
             "title": w.title,
             "x": w.x, "y": w.y,
@@ -912,6 +940,9 @@ impl Tool for ClickTool {
             Some(v) => v,
             None => return ToolResult::error("Provide either element_index or window_id + x/y."),
         };
+        if let Some(rejection) = gnome_input_rejection("click", xid) {
+            return rejection;
+        }
         let from_zoom = args.bool_or("from_zoom", false);
         let mut x = args.f64_or("x", 0.0);
         let mut y = args.f64_or("y", 0.0);
@@ -1004,6 +1035,9 @@ impl Tool for TypeTextTool {
                 }
             }
         };
+        if let Some(rejection) = gnome_input_rejection("type_text", xid) {
+            return rejection;
+        }
 
         // EIS nested compositor: focus-FREE per-surface typing into window_id
         // (the target need not be focused). Routed over the inject control socket.
@@ -1196,6 +1230,9 @@ impl Tool for PressKeyTool {
                 }
             }
         };
+        if let Some(rejection) = gnome_input_rejection("press_key", xid) {
+            return rejection;
+        }
         // EIS nested compositor: focus-free named-key into window_id.
         if crate::wayland::is_inject_mode() {
             let key_w = key.clone();
@@ -1284,6 +1321,9 @@ impl Tool for HotkeyTool {
                 }
             }
         };
+        if let Some(rejection) = gnome_input_rejection("hotkey", xid) {
+            return rejection;
+        }
 
         // Parse keys array (preferred) or fall back to legacy key+modifiers.
         let (key, mods) = if let Some(arr) = args.get("keys").and_then(|v| v.as_array()) {
@@ -1415,6 +1455,9 @@ impl Tool for ScrollTool {
                 }
             }
         };
+        if let Some(rejection) = gnome_input_rejection("scroll", xid) {
+            return rejection;
+        }
 
         // X11 scroll buttons: 4=up, 5=down, 6=left, 7=right
         // Note: "page" scroll is still per-click on X11; send more ticks for page.
@@ -1502,6 +1545,9 @@ impl Tool for DoubleClickTool {
         let xid = match args.opt_u64("window_id") {
             Some(v) => v, None => return ToolResult::error("Provide either element_index or window_id + x/y."),
         };
+        if let Some(rejection) = gnome_input_rejection("pointer", xid) {
+            return rejection;
+        }
         let from_zoom = args.bool_or("from_zoom", false);
         let mut x = args.f64_or("x", 0.0);
         let mut y = args.f64_or("y", 0.0);
@@ -1604,6 +1650,9 @@ impl Tool for RightClickTool {
         let xid = match args.opt_u64("window_id") {
             Some(v) => v, None => return ToolResult::error("Provide either element_index or window_id + x/y."),
         };
+        if let Some(rejection) = gnome_input_rejection("pointer", xid) {
+            return rejection;
+        }
         let from_zoom = args.bool_or("from_zoom", false);
         let mut x = args.f64_or("x", 0.0);
         let mut y = args.f64_or("y", 0.0);
@@ -2809,7 +2858,7 @@ impl Tool for CheckPermissionsTool {
         })
     }
     async fn invoke(&self, _args: Value) -> ToolResult {
-        // Check X11 connectivity (required for window enumeration and input injection).
+        // Check X11 connectivity (required for XWayland window enumeration and X11 input injection).
         let x11_ok = tokio::task::spawn_blocking(|| {
             x11rb::rust_connection::RustConnection::connect(None).is_ok()
         }).await.unwrap_or(false);
@@ -2819,24 +2868,51 @@ impl Tool for CheckPermissionsTool {
             || std::path::Path::new("/run/user").exists();
 
         let wayland_display = std::env::var("WAYLAND_DISPLAY").ok();
+        let gnome = tokio::task::spawn_blocking(crate::gnome::diagnostic)
+            .await
+            .unwrap_or_default();
         let status_text = format!(
-            "X11 display: {}\nWayland: {}\nAT-SPI (D-Bus): {}\nXSendEvent injection: {}",
+            "X11 display: {}\nWayland: {}\nGNOME Shell backend: {}\nGNOME Shell extension: {}\nAT-SPI (D-Bus): {}\nXSendEvent injection: {}",
             if x11_ok { "✅ connected" } else { "❌ DISPLAY not set or X11 unavailable" },
             match &wayland_display {
                 Some(s) if crate::wayland::wayland_enabled() =>
-                    format!("✅ native Wayland session (WAYLAND_DISPLAY={s}) — experimental backend ENABLED"),
+                    format!("✅ native Wayland session (WAYLAND_DISPLAY={s}) — experimental wlroots backend ENABLED"),
                 Some(s) => format!(
-                    "⚠️  native Wayland session (WAYLAND_DISPLAY={s}) — experimental backend OFF; \
+                    "⚠️  native Wayland session (WAYLAND_DISPLAY={s}) — experimental wlroots backend OFF; \
                      set {}=1 to enable it",
                     crate::wayland::ENABLE_WAYLAND_ENV
                 ),
                 None => "❌ not a Wayland session".to_string(),
             },
+            if gnome.enabled {
+                format!("✅ enabled via {}=1", crate::gnome::ENABLE_GNOME_ENV)
+            } else {
+                format!("⚠️  off; set {}=1 to include native GNOME Wayland windows", crate::gnome::ENABLE_GNOME_ENV)
+            },
+            if gnome.reachable {
+                format!("✅ reachable ({} GNOME window(s))", gnome.window_count)
+            } else if let Some(err) = &gnome.error {
+                format!("❌ unreachable ({err})")
+            } else {
+                "❌ unreachable".to_string()
+            },
             if atspi_ok { "✅ D-Bus session available" } else { "⚠️  D-Bus session not detected" },
             if x11_ok { "✅ available" } else { "❌ requires X11" }
         );
         ToolResult::text(status_text)
-            .with_structured(json!({ "x11": x11_ok, "wayland": wayland_display.is_some(), "wayland_enabled": crate::wayland::wayland_enabled(), "atspi": atspi_ok, "xsend_event": x11_ok }))
+            .with_structured(json!({
+                "x11": x11_ok,
+                "wayland": wayland_display.is_some(),
+                "wayland_enabled": crate::wayland::wayland_enabled(),
+                "gnome_shell": {
+                    "enabled": gnome.enabled,
+                    "reachable": gnome.reachable,
+                    "window_count": gnome.window_count,
+                    "error": gnome.error,
+                },
+                "atspi": atspi_ok,
+                "xsend_event": x11_ok,
+            }))
     }
 }
 
@@ -3007,7 +3083,9 @@ impl Tool for GetAccessibilityTreeTool {
         GAX_DEF.get_or_init(|| ToolDef {
             name: "get_accessibility_tree".into(),
             description: "Return a lightweight snapshot of the desktop: running processes and \
-                on-screen visible X11 windows with their bounds and owner pid.\n\n\
+                on-screen visible Linux windows with their bounds and owner pid. With \
+                CUA_DRIVER_GNOME_SHELL=1, native GNOME Wayland windows from the local \
+                GNOME Shell extension are included alongside X11/XWayland windows.\n\n\
                 For the full AT-SPI subtree of a single window (with interactive element indices \
                 you can click by), use get_window_state instead — this is a fast discovery read.".into(),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
@@ -3016,7 +3094,7 @@ impl Tool for GetAccessibilityTreeTool {
     }
     async fn invoke(&self, _args: Value) -> ToolResult {
         let (procs, windows) = tokio::task::spawn_blocking(|| {
-            (crate::proc_fs::list_processes(), crate::x11::list_windows(None))
+            (crate::proc_fs::list_processes(), crate::wayland::list_windows_dispatch(None))
         }).await.unwrap_or_default();
 
         let mut lines = vec![format!(
@@ -3034,8 +3112,8 @@ impl Tool for GetAccessibilityTreeTool {
                 let title = if w.title.is_empty() { "(no title)".to_owned() }
                     else { format!("\"{}\"", w.title) };
                 lines.push(format!(
-                    "- pid={:?} {} [window_id: {}] {}x{}+{}+{}",
-                    w.pid, title, w.xid, w.width, w.height, w.x, w.y
+                    "- backend={} pid={:?} {} [window_id: {}] {}x{}+{}+{}",
+                    window_backend_label(w.xid), w.pid, title, w.xid, w.width, w.height, w.x, w.y
                 ));
             }
             lines.push("→ Call get_window_state(pid, window_id) to inspect a window's UI.".to_owned());
@@ -3044,7 +3122,7 @@ impl Tool for GetAccessibilityTreeTool {
         let structured = json!({
             "processes": procs.iter().map(|p| json!({"pid":p.pid,"name":p.name})).collect::<Vec<_>>(),
             "windows": windows.iter().map(|w| json!({
-                "window_id": w.xid, "pid": w.pid, "title": w.title,
+                "window_id": w.xid, "backend": window_backend_label(w.xid), "pid": w.pid, "title": w.title,
                 "x": w.x, "y": w.y, "width": w.width, "height": w.height
             })).collect::<Vec<_>>()
         });
@@ -3226,7 +3304,7 @@ impl Tool for KillAppTool {
     }
 }
 
-// ── bring_to_front (Linux stub) ──────────────────────────────────────────────
+// ── bring_to_front ────────────────────────────────────────────────────────────
 
 pub struct BringToFrontTool;
 
@@ -3238,11 +3316,11 @@ impl Tool for BringToFrontTool {
         BTF_DEF.get_or_init(|| ToolDef {
             name: "bring_to_front".into(),
             description:
-                "Activate a window so subsequent input tools land on it. **Windows-only \
-                 today:** on Linux this stub returns an error; the X11/Wayland equivalents \
-                 (`wmctrl -a`, `xdotool windowactivate`) aren't wired up because the Linux \
-                 input tools deliver via AT-SPI / X11 input injection which already reaches \
-                 backgrounded windows without needing activation."
+                "Activate a window so subsequent focus-based input tools land on it. On Linux, \
+                 GNOME Shell backend window IDs (from list_windows with CUA_DRIVER_GNOME_SHELL=1) \
+                 are activated through the local GNOME Shell extension. X11 windows still return \
+                 the legacy unsupported response because Linux X11 input tools can already target \
+                 backgrounded windows without foreground activation."
                 .into(),
             input_schema: serde_json::json!({
                 "type":"object","required":["pid"],"properties":{
@@ -3254,27 +3332,50 @@ impl Tool for BringToFrontTool {
         })
     }
 
-    async fn invoke(&self, _args: Value) -> ToolResult {
+    async fn invoke(&self, args: Value) -> ToolResult {
+        use cua_driver_core::tool_args::ArgsExt;
+        let pid = args.u64_or("pid", 0) as u32;
+        let window_id = match args.opt_u64("window_id") {
+            Some(id) => id,
+            None => {
+                let windows = tokio::task::spawn_blocking(move || {
+                    crate::wayland::list_windows_dispatch(Some(pid))
+                })
+                .await
+                .unwrap_or_default();
+                match windows.first() {
+                    Some(w) => w.xid,
+                    None => return ToolResult::error(format!("No windows found for pid {pid}. Provide window_id.")),
+                }
+            }
+        };
+
+        if crate::gnome::is_gnome_window_id(window_id) {
+            let result = tokio::task::spawn_blocking(move || crate::gnome::activate_window(window_id)).await;
+            return match result {
+                Ok(Ok(())) => ToolResult::text(format!("✅ Activated GNOME Shell window {window_id}."))
+                    .with_structured(json!({"backend":"gnome","window_id":window_id})),
+                Ok(Err(e)) => ToolResult::error(e.to_string()),
+                Err(e) => ToolResult::error(format!("Task error: {e}")),
+            };
+        }
+
         ToolResult::error(
-            "bring_to_front is Windows-only today. On Linux the input tools deliver via \
-             AT-SPI / X11 input injection which already reaches backgrounded windows. If \
-             you need explicit activation for your own UX reasons, shell out to \
-             `wmctrl -a` or `xdotool windowactivate` from outside cua-driver."
+            "bring_to_front currently supports GNOME Shell backend window IDs on Linux. \
+             X11 input tools deliver via AT-SPI / X11 input injection and can reach \
+             backgrounded windows without foreground activation. If you need explicit \
+             X11 activation for UX reasons, shell out to `wmctrl -a` or \
+             `xdotool windowactivate` from outside cua-driver."
                 .to_string(),
         )
         .with_structured(serde_json::json!({
-            "code": "bring_to_front_unsupported_on_platform",
+            "code": "bring_to_front_unsupported_for_backend",
             "platform": "linux",
-            // Machine-readable remediation hint — mirrors the macOS
-            // bring_to_front stub's structured `suggestion` field so
-            // cross-platform clients can dispatch on a uniform key.
+            "backend": window_backend_label(window_id),
+            "window_id": window_id,
             "suggestion":
-                "Linux input tools (click / type_text / press_key / hotkey) already \
-                 reach backgrounded windows via AT-SPI / X11 input injection — \
-                 there is no equivalent need to bring a window to the foreground. \
-                 If you need explicit window activation for UX reasons, shell out \
-                 to `wmctrl -a <title>` or `xdotool windowactivate <wid>` from \
-                 outside cua-driver.",
+                "Use a GNOME Shell backend window_id from list_windows with CUA_DRIVER_GNOME_SHELL=1, \
+                 or use existing click / type_text / press_key / hotkey tools directly for X11/XWayland windows.",
         }))
     }
 }
