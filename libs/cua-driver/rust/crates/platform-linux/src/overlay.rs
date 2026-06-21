@@ -3,10 +3,12 @@
 //! Architecture:
 //! - Creates an override-redirect (non-reparented) X11 window with 32-bit ARGB visual
 //!   from XComposite.  The window covers the full display area.
-//! - A background thread renders frames at ~60 Hz using tiny-skia and XShmPutImage
-//!   (or XPutImage fallback) with XRender ARGB compositing.
+//! - A background thread renders frames at ~60 Hz using tiny-skia and XPutImage
+//!   while cursors are animating/fading, then parks on the command channel when
+//!   every cursor is quiescent.
 //! - Mouse events pass through via `XShapeSelectInput(ShapeInput, empty-region)`.
-//! - Z-ordering: `XRaiseWindow` every 80ms to stay above normal windows.
+//! - Z-ordering: reasserted while rendering so the overlay stays above the
+//!   currently actuated X11 window without burning CPU while idle.
 //! - Wayland: when WAYLAND_DISPLAY is set but DISPLAY is also available (XWayland),
 //!   the X11 path is used.  Pure Wayland support is a TODO.
 //!
@@ -285,6 +287,29 @@ impl RenderState {
         // the visual update silently so callers don't see an error.
         let _ = self.core.apply_command_base(cmd, false, false);
     }
+
+    /// True while the Linux render loop must keep waking at frame cadence
+    /// because the next tick can still change pixels: an in-flight glide path,
+    /// spring-settle, click pulse, or idle fade that has not yet fully hidden a
+    /// placed cursor. A brand-new sentinel cursor is quiescent, so a fresh
+    /// daemon with no activity can park instead of compositing a full-screen
+    /// transparent X11 pixmap at ~60 Hz forever.
+    fn needs_frame_tick(&self) -> bool {
+        self.core.path.is_some()
+            || self.core.spring.is_some()
+            || self.core.click_t.is_some()
+            || (self.core.motion.idle_hide_ms > 0.0
+                && self.core.visible
+                && self.core.pos.0 >= -100.0
+                && self.core.idle_alpha >= 0.004)
+    }
+}
+
+/// True if any owned cursor still needs animation/fade ticks. When false, the
+/// overlay thread can skip full-screen pixmap allocation/RGBA→BGRA conversion /
+/// XPutImage and wait cheaply for the next command.
+fn render_map_needs_frame_tick(map: &RenderMap) -> bool {
+    map.cursors.values().any(RenderState::needs_frame_tick)
 }
 
 // ── X11 thread ────────────────────────────────────────────────────────────
@@ -383,22 +408,38 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
     conn.map_window(win).ok();
     conn.flush().ok();
 
-    // Main render loop at ~60Hz.
+    // Main render loop. Active cursors tick at ~60Hz; once every cursor is
+    // quiescent, park on the command channel with a slow timeout so an idle
+    // daemon does not allocate/swizzle/blit a full-screen pixmap forever.
     let frame_dur = Duration::from_millis(16);
+    let idle_timeout = Duration::from_millis(250);
     let mut last_tick = Instant::now();
     let mut last_ztick = Instant::now();
+    let mut was_active = false;
+    let mut pending_msg: Option<OverlayMsg> = None;
     let z_enforcer = X11ZOrderEnforcer { conn: &conn, win };
 
     loop {
-        let now = Instant::now();
-        let dt  = now.duration_since(last_tick).as_secs_f64().min(0.05);
-        last_tick = now;
+        let frame_start = Instant::now();
+        let dt  = frame_start.duration_since(last_tick).as_secs_f64().min(0.05);
+        last_tick = frame_start;
 
-        // Drain commands and tick.
-        let (arrived, pinned_wid) = {
+        // Drain commands, tick, and maybe composite one pixmap. The expensive
+        // paint path runs only when a command arrived, a cursor still needs
+        // animation/fade ticks, or the previous tick was active and we owe one
+        // final resting/clear frame.
+        let (pixmap, arrived, pinned_wid, needs_tick) = {
             let mut guard = RENDER.lock().unwrap();
             if let Some(map) = guard.as_mut() {
+                let mut had_msg = false;
+                if let Some(msg) = pending_msg.take() {
+                    had_msg = true;
+                    if let Some(key) = apply_msg(map, msg) {
+                        map.last_active = Some(key);
+                    }
+                }
                 while let Ok(msg) = rx.try_recv() {
+                    had_msg = true;
                     if let Some(key) = apply_msg(map, msg) {
                         map.last_active = Some(key);
                     }
@@ -409,52 +450,69 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
                         arrived.push(key.clone());
                     }
                 }
+                let needs_tick = render_map_needs_frame_tick(map);
                 let pinned_wid = map
                     .last_active
                     .as_ref()
                     .and_then(|key| map.cursors.get(key))
                     .and_then(|rs| rs.core.pinned_wid);
-                (arrived, pinned_wid)
-            } else {
-                (Vec::new(), None)
-            }
-        };
 
-        // Render and paint.
-        let pixmap = {
-            let guard = RENDER.lock().unwrap();
-            guard.as_ref().map(|map| {
-                let mut pm = tiny_skia::Pixmap::new(map.scr_w.max(1), map.scr_h.max(1))
-                    .unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap());
-                for rs in map.cursors.values() {
-                    cursor_overlay::paint_cursor(&mut pm, &rs.core, 0.0, 0.0, None);
-                }
-                pm
-            })
+                let should_render = had_msg || needs_tick || was_active;
+                let pixmap = if should_render {
+                    let mut pm = tiny_skia::Pixmap::new(map.scr_w.max(1), map.scr_h.max(1))
+                        .unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap());
+                    for rs in map.cursors.values() {
+                        cursor_overlay::paint_cursor(&mut pm, &rs.core, 0.0, 0.0, None);
+                    }
+                    Some(pm)
+                } else {
+                    None
+                };
+
+                (pixmap, arrived, pinned_wid, needs_tick)
+            } else {
+                (None, Vec::new(), None, false)
+            }
         };
 
         if let Some(pm) = pixmap {
             paint_x11(&conn, win, scr_w, scr_h, depth, visual_id, &pm);
+
+            // Z-order maintenance every 80ms while the overlay is actively
+            // rendering. Once quiescent, leave the current z-slot untouched
+            // until a command wakes the loop again.
+            if last_ztick.elapsed() >= Duration::from_millis(80) {
+                last_ztick = Instant::now();
+                z_enforcer.reassert(pinned_wid);
+            }
         }
 
         for key in &arrived {
             arrival_fire(key);
         }
 
-        // Z-order maintenance every 80ms — delegate to the cross-platform
-        // ZOrderEnforcer so the contract for "z+1 of the application under
-        // test" is documented once in `cursor_overlay::z_order`.
-        if last_ztick.elapsed() >= Duration::from_millis(80) {
-            last_ztick = Instant::now();
-            z_enforcer.reassert(pinned_wid);
-        }
-
         // Drain any X events (needed to avoid blocking).
         while let Ok(Some(_)) = conn.poll_for_event() {}
 
-        let elapsed = Instant::now().duration_since(last_tick);
-        if let Some(remaining) = frame_dur.checked_sub(elapsed) {
-            std::thread::sleep(remaining);
+        was_active = needs_tick;
+
+        if needs_tick {
+            let elapsed = Instant::now().duration_since(frame_start);
+            if let Some(remaining) = frame_dur.checked_sub(elapsed) {
+                std::thread::sleep(remaining);
+            }
+        } else {
+            match rx.recv_timeout(idle_timeout) {
+                Ok(msg) => {
+                    pending_msg = Some(msg);
+                    // The next tick should start a newly-arrived command from
+                    // dt≈0 rather than jumping the animation by the whole idle
+                    // parking interval.
+                    last_tick = Instant::now();
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
         }
     }
 }
@@ -574,6 +632,110 @@ fn paint_x11(
 
     conn.free_gc(gc_id).ok();
     conn.flush().ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_map() -> RenderMap {
+        let cfg = CursorConfig::default();
+        let mut cursors = HashMap::new();
+        cursors.insert("default".to_owned(), RenderState::new(cfg.clone()));
+        RenderMap {
+            cursors,
+            scr_w: 1920,
+            scr_h: 1080,
+            template: cfg,
+            ended: HashSet::new(),
+            last_active: None,
+        }
+    }
+
+    fn move_msg(key: &str, x: f64, y: f64) -> OverlayMsg {
+        OverlayMsg::Cmd(KeyedOverlayCommand {
+            key: key.to_owned(),
+            cmd: OverlayCommand::MoveTo {
+                x,
+                y,
+                end_heading_radians: std::f64::consts::FRAC_PI_4,
+            },
+        })
+    }
+
+    #[test]
+    fn sentinel_cursor_is_quiescent_no_frame_tick() {
+        // A brand-new daemon has only the off-screen default cursor. It must not
+        // request frame ticks, or Linux `serve` burns a core compositing a blank
+        // full-screen X11 pixmap forever.
+        let map = empty_map();
+        assert!(
+            !render_map_needs_frame_tick(&map),
+            "an untouched sentinel-only overlay must be quiescent"
+        );
+    }
+
+    #[test]
+    fn animating_cursor_requests_frame_ticks() {
+        let mut map = empty_map();
+        apply_msg(&mut map, move_msg("sessA", 60.0, 60.0));
+        assert!(
+            render_map_needs_frame_tick(&map),
+            "a cursor with an in-flight glide must request frame ticks"
+        );
+        assert!(
+            map.cursors["sessA"].needs_frame_tick(),
+            "the animating cursor itself must report needs_frame_tick"
+        );
+    }
+
+    #[test]
+    fn click_pulse_requests_frame_ticks_then_goes_quiescent() {
+        let mut map = empty_map();
+        apply_msg(
+            &mut map,
+            OverlayMsg::Cmd(KeyedOverlayCommand {
+                key: "sessA".to_owned(),
+                cmd: OverlayCommand::ClickPulse { x: 10.0, y: 10.0 },
+            }),
+        );
+        assert!(
+            render_map_needs_frame_tick(&map),
+            "click pulse must keep ticking"
+        );
+
+        // Disable idle-hide so the only activity source is the click pulse, then
+        // advance time past the pulse: the cursor must fall quiescent so the
+        // loop can park.
+        for rs in map.cursors.values_mut() {
+            rs.core.motion.idle_hide_ms = 0.0;
+        }
+        for _ in 0..120 {
+            for rs in map.cursors.values_mut() {
+                rs.tick(0.016);
+            }
+        }
+        assert!(
+            !render_map_needs_frame_tick(&map),
+            "after the click pulse finishes the overlay must go quiescent"
+        );
+    }
+
+    #[test]
+    fn hidden_cursor_is_quiescent_after_clear_frame() {
+        let mut map = empty_map();
+        apply_msg(&mut map, move_msg("sessA", 60.0, 60.0));
+        let rs = map.cursors.get_mut("sessA").unwrap();
+        rs.core.path = None;
+        rs.core.spring = None;
+        rs.core.click_t = None;
+        rs.core.pos = (60.0, 60.0);
+        rs.core.visible = false;
+        assert!(
+            !render_map_needs_frame_tick(&map),
+            "hidden cursors should not keep the frame loop active after the clear frame"
+        );
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
