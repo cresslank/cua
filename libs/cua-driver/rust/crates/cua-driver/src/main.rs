@@ -30,6 +30,7 @@ mod cli;
 mod doctor;
 mod mcp_http;
 mod proxy;
+mod responsibility;
 mod serve;
 mod skills;
 mod telemetry;
@@ -196,6 +197,12 @@ fn main() {
             cli::run_mcp_config(client.as_deref());
             return;
         }
+        cli::Command::Manifest { pretty } => {
+            // Surface 8: machine-readable CLI manifest. Read-only — no
+            // registry build needed, no daemon contact.
+            cli::run_manifest(pretty);
+            return;
+        }
         cli::Command::Call { tool, json_args, screenshot_out_file, socket } => {
             // Register callbacks (needed if the tool does screenshots/recording).
             cua_driver_core::recording::set_screenshot_fn(|window_id, pid| {
@@ -226,6 +233,7 @@ fn main() {
             return;
         }
         cli::Command::Serve { socket, no_permissions_gate, claude_code_compat } => {
+            responsibility::reexec_disclaimed_if_needed();
             // Long-running daemon — kick off the background update check
             // before any blocking work so the banner can land on stderr
             // early in the serve lifecycle.
@@ -561,6 +569,12 @@ fn main() -> anyhow::Result<()> {
             cli::run_mcp_config(client.as_deref());
             return Ok(());
         }
+        cli::Command::Manifest { pretty } => {
+            // Surface 8: machine-readable CLI manifest. Read-only — no
+            // registry build needed.
+            cli::run_manifest(pretty);
+            return Ok(());
+        }
         cli::Command::Call { tool, json_args, screenshot_out_file, socket } => {
             let reg = Arc::new(build_registry_no_cursor());
             reg.init_self_weak();
@@ -571,6 +585,7 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         cli::Command::Serve { socket, no_permissions_gate, claude_code_compat } => {
+            responsibility::reexec_disclaimed_if_needed();
             // Long-running daemon — kick off the background update check
             // before any blocking work so the banner can land on stderr.
             version_check::maybe_announce_update();
@@ -784,6 +799,11 @@ fn build_registry(cursor_cfg: cursor_overlay::CursorConfig) -> cua_driver_core::
         cua_driver_core::video::set_video_backend_factory(
             Box::new(cua_driver_core::video_ffmpeg::FfmpegVideoBackendFactory),
         );
+        // SSH-driven Wayland+Xwayland sessions inherit DISPLAY but not
+        // XAUTHORITY; adopt the running X server's auth cookie so X11 tools
+        // don't all fail "Authorization required" (#1926). No-op when
+        // XAUTHORITY is already set or there's no DISPLAY.
+        platform_linux::xauth::ensure_xauthority_discovered();
         // Turn on Chromium/Electron (and GTK/Qt) accessibility for the session
         // so their AT-SPI trees are visible to get_window_state. Best-effort and
         // idempotent; only on the serve path, not for short-lived CLI calls.

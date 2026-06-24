@@ -12,9 +12,10 @@
 
 use cua_driver_core::tool::ToolRegistry;
 
-pub mod tools;
+pub mod health_report;
 pub mod overlay;
 pub mod pip;
+pub mod tools;
 
 #[cfg(target_os = "linux")]
 pub mod x11;
@@ -45,6 +46,13 @@ pub mod wayland;
 
 #[cfg(target_os = "linux")]
 pub mod gnome;
+
+// `terminal` is OS-independent (pure string matching + a thin x11 hook).
+// Keeping it un-gated lets the unit tests run on any host.
+pub mod terminal;
+
+#[cfg(target_os = "linux")]
+pub mod xauth;
 
 pub fn register_tools() -> ToolRegistry {
     #[cfg(target_os = "linux")]
