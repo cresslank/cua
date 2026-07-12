@@ -1428,11 +1428,11 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     }
 
     if is_wayland() {
-        // wlroots compositors expose zwlr_foreign_toplevel_management — use it
-        // (it has no pid, so filter_pid can't apply there).
+        // wlroots compositors expose zwlr_foreign_toplevel_management, but
+        // those records do not carry a pid. Use them only for unfiltered
+        // discovery; pid-filtered callers fall through to the AT-SPI registry.
         match list_windows() {
-            Ok(ws) if !ws.is_empty() => {
-                // foreign-toplevel has no pid, so filter_pid cannot apply.
+            Ok(ws) if !ws.is_empty() && filter_pid.is_none() => {
                 crate::gnome::append_deduped(&mut out, ws);
             }
             Ok(_) => {
