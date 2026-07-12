@@ -15,7 +15,7 @@
 # helper is hard-pinned to `cua-driver-rs-v*` and will never pick it up.
 #
 # Canonical user-facing invocation (forwards here by default):
-#   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"
+#   /bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)"
 #
 # Flags:
 #   --bin-dir <path>     install the visible binary/symlink to <path>
@@ -82,7 +82,7 @@ set -euo pipefail
 # Failure here is non-fatal: the daemon-stop is a best-effort upgrade
 # nicety, not load-bearing. If we can't load the helpers, define
 # no-op stubs so the rest of the script can call them unconditionally.
-_CUA_INSTALL_COMMON_URL="https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/_install-common.sh"
+_CUA_INSTALL_COMMON_URL="https://cua.ai/driver/_install-common.sh"
 _cua_install_common_loaded=0
 if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" != "-" && -f "${BASH_SOURCE[0]}" ]]; then
     _CUA_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -485,7 +485,7 @@ case "$OS-$ARCH_RAW" in
     *)
         err "unsupported platform: $OS / $ARCH_RAW"
         err "  cua-driver-rs ships prebuilts for: darwin-arm64, darwin-x86_64, linux-x86_64, linux-arm64."
-        err "  Windows users: install via install.ps1 (irm https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.ps1 | iex)."
+        err "  Windows users: install via install.ps1 (irm https://cua.ai/driver/install.ps1 | iex)."
         exit 1
         ;;
 esac
@@ -558,7 +558,7 @@ verify_release_checksum() {
 # the baked line hasn't been updated yet (dev / pre-release checkouts).
 #
 # ~~~ BAKED_VERSION: auto-updated by CD workflow after each release — do not edit ~~~
-CUA_DRIVER_RS_BAKED_VERSION="0.6.6"
+CUA_DRIVER_RS_BAKED_VERSION="0.7.1"
 # ~~~ END_BAKED_VERSION ~~~
 
 if [[ -n "${CUA_DRIVER_RS_VERSION:-}" ]]; then
@@ -878,7 +878,7 @@ fi
 # (Try-it / skill pack / MCP setup / docs link) with {{BINARY}}
 # placeholders; OS-specific bits (autostart / TCC) stay inline below
 # in each installer where they're per-shell natural.
-HINTS_URL="https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/post-install-hints.txt"
+HINTS_URL="https://cua.ai/driver/post-install-hints.txt"
 HINTS_TXT="$TMP_DIR/post-install-hints.txt"
 if curl -fsSL "$HINTS_URL" -o "$HINTS_TXT" 2>/dev/null && [ -s "$HINTS_TXT" ]; then
     sed "s|{{BINARY}}|$BIN_LINK|g" "$HINTS_TXT"

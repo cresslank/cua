@@ -1,0 +1,70 @@
+---
+title: 'Drive a Web Page'
+description: 'Read and act on the page already loaded in a browser or Electron app with the page tool: get text, query the DOM, click, insert text, type keystrokes, run JavaScript.'
+---
+
+# Drive a Web Page
+
+Use the `page` tool on the page already loaded in a running browser or Electron app. Open the URL first, either through `launch_app` or by having the user open it. This is the DOM/CDP path. Honest-verification `escalation.recommended: 'page'` points here when AX typing echoes but the DOM does not observe it. For the agent-side escalation behavior, see [Agent action policy](/reference/cua-driver/action-selection-policy) and [Capture and delivery modalities](/concepts/capture-and-delivery-modalities).
+
+## When to use it
+
+Use `page` when the target is browser-tab content and the accessibility layer cannot prove the result. It is especially useful after `type_text` returns `effect: "unverifiable"` with `escalation.recommended: "page"`.
+
+Read actions (`get_text`, `query_dom`) work broadly, and `execute_javascript` works cross-platform given a CDP endpoint. `insert_text` and `type_keystrokes` are macOS-only for now; Windows and Linux return a clear "not implemented" error rather than a silent no-op. See the [`page` tool reference](/reference/cua-driver/mcp-tools#page) for the full action list, parameters, and platform notes.
+
+## insert_text vs type_keystrokes
+
+`insert_text` does a bulk CDP DOM-level insert. It is fast and does not fire JS key events. `type_keystrokes` sends per-character keydown/keyup events through CDP. It is slower and fires JS handlers. Use `type_keystrokes` for React/Vue inputs and other frameworks that listen for key events.
+
+## Examples
+
+Read all visible text from an open page:
+
+```jsonc
+page({
+  pid,
+  window_id,
+  action: "get_text"
+})
+```
+
+Query a CSS selector and return its `href` attribute:
+
+```jsonc
+page({
+  pid,
+  window_id,
+  action: "query_dom",
+  css_selector: "a.docs-link",
+  attributes: ["href"]
+})
+```
+
+Type into the focused input field with real key events:
+
+```jsonc
+page({
+  action: "type_keystrokes",
+  text: "status: ready",
+  cdp_port: 9222,
+  target_url_contains: "localhost"
+})
+```
+
+Run JavaScript to read a value from the page:
+
+```jsonc
+page({
+  pid,
+  window_id,
+  action: "execute_javascript",
+  javascript: "document.querySelector('#total')?.textContent"
+})
+```
+
+## Related
+
+- [page tool reference](/reference/cua-driver/mcp-tools#page)
+- [Agent action policy](/reference/cua-driver/action-selection-policy)
+- [Capture and delivery modalities](/concepts/capture-and-delivery-modalities)

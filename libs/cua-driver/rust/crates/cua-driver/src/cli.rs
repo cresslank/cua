@@ -140,6 +140,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--cursor-icon", "--cursor-id", "--cursor-palette", "--cursor-shape",
     "--glide-ms", "--dwell-ms", "--idle-hide-ms",
     "--screenshot-out-file", "--client", "--socket", "--pid-file", "--type",
+    "--host-bundle-id",
     // Experimental PiP preview — value flag for the optional geometry
     // override (--experimental-pip itself is a bare flag and doesn't
     // need to be listed here).
@@ -201,6 +202,10 @@ pub fn parse_command() -> Command {
         println!("mcp options (macOS):");
         println!("  --no-daemon-relaunch    Stay in-process; skip auto-launching the CuaDriver daemon.");
         println!("                          Also: CUA_DRIVER_RS_MCP_NO_RELAUNCH=1");
+        println!("  --embedded              Run embedded inside a host app (also: CUA_DRIVER_EMBEDDED=1).");
+        println!("                          Inherits the host's TCC grants; never prompts or relaunches.");
+        println!("                          See Skills/cua-driver/EMBEDDING.md.");
+        println!("  --host-bundle-id <id>   Advisory host bundle id label for check_permissions output.");
         println!("  --socket <path>         Override the daemon UDS path used by the proxy fallback.");
         println!("  --claude-code-computer-use-compat");
         println!("                          Select the Claude Code computer-use compat surface.");
@@ -216,13 +221,15 @@ pub fn parse_command() -> Command {
         println!("  cursor (keyed by session id) that shows where the agent acts without moving the");
         println!("  real pointer. It is removed when the session ends. A pure accessibility (AX)");
         println!("  action snaps the cursor with a brief pulse on its first action instead of a long");
-        println!("  glide, so it can be easy to miss — do a pixel click or move_agent_cursor first");
+        println!("  glide, so it can be easy to miss — do a pixel click or move_cursor first");
         println!("  for a visibly gliding demo. These flags tune the overlay on `serve`/`mcp`:");
         println!("  --no-overlay            Disable the cursor overlay entirely for this daemon.");
         println!("  --cursor-id <id>        Name the default cursor instance (default: 'default').");
         println!("  --cursor-icon <path>    Use a custom PNG / JPEG / SVG / ICO cursor asset.");
-        println!("  --cursor-shape <name>   Built-in silhouette: 'arrow' (default — procedural");
-        println!("                          gradient diamond) or 'teardrop' (embedded cursor-up SVG).");
+        println!("  --cursor-shape <name>   Built-in silhouette: {} ('teardrop' is the default —",
+            cursor_overlay::BuiltinShape::names_help());
+        println!("                          embedded cursor-up SVG; 'arrow' is the procedural gradient");
+        println!("                          diamond). Same vocabulary as MCP `cursor_icon`.");
         println!("  --cursor-palette <name> Pick a built-in colour palette for the cursor.");
         println!("  (These are no-ops for one-shot CLI calls like `cua-driver call` — the overlay");
         println!("   needs the long-lived AppKit runloop that only `serve` / `mcp` keep alive.)");
@@ -251,6 +258,16 @@ pub fn parse_command() -> Command {
     let screenshot_out_file = flag_value(&args, "--screenshot-out-file");
     let mcp_client = flag_value(&args, "--client");
     let socket = flag_value(&args, "--socket");
+
+    // `--embedded` / `--host-bundle-id` export to the environment rather
+    // than threading through `Command`: all consumers read
+    // `cua_driver_core::embedded_mode()` and children inherit the mode.
+    if args.iter().any(|a| a == "--embedded") {
+        std::env::set_var(cua_driver_core::EMBEDDED_ENV, "1");
+    }
+    if let Some(id) = flag_value(&args, "--host-bundle-id") {
+        std::env::set_var(cua_driver_core::HOST_BUNDLE_ID_ENV, id);
+    }
 
     // Strip cursor-overlay flags (and their values) to expose the subcommand.
     let mut positionals: Vec<&str> = Vec::new();
@@ -538,6 +555,12 @@ pub fn run_describe(registry: &ToolRegistry, name: &str) {
 #[cfg(target_os = "macos")]
 pub fn should_use_daemon_proxy(no_daemon_relaunch: bool) -> bool {
     use crate::bundle::{is_env_truthy, is_executable_inside_cuadriver_app, parent_is_not_launchd};
+    // Embedded mode stays in-process: relaunching via `open -a CuaDriver`
+    // would leave the host's TCC responsibility chain and could prompt
+    // for com.trycua.driver.
+    if cua_driver_core::embedded_mode() {
+        return false;
+    }
     if no_daemon_relaunch {
         return false;
     }
@@ -588,6 +611,10 @@ pub fn should_use_daemon_proxy(no_daemon_relaunch: bool) -> bool {
 #[cfg(not(target_os = "macos"))]
 pub fn should_use_daemon_proxy(no_daemon_relaunch: bool) -> bool {
     use crate::bundle::is_env_truthy;
+    // Same rule as macOS: an embedded driver answers in-process.
+    if cua_driver_core::embedded_mode() {
+        return false;
+    }
     if no_daemon_relaunch {
         return false;
     }
@@ -844,14 +871,18 @@ pub fn build_manifest() -> serde_json::Value {
               "args": [
                   { "name": "--no-daemon-relaunch", "type": "flag", "description": "Skip the bundle-based TCC auto-relaunch and stay in-process." },
                   { "name": "--socket", "type": "string", "description": "Override the daemon proxy UDS path." },
-                  { "name": "--claude-code-computer-use-compat", "type": "flag", "description": "Select the Claude Code computer-use compat tool surface." }
+                  { "name": "--claude-code-computer-use-compat", "type": "flag", "description": "Select the Claude Code computer-use compat tool surface." },
+                  { "name": "--embedded", "type": "flag", "description": "Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CUA_DRIVER_EMBEDDED=1." },
+                  { "name": "--host-bundle-id", "type": "string", "description": "Advisory host bundle id label echoed in check_permissions output." }
               ] },
             { "name": "serve",
               "description": "Run the long-lived daemon — backs the proxy/auto-relaunch path on macOS and the autostart Session 1+ daemon on Windows.",
               "args": [
                   { "name": "--socket", "type": "string", "description": "Override the listen socket path." },
                   { "name": "--no-permissions-gate", "type": "flag", "description": "Skip the macOS TCC first-launch gate." },
-                  { "name": "--claude-code-computer-use-compat", "type": "flag", "description": "Forwarded by the MCP proxy when the client asked for the compat surface." }
+                  { "name": "--claude-code-computer-use-compat", "type": "flag", "description": "Forwarded by the MCP proxy when the client asked for the compat surface." },
+                  { "name": "--embedded", "type": "flag", "description": "Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CUA_DRIVER_EMBEDDED=1." },
+                  { "name": "--host-bundle-id", "type": "string", "description": "Advisory host bundle id label echoed in check_permissions output." }
               ] },
             { "name": "stop",
               "description": "Stop a running daemon by sending it a shutdown request.",
@@ -875,7 +906,7 @@ pub fn build_manifest() -> serde_json::Value {
               ] },
             { "name": "mcp-config",
               "description": "Print the MCP server config snippet or a client-specific install command.",
-              "args": [ { "name": "--client", "type": "string", "description": "One of: claude, codex, cursor, hermes, antigravity, openclaw, opencode, pi. Omit for the generic snippet." } ] },
+              "args": [ { "name": "--client", "type": "string", "description": "One of: claude, codex, cursor, hermes, antigravity, openclaw, opencode, pi, qwen, droid, zcode. Omit for the generic snippet." } ] },
             { "name": "manifest",
               "description": "Emit this machine-readable description of the CLI surface.",
               "args": [ { "name": "--pretty", "type": "flag", "description": "Pretty-print the JSON." } ] },
@@ -1102,8 +1133,47 @@ pub fn run_mcp_config(client: Option<&str>) {
                  exactly the shape Pi is designed around."
             );
         }
+        Some("qwen") | Some("qwen-code") => {
+            // Qwen Code (Alibaba's open-source coding CLI, a Gemini-CLI fork).
+            // Config: ~/.qwen/settings.json (user) or .qwen/settings.json
+            // (project), top-level "mcpServers" keyed by name. It also ships a
+            // CLI: `qwen mcp add <name> <command> [args...]`.
+            println!("qwen mcp add cua-driver {binary} mcp");
+        }
+        Some("droid") | Some("factory") => {
+            // Factory Droid CLI. Config: ~/.factory/mcp.json (user) or
+            // .factory/mcp.json (folder/project), top-level "mcpServers" with
+            // "type":"stdio". The CLI takes command+args as one quoted string.
+            println!("droid mcp add cua-driver \"{binary} mcp\"");
+        }
+        Some("zcode") => {
+            // ZCode by Z.ai (GLM coding harness) — a GUI app. MCP servers are
+            // added in Settings -> MCP Servers -> New MCP Server (type: stdio),
+            // or by pasting JSON under "Full configuration". No CLI and no
+            // documented config-file path, so emit the JSON to paste. (Z.ai's
+            // separate `zai` CLI does have `zai mcp add` — noted below.)
+            let normalised = binary.replace('\\', "/");
+            let full = serde_json::json!({
+                "mcpServers": {
+                    "cua-driver": {
+                        "command": normalised,
+                        "args": ["mcp"],
+                        "type": "stdio",
+                    }
+                }
+            });
+            let pretty = serde_json::to_string_pretty(&full)
+                .unwrap_or_else(|_| full.to_string());
+            println!(
+                "# ZCode (Z.ai) is a GUI app — add via Settings -> MCP Servers ->\n\
+                 # New MCP Server (type: stdio), or paste this under \"Full\n\
+                 # configuration\". If you use Z.ai's `zai` CLI instead, run:\n\
+                 #   zai mcp add cua-driver --transport stdio --command \"{binary}\" --args mcp\n\
+                 {pretty}",
+            );
+        }
         Some(other) => {
-            eprintln!("Unknown client '{other}'. Valid: claude, codex, cursor, antigravity, openclaw, opencode, hermes, pi.");
+            eprintln!("Unknown client '{other}'. Valid: claude, codex, cursor, antigravity, openclaw, opencode, hermes, pi, qwen, droid, zcode.");
             process::exit(2);
         }
     }
@@ -1978,11 +2048,13 @@ fn cli_docs_json() -> serde_json::Value {
                 "discussion": "On macOS, shell-spawned MCP processes can auto-launch and proxy through a CuaDriver.app daemon so TCC grants attach to the bundle. On Windows and Linux, MCP proxies through an already-running daemon when one is listening.",
                 "arguments": no_args,
                 "options": [
-                    {"name":"socket","short_name":null,"help":"Override the daemon socket or named-pipe path used by the proxy fallback.","type":"String","default_value":null,"is_optional":true}
+                    {"name":"socket","short_name":null,"help":"Override the daemon socket or named-pipe path used by the proxy fallback.","type":"String","default_value":null,"is_optional":true},
+                    {"name":"host-bundle-id","short_name":null,"help":"Advisory host bundle id label echoed in check_permissions output (embedded mode).","type":"String","default_value":null,"is_optional":true}
                 ],
                 "flags": [
                     {"name":"no-daemon-relaunch","short_name":null,"help":"Stay in-process instead of proxying through a daemon.","default_value":false},
-                    {"name":"claude-code-computer-use-compat","short_name":null,"help":"Expose the Claude Code computer-use compatibility screenshot surface.","default_value":false}
+                    {"name":"claude-code-computer-use-compat","short_name":null,"help":"Expose the Claude Code computer-use compatibility screenshot surface.","default_value":false},
+                    {"name":"embedded","short_name":null,"help":"Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CUA_DRIVER_EMBEDDED=1.","default_value":false}
                 ],
                 "subcommands": no_subcommands
             },
@@ -2026,10 +2098,12 @@ fn cli_docs_json() -> serde_json::Value {
                 "arguments": no_args,
                 "options": [
                     {"name":"socket","short_name":null,"help":"Override the daemon socket or named-pipe path.","type":"String","default_value":null,"is_optional":true},
-                    {"name":"pid-file","short_name":null,"help":"Override the pid-file path on Unix targets.","type":"String","default_value":null,"is_optional":true}
+                    {"name":"pid-file","short_name":null,"help":"Override the pid-file path on Unix targets.","type":"String","default_value":null,"is_optional":true},
+                    {"name":"host-bundle-id","short_name":null,"help":"Advisory host bundle id label echoed in check_permissions output (embedded mode).","type":"String","default_value":null,"is_optional":true}
                 ],
                 "flags": [
-                    {"name":"no-permissions-gate","short_name":null,"help":"Skip the macOS first-launch permissions gate.","default_value":false}
+                    {"name":"no-permissions-gate","short_name":null,"help":"Skip the macOS first-launch permissions gate.","default_value":false},
+                    {"name":"embedded","short_name":null,"help":"Run embedded inside a host app: inherit the host's TCC grants, never prompt or relaunch. Also CUA_DRIVER_EMBEDDED=1.","default_value":false}
                 ],
                 "subcommands": no_subcommands
             },
@@ -2057,7 +2131,7 @@ fn cli_docs_json() -> serde_json::Value {
             {
                 "name": "mcp-config",
                 "abstract": "Print MCP server config or a client-specific install command.",
-                "discussion": "Supported clients include claude, codex, cursor, antigravity, openclaw, opencode, hermes, and pi.",
+                "discussion": "Supported clients include claude, codex, cursor, antigravity, openclaw, opencode, hermes, pi, qwen, droid, and zcode.",
                 "arguments": no_args,
                 "options": [{"name":"client","short_name":null,"help":"Client name to print configuration for.","type":"String","default_value":null,"is_optional":true}],
                 "flags": no_flags,
@@ -2217,7 +2291,7 @@ fn cli_docs_json() -> serde_json::Value {
 pub fn run_dump_docs_with_type(registry: &ToolRegistry, pretty: bool, doc_type: &str) {
     // Each MCP tool: `{name, description, input_schema}` (Swift's MCPToolDoc
     // shape — Rust adds read_only/destructive/idempotent as intentional
-    // extras documented in PARITY.md).
+    // extras).
     let tools: Vec<serde_json::Value> = registry.iter_defs()
         .map(|(_, def)| serde_json::json!({
             "name":         def.name,
@@ -2688,7 +2762,7 @@ pub fn run_config_cmd(
             // The set_config tool keeps existing values if keys are absent,
             // so we send the known defaults explicitly.
             let defaults = serde_json::json!({
-                "capture_mode": "som",
+                "capture_mode": "ax",
                 "max_image_dimension": 0
             });
             let result = rt.block_on(async {

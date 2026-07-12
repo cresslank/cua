@@ -19,6 +19,11 @@ platform: no focus steal, no cursor warp.
 - `LINUX.md` — Linux carve-out (X11 background input via AT-SPI +
   XSendEvent, recording, Wayland opt-in/preview). Read this when
   driving on Linux.
+- `EMBEDDING.md` — embedding cua-driver inside another macOS app
+  (agent harness) so the driver inherits the host's Accessibility +
+  Screen Recording grants with zero extra prompts. Read this when
+  integrating the driver into your own app rather than running it
+  standalone.
 
 ## What the skill covers
 
@@ -54,7 +59,7 @@ forbidden-list / launch / click details.
    that were stabilized in Sonoma.
 2. **`cua-driver` CLI + `CuaDriver.app`** — installable one-liner:
    ```bash
-   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"
+   /bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)"
    ```
    Or from a clone of `trycua/cua`:
    ```bash
@@ -79,7 +84,7 @@ forbidden-list / launch / click details.
 1. **Windows 10/11** (any edition with PowerShell 5.1+).
 2. **`cua-driver` CLI (Rust port `cua-driver-rs`)** — one-liner:
    ```powershell
-   irm https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.ps1 | iex
+   irm https://cua.ai/driver/install.ps1 | iex
    ```
    No TCC equivalent; no UAC elevation required for the default
    per-user install. See `WINDOWS.md` for Session 0 vs Session 1+
@@ -94,7 +99,7 @@ The full tool surface is supported on X11 (background input via AT-SPI
 opt-in and still preview. See `LINUX.md`. Install:
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/trycua/cua/main/libs/cua-driver/scripts/install.sh)"
+/bin/bash -c "$(curl -fsSL https://cua.ai/driver/install.sh)"
 ```
 
 (On Linux the canonical installer auto-detects the non-macOS host and
@@ -185,11 +190,12 @@ Use MCP for this Claude Code vision/computer-use-style path. CLI screenshots sti
   reused across turns, or across different windows of the same app.
   Call `get_window_state({pid, window_id})` first in the same turn,
   with the same window_id you're about to act against.
-- Empty `tree_markdown` → `capture_mode` is set to `vision`, which
-  skips the AX walk by design. Flip back to the default `som`
-  (`cua-driver config set capture_mode som`) to get the tree.
-  Tiny screenshot → likely a stale window capture. See "Behavior
-  matrix" in SKILL.md for the full mode table.
+- Empty `tree_markdown` (with `degraded:true`) → this is a non-AX
+  surface (canvas / WebGL / Electron web content), not a mode problem
+  — `get_window_state` always walks the tree now. Act by pixel off the
+  screenshot already in the same response (an element px action).
+  Tiny screenshot → likely a stale window capture. See the perception
+  + element ax/px action notes in SKILL.md.
 - System-alert beep when pressing Return on a minimized Chrome
   omnibox → the keyboard-commit-on-minimized limitation. Use
   `set_value` on the field instead, or AX-click a Go/Submit button.

@@ -139,8 +139,27 @@ pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
     // Also forward to the native-Wayland layer-shell overlay when Wayland
     // is opted in. The wayland overlay's `forward` is a no-op when its
     // owner thread isn't started yet (which is the normal X11-only case).
-    if crate::wayland::is_wayland() {
-        let _ = crate::wayland::overlay::forward(&msg);
+    #[cfg(target_os = "linux")]
+    {
+        if crate::wayland::is_wayland() {
+            let _ = crate::wayland::overlay::forward(&msg);
+            // Non-wlroots compositors (GNOME Mutter / KDE) expose no
+            // `zwlr_layer_shell_v1`, so the forward above is a no-op there. Drive
+            // the agent cursor through the WinRects shell extension instead
+            // (no-op if it isn't installed). Only the SINGLE positioning commands
+            // are forwarded — never the interpolated `MoveTo` stream (the
+            // extension does its own easing; the glide target is sent once from
+            // `overlay_glide_to_for`).
+            match &cmd {
+                cursor_overlay::OverlayCommand::ClickPulse { x, y } => {
+                    crate::wayland::shell_helper::click_pulse(*x as i32, *y as i32);
+                }
+                cursor_overlay::OverlayCommand::SnapTo { x, y, .. } => {
+                    crate::wayland::shell_helper::move_cursor(*x as i32, *y as i32);
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -628,7 +647,7 @@ impl<'a, C: x11rb::connection::Connection> ZOrderEnforcer for X11ZOrderEnforcer<
 
 #[cfg(target_os = "linux")]
 fn find_argb_visual(
-    conn: &impl x11rb::connection::Connection,
+    _conn: &impl x11rb::connection::Connection,
     screen: &x11rb::protocol::xproto::Screen,
 ) -> Option<(u32, u8, u32)> {
     use x11rb::protocol::xproto::VisualClass;
