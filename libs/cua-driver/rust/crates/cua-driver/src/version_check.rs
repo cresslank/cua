@@ -379,13 +379,29 @@ fn is_enabled() -> bool {
     true
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_HOME_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+fn home_directory() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = TEST_HOME_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return Some(home);
+    }
+
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
 /// Read the `update_check_enabled` flag out of the same JSON config file
 /// the `cua-driver config set` subcommand writes to. Returns `None` when
 /// the file is missing, unreadable, or doesn't have the key.
 fn read_config_flag() -> Option<bool> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))?;
-    let path = PathBuf::from(home).join(".cua-driver").join("config.json");
+    let path = home_directory()?.join(".cua-driver").join("config.json");
     let raw = std::fs::read_to_string(&path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&raw).ok()?;
     json.get("update_check_enabled").and_then(|v| v.as_bool())
@@ -472,9 +488,7 @@ fn write_cache(cache: &VersionCache) -> std::io::Result<()> {
 }
 
 fn cache_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))?;
-    Some(PathBuf::from(home).join(HOME_SUBDIRECTORY).join(CACHE_FILE_NAME))
+    Some(home_directory()?.join(HOME_SUBDIRECTORY).join(CACHE_FILE_NAME))
 }
 
 // ── HTTP fetch (shared with the `update` subcommand) ─────────────────────
@@ -587,28 +601,26 @@ mod tests {
     /// is process-global, parallel tests would race.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Redirect `HOME` / `USERPROFILE` to a fresh temp dir for the body
-    /// of `f`, then restore. Ensures the cache file lives in an isolated
-    /// directory and never touches the developer's real
+    /// Redirect this module's home lookup to a fresh temp dir for the body of
+    /// `f`. The thread-local override prevents parallel tests elsewhere in the
+    /// process from racing through the process-global `HOME` environment.
+    /// Ensures the cache file lives in an isolated directory and never touches the developer's real
     /// `~/.cua-driver-rs/version_check.json`.
     fn with_isolated_home<R>(f: impl FnOnce(&std::path::Path) -> R) -> R {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let saved_home = std::env::var_os("HOME");
-        let saved_userprofile = std::env::var_os("USERPROFILE");
-        unsafe { std::env::set_var("HOME", tmp.path()); }
-        unsafe { std::env::set_var("USERPROFILE", tmp.path()); }
-
-        let result = f(tmp.path());
-
-        match saved_home {
-            Some(s) => unsafe { std::env::set_var("HOME", s); },
-            None => unsafe { std::env::remove_var("HOME"); },
+        struct ResetTestHome;
+        impl Drop for ResetTestHome {
+            fn drop(&mut self) {
+                TEST_HOME_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+            }
         }
-        match saved_userprofile {
-            Some(s) => unsafe { std::env::set_var("USERPROFILE", s); },
-            None => unsafe { std::env::remove_var("USERPROFILE"); },
-        }
-        result
+
+        TEST_HOME_OVERRIDE.with(|slot| {
+            assert!(slot.borrow().is_none(), "nested test home override");
+            *slot.borrow_mut() = Some(tmp.path().to_path_buf());
+        });
+        let _reset = ResetTestHome;
+        f(tmp.path())
     }
 
     // ── is_newer ────────────────────────────────────────────────────────

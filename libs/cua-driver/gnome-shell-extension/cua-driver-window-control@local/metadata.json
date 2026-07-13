@@ -1,7 +1,0 @@
-{
-  "uuid": "cua-driver-window-control@local",
-  "name": "Cua Driver Window Control",
-  "description": "Local opt-in D-Bus bridge that exposes bounded GNOME Shell window/workspace metadata and safe window-control methods to Cua Driver.",
-  "shell-version": ["45", "46", "47", "48", "49", "50"],
-  "version": 1
-}

@@ -651,8 +651,13 @@ dependencies = [
 name = "cua-driver-testkit"
 version = "0.7.1"
 dependencies = [
+ "core-foundation",
+ "objc2-app-kit",
+ "serde",
  "serde_json",
+ "tempfile",
  "windows 0.61.3",
+ "x11rb",
 ]
 
 [[package]]
@@ -936,13 +941,6 @@ name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
-
-[[package]]
-name = "focus-monitor-win"
-version = "0.7.1"
-dependencies = [
- "windows 0.58.0",
-]
 
 [[package]]
 name = "foldhash"
@@ -1975,9 +1973,11 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "wayland-backend",
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",
+ "wayland-scanner",
  "x11",
  "x11rb",
  "xkbcommon",
