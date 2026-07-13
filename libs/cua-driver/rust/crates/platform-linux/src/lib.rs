@@ -42,10 +42,13 @@ pub mod atspi;
 pub mod a11y;
 
 #[cfg(target_os = "linux")]
-pub mod wayland;
+pub mod recording_hooks;
 
 #[cfg(target_os = "linux")]
-pub mod gnome;
+pub mod video_wayland;
+
+#[cfg(target_os = "linux")]
+pub mod wayland;
 
 // `terminal` is OS-independent (pure string matching + a thin x11 hook).
 // Keeping it un-gated lets the unit tests run on any host.
