@@ -113,12 +113,12 @@ export default class WinRectsExtension extends Extension {
             const [width, height] = global.display.get_size();
             if (width <= 0 || height <= 0)
                 throw new Error(`Invalid display size ${width}x${height}`);
-            // GNOME 50's screenshot_stage_to_content() also snapshots the real
-            // cursor sprite. Remote/headless pointer seats can expose a 0x0
-            // sprite, making the whole capture fail before a stage texture is
-            // returned. screenshot_area() captures the same compositor stage
-            // without copying that cursor; cua-driver draws its own cursor.
-            await shooter.screenshot_area(0, 0, width, height, stream);
+            // GNOME 50's screenshot_stage_to_content() copies the real cursor
+            // sprite after painting the stage. Remote/headless pointer seats
+            // can expose a 0x0 sprite, and that copy can crash Shell. The
+            // stream API has an explicit include_cursor flag, so keep cursor
+            // capture disabled; cua-driver draws its own agent cursor.
+            await shooter.screenshot(false, stream);
             stream.close(null);
             const encoded = GLib.base64_encode(stream.steal_as_bytes().get_data());
             invocation.return_value(new GLib.Variant('(s)', [encoded]));

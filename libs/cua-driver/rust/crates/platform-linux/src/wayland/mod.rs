@@ -1003,8 +1003,14 @@ pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
     if is_wayland() {
         // Tier 1: the opt-in GNOME compositor helper. It avoids probing
         // wlroots-only protocols and captures the Shell stage without consent.
-        if let Some(bytes) = shell_helper::screenshot_display() {
-            return Ok(bytes);
+        // If the helper is present but capture fails, do not fall through to
+        // GNOME's portal implementation: on GNOME 50 a malformed 0x0 cursor
+        // sprite can crash Shell inside screenshot_stage_to_content().
+        if let Some(result) = checked_shell_helper_capture(
+            shell_helper::available(),
+            shell_helper::screenshot_display,
+        ) {
+            return result;
         }
         // Tier 2: native wlroots screencopy (fast, zero consent).
         match screenshot_bytes() {
@@ -1039,6 +1045,15 @@ pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
     // so we don't re-enter screenshot_display_bytes (which routes back here
     // on Wayland — would loop forever).
     crate::capture::screenshot_display_bytes_x11()
+}
+
+fn checked_shell_helper_capture(
+    available: bool,
+    capture: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<anyhow::Result<Vec<u8>>> {
+    available.then(|| {
+        capture().ok_or_else(|| anyhow::anyhow!("GNOME compositor helper capture failed"))
+    })
 }
 
 /// Per-window capture dispatcher. On X11 forwards to the existing window
@@ -3104,6 +3119,27 @@ mod tests {
             ),
             (2279, 714, 563, 784)
         );
+    }
+
+    #[test]
+    fn shell_helper_capture_failure_is_terminal() {
+        let result = checked_shell_helper_capture(true, || None)
+            .expect("available helper must produce a terminal result");
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "GNOME compositor helper capture failed"
+        );
+    }
+
+    #[test]
+    fn unavailable_shell_helper_does_not_attempt_capture() {
+        let called = std::cell::Cell::new(false);
+        let result = checked_shell_helper_capture(false, || {
+            called.set(true);
+            Some(vec![1, 2, 3])
+        });
+        assert!(result.is_none());
+        assert!(!called.get());
     }
 
     #[test]
