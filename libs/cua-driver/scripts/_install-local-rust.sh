@@ -13,6 +13,7 @@
 #
 # Rust local installer (dev-only helper for libs/cua-driver/rust):
 #   --release    build the release configuration (default: debug)
+#                Linux builds include portal-input, matching release artifacts.
 #   --autostart  register an auto-start daemon (macOS: LaunchAgent;
 #                Linux: systemd user unit). Default off; the post-install
 #                message prints the registration command for the platform.
@@ -130,6 +131,14 @@ case "$OS" in
     *)      echo "${RED}Unsupported OS: $OS${NORMAL}"; exit 1 ;;
 esac
 
+CARGO_FEATURE_ARGS=()
+if [ "$OS" = "Linux" ]; then
+    # Ordinary Linux release artifacts include RemoteDesktop/libei input for
+    # GNOME and KDE. Keep local installs behaviorally equivalent instead of
+    # silently producing a version-identical binary with no native input path.
+    CARGO_FEATURE_ARGS=(--features portal-input)
+fi
+
 # Canonical home is `~/.cua-driver/` (renamed from `~/.cua-driver-rs/`
 # in v0.2.16 — PR #1644). Accept the legacy `CUA_DRIVER_RS_HOME` env var
 # too so any dev scripts that still set it keep working.
@@ -155,6 +164,9 @@ echo "${BOLD}${BLUE}cua-driver-rs local installer${NORMAL}"
 echo "  source:  ${BOLD}$REPO_ROOT${NORMAL}"
 echo "  config:  ${BOLD}$BUILD_CONFIG${NORMAL}"
 echo "  target:  ${BOLD}$TARGET_TRIPLE${NORMAL}"
+if [ "${#CARGO_FEATURE_ARGS[@]}" -gt 0 ]; then
+    echo "  features: ${BOLD}portal-input${NORMAL}"
+fi
 echo "  bin:     ${BOLD}$BIN_DIR/cua-driver${NORMAL}"
 echo "  current: ${BOLD}$CURRENT_LINK${NORMAL}"
 echo ""
@@ -191,9 +203,9 @@ fi
 echo "${BOLD}Building cua-driver ($BUILD_CONFIG)...${NORMAL}"
 cd "$REPO_ROOT"
 if [ "$BUILD_CONFIG" = "release" ]; then
-    cargo build --release -p cua-driver
+    cargo build --locked --release -p cua-driver "${CARGO_FEATURE_ARGS[@]}"
 else
-    cargo build -p cua-driver
+    cargo build --locked -p cua-driver "${CARGO_FEATURE_ARGS[@]}"
 fi
 
 BUILT_BINARY="$REPO_ROOT/target/$BUILD_CONFIG/cua-driver"
@@ -207,8 +219,15 @@ echo ""
 
 echo "${BOLD}Staging into $VERSIONED_DIR${NORMAL}"
 mkdir -p "$VERSIONED_DIR"
-cp "$BUILT_BINARY" "$VERSIONED_DIR/cua-driver"
-chmod +x "$VERSIONED_DIR/cua-driver"
+STAGED_BINARY="$VERSIONED_DIR/cua-driver"
+STAGED_BINARY_TMP="$VERSIONED_DIR/.cua-driver.tmp.$$"
+rm -f "$STAGED_BINARY_TMP"
+cp "$BUILT_BINARY" "$STAGED_BINARY_TMP"
+chmod +x "$STAGED_BINARY_TMP"
+# Replacing a running executable in place can fail with ETXTBSY on Linux.
+# Rename a complete sibling file over it instead: existing processes retain
+# the old inode while new launches atomically receive the new build.
+mv -f "$STAGED_BINARY_TMP" "$STAGED_BINARY"
 
 # Re-sign with a fresh ad-hoc signature.
 #

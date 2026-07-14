@@ -28,6 +28,9 @@ use crate::x11::WindowInfo;
 const DEST: &str = "org.cua.WinRects";
 const PATH: &str = "/org/cua/WinRects";
 const IFACE: &str = "org.cua.WinRects";
+const INTROSPECT_DEST: &str = "org.gnome.Shell.Introspect";
+const INTROSPECT_PATH: &str = "/org/gnome/Shell/Introspect";
+const INTROSPECT_IFACE: &str = "org.gnome.Shell.Introspect";
 
 pub fn available() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -39,15 +42,25 @@ fn gdbus_call(method: &str, args: &[String]) -> Option<String> {
 }
 
 fn gdbus_call_with_timeout(method: &str, args: &[String], timeout: Duration) -> Option<String> {
+    gdbus_call_target(DEST, PATH, &format!("{IFACE}.{method}"), args, timeout)
+}
+
+fn gdbus_call_target(
+    dest: &str,
+    path: &str,
+    method: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Option<String> {
     let mut cmd = Command::new("gdbus");
     cmd.arg("call")
         .arg("--session")
         .arg("--dest")
-        .arg(DEST)
+        .arg(dest)
         .arg("--object-path")
-        .arg(PATH)
+        .arg(path)
         .arg("--method")
-        .arg(format!("{IFACE}.{method}"));
+        .arg(method);
     for a in args {
         cmd.arg(a);
     }
@@ -82,6 +95,29 @@ pub fn screenshot_display() -> Option<Vec<u8>> {
         return None;
     }
     B64.decode(&raw[start..end]).ok()
+}
+
+/// GNOME's logical desktop size. Shell screenshots are encoded in physical
+/// pixels, while MetaWindow frame rectangles use these logical coordinates.
+pub fn logical_screen_size() -> Option<(u32, u32)> {
+    let raw = gdbus_call_target(
+        INTROSPECT_DEST,
+        INTROSPECT_PATH,
+        "org.freedesktop.DBus.Properties.Get",
+        &[INTROSPECT_IFACE.to_owned(), "ScreenSize".to_owned()],
+        Duration::from_millis(800),
+    )?;
+    parse_screen_size(&raw)
+}
+
+fn parse_screen_size(raw: &str) -> Option<(u32, u32)> {
+    let mut values = raw
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u32>().ok());
+    let width = values.next()?;
+    let height = values.next()?;
+    (width > 0 && height > 0).then_some((width, height))
 }
 
 /// `Child::wait` with a deadline (no extra crates). Kills + reaps on timeout.
@@ -284,6 +320,12 @@ pub fn hide_cursor() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_shell_logical_screen_size_property() {
+        assert_eq!(parse_screen_size("(<(4096, 1728)>,)"), Some((4096, 1728)));
+        assert_eq!(parse_screen_size("(<(0, 1728)>,)"), None);
+    }
 
     #[test]
     fn parses_and_filters_shell_windows() {

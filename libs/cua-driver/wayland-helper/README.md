@@ -27,6 +27,15 @@ needed (unlike libei/RemoteDesktop).
 
 ## Install
 
+The `local-hardened` metadata also admits GNOME Shell 50. Static packaging
+passes on Shell 50, but the extension still requires a real-session smoke after
+the first logout/login because Shell-only resources cannot be loaded by a
+standalone `gjs` process.
+
+On Shell 50, `Capture` uses the cursor-free `screenshot_area()` API. The older
+stage-content path can fail on remote/headless pointer seats when Mutter exposes
+a 0x0 real-cursor sprite; cua-driver renders its own agent cursor instead.
+
 ```
 ./install.sh          # copies to ~/.local/share/gnome-shell/extensions + enables
 # then log out/in once (GNOME loads extensions only at session startup)

@@ -74,17 +74,20 @@ pub const ENABLE_WAYLAND_ENV: &str = "CUA_DRIVER_RS_ENABLE_WAYLAND";
 /// (native screencopy + a `grim` fallback), and virtual-pointer /
 /// virtual-keyboard input via the wlroots protocols. Per-window image
 /// capture still depends on the staging `ext-image-copy-capture-v1`
-/// protocol, so the backend stays OFF by default and a pure-Wayland
-/// session is reported as unsupported unless the user explicitly sets
-/// `CUA_DRIVER_RS_ENABLE_WAYLAND=1`. Any value other than empty / `0` /
-/// `false` enables it.
+/// protocol. An explicit env setting always wins: any value other than empty /
+/// `0` / `false` enables it, while those false values disable it. When the env
+/// setting is absent, a reachable bundled WinRects helper is also an opt-in:
+/// the user deliberately installed compositor support and restored Hermes
+/// panes may predate the shell environment that exported this variable.
 pub fn wayland_enabled() -> bool {
     match std::env::var(ENABLE_WAYLAND_ENV) {
         Ok(v) => {
             let v = v.trim();
             !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
         }
-        Err(_) => false,
+        Err(_) => {
+            std::env::var_os("WAYLAND_DISPLAY").is_some() && shell_helper::available()
+        }
     }
 }
 
@@ -902,25 +905,91 @@ fn crop_png_to_rect(
     rect_height: u32,
     label: &str,
 ) -> anyhow::Result<Vec<u8>> {
+    crop_png_to_rect_with_logical_size(
+        output_png,
+        rect_x,
+        rect_y,
+        rect_width,
+        rect_height,
+        label,
+        shell_helper::logical_screen_size(),
+    )
+}
+
+fn crop_png_to_rect_with_logical_size(
+    output_png: &[u8],
+    rect_x: i32,
+    rect_y: i32,
+    rect_width: u32,
+    rect_height: u32,
+    label: &str,
+    logical_screen_size: Option<(u32, u32)>,
+) -> anyhow::Result<Vec<u8>> {
     let image = image::load_from_memory(output_png)?;
     let image_width = image.width();
     let image_height = image.height();
-    let x = rect_x.max(0) as u32;
-    let y = rect_y.max(0) as u32;
+    let (x, y, scaled_width, scaled_height) = physical_crop_geometry(
+        image_width,
+        image_height,
+        logical_screen_size,
+        rect_x,
+        rect_y,
+        rect_width,
+        rect_height,
+    );
     if x >= image_width || y >= image_height {
         anyhow::bail!(
             "{label} origin ({x},{y}) is outside captured output {image_width}x{image_height}"
         );
     }
-    let width = rect_width.min(image_width - x);
-    let height = rect_height.min(image_height - y);
+    let width = scaled_width.min(image_width - x);
+    let height = scaled_height.min(image_height - y);
     if width == 0 || height == 0 {
         anyhow::bail!("{label} has empty capture geometry");
     }
     let cropped = image.crop_imm(x, y, width, height);
+    let cropped = if width != rect_width || height != rect_height {
+        cropped.resize_exact(
+            rect_width,
+            rect_height,
+            image::imageops::FilterType::Lanczos3,
+        )
+    } else {
+        cropped
+    };
     let mut cursor = std::io::Cursor::new(Vec::new());
     cropped.write_to(&mut cursor, image::ImageFormat::Png)?;
     Ok(cursor.into_inner())
+}
+
+fn physical_crop_geometry(
+    image_width: u32,
+    image_height: u32,
+    logical_screen_size: Option<(u32, u32)>,
+    rect_x: i32,
+    rect_y: i32,
+    rect_width: u32,
+    rect_height: u32,
+) -> (u32, u32, u32, u32) {
+    let (scale_x, scale_y) = logical_screen_size
+        .filter(|(width, height)| *width > 0 && *height > 0)
+        .map(|(width, height)| {
+            (
+                image_width as f64 / width as f64,
+                image_height as f64 / height as f64,
+            )
+        })
+        .filter(|(x, y)| {
+            *x >= 0.25 && *x <= 8.0 && *y >= 0.25 && *y <= 8.0 && (x - y).abs() <= 0.02
+        })
+        .unwrap_or((1.0, 1.0));
+
+    (
+        ((rect_x.max(0) as f64) * scale_x).round() as u32,
+        ((rect_y.max(0) as f64) * scale_y).round() as u32,
+        ((rect_width as f64) * scale_x).round().max(1.0) as u32,
+        ((rect_height as f64) * scale_y).round().max(1.0) as u32,
+    )
 }
 
 /// Display-level capture dispatcher. Cascade:
@@ -3007,10 +3076,34 @@ mod tests {
         source
             .write_to(&mut encoded, image::ImageFormat::Png)
             .expect("encode fixture PNG");
-        let cropped = crop_png_to_rect(encoded.get_ref(), 2, 1, 3, 4, "fixture")
-            .expect("crop fixture PNG");
+        let cropped = crop_png_to_rect_with_logical_size(
+            encoded.get_ref(),
+            2,
+            1,
+            3,
+            4,
+            "fixture",
+            None,
+        )
+        .expect("crop fixture PNG");
         let decoded = image::load_from_memory(&cropped).expect("decode cropped PNG");
         assert_eq!((decoded.width(), decoded.height()), (3, 4));
+    }
+
+    #[test]
+    fn hidpi_crop_scales_logical_geometry_into_physical_capture() {
+        assert_eq!(
+            physical_crop_geometry(
+                5120,
+                2160,
+                Some((4096, 1728)),
+                1823,
+                571,
+                450,
+                627,
+            ),
+            (2279, 714, 563, 784)
+        );
     }
 
     #[test]

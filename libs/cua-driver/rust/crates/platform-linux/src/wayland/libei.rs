@@ -196,6 +196,14 @@ fn write_restore_token(token: &str) -> anyhow::Result<()> {
     })
 }
 
+/// GNOME's portal backend currently fails to present RemoteDesktop dialogs
+/// for an empty parent string, even though the portal specification permits
+/// unparented requests. `wayland:` is the accepted non-empty sentinel for a
+/// Wayland client without an exportable application surface.
+fn unparented_wayland_identifier() -> ashpd::WindowIdentifier {
+    ashpd::WindowIdentifier::from_xdg_foreign_exported(String::new())
+}
+
 /// Spawn the libei worker thread (idempotent — safe to call from every
 /// MCP tool invocation; subsequent calls are no-ops).
 pub fn ensure_started() -> anyhow::Result<()> {
@@ -468,8 +476,9 @@ fn open_eis_context() -> anyhow::Result<(reis::ei::Context, PortalKeepAlive)> {
             .response()
             .map_err(|e| anyhow::anyhow!("portal select_devices response error: {e}"))?;
 
+        let parent = unparented_wayland_identifier();
         let started = proxy
-            .start(&session, None, StartOptions::default())
+            .start(&session, Some(&parent), StartOptions::default())
             .await
             .map_err(|e| anyhow::anyhow!("portal start failed: {e}"))?
             .response()
@@ -1264,6 +1273,11 @@ fn device_interface<T: reis::Interface>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unparented_portal_dialog_uses_nonempty_wayland_identifier() {
+        assert_eq!(unparented_wayland_identifier().to_string(), "wayland:");
+    }
 
     #[test]
     fn key_sequence_accepts_empty_and_maximum_length_requests() {
