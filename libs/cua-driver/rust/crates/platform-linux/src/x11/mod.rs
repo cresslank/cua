@@ -23,34 +23,6 @@ pub struct WindowInfo {
     pub height: u32,
 }
 
-/// Return the best available X11/XWayland desktop size.
-///
-/// GNOME/Mutter's rootless XWayland can report a 0x0 root screen even while
-/// XWayland top-level windows are visible and automation is otherwise usable.
-/// Prefer the X11 screen size when it is non-zero, then fall back to EWMH
-/// workarea extents and finally the bounding box of visible X11 windows.
-pub fn screen_size() -> Result<(u32, u32)> {
-    let (conn, screen_num) = RustConnection::connect(None)?;
-    let screen = &conn.setup().roots[screen_num];
-    let root = screen.root;
-
-    let width = screen.width_in_pixels as u32;
-    let height = screen.height_in_pixels as u32;
-    if width > 0 && height > 0 {
-        return Ok((width, height));
-    }
-
-    if let Ok(Some(size)) = get_workarea_extent(&conn, root) {
-        return Ok(size);
-    }
-
-    if let Ok(Some(size)) = get_window_bounds_extent(&conn, root) {
-        return Ok(size);
-    }
-
-    Ok((width, height))
-}
-
 /// List top-level windows, optionally filtered by pid.
 pub fn list_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     match list_windows_inner(filter_pid) {
@@ -150,58 +122,6 @@ fn client_list_property(property_type: Atom, windows: &[Window]) -> Option<&[Win
 
 fn fallback_window_is_listable(map_state: MapState) -> bool {
     map_state == MapState::VIEWABLE
-}
-
-fn get_workarea_extent(conn: &RustConnection, root: Window) -> Result<Option<(u32, u32)>> {
-    let atom = get_atom(conn, "_NET_WORKAREA")?;
-    let reply = conn.get_property(false, root, atom, AtomEnum::CARDINAL, 0, u32::MAX)?.reply()?;
-    let values: Vec<u32> = reply.value32().map(|iter| iter.collect()).unwrap_or_default();
-
-    let mut max_right = 0i64;
-    let mut max_bottom = 0i64;
-    for chunk in values.chunks_exact(4) {
-        let x = chunk[0] as i64;
-        let y = chunk[1] as i64;
-        let width = chunk[2] as i64;
-        let height = chunk[3] as i64;
-        if width > 0 && height > 0 {
-            max_right = max_right.max(x + width);
-            max_bottom = max_bottom.max(y + height);
-        }
-    }
-
-    if max_right > 0 && max_bottom > 0 {
-        Ok(Some((max_right as u32, max_bottom as u32)))
-    } else {
-        Ok(None)
-    }
-}
-
-fn get_window_bounds_extent(conn: &RustConnection, root: Window) -> Result<Option<(u32, u32)>> {
-    let windows = get_window_list(conn, root)?;
-    let mut min_x = i64::MAX;
-    let mut min_y = i64::MAX;
-    let mut max_x = i64::MIN;
-    let mut max_y = i64::MIN;
-
-    for xid in windows {
-        let Ok(geom) = conn.get_geometry(xid)?.reply() else { continue };
-        if geom.width == 0 || geom.height == 0 {
-            continue;
-        }
-        let trans = conn.translate_coordinates(xid, root, 0, 0)?.reply().ok();
-        let (x, y) = trans.map(|t| (t.dst_x as i64, t.dst_y as i64)).unwrap_or((0, 0));
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(x + geom.width as i64);
-        max_y = max_y.max(y + geom.height as i64);
-    }
-
-    if min_x != i64::MAX && min_y != i64::MAX && max_x > min_x && max_y > min_y {
-        Ok(Some(((max_x - min_x) as u32, (max_y - min_y) as u32)))
-    } else {
-        Ok(None)
-    }
 }
 
 fn get_atom(conn: &RustConnection, name: &str) -> Result<Atom> {
