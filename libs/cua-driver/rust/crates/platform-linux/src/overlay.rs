@@ -157,27 +157,26 @@ pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
                 // a target visibility scope is intentionally unsupported.
                 match &cmd {
                     cursor_overlay::OverlayCommand::PinAbove(window_id) => {
-                        gnome_targets().lock().unwrap().insert(key.clone(), *window_id);
+                        gnome_targets()
+                            .lock()
+                            .unwrap()
+                            .insert(key.clone(), *window_id);
                     }
                     cursor_overlay::OverlayCommand::MoveTo { x, y, .. }
                     | cursor_overlay::OverlayCommand::SnapTo { x, y, .. } => {
-                        if let Some(window_id) = gnome_targets().lock().unwrap().get(&key).copied() {
+                        if let Some(window_id) = gnome_targets().lock().unwrap().get(&key).copied()
+                        {
                             let _ = crate::wayland::shell_helper::move_cursor(
-                                &key,
-                                window_id,
-                                *x as i32,
-                                *y as i32,
+                                &key, window_id, *x as i32, *y as i32,
                             );
                             arrival_fire(&key);
                         }
                     }
                     cursor_overlay::OverlayCommand::ClickPulse { x, y } => {
-                        if let Some(window_id) = gnome_targets().lock().unwrap().get(&key).copied() {
+                        if let Some(window_id) = gnome_targets().lock().unwrap().get(&key).copied()
+                        {
                             let _ = crate::wayland::shell_helper::click_pulse(
-                                &key,
-                                window_id,
-                                *x as i32,
-                                *y as i32,
+                                &key, window_id, *x as i32, *y as i32,
                             );
                         }
                     }
