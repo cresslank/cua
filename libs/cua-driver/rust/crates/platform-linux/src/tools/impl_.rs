@@ -6742,14 +6742,14 @@ impl Tool for BringToFrontTool {
             })
             .await;
             return match result {
-                Ok(Ok(())) => ToolResult::text(format!(
-                    "Brought Wayland window {window_id} to front."
-                ))
-                .with_structured(serde_json::json!({
-                    "window_id": window_id,
-                    "platform": "linux",
-                    "session": "wayland",
-                })),
+                Ok(Ok(())) => {
+                    ToolResult::text(format!("Brought Wayland window {window_id} to front."))
+                        .with_structured(serde_json::json!({
+                            "window_id": window_id,
+                            "platform": "linux",
+                            "session": "wayland",
+                        }))
+                }
                 Ok(Err(error)) => ToolResult::error(error.to_string()),
                 Err(error) => ToolResult::error(format!("Task error: {error}")),
             };
