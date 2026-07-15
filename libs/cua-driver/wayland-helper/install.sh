@@ -15,8 +15,8 @@ elif [[ $# -gt 0 ]]; then
   exit 2
 fi
 mkdir -p "$DEST"
-cp -f "$SRC/metadata.json" "$SRC/extension.js" "$DEST/"
-echo "Staged $UUID v2 to $DEST."
+cp -f "$SRC/metadata.json" "$SRC/extension.js" "$SRC/policy.js" "$DEST/"
+echo "Staged $UUID protocol v6 to $DEST."
 
 if ! $ENABLE; then
   echo "Not enabling it automatically. Re-run with --enable after warning the user."
