@@ -7,7 +7,7 @@
 #   * focus-FREE per-surface KEYBOARD injection (type into an unfocused window),
 #   * MULTI-cursor pointer injection (N independent cursors on one window),
 #
-# both routed by stable process identity (with app_id fallback), driven over a tiny line
+# both routed by an exact compositor-owned surface token, driven over a tiny line
 # protocol on a unix control socket ($CUA_INJECT_SOCKET). It also exposes
 # foreign-toplevel-management (so cua-driver's list_windows enumerates windows)
 # and screencopy (so grim captures the output) — the same protocols labwc gives
@@ -15,14 +15,15 @@
 #
 # The injection primitives (cua_motion/cua_button/cua_kbd_*) deliver wl_pointer/
 # wl_keyboard straight to a target client's resources, bypassing seat focus —
-# routed by process identity rather than a connection-local object id and transported over a plain
+# routed by a compositor-instance epoch plus toplevel id and transported over a plain
 # socket rather than libei/EIS, since cua owns both ends and the portal/libei
-# layer buys nothing here. The socket speaks a versioned v1 line protocol: the
-# client sends the `cua-inject v1` banner (echoed back on match), then every
+# layer buys nothing here. The socket speaks a versioned v2 line protocol: the
+# client sends the `cua-inject v2` banner (echoed back on match), then every
 # command line is answered by exactly one `ok` / `err <reason>` acknowledgement.
 #
 # Usage: cua_compositor_patch.py <tinywl.c in> <cua-compositor.c out>
-import sys, io
+import sys
+import io
 
 inp = sys.argv[1] if len(sys.argv) > 1 else "tinywl.c"
 out = sys.argv[2] if len(sys.argv) > 2 else "cua-compositor.c"
@@ -42,6 +43,8 @@ INCLUDES = r"""#include <stdint.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/random.h>
+#include <sys/stat.h>
 #include <linux/input-event-codes.h>
 #include <wayland-server-protocol.h>
 #include <xkbcommon/xkbcommon.h>
@@ -50,6 +53,20 @@ INCLUDES = r"""#include <stdint.h>
 #include <wlr/types/wlr_xdg_output_v1.h>
 
 #define CUA_MAXDEV 64
+struct tinywl_server;
+struct tinywl_toplevel;
+struct cua_conn {
+	struct tinywl_server *server;
+	struct wl_event_source *src;
+	struct wl_event_source *capture_timer;
+	struct tinywl_toplevel *action_target;
+	uint64_t capture_lease;
+	int hello;
+	char buf[16384];
+	size_t len;
+};
+static void cua_assign_target(struct tinywl_toplevel *t);
+static void cua_ftl_request_activate(struct wl_listener *listener, void *data);
 /* Per-cursor / per-keyboard enter bookkeeping (idx = logical device). */
 struct cua_devstate { struct wlr_surface *entered; };
 static struct cua_devstate cua_ptr[CUA_MAXDEV];
@@ -63,6 +80,8 @@ static xkb_mod_mask_t g_logo_mask = 0;
 struct cua_keyent { uint32_t keycode; int shift; int valid; };
 static struct cua_keyent g_chartab[128];
 static struct wlr_foreign_toplevel_manager_v1 *g_ftl_mgr = NULL;
+static uint64_t g_cua_epoch = 0;
+static uint64_t g_cua_next_id = 1;
 static void cua_ftl_request_activate(struct wl_listener *listener, void *data);
 
 """
@@ -70,14 +89,21 @@ static void cua_ftl_request_activate(struct wl_listener *listener, void *data);
 # A foreign-toplevel handle pointer on each toplevel (for list_windows).
 STRUCT_FIELD = (
     "\tstruct wlr_xdg_toplevel *xdg_toplevel;\n"
+    "\tuint64_t cua_id;\n"
+    "\tchar cua_target[96];\n"
+    "\tstruct cua_conn *cua_action_owner;\n"
     "\tstruct wlr_foreign_toplevel_handle_v1 *ftl;\n"
     "\tstruct wl_listener ftl_request_activate;\n"
 )
 
 FUNCS = r"""
-/* v1 control-protocol banner: the client sends this line, the compositor echoes
- * it to confirm both speak v1. Any other first line is refused. */
-#define CUA_PROTO_HELLO "cua-inject v1"
+/* v2 requires an exact compositor-owned toplevel token on every mutating
+ * target command. The token includes this compositor instance's epoch. */
+#define CUA_PROTO_HELLO "cua-inject v2"
+struct cua_conn;
+static struct cua_conn *g_capture_owner = NULL;
+
+static uint64_t g_capture_lease_seq = 1;
 static void cua_ftl_request_activate(struct wl_listener *listener, void *data) {
 	(void)data;
 	struct tinywl_toplevel *t = wl_container_of(listener, t, ftl_request_activate);
@@ -106,31 +132,30 @@ static void cua_pframe(struct wl_resource *res) {
 		wl_pointer_send_frame(res);
 }
 static pid_t cua_toplevel_pid(struct tinywl_toplevel *t);
-/* Resolve a target window by its xdg app_id, refusing missing and ambiguous
- * matches so a command never silently drives the wrong window. In v1 duplicate
- * app_ids are simply not addressable. On failure returns NULL and points *err
- * at a stable reason token; on success *err is left untouched. */
-static struct tinywl_toplevel *cua_resolve_target(struct tinywl_server *server, const char *app_id, const char **err) {
-	struct tinywl_toplevel *t, *found = NULL;
-	int matches = 0;
-	if (!strncmp(app_id, "pid:", 4)) {
-		char *end = NULL;
-		long pid = strtol(app_id + 4, &end, 10);
-		if (pid <= 0 || !end || *end) { *err = "bad-pid"; return NULL; }
-		wl_list_for_each(t, &server->toplevels, link) {
-			if (cua_toplevel_pid(t) == (pid_t)pid) { found = t; matches++; }
-		}
-		if (matches == 0) { *err = "unknown-pid"; return NULL; }
-		if (matches > 1) { *err = "ambiguous-pid"; return NULL; }
-		return found;
-	}
+static void cua_init_epoch(void) {
+	if (g_cua_epoch) return;
+	if (getrandom(&g_cua_epoch, sizeof g_cua_epoch, 0) != sizeof g_cua_epoch)
+		g_cua_epoch = ((uint64_t)time(NULL) << 32) ^ (uint64_t)getpid();
+	if (!g_cua_epoch) g_cua_epoch = 1;
+}
+static void cua_assign_target(struct tinywl_toplevel *t) {
+	if (t->cua_id) return;
+	cua_init_epoch();
+	t->cua_id = g_cua_next_id++;
+	snprintf(t->cua_target, sizeof t->cua_target, "surface:%016llx:%016llx",
+		(unsigned long long)g_cua_epoch, (unsigned long long)t->cua_id);
+}
+/* Resolve only the exact v2 token. PID, app-id, title, and newest-window
+ * fallbacks are deliberately unsupported because one browser process may own
+ * several independently controlled toplevels. */
+static struct tinywl_toplevel *cua_resolve_target(struct tinywl_server *server, const char *target, const char **err) {
+	struct tinywl_toplevel *t;
+	if (strncmp(target, "surface:", 8)) { *err = "exact-target-required"; return NULL; }
 	wl_list_for_each(t, &server->toplevels, link) {
-		const char *a = t->xdg_toplevel ? t->xdg_toplevel->app_id : NULL;
-		if (a && strcmp(a, app_id) == 0) { found = t; matches++; }
+		if (t->cua_target[0] && !strcmp(t->cua_target, target)) return t;
 	}
-	if (matches == 0) { *err = "unknown-app-id"; return NULL; }
-	if (matches > 1) { *err = "ambiguous-app-id"; return NULL; }
-	return found;
+	*err = "stale-or-unknown-target";
+	return NULL;
 }
 static pid_t cua_toplevel_pid(struct tinywl_toplevel *t) {
 	if (!t || !t->xdg_toplevel || !t->xdg_toplevel->base->surface) return 0;
@@ -139,19 +164,10 @@ static pid_t cua_toplevel_pid(struct tinywl_toplevel *t) {
 	wl_client_get_credentials(client, &pid, &uid, &gid);
 	return pid;
 }
-/* Focus exactly one mapped toplevel owned by `target_pid`. Refuse ambiguity:
- * process-scoped activation is only safe when the process owns one window. */
-static const char *cua_activate_pid(struct tinywl_server *server, pid_t target_pid) {
-	struct tinywl_toplevel *t, *found = NULL;
-	int matches = 0;
-	wl_list_for_each(t, &server->toplevels, link) {
-		if (target_pid > 0 && cua_toplevel_pid(t) == target_pid) {
-			found = t;
-			matches++;
-		}
-	}
-	if (matches == 0) return "unknown-pid";
-	if (matches > 1) return "ambiguous-pid";
+static const char *cua_activate_target(struct tinywl_server *server, const char *target) {
+	const char *err = NULL;
+	struct tinywl_toplevel *found = cua_resolve_target(server, target, &err);
+	if (!found) return err;
 	focus_toplevel(found);
 	/* tinywl only notifies seat keyboard focus when a physical wlr_keyboard is
 	 * attached. Headless CI has none, so establish the logical focus explicitly
@@ -182,11 +198,20 @@ static void cua_query_state(struct tinywl_server *server, pid_t target_pid, char
 		 (focused_toplevel ? "background_occluded" : "background_visible"));
 	snprintf(out, out_len, "state %d %s", (int)focused_pid, state);
 }
-static const char *cua_query_geometry(struct tinywl_server *server, pid_t target_pid, char *out, size_t out_len) {
+static const char *cua_query_geometry(struct tinywl_server *server, const char *selector, char *out, size_t out_len) {
 	struct tinywl_toplevel *t, *target = NULL;
 	int matches = 0;
-	wl_list_for_each(t, &server->toplevels, link) {
-		if (cua_toplevel_pid(t) == target_pid) { target = t; matches++; }
+	if (!strncmp(selector, "surface:", 8)) {
+		const char *err = NULL;
+		target = cua_resolve_target(server, selector, &err);
+		if (!target) return err;
+		matches = 1;
+	} else {
+		char *end = NULL; long target_pid = strtol(selector, &end, 10);
+		if (target_pid <= 0 || !end || *end) return "exact-target-or-pid-required";
+		wl_list_for_each(t, &server->toplevels, link) {
+			if (cua_toplevel_pid(t) == target_pid) { target = t; matches++; }
+		}
 	}
 	if (!matches) return "target-not-found";
 	if (matches > 1) return "ambiguous-pid";
@@ -469,21 +494,16 @@ static int cua_hotkey(struct tinywl_server *server, struct tinywl_toplevel *t, c
 /* Process one command line. Returns NULL on success, else a stable error token
  * the caller sends back as `err <token>`. The command is only acknowledged
  * after it has been resolved and applied — never before. */
-static const char *cua_handle_cmd(struct tinywl_server *server, char *line) {
+static const char *cua_handle_cmd(struct tinywl_server *server, char *line, struct tinywl_toplevel *batch_target) {
 	char cmd[8], app[128];
 	if (sscanf(line, "%7s", cmd) != 1) return "empty";
+	if (!batch_target) return "batch-required";
+	if (!strcmp(cmd, "d")) return "exact-target-required";
+	if (sscanf(line, "%*7s %127s", app) != 1) return "bad-args";
+	if (strcmp(app, batch_target->cua_target)) return "batch-target-mismatch";
 	const char *err = NULL;
 	struct tinywl_toplevel *t;
-	if (!strcmp(cmd, "d")) {
-		double x, y; unsigned count, btn;
-		if (sscanf(line, "d %lf %lf %u %u", &x, &y, &count, &btn) != 4) return "bad-args";
-		if (!(t = cua_desktop_motion(server, x, y))) return "no-surface-at-point";
-		for (unsigned i = 0; i < (count ? count : 1); i++) {
-			if (!cua_button(server, t, 0, btn, true)) return "no-pointer-resource";
-			if (!cua_button(server, t, 0, btn, false)) return "no-pointer-resource";
-		}
-		return NULL;
-	} else if (!strcmp(cmd, "m")) {
+	if (!strcmp(cmd, "m")) {
 		int idx; double x, y;
 		if (sscanf(line, "m %127s %d %lf %lf", app, &idx, &x, &y) != 4) return "bad-args";
 		if (!(t = cua_resolve_target(server, app, &err))) return err;
@@ -526,10 +546,48 @@ static const char *cua_handle_cmd(struct tinywl_server *server, char *line) {
 	}
 	return "unknown-command";
 }
-struct cua_conn { struct tinywl_server *server; struct wl_event_source *src; int hello; char buf[16384]; size_t len; };
+static void cua_schedule_frames(struct tinywl_server *server) {
+	struct tinywl_output *output;
+	wl_list_for_each(output, &server->outputs, link) wlr_output_schedule_frame(output->wlr_output);
+}
+static void cua_capture_restore(struct cua_conn *c) {
+	if (!c || g_capture_owner != c) return;
+	struct tinywl_toplevel *t;
+	wl_list_for_each(t, &c->server->toplevels, link) wlr_scene_node_set_enabled(&t->scene_tree->node, true);
+	if (c->capture_timer) { wl_event_source_remove(c->capture_timer); c->capture_timer = NULL; }
+	c->capture_lease = 0;
+	g_capture_owner = NULL;
+	cua_schedule_frames(c->server);
+}
+static int cua_capture_timeout(void *data) {
+	struct cua_conn *c = data;
+	c->capture_timer = NULL;
+	cua_capture_restore(c);
+	return 0;
+}
+static const char *cua_capture_begin(struct cua_conn *c, const char *target, char *out, size_t out_len) {
+	if (g_capture_owner) return "capture-busy";
+	const char *err = NULL;
+	struct tinywl_toplevel *wanted = cua_resolve_target(c->server, target, &err);
+	if (!wanted) return err;
+	struct tinywl_toplevel *t;
+	wl_list_for_each(t, &c->server->toplevels, link)
+		wlr_scene_node_set_enabled(&t->scene_tree->node, t == wanted);
+	c->capture_lease = g_capture_lease_seq++;
+	if (!c->capture_lease) c->capture_lease = g_capture_lease_seq++;
+	g_capture_owner = c;
+	c->capture_timer = wl_event_loop_add_timer(wl_display_get_event_loop(c->server->wl_display), cua_capture_timeout, c);
+	if (c->capture_timer) wl_event_source_timer_update(c->capture_timer, 10000);
+	cua_schedule_frames(c->server);
+	snprintf(out, out_len, "capture %llu", (unsigned long long)c->capture_lease);
+	return NULL;
+}
 /* Tear a connection down once: remove its event source (else the loop fires it
  * again on freed data -> double free), close the fd, free the state. */
 static int cua_conn_drop(struct cua_conn *c, int fd) {
+	cua_capture_restore(c);
+	if (c->action_target && c->action_target->cua_action_owner == c)
+		c->action_target->cua_action_owner = NULL;
 	if (c->src) wl_event_source_remove(c->src);
 	close(fd); free(c);
 	return 0;
@@ -546,7 +604,7 @@ static int cua_conn_readable(int fd, uint32_t mask, void *data) {
 		/* Tolerate CRLF clients by trimming a trailing carriage return. */
 		if (nl > p && nl[-1] == '\r') nl[-1] = 0;
 		if (!c->hello) {
-			/* The first line must be the versioned v1 handshake. */
+			/* The first line must be the versioned v2 handshake. */
 			if (!strcmp(p, CUA_PROTO_HELLO)) {
 				c->hello = 1;
 				cua_reply(fd, CUA_PROTO_HELLO);
@@ -555,20 +613,45 @@ static int cua_conn_readable(int fd, uint32_t mask, void *data) {
 				return cua_conn_drop(c, fd);
 			}
 		} else {
-			int query_pid, geometry_pid, activate_pid;
+			int query_pid;
+			char geometry_target[128];
+			char activate_target[128];
+			char capture_target[128];
+			char begin_target[128];
+			unsigned long long restore_lease;
 			if (sscanf(p, "q %d", &query_pid) == 1) {
 				char msg[128]; cua_query_state(c->server, (pid_t)query_pid, msg, sizeof msg);
 				cua_reply(fd, msg);
-			} else if (sscanf(p, "g %d", &geometry_pid) == 1) {
+			} else if (sscanf(p, "g %127s", geometry_target) == 1) {
 				char msg[128];
-				const char *err = cua_query_geometry(c->server, (pid_t)geometry_pid, msg, sizeof msg);
+				const char *err = cua_query_geometry(c->server, geometry_target, msg, sizeof msg);
 				if (err) {
 					char reply[128]; snprintf(reply, sizeof reply, "err %s", err); cua_reply(fd, reply);
 				} else {
 					cua_reply(fd, msg);
 				}
-			} else if (sscanf(p, "f %d", &activate_pid) == 1) {
-				const char *err = cua_activate_pid(c->server, (pid_t)activate_pid);
+			} else if (sscanf(p, "c %127s", capture_target) == 1) {
+				char msg[128];
+				const char *err = cua_capture_begin(c, capture_target, msg, sizeof msg);
+				wl_display_flush_clients(c->server->wl_display);
+				if (err) { char reply[128]; snprintf(reply, sizeof reply, "err %s", err); cua_reply(fd, reply); }
+				else cua_reply(fd, msg);
+			} else if (sscanf(p, "r %llu", &restore_lease) == 1) {
+				if (g_capture_owner != c || c->capture_lease != (uint64_t)restore_lease) cua_reply(fd, "err stale-capture-lease");
+				else { cua_capture_restore(c); cua_reply(fd, "ok"); }
+			} else if (sscanf(p, "begin %127s", begin_target) == 1) {
+				const char *resolve_err = NULL;
+				struct tinywl_toplevel *batch_target = cua_resolve_target(c->server, begin_target, &resolve_err);
+				if (!batch_target) { char msg[128]; snprintf(msg, sizeof msg, "err %s", resolve_err); cua_reply(fd, msg); }
+				else if (c->action_target) cua_reply(fd, "err nested-batch");
+				else if (batch_target->cua_action_owner && batch_target->cua_action_owner != c) cua_reply(fd, "err target-busy");
+				else { c->action_target = batch_target; batch_target->cua_action_owner = c; cua_reply(fd, "ok"); }
+			} else if (!strcmp(p, "end")) {
+				if (!c->action_target) cua_reply(fd, "err no-active-batch");
+				else { c->action_target->cua_action_owner = NULL; c->action_target = NULL; cua_reply(fd, "ok"); }
+			} else if (sscanf(p, "f %127s", activate_target) == 1) {
+				const char *err = !c->action_target ? "batch-required" :
+					(strcmp(activate_target, c->action_target->cua_target) ? "batch-target-mismatch" : cua_activate_target(c->server, activate_target));
 				wl_display_flush_clients(c->server->wl_display);
 				if (err) {
 					char msg[128]; snprintf(msg, sizeof msg, "err %s", err); cua_reply(fd, msg);
@@ -576,7 +659,7 @@ static int cua_conn_readable(int fd, uint32_t mask, void *data) {
 					cua_reply(fd, "ok");
 				}
 			} else {
-				const char *err = cua_handle_cmd(c->server, p);
+				const char *err = c->action_target ? cua_handle_cmd(c->server, p, c->action_target) : "batch-required";
 				/* Deliver injected events before acking so `ok` means "processed",
 				 * never merely "parsed". */
 				wl_display_flush_clients(c->server->wl_display);
@@ -611,11 +694,12 @@ static void cua_setup_control_socket(struct tinywl_server *server) {
 	int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
 	if (fd < 0) { wlr_log(WLR_ERROR, "[cua] socket(): %s", strerror(errno)); return; }
 	struct sockaddr_un addr = {0}; addr.sun_family = AF_UNIX;
-	snprintf(addr.sun_path, sizeof addr.sun_path, "%s", path);
+	if (strlen(path) >= sizeof addr.sun_path) { wlr_log(WLR_ERROR, "[cua] injection socket path too long"); close(fd); return; }
+	memcpy(addr.sun_path, path, strlen(path) + 1);
 	unlink(path);
-	if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0 || listen(fd, 4) < 0) {
-		wlr_log(WLR_ERROR, "[cua] bind/listen %s: %s", path, strerror(errno)); close(fd); return;
-	}
+	if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0) { wlr_log(WLR_ERROR, "[cua] bind %s: %s", path, strerror(errno)); close(fd); return; }
+	if (chmod(path, 0600) < 0 || listen(fd, 16) < 0) { wlr_log(WLR_ERROR, "[cua] secure/listen %s: %s", path, strerror(errno)); close(fd); unlink(path); return; }
+	cua_init_epoch();
 	cua_init_keymap();
 	wl_event_loop_add_fd(wl_display_get_event_loop(server->wl_display), fd,
 		WL_EVENT_READABLE, cua_listen_cb, server);
@@ -643,12 +727,12 @@ src = repl(src, "int main(int argc, char *argv[]) {", FUNCS + "int main(int argc
 src = repl(src,
     "\twl_list_insert(&toplevel->server->toplevels, &toplevel->link);\n\n\tfocus_toplevel(toplevel);",
     "\twl_list_insert(&toplevel->server->toplevels, &toplevel->link);\n"
+    "\tcua_assign_target(toplevel);\n"
     "\tif (g_ftl_mgr) {\n"
     "\t\ttoplevel->ftl = wlr_foreign_toplevel_handle_v1_create(g_ftl_mgr);\n"
     "\t\tif (toplevel->xdg_toplevel->title)\n"
     "\t\t\twlr_foreign_toplevel_handle_v1_set_title(toplevel->ftl, toplevel->xdg_toplevel->title);\n"
-    "\t\tif (toplevel->xdg_toplevel->app_id)\n"
-    "\t\t\twlr_foreign_toplevel_handle_v1_set_app_id(toplevel->ftl, toplevel->xdg_toplevel->app_id);\n"
+    "\t\twlr_foreign_toplevel_handle_v1_set_app_id(toplevel->ftl, toplevel->cua_target);\n"
     "\t\ttoplevel->ftl_request_activate.notify = cua_ftl_request_activate;\n"
     "\t\twl_signal_add(&toplevel->ftl->events.request_activate, &toplevel->ftl_request_activate);\n"
     "\t}\n\n\tfocus_toplevel(toplevel);",
@@ -662,6 +746,7 @@ src = repl(src,
     "\t\tif (cua_ptr[i].entered && wlr_surface_get_root_surface(cua_ptr[i].entered) == cua_surface) cua_ptr[i].entered = NULL;\n"
     "\t\tif (cua_kbd_state[i].entered && wlr_surface_get_root_surface(cua_kbd_state[i].entered) == cua_surface) cua_kbd_state[i].entered = NULL;\n"
     "\t}\n"
+    "\tif (toplevel->cua_action_owner) { toplevel->cua_action_owner->action_target = NULL; toplevel->cua_action_owner = NULL; }\n"
     "\tif (toplevel->ftl) { wl_list_remove(&toplevel->ftl_request_activate.link); wlr_foreign_toplevel_handle_v1_destroy(toplevel->ftl); toplevel->ftl = NULL; }\n"
     "\twl_list_remove(&toplevel->link);\n}",
     "ftl-on-unmap")
@@ -673,8 +758,7 @@ src = repl(src,
     "\tif (toplevel->ftl) {\n"
     "\t\tif (toplevel->xdg_toplevel->title)\n"
     "\t\t\twlr_foreign_toplevel_handle_v1_set_title(toplevel->ftl, toplevel->xdg_toplevel->title);\n"
-    "\t\tif (toplevel->xdg_toplevel->app_id)\n"
-    "\t\t\twlr_foreign_toplevel_handle_v1_set_app_id(toplevel->ftl, toplevel->xdg_toplevel->app_id);\n"
+    "\t\twlr_foreign_toplevel_handle_v1_set_app_id(toplevel->ftl, toplevel->cua_target);\n"
     "\t}",
     "ftl-on-commit")
 

@@ -40,6 +40,11 @@ static CMD_RX_CELL: Mutex<Option<std::sync::mpsc::Receiver<OverlayMsg>>> = Mutex
 static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
 static ARRIVAL_TX: Mutex<Option<HashMap<CursorKey, tokio::sync::oneshot::Sender<()>>>> =
     Mutex::new(None);
+static GNOME_TARGETS: OnceLock<Mutex<HashMap<CursorKey, u64>>> = OnceLock::new();
+
+fn gnome_targets() -> &'static Mutex<HashMap<CursorKey, u64>> {
+    GNOME_TARGETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
 
 fn arrival_register(key: CursorKey, tx: tokio::sync::oneshot::Sender<()>) {
     let mut guard = ARRIVAL_TX.lock().unwrap();
@@ -146,15 +151,38 @@ pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
     {
         if crate::wayland::is_wayland() {
             if crate::wayland::shell_helper::available() {
-                // GNOME has no layer-shell. Drive only the final positioning
-                // commands through the compositor helper; it performs its own
-                // easing and avoids starting a worker that must fail.
+                // GNOME has no layer-shell. WinRects v2 owns one Shell actor per
+                // cursor key, bound to an exact incarnation-qualified target.
+                // Never send an unpinned cursor command: a global actor without
+                // a target visibility scope is intentionally unsupported.
                 match &cmd {
-                    cursor_overlay::OverlayCommand::ClickPulse { x, y } => {
-                        crate::wayland::shell_helper::click_pulse(*x as i32, *y as i32);
+                    cursor_overlay::OverlayCommand::PinAbove(window_id) => {
+                        gnome_targets().lock().unwrap().insert(key.clone(), *window_id);
                     }
-                    cursor_overlay::OverlayCommand::SnapTo { x, y, .. } => {
-                        crate::wayland::shell_helper::move_cursor(*x as i32, *y as i32);
+                    cursor_overlay::OverlayCommand::MoveTo { x, y, .. }
+                    | cursor_overlay::OverlayCommand::SnapTo { x, y, .. } => {
+                        if let Some(window_id) = gnome_targets().lock().unwrap().get(&key).copied() {
+                            let _ = crate::wayland::shell_helper::move_cursor(
+                                &key,
+                                window_id,
+                                *x as i32,
+                                *y as i32,
+                            );
+                            arrival_fire(&key);
+                        }
+                    }
+                    cursor_overlay::OverlayCommand::ClickPulse { x, y } => {
+                        if let Some(window_id) = gnome_targets().lock().unwrap().get(&key).copied() {
+                            let _ = crate::wayland::shell_helper::click_pulse(
+                                &key,
+                                window_id,
+                                *x as i32,
+                                *y as i32,
+                            );
+                        }
+                    }
+                    cursor_overlay::OverlayCommand::SetEnabled(false) => {
+                        crate::wayland::shell_helper::hide_cursor(&key);
                     }
                     _ => {}
                 }
@@ -285,7 +313,11 @@ pub fn remove_cursor(key: CursorKey) {
         return;
     }
     if let Some(tx) = CMD_TX.get() {
-        let _ = tx.try_send(OverlayMsg::Remove(key));
+        let _ = tx.try_send(OverlayMsg::Remove(key.clone()));
+    }
+    if crate::wayland::is_wayland() && crate::wayland::shell_helper::available() {
+        gnome_targets().lock().unwrap().remove(&key);
+        crate::wayland::shell_helper::remove_cursor(&key);
     }
 }
 

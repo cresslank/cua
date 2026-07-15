@@ -1060,14 +1060,14 @@ pub mod linux {
             .map_err(|error| ObserverError::new(format!("clone observer socket: {error}")))?;
         let mut reader = BufReader::new(stream);
 
-        writeln!(writer, "cua-inject v1")
+        writeln!(writer, "cua-inject v2")
             .and_then(|_| writer.flush())
             .map_err(|error| ObserverError::new(format!("write observer handshake: {error}")))?;
         let mut line = String::new();
         reader
             .read_line(&mut line)
             .map_err(|error| ObserverError::new(format!("read observer handshake: {error}")))?;
-        if line.trim() != "cua-inject v1" {
+        if line.trim() != "cua-inject v2" {
             return Err(ObserverError::new(format!(
                 "cua-compositor observer handshake mismatch: {:?}",
                 line.trim()

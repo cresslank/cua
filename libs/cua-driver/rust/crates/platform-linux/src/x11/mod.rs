@@ -21,6 +21,21 @@ pub struct WindowInfo {
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    /// Compositor-native identifier when `xid` is an incarnation-aware adapter
+    /// ID (GNOME WinRects v2). `None` on ordinary X11/wlroots paths.
+    pub native_window_id: Option<u64>,
+    /// Exact compositor target token. Includes the helper/compositor
+    /// incarnation and therefore changes when the helper restarts.
+    pub target_id: Option<String>,
+    pub helper_epoch: Option<String>,
+    /// Diagnostic workspace index only; never use it as durable identity.
+    pub workspace_index: Option<i32>,
+    pub workspace_active: Option<bool>,
+    pub sticky: Option<bool>,
+    pub monitor: Option<i32>,
+    /// True only when the compositor says a current stage crop can include the
+    /// target. `None` means this capability was not advertised.
+    pub capture_current: Option<bool>,
 }
 
 /// List top-level windows, optionally filtered by pid.
@@ -78,6 +93,14 @@ fn list_windows_inner(filter_pid: Option<u32>) -> Result<Vec<WindowInfo>> {
             y,
             width: w,
             height: h,
+            native_window_id: None,
+            target_id: None,
+            helper_epoch: None,
+            workspace_index: None,
+            workspace_active: None,
+            sticky: None,
+            monitor: None,
+            capture_current: None,
         });
     }
 

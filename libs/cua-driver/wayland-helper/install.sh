@@ -7,9 +7,24 @@ set -euo pipefail
 UUID="winrects@cua"
 SRC="$(cd "$(dirname "$0")" && pwd)/$UUID"
 DEST="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$UUID"
+ENABLE=false
+if [[ "${1:-}" == "--enable" ]]; then
+  ENABLE=true
+elif [[ $# -gt 0 ]]; then
+  echo "usage: $0 [--enable]" >&2
+  exit 2
+fi
 mkdir -p "$DEST"
 cp -f "$SRC/metadata.json" "$SRC/extension.js" "$DEST/"
-# Add to the enabled set (preserves existing).
+echo "Staged $UUID v2 to $DEST."
+
+if ! $ENABLE; then
+  echo "Not enabling it automatically. Re-run with --enable after warning the user."
+  echo "On GNOME Wayland, loading this new extension code requires ONE logout/login."
+  exit 0
+fi
+
+# Explicit --enable: add to the enabled set while preserving existing entries.
 cur=$(gsettings get org.gnome.shell enabled-extensions 2>/dev/null || echo "@as []")
 python3 - "$cur" "$UUID" <<'PY'
 import sys, ast
@@ -20,6 +35,6 @@ import subprocess
 subprocess.run(["gsettings","set","org.gnome.shell","enabled-extensions",str(l)])
 print("enabled-extensions ->", l)
 PY
-echo "Installed $UUID to $DEST."
-echo "GNOME Shell scans extensions only at startup, so log out/in (or restart the"
-echo "session) ONCE to load it. After that: gnome-extensions info $UUID should show State: ACTIVE."
+echo "Enabled $UUID in settings."
+echo "LOGOUT/LOGIN REQUIRED ONCE: GNOME Wayland cannot reload Shell in place safely."
+echo "After login: gnome-extensions info $UUID should show State: ACTIVE."

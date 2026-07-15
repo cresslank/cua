@@ -19,7 +19,7 @@
 
 stdenv.mkDerivation {
   pname = "cua-compositor";
-  version = "0.1.0";
+  version = "0.2.0";
 
   src = lib.cleanSource ./.;
 
@@ -55,7 +55,7 @@ stdenv.mkDerivation {
   '';
 
   meta = {
-    description = "Headless wlroots compositor with focus-free + multi-cursor input injection for cua-driver";
+    description = "Headless wlroots compositor with exact-surface focus-free and multi-cursor input injection for cua-driver";
     platforms = lib.platforms.linux;
     mainProgram = "cua-compositor";
   };

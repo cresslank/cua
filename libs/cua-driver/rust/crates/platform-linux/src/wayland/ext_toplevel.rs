@@ -241,6 +241,14 @@ fn merge_atspi_records(
             y: 0,
             width: 0,
             height: 0,
+            native_window_id: None,
+            target_id: None,
+            helper_epoch: None,
+            workspace_index: None,
+            workspace_active: None,
+            sticky: None,
+            monitor: None,
+            capture_current: None,
         };
         if let Some(index) = matching_atspi {
             claimed[index] = true;
@@ -308,6 +316,14 @@ mod tests {
             y: 20,
             width: 800,
             height: 600,
+            native_window_id: None,
+            target_id: None,
+            helper_epoch: None,
+            workspace_index: None,
+            workspace_active: None,
+            sticky: None,
+            monitor: None,
+            capture_current: None,
         }
     }
 

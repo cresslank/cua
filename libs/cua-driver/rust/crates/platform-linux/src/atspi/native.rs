@@ -843,6 +843,14 @@ fn list_windows_blocking(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo>
                         y,
                         width,
                         height,
+                        native_window_id: None,
+                        target_id: None,
+                        helper_epoch: None,
+                        workspace_index: None,
+                        workspace_active: None,
+                        sticky: None,
+                        monitor: None,
+                        capture_current: None,
                     });
                     emitted += 1;
                 }
@@ -860,6 +868,14 @@ fn list_windows_blocking(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo>
                         y: 0,
                         width: 0,
                         height: 0,
+                        native_window_id: None,
+                        target_id: None,
+                        helper_epoch: None,
+                        workspace_index: None,
+                        workspace_active: None,
+                        sticky: None,
+                        monitor: None,
+                        capture_current: None,
                     });
                 }
             }

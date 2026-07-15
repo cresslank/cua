@@ -445,6 +445,15 @@ fn window_record_json(w: &crate::x11::WindowInfo) -> Value {
         "bounds": { "x": w.x, "y": w.y, "width": w.width, "height": w.height },
         "is_on_screen": w.is_on_screen,
         "z_index": w.z_index,
+        "native_window_id": w.native_window_id,
+        "target_id": w.target_id,
+        "helper_epoch": w.helper_epoch,
+        // Workspace indexes are live diagnostic metadata, not durable IDs.
+        "workspace_index": w.workspace_index,
+        "workspace_active": w.workspace_active,
+        "sticky": w.sticky,
+        "monitor": w.monitor,
+        "capture_current": w.capture_current,
         // Legacy alias: flat fields kept inline for pre-existing callers.
         "x": w.x, "y": w.y,
         "width": w.width, "height": w.height,
@@ -468,6 +477,14 @@ mod list_windows_tests {
             y: 20,
             width: 300,
             height: 400,
+            native_window_id: None,
+            target_id: None,
+            helper_epoch: None,
+            workspace_index: None,
+            workspace_active: None,
+            sticky: None,
+            monitor: None,
+            capture_current: None,
         };
         let rec = window_record_json(&w);
 
@@ -1538,14 +1555,9 @@ async fn overlay_glide_to_for(cursor_id: &str, sx: f64, sy: f64) {
     if !crate::overlay::is_enabled_for(cursor_id) {
         return;
     }
-    // Wayland (Mutter/KDE, no layer-shell): glide the agent cursor via the
-    // WinRects shell extension. It eases to the target itself, so send the
-    // destination once here rather than the interpolated stream the X11 render
-    // loop uses (which is invisible on those compositors anyway). No-op if the
-    // extension isn't installed.
-    if crate::wayland::is_wayland() {
-        crate::wayland::shell_helper::move_cursor(sx as i32, sy as i32);
-    }
+    // On GNOME, send_command_for forwards through WinRects v2 only after the
+    // cursor key has been pinned to an exact target. There is intentionally no
+    // unqualified Shell-global cursor movement path.
     let pos = crate::overlay::current_position_for(cursor_id);
     if pos.0 < 0.0 && pos.1 < 0.0 {
         crate::overlay::send_command_for(
@@ -6696,7 +6708,7 @@ impl Tool for BringToFrontTool {
             input_schema: serde_json::json!({
                 "type":"object","required":["pid"],"properties":{
                     "pid":{"type":"integer"},
-                    "window_id":{"type":"integer","description":"X11 window id (xid) to activate. If omitted, the first window of `pid` is used."}
+                    "window_id":{"type":"integer","description":"Exact window id to activate. Required when a Wayland process owns more than one toplevel."}
                 },"additionalProperties":false
             }),
             read_only: false, destructive: false, idempotent: true, open_world: false,
@@ -6709,17 +6721,24 @@ impl Tool for BringToFrontTool {
         if crate::wayland::is_wayland() {
             let window_id = match args.opt_u64("window_id") {
                 Some(window_id) => window_id,
-                None => match crate::wayland::list_windows_dispatch(Some(pid)).first() {
-                    Some(window) => window.xid,
-                    None => {
+                None => match crate::wayland::list_windows_dispatch(Some(pid)).as_slice() {
+                    [window] => window.xid,
+                    [] => {
                         return ToolResult::error(format!(
                             "bring_to_front: no window_id given and no Wayland windows found for pid {pid}."
+                        ))
+                    }
+                    windows => {
+                        return ToolResult::error(format!(
+                            "target_ambiguous: pid {pid} owns {} Wayland windows; provide an exact window_id.",
+                            windows.len()
                         ))
                     }
                 },
             };
             let result = tokio::task::spawn_blocking(move || {
                 crate::wayland::activate_window_for_input_target(window_id, Some(pid))
+                    .and_then(crate::wayland::ForegroundInputGuard::keep_focus)
             })
             .await;
             return match result {

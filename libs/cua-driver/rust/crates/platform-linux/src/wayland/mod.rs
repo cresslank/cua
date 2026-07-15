@@ -61,6 +61,7 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
 
 /// Linux evdev BTN_LEFT — the button code the virtual-pointer protocol expects.
 const BTN_LEFT: u32 = 0x110;
+static HOST_RAW_INPUT_LEASE: Mutex<()> = Mutex::new(());
 
 use crate::x11::WindowInfo;
 
@@ -262,6 +263,15 @@ fn remember_identity(id: u64, toplevel: &Toplevel) {
             },
         );
     }
+}
+
+fn private_target_window_id(target: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in target.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash.max(1)
 }
 
 fn identity_for(id: u64) -> Option<ToplevelIdentity> {
@@ -601,7 +611,8 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
         if tl.closed {
             continue;
         }
-        let title = if tl.app_id.is_empty() {
+        let exact_private_target = tl.app_id.starts_with("surface:");
+        let title = if tl.app_id.is_empty() || exact_private_target {
             tl.title.clone()
         } else {
             format!("{} [{}]", tl.title, tl.app_id)
@@ -620,7 +631,11 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
                         && window.app_id == tl.app_id
                 })
             });
-        let stable_id = sway.map(|window| window.id).unwrap_or(*id as u64);
+        let stable_id = if exact_private_target {
+            private_target_window_id(&tl.app_id)
+        } else {
+            sway.map(|window| window.id).unwrap_or(*id as u64)
+        };
         if let Some(window) = sway {
             used_sway_ids.insert(window.id);
         }
@@ -628,7 +643,11 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
         out.push(WindowInfo {
             xid: stable_id,
             pid: sway.map(|window| window.pid),
-            app_name: tl.app_id.clone(),
+            app_name: if exact_private_target {
+                String::new()
+            } else {
+                tl.app_id.clone()
+            },
             title,
             is_on_screen: sway.map(|window| window.visible).unwrap_or(true),
             z_index: None,
@@ -636,6 +655,16 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
             y: sway.map(|window| window.y).unwrap_or(0),
             width: sway.map(|window| window.width).unwrap_or(0),
             height: sway.map(|window| window.height).unwrap_or(0),
+            native_window_id: Some(u64::from(*id)),
+            target_id: exact_private_target.then(|| tl.app_id.clone()),
+            helper_epoch: exact_private_target.then(|| {
+                tl.app_id.split(':').nth(1).unwrap_or_default().to_owned()
+            }),
+            workspace_index: None,
+            workspace_active: None,
+            sticky: None,
+            monitor: None,
+            capture_current: None,
         });
     }
     Ok(out)
@@ -879,7 +908,28 @@ pub(crate) unsafe fn borrowed_fd(fd: i32) -> std::os::fd::OwnedFd {
 /// output-level path used by `get_window_state`'s vision payload.
 pub fn screenshot_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
     if is_wayland() {
-        let bytes = screenshot_display_dispatch()?;
+        // The private compositor temporarily disables every other toplevel for
+        // one screencopy lease, so output capture becomes an exact target image
+        // even when that target was occluded. Drop restores the scene; the
+        // compositor also restores on socket close or a bounded timeout.
+        let _private_capture = if is_inject_mode() {
+            Some(inject_capture_lease(xid)?)
+        } else {
+            None
+        };
+        let bytes = if shell_helper::present() {
+            if !shell_helper::available() {
+                anyhow::bail!(
+                    "helper_protocol_mismatch: installed GNOME WinRects helper does not support exact-target v2"
+                );
+            }
+            // WinRects v2 validates the exact incarnation-qualified target and
+            // refuses inactive-workspace stage crops. Do not fall through to a
+            // display/portal capture when that exact-target gate refuses.
+            shell_helper::screenshot_window(xid)?
+        } else {
+            screenshot_display_dispatch()?
+        };
         if let Some((x, y, width, height)) = window_geometry(xid) {
             crop_png_to_rect(
                 &bytes,
@@ -1001,18 +1051,9 @@ fn physical_crop_geometry(
 /// 3. X11: existing root-window path.
 pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
     if is_wayland() {
-        // Tier 1: the opt-in GNOME compositor helper. It avoids probing
-        // wlroots-only protocols and captures the Shell stage without consent.
-        // If the helper is present but capture fails, do not fall through to
-        // GNOME's portal implementation: on GNOME 50 a malformed 0x0 cursor
-        // sprite can crash Shell inside screenshot_stage_to_content().
-        if let Some(result) = checked_shell_helper_capture(
-            shell_helper::available(),
-            shell_helper::screenshot_display,
-        ) {
-            return result;
-        }
-        // Tier 2: native wlroots screencopy (fast, zero consent).
+        // Tier 1: native wlroots screencopy (fast, zero consent). WinRects v2
+        // intentionally has no unqualified display capture method; callers
+        // targeting a GNOME window use screenshot_dispatch's exact-target gate.
         match screenshot_bytes() {
             Ok(bytes) => return Ok(bytes),
             Err(e) => {
@@ -1021,7 +1062,7 @@ pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
                 );
             }
         }
-        // Tier 3: ext-image-copy-capture-v1 (sway 1.10+, labwc 0.8+, niri,
+        // Tier 2: ext-image-copy-capture-v1 (sway 1.10+, labwc 0.8+, niri,
         // hyprland, KDE 6.2+, GNOME 47+).
         match ext_screencopy::screenshot_via_ext_copy() {
             Ok(bytes) => return Ok(bytes),
@@ -1031,7 +1072,7 @@ pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
                 );
             }
         }
-        // Tier 4: xdg-desktop-portal (GNOME, KDE, COSMIC fallback).
+        // Tier 3: xdg-desktop-portal (GNOME, KDE, COSMIC fallback).
         match portal_screenshot::screenshot_via_portal() {
             Ok(bytes) => return Ok(bytes),
             Err(e) => {
@@ -1047,14 +1088,6 @@ pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
     crate::capture::screenshot_display_bytes_x11()
 }
 
-fn checked_shell_helper_capture(
-    available: bool,
-    capture: impl FnOnce() -> Option<Vec<u8>>,
-) -> Option<anyhow::Result<Vec<u8>>> {
-    available.then(|| {
-        capture().ok_or_else(|| anyhow::anyhow!("GNOME compositor helper capture failed"))
-    })
-}
 
 /// Per-window capture dispatcher. On X11 forwards to the existing window
 /// capture path; on pure Wayland returns a typed error pointing at the
@@ -1225,8 +1258,101 @@ pub fn open_vptr_session(activate_window_id: Option<u64>) -> anyhow::Result<Vptr
 /// foreign-toplevel protocol; GNOME uses the bundled compositor helper. Other
 /// compositors must refuse until they provide an equally target-addressable
 /// adapter, because global injection without this gate can affect the wrong app.
-pub fn activate_window_for_input(window_id: u64) -> anyhow::Result<()> {
-    let pid = crate::atspi::list_windows(None)
+pub struct ForegroundInputGuard {
+    // Drop order matters: restore the prior GNOME context before releasing the
+    // process-wide raw-input lease to the next waiting action.
+    _transaction: Option<shell_helper::ForegroundTransaction>,
+    _lease: Option<HostRawInputLease>,
+}
+
+struct HostRawInputLease {
+    _process: std::sync::MutexGuard<'static, ()>,
+    _session_file: std::fs::File,
+}
+
+impl ForegroundInputGuard {
+    /// Keep the explicitly requested focus change rather than restoring the
+    /// prior context. Raw input actions never call this; it is reserved for the
+    /// dedicated bring_to_front tool.
+    pub fn keep_focus(mut self) -> anyhow::Result<()> {
+        if let Some(transaction) = self._transaction.take() {
+            transaction.commit()?;
+        }
+        Ok(())
+    }
+}
+
+fn acquire_host_raw_input_lease() -> anyhow::Result<HostRawInputLease> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let process = loop {
+        match HOST_RAW_INPUT_LEASE.try_lock() {
+            Ok(lease) => break lease,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                break poisoned.into_inner();
+            }
+            Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                anyhow::bail!(
+                    "input_busy: another raw Wayland foreground transaction holds the process lease"
+                );
+            }
+        }
+    };
+
+    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            // SAFETY: getuid has no preconditions and does not dereference data.
+            let uid = unsafe { libc::getuid() };
+            std::path::PathBuf::from(format!("/run/user/{uid}"))
+        });
+    let lock_path = runtime_dir.join("cua-driver-gnome-raw-input.lock");
+    let session_file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|error| anyhow::anyhow!("input_unavailable: cannot open {}: {error}", lock_path.display()))?;
+
+    loop {
+        // SAFETY: session_file owns a valid descriptor for the duration of the
+        // call; LOCK_NB prevents an unbounded kernel wait.
+        let result = unsafe { libc::flock(session_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(HostRawInputLease {
+                _process: process,
+                _session_file: session_file,
+            });
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(code)
+                if (code == libc::EWOULDBLOCK || code == libc::EAGAIN)
+                    && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN => {
+                anyhow::bail!(
+                    "input_busy: another raw Wayland foreground transaction holds the host session lease"
+                );
+            }
+            _ => anyhow::bail!(
+                "input_unavailable: cannot lock {}: {error}",
+                lock_path.display()
+            ),
+        }
+    }
+}
+
+pub fn activate_window_for_input(window_id: u64) -> anyhow::Result<ForegroundInputGuard> {
+    let pid = list_windows_dispatch(None)
         .into_iter()
         .find(|window| window.xid == window_id)
         .and_then(|window| window.pid);
@@ -1239,16 +1365,25 @@ pub fn activate_window_for_input(window_id: u64) -> anyhow::Result<()> {
 pub fn activate_window_for_input_target(
     window_id: u64,
     target_pid: Option<u32>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ForegroundInputGuard> {
     if is_inject_mode() {
-        let pid = target_pid.ok_or_else(|| {
-            anyhow::anyhow!(
-                "foreground_unavailable: cua-compositor activation requires a verified target pid"
-            )
-        })?;
-        inject_send(&[format!("f {pid}")])?;
+        let target = inject_target_for_window(window_id)?;
+        inject_send(&[format!("f {target}")])?;
         std::thread::sleep(std::time::Duration::from_millis(60));
-        return Ok(());
+        return Ok(ForegroundInputGuard {
+            _transaction: None,
+            _lease: None,
+        });
+    }
+
+    let lease = acquire_host_raw_input_lease()?;
+
+    if shell_helper::available() {
+        let transaction = shell_helper::begin_foreground(window_id)?;
+        return Ok(ForegroundInputGuard {
+            _transaction: Some(transaction),
+            _lease: Some(lease),
+        });
     }
 
     let conn = Connection::connect_to_env()?;
@@ -1269,12 +1404,10 @@ pub fn activate_window_for_input_target(
         handle.activate(&seat);
         queue.roundtrip(&mut state)?;
         std::thread::sleep(std::time::Duration::from_millis(60));
-        return Ok(());
-    }
-
-    if shell_helper::activate_window(window_id) {
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        return Ok(());
+        return Ok(ForegroundInputGuard {
+            _transaction: None,
+            _lease: Some(lease),
+        });
     }
 
     anyhow::bail!(
@@ -1351,7 +1484,7 @@ pub fn click(window_id: u64, x: i32, y: i32, count: u32, button: u8) -> anyhow::
         || click_vptr(Some(window_id), x, y, count, button),
         || {
             libei_wait_pointer_ready()?;
-            activate_window_for_input(window_id)?;
+            let _foreground = activate_window_for_input(window_id)?;
             libei_click(x, y, count, button)
         },
     )
@@ -1439,6 +1572,15 @@ pub fn window_local_to_output(window_id: u64, x: i32, y: i32) -> (i32, i32) {
 /// object ID came from an earlier Wayland connection. Protocol object IDs are
 /// connection-local, so direct equality is only a fast path.
 pub fn window_geometry(window_id: u64) -> Option<(i32, i32, u32, u32)> {
+    if shell_helper::available() {
+        // WinRects v2 IDs include the helper incarnation. Never weaken an
+        // exact GNOME target into title/PID guessing after a stale-ID miss.
+        return shell_helper::list_windows(None)?
+            .into_iter()
+            .find(|window| window.xid == window_id)
+            .map(|window| (window.x, window.y, window.width, window.height));
+    }
+
     if let Some(window) = sway_ipc::window_for_id(window_id) {
         return Some((window.x, window.y, window.width, window.height));
     }
@@ -1515,7 +1657,7 @@ pub fn scroll_at(
         || scroll_vptr(window_id, point, &direction, amount),
         || {
             libei_wait_scroll_ready()?;
-            activate_window_for_input(window_id)?;
+            let _foreground = activate_window_for_input(window_id)?;
             if let Some((x, y)) = point {
                 libei_move_absolute(x, y)?;
             }
@@ -1641,7 +1783,7 @@ pub fn drag(
         || drag_vptr(window_id, from_x, from_y, to_x, to_y, steps, button),
         || {
             libei_wait_pointer_ready()?;
-            activate_window_for_input(window_id)?;
+            let _foreground = activate_window_for_input(window_id)?;
             libei_drag(from_x, from_y, to_x, to_y, steps, button)
         },
     )
@@ -1716,7 +1858,7 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
-    activate_window_for_input(window_id)?;
+    let _foreground = activate_window_for_input(window_id)?;
     // Lead with a no-op Shift_L tap: on a freshly-focused window under a headless
     // seat (notably sway), the compositor needs the first virtual-keyboard event
     // to wire up keyboard routing, and that first key is dropped. Sacrificing a
@@ -1735,7 +1877,6 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
         other => with_wtype_libei_fallback(
             || {
                 libei_wait_keyboard_ready()?;
-                activate_window_for_input(window_id)?;
                 libei_type_text(text)
             },
             other.map(|o| String::from_utf8_lossy(&o.stderr).into_owned()),
@@ -1745,7 +1886,7 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
 
 /// Press a single named key into the focused Wayland surface via `wtype -k`.
 pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
-    activate_window_for_input(window_id)?;
+    let _foreground = activate_window_for_input(window_id)?;
     let keysym = key_to_keysym(key);
     // Keep the sacrificial modifier and requested key in one virtual-keyboard
     // lifetime. Starting a second wtype process creates a fresh protocol object,
@@ -1758,7 +1899,6 @@ pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
         other => with_wtype_libei_fallback(
             || {
                 libei_wait_keyboard_ready()?;
-                activate_window_for_input(window_id)?;
                 libei_press_key(key)
             },
             other.map(|o| String::from_utf8_lossy(&o.stderr).into_owned()),
@@ -1772,7 +1912,7 @@ pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
 /// straight to wtype's `-k` so single-character keys and X keysym names work
 /// as-is. This is the Wayland equivalent of the X11 `send_key` modifier mask.
 pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
-    activate_window_for_input(window_id)?;
+    let _foreground = activate_window_for_input(window_id)?;
     let (mods, final_key) = partition_modifiers(keys)?;
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
         return Ok(());
@@ -1789,7 +1929,6 @@ pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
                 return with_wtype_libei_fallback(
                     || {
                         libei::wait_keyboard_ready()?;
-                        activate_window_for_input(window_id)?;
                         libei_hotkey(&mods, &final_key)
                     },
                     stderr,
@@ -2208,8 +2347,8 @@ fn key_to_evdev(key: &str) -> Option<u32> {
 // acknowledgement is transport evidence only, not proof the target changed.
 
 /// Version banner exchanged at connect time: the client sends this line and the
-/// compositor must echo it back verbatim to confirm both speak v1.
-const INJECT_PROTO_HELLO: &str = "cua-inject v1";
+/// compositor must echo it back verbatim to confirm both speak v2.
+const INJECT_PROTO_HELLO: &str = "cua-inject v2";
 
 /// The exact named keys the nested compositor's `k` command can emit — the
 /// whitelist in `cua_key_named` (cua_compositor_patch.py). Compared
@@ -2242,7 +2381,7 @@ fn validate_injectable_text(text: &str) -> anyhow::Result<()> {
         if !ok {
             anyhow::bail!(
                 "cua-compositor cannot type {ch:?}: only printable ASCII plus newline and tab \
-                 are supported in the v1 injection protocol"
+                 are supported in the v2 injection protocol"
             );
         }
     }
@@ -2298,7 +2437,7 @@ fn parse_inject_hello(line: &str) -> anyhow::Result<()> {
         Ok(())
     } else if let Some(reason) = trimmed.strip_prefix("err") {
         anyhow::bail!(
-            "cua-compositor rejected the v1 handshake:{}",
+            "cua-compositor rejected the v2 handshake:{}",
             if reason.trim().is_empty() {
                 String::new()
             } else {
@@ -2349,11 +2488,10 @@ fn read_inject_line(reader: &mut impl std::io::BufRead) -> anyhow::Result<String
     Ok(line)
 }
 
-/// Connect to the nested cua-compositor control socket, perform the v1
-/// handshake, then send each command line and require exactly one
-/// acknowledgement per command. Fails on protocol mismatch, timeout, EOF, or a
-/// compositor error line — the earlier fire-and-forget path hid all of these.
-fn inject_exchange(lines: &[String]) -> anyhow::Result<Vec<String>> {
+fn open_inject_connection() -> anyhow::Result<(
+    std::os::unix::net::UnixStream,
+    std::io::BufReader<std::os::unix::net::UnixStream>,
+)> {
     use std::io::{BufReader, Write};
     use std::os::unix::net::UnixStream;
     let path = inject_socket_path().ok_or_else(|| anyhow::anyhow!("CUA_INJECT_SOCKET not set"))?;
@@ -2374,10 +2512,20 @@ fn inject_exchange(lines: &[String]) -> anyhow::Result<Vec<String>> {
     let mut writer = stream.try_clone()?;
     let mut reader = BufReader::new(stream);
 
-    // v1 handshake: send our banner and require the compositor to echo it.
+    // v2 handshake: send our banner and require the compositor to echo it.
     writeln!(writer, "{INJECT_PROTO_HELLO}")?;
     writer.flush()?;
     parse_inject_hello(&read_inject_line(&mut reader)?)?;
+    Ok((writer, reader))
+}
+
+/// Connect to the nested cua-compositor control socket, perform the v2
+/// handshake, then send each command line and require exactly one
+/// acknowledgement per command. Fails on protocol mismatch, timeout, EOF, or a
+/// compositor error line — the earlier fire-and-forget path hid all of these.
+fn inject_exchange(lines: &[String]) -> anyhow::Result<Vec<String>> {
+    use std::io::Write;
+    let (mut writer, mut reader) = open_inject_connection()?;
 
     let mut replies = Vec::with_capacity(lines.len());
     // One command per line; block on its response before the next.
@@ -2389,11 +2537,97 @@ fn inject_exchange(lines: &[String]) -> anyhow::Result<Vec<String>> {
     Ok(replies)
 }
 
-fn inject_send(lines: &[String]) -> anyhow::Result<()> {
-    for reply in inject_exchange(lines)? {
-        parse_inject_reply(&reply)?;
+fn inject_batch_target(lines: &[String]) -> anyhow::Result<&str> {
+    let batch_target = lines
+        .first()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .filter(|target| target.starts_with("surface:"))
+        .ok_or_else(|| anyhow::anyhow!("exact private target required for input batch"))?;
+    for line in lines {
+        let target = line
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| anyhow::anyhow!("targetless private input is unavailable"))?;
+        if target != batch_target {
+            anyhow::bail!("one private input batch cannot span multiple targets");
+        }
     }
+    Ok(batch_target)
+}
+
+fn inject_send(lines: &[String]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let batch_target = inject_batch_target(lines)?;
+    let (mut writer, mut reader) = open_inject_connection()?;
+    writeln!(writer, "begin {batch_target}")?;
+    writer.flush()?;
+    parse_inject_reply(&read_inject_line(&mut reader)?)?;
+    for line in lines {
+        writeln!(writer, "{line}")?;
+        writer.flush()?;
+        // Stop on the first rejected command. Closing the socket releases the
+        // compositor batch owner, and callers receive an explicit potentially-
+        // partial failure instead of blindly continuing a drag/click sequence.
+        parse_inject_reply(&read_inject_line(&mut reader)?)?;
+    }
+    writeln!(writer, "end")?;
+    writer.flush()?;
+    parse_inject_reply(&read_inject_line(&mut reader)?)?;
     Ok(())
+}
+
+fn parse_capture_lease(line: &str) -> anyhow::Result<u64> {
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() == 2 && fields[0] == "capture" {
+        return Ok(fields[1].parse()?);
+    }
+    if let Some(reason) = line.trim().strip_prefix("err") {
+        anyhow::bail!("cua-compositor exact capture refused: {}", reason.trim());
+    }
+    anyhow::bail!("unexpected cua-compositor capture response: {:?}", line.trim())
+}
+
+pub struct InjectCaptureLease {
+    writer: std::os::unix::net::UnixStream,
+    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+    lease: u64,
+}
+
+impl InjectCaptureLease {
+    fn begin(window_id: u64) -> anyhow::Result<Self> {
+        use std::io::Write;
+        let target = inject_target_for_window(window_id)?;
+        let (mut writer, mut reader) = open_inject_connection()?;
+        writeln!(writer, "c {target}")?;
+        writer.flush()?;
+        let lease = parse_capture_lease(&read_inject_line(&mut reader)?)?;
+        Ok(Self {
+            writer,
+            reader,
+            lease,
+        })
+    }
+}
+
+impl Drop for InjectCaptureLease {
+    fn drop(&mut self) {
+        use std::io::Write;
+        let restored = writeln!(self.writer, "r {}", self.lease)
+            .and_then(|_| self.writer.flush())
+            .ok()
+            .and_then(|_| read_inject_line(&mut self.reader).ok())
+            .is_some_and(|reply| parse_inject_reply(&reply).is_ok());
+        if !restored {
+            tracing::warn!(
+                "cua-compositor exact-capture lease {} was not explicitly restored; socket close/timeout will recover it",
+                self.lease
+            );
+        }
+    }
+}
+
+pub fn inject_capture_lease(window_id: u64) -> anyhow::Result<InjectCaptureLease> {
+    InjectCaptureLease::begin(window_id)
 }
 
 fn parse_inject_geometry(line: &str) -> anyhow::Result<((i32, i32), (i32, i32))> {
@@ -2428,6 +2662,18 @@ fn inject_window_origin(pid: u32) -> Option<(i32, i32)> {
         return None;
     }
     let replies = inject_exchange(&[format!("g {pid}")]).ok()?;
+    replies
+        .first()
+        .and_then(|line| parse_inject_geometry(line).ok())
+        .map(|geometry| geometry.1)
+}
+
+fn inject_window_origin_for_window(window_id: u64) -> Option<(i32, i32)> {
+    if !is_inject_mode() {
+        return None;
+    }
+    let target = inject_target_for_window(window_id).ok()?;
+    let replies = inject_exchange(&[format!("g {target}")]).ok()?;
     replies
         .first()
         .and_then(|line| parse_inject_geometry(line).ok())
@@ -2472,27 +2718,18 @@ fn evdev_button(x_button: u32) -> u32 {
     }
 }
 
-/// Sentinel error when a window_id has no registered cua-compositor identity.
-fn no_app_id(window_id: u64) -> anyhow::Error {
-    anyhow::anyhow!(
-        "no known cua-compositor app_id for window {window_id}; call list_windows first so its \
-         Wayland identity is registered"
-    )
-}
-
-/// Resolve the strongest target token understood by the private nested
-/// compositor. AT-SPI window IDs are synthetic on Wayland, but its process ID
-/// is the same credential the compositor observes on the owning wl_client.
-/// Fall back to app_id for clients whose accessibility metadata has no PID.
+/// Resolve the exact compositor-owned v2 surface token. PID, app-id, title, and
+/// newest-window fallbacks are intentionally forbidden: one browser process can
+/// own several independently controlled toplevels.
 pub fn inject_target_for_window(window_id: u64) -> anyhow::Result<String> {
-    if let Some(pid) = crate::atspi::list_windows(None)
-        .into_iter()
-        .find(|window| window.xid == window_id)
-        .and_then(|window| window.pid)
-    {
-        return Ok(format!("pid:{pid}"));
+    if let Some(target) = app_id_for_window(window_id) {
+        if target.starts_with("surface:") {
+            return Ok(target);
+        }
     }
-    app_id_for_window(window_id).ok_or_else(|| no_app_id(window_id))
+    Err(anyhow::anyhow!(
+        "no exact cua-compositor v2 surface token for window {window_id}; call list_windows first"
+    ))
 }
 
 /// Focus-free type into the window's surface (no focus change). Rejects any
@@ -2603,13 +2840,7 @@ fn resample(path: &[(f64, f64)], steps: usize) -> Vec<(f64, f64)> {
     out
 }
 
-/// Run N pointer drags concurrently on their target windows: each cursor presses
-/// at its start, glides through its (interleaved) waypoints, and releases. This
-/// is true multi-cursor — each `idx` is an independent cursor in the compositor.
-pub fn inject_parallel_drags(drags: &[InjectDrag]) -> anyhow::Result<()> {
-    if drags.is_empty() {
-        return Ok(());
-    }
+fn inject_target_drags(drags: &[&InjectDrag]) -> anyhow::Result<()> {
     let resampled: Vec<Vec<(f64, f64)>> = drags
         .iter()
         .map(|d| resample(&d.path, d.steps.max(1)))
@@ -2644,6 +2875,34 @@ pub fn inject_parallel_drags(drags: &[InjectDrag]) -> anyhow::Result<()> {
         ));
     }
     inject_send(&lines)
+}
+
+/// Run N pointer drags concurrently. Drags on one exact surface are interleaved
+/// in a single atomic surface batch; distinct surfaces use independent socket
+/// connections and can advance concurrently.
+pub fn inject_parallel_drags(drags: &[InjectDrag]) -> anyhow::Result<()> {
+    if drags.is_empty() {
+        return Ok(());
+    }
+    let mut by_target = std::collections::BTreeMap::<&str, Vec<&InjectDrag>>::new();
+    for drag in drags {
+        if !drag.app_id.starts_with("surface:") {
+            anyhow::bail!("parallel private drag requires an exact surface target");
+        }
+        by_target.entry(&drag.app_id).or_default().push(drag);
+    }
+    std::thread::scope(|scope| {
+        let handles = by_target
+            .into_values()
+            .map(|target_drags| scope.spawn(move || inject_target_drags(&target_drags)))
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("private drag worker panicked"))??;
+        }
+        Ok(())
+    })
 }
 
 /// Focus-free single drag using the same per-surface path as parallel drags.
@@ -2701,6 +2960,15 @@ fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
 /// Window-enumeration dispatcher: native Wayland when available, else X11.
 pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     if wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        if shell_helper::present() {
+            if !shell_helper::available() {
+                tracing::error!(
+                    "installed GNOME WinRects helper is incompatible; refusing non-incarnation-aware window enumeration"
+                );
+                return Vec::new();
+            }
+            return shell_helper::list_windows(filter_pid).unwrap_or_default();
+        }
         // Prefer the richer wlroots protocol. The generic staging protocol is
         // only consulted when wlroots yields no windows (including when its
         // manager global is absent).
@@ -2708,7 +2976,7 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
             Ok(ws) if !ws.is_empty() => Ok(enrich_native_windows(
                 ws,
                 wayland_atspi_windows(filter_pid),
-                is_inject_mode(),
+                false,
             )),
             Ok(_) => ext_toplevel::list_windows(),
             Err(wlr_error) => ext_toplevel::list_windows().map_err(|ext_error| {
@@ -2837,6 +3105,13 @@ fn enrich_native_windows(
         claimed.insert(index);
         let candidate = &atspi[index];
         window.pid = candidate.pid;
+        if window.app_name.is_empty() {
+            window.app_name = candidate.app_name.clone();
+        }
+        if let Some((window_x, window_y)) = inject_window_origin_for_window(window.xid) {
+            window.x = window_x;
+            window.y = window_y;
+        }
         if adopt_atspi_ids {
             let toplevel = Toplevel {
                 title: undecorated_native_title(window).to_owned(),
@@ -2994,6 +3269,14 @@ mod tests {
             y: 0,
             width: 0,
             height: 0,
+            native_window_id: None,
+            target_id: None,
+            helper_epoch: None,
+            workspace_index: None,
+            workspace_active: None,
+            sticky: None,
+            monitor: None,
+            capture_current: None,
         }
     }
 
@@ -3121,26 +3404,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn shell_helper_capture_failure_is_terminal() {
-        let result = checked_shell_helper_capture(true, || None)
-            .expect("available helper must produce a terminal result");
-        assert_eq!(
-            result.unwrap_err().to_string(),
-            "GNOME compositor helper capture failed"
-        );
-    }
-
-    #[test]
-    fn unavailable_shell_helper_does_not_attempt_capture() {
-        let called = std::cell::Cell::new(false);
-        let result = checked_shell_helper_capture(false, || {
-            called.set(true);
-            Some(vec![1, 2, 3])
-        });
-        assert!(result.is_none());
-        assert!(!called.get());
-    }
 
     #[test]
     fn injectable_text_accepts_printable_ascii_newline_and_tab() {
@@ -3201,10 +3464,58 @@ mod tests {
     }
 
     #[test]
+    fn private_target_ids_are_stable_within_an_epoch_and_change_across_epochs() {
+        let first = "surface:1111111111111111:0000000000000001";
+        let restarted = "surface:2222222222222222:0000000000000001";
+        assert_eq!(private_target_window_id(first), private_target_window_id(first));
+        assert_ne!(private_target_window_id(first), private_target_window_id(restarted));
+    }
+
+    #[test]
+    fn capture_lease_reply_is_typed_and_rejects_errors() {
+        assert_eq!(parse_capture_lease("capture 42\n").unwrap(), 42);
+        assert!(parse_capture_lease("err capture-busy").is_err());
+        assert!(parse_capture_lease("ok").is_err());
+    }
+
+    #[test]
+    fn private_input_batches_require_one_exact_surface() {
+        let one = vec![
+            "m surface:epoch-a:0001 0 1 2".to_string(),
+            "b surface:epoch-a:0001 0 272 1".to_string(),
+        ];
+        assert_eq!(inject_batch_target(&one).unwrap(), "surface:epoch-a:0001");
+        assert!(inject_batch_target(&[
+            "m surface:epoch-a:0001 0 1 2".to_string(),
+            "b surface:epoch-a:0002 0 272 1".to_string(),
+        ])
+        .is_err());
+        assert!(inject_batch_target(&["d 1 2 1 272".to_string()]).is_err());
+    }
+
+    #[test]
+    fn inject_target_requires_an_exact_surface_token() {
+        let exact = Toplevel {
+            title: "one".to_owned(),
+            app_id: "surface:1111111111111111:0000000000000002".to_owned(),
+            closed: false,
+        };
+        let legacy = Toplevel {
+            title: "two".to_owned(),
+            app_id: "org.example.App".to_owned(),
+            closed: false,
+        };
+        remember_identity(9_001, &exact);
+        remember_identity(9_002, &legacy);
+        assert_eq!(inject_target_for_window(9_001).unwrap(), exact.app_id);
+        assert!(inject_target_for_window(9_002).is_err());
+    }
+
+    #[test]
     fn hello_reply_parses_exact_banner_and_rejects_mismatch() {
-        parse_inject_hello("cua-inject v1\n").expect("verbatim banner is accepted");
-        parse_inject_hello("  cua-inject v1  ").expect("surrounding whitespace is tolerated");
-        assert!(parse_inject_hello("cua-inject v2").is_err());
+        parse_inject_hello("cua-inject v2\n").expect("verbatim banner is accepted");
+        parse_inject_hello("  cua-inject v2  ").expect("surrounding whitespace is tolerated");
+        assert!(parse_inject_hello("cua-inject v1").is_err());
         assert!(parse_inject_hello("err unsupported-version").is_err());
         assert!(parse_inject_hello("garbage").is_err());
     }
