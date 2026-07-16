@@ -296,7 +296,10 @@ echo ""
 # and the daemon re-prompts ("I already granted!"). Signing with a certificate
 # keys the grant on the cert identity instead, which is stable across rebuilds.
 # We create a self-signed code-signing cert once (idempotent, in the login
-# keychain) and reuse it. Local dev only; releases are CI-signed.
+# keychain by default) and reuse it. A maintainer VM may point
+# CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN at a dedicated, already-unlocked keychain;
+# this avoids image-specific login-keychain ACL failures. Local dev only;
+# releases are CI-signed.
 #
 # Echoes the `codesign --sign` argument: the valid identity's SHA-1 when
 # available, or "-" when it can't be created — no codesign/openssl, CI,
@@ -306,8 +309,10 @@ echo ""
 CUA_LOCAL_SIGN_CN="CuaDriver Local Signing (cua-driver-rs)"
 ensure_local_signing_identity() {
     { [ "$OS" = "Darwin" ] && command -v codesign >/dev/null 2>&1; } || { printf -- '-'; return; }
-    local kc="$HOME/Library/Keychains/login.keychain-db"
-    [ -f "$kc" ] || kc="$HOME/Library/Keychains/login.keychain"
+    local kc="${CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN:-$HOME/Library/Keychains/login.keychain-db}"
+    if [ -z "${CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN:-}" ] && [ ! -f "$kc" ]; then
+        kc="$HOME/Library/Keychains/login.keychain"
+    fi
     [ -f "$kc" ] || { printf -- '-'; return; }
     local identity
     identity="$(security find-identity -v -p codesigning "$kc" 2>/dev/null \
@@ -351,11 +356,25 @@ codesign_bounded() {
     local timeout_seconds="$1"
     shift
     if command -v gtimeout >/dev/null 2>&1; then
-        gtimeout "$timeout_seconds" codesign "$@"
+        if [ -n "${CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN:-}" ]; then
+            gtimeout "$timeout_seconds" codesign \
+                --keychain "$CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN" "$@"
+        else
+            gtimeout "$timeout_seconds" codesign "$@"
+        fi
     elif command -v perl >/dev/null 2>&1; then
-        perl -e 'alarm shift; exec @ARGV' "$timeout_seconds" codesign "$@"
+        if [ -n "${CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN:-}" ]; then
+            perl -e 'alarm shift; exec @ARGV' "$timeout_seconds" codesign \
+                --keychain "$CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN" "$@"
+        else
+            perl -e 'alarm shift; exec @ARGV' "$timeout_seconds" codesign "$@"
+        fi
     else
-        codesign "$@"
+        if [ -n "${CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN:-}" ]; then
+            codesign --keychain "$CUA_DRIVER_LOCAL_SIGNING_KEYCHAIN" "$@"
+        else
+            codesign "$@"
+        fi
     fi
 }
 
@@ -415,7 +434,7 @@ if [ "$OS" = "Darwin" ]; then
         elif [ -d "$APP_DEST" ] \
              && codesign -d -r- "$APP_DEST" 2>&1 | grep -q 'certificate leaf'; then
             echo "${RED}Error: stable signing failed; preserving the existing certificate-signed $APP_DEST and its TCC grants.${NORMAL}" >&2
-            echo "Unlock/authorize the login-keychain signing key, then rerun install-local." >&2
+            echo "Unlock/authorize the configured signing-keychain key, then rerun install-local." >&2
             exit 1
         else
             clean_partial_bundle_signature "$APP_STAGE"

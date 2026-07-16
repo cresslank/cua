@@ -5,6 +5,7 @@ use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
+use crate::policy::{configured_policy, PolicyDecision};
 use crate::protocol::{initialize_result, InitializeMetadata, Request, Response, ResponseBody};
 use crate::tool::ToolRegistry;
 
@@ -263,6 +264,7 @@ pub fn observe_proxy_tool_completed(outcome: ToolCompletionObservation) {
 /// responses to stdout. Exits when stdin reaches EOF or a fatal I/O
 /// error occurs.
 pub async fn run(registry: Arc<ToolRegistry>) -> anyhow::Result<()> {
+    configured_policy().map_err(anyhow::Error::msg)?;
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let mut reader = BufReader::new(stdin);
@@ -443,10 +445,8 @@ fn classify_tool_completion(
         .and_then(|value| value.get("isError"))
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
-    let success = timer.valid_params
-        && timer.known_tool
-        && rpc_error_code.is_none()
-        && !tool_reported_error;
+    let success =
+        timer.valid_params && timer.known_tool && rpc_error_code.is_none() && !tool_reported_error;
 
     let error_class = if success {
         ToolErrorClass::None
@@ -454,9 +454,7 @@ fn classify_tool_completion(
         ToolErrorClass::InvalidParams
     } else if !timer.known_tool {
         ToolErrorClass::UnknownTool
-    } else if rpc_error_code == Some(-32603)
-        && timer.path == StdioExecutionPath::DaemonProxy
-    {
+    } else if rpc_error_code == Some(-32603) && timer.path == StdioExecutionPath::DaemonProxy {
         ToolErrorClass::TransportError
     } else if rpc_error_code.is_some() {
         ToolErrorClass::InternalError
@@ -562,7 +560,11 @@ fn size_bucket(size: usize) -> OutputSizeBucket {
 /// tools/list / tools/call). Shared by the stdio loop above and the
 /// daemon's HTTP transport (`cua-driver`'s `mcp_http`) so both speak the
 /// exact same MCP semantics.
-pub async fn handle_request(req: Request, id: serde_json::Value, registry: &Arc<ToolRegistry>) -> Response {
+pub async fn handle_request(
+    req: Request,
+    id: serde_json::Value,
+    registry: &Arc<ToolRegistry>,
+) -> Response {
     match req.method.as_str() {
         "initialize" => Response::ok(id, initialize_result()),
 
@@ -570,7 +572,64 @@ pub async fn handle_request(req: Request, id: serde_json::Value, registry: &Arc<
 
         "tools/call" => match req.tool_call() {
             Err(e) => Response::error(id, -32602, format!("Invalid params: {e}")),
-            Ok(call) => {
+            Ok(mut call) => {
+                crate::tool_args::sanitize_reserved_args(&mut call.args);
+                match configured_policy() {
+                    Ok(Some(policy)) => match policy.evaluate(&call.name, &call.args) {
+                        PolicyDecision::Allow => {}
+                        PolicyDecision::Deny(reason) => {
+                            return Response::error(
+                                id,
+                                -32603,
+                                format!("Permission denied: {reason}"),
+                            );
+                        }
+                        PolicyDecision::Error(message) => {
+                            return Response::error(
+                                id,
+                                -32603,
+                                format!("Policy evaluation error: {message}"),
+                            );
+                        }
+                    },
+                    Ok(None) => {}
+                    Err(message) => {
+                        return Response::error(
+                            id,
+                            -32603,
+                            format!("Policy loading error: {message}"),
+                        );
+                    }
+                }
+
+                let public_session = call
+                    .args
+                    .get("session")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|session| !session.is_empty())
+                    .map(str::to_owned);
+                if let (Some(arguments), Some(session)) =
+                    (call.args.as_object_mut(), public_session)
+                {
+                    arguments.insert(
+                        "_session_id".to_owned(),
+                        serde_json::Value::String(session.clone()),
+                    );
+                    arguments.insert(
+                        "_transport_session_id".to_owned(),
+                        serde_json::Value::String(session.clone()),
+                    );
+                    crate::session::touch_session(&session);
+                }
+                if call.name == "browser_prepare" {
+                    if let Some(arguments) = call.args.as_object_mut() {
+                        arguments.insert(
+                            crate::browser::approval::MCP_HOST_APPROVAL_ARG.to_owned(),
+                            serde_json::Value::Bool(true),
+                        );
+                    }
+                }
+
                 let result = registry.invoke(&call.name, call.args).await;
                 match serde_json::to_value(result) {
                     Ok(v) => Response::ok(id, v),
@@ -615,7 +674,10 @@ mod observation_tests {
 
         let debug = format!("{observation:?}");
         for forbidden in ["private task text", "private-base64", "result body"] {
-            assert!(!debug.contains(forbidden), "observer leaked content: {debug}");
+            assert!(
+                !debug.contains(forbidden),
+                "observer leaked content: {debug}"
+            );
         }
     }
 
@@ -659,7 +721,10 @@ mod observation_tests {
         let invalid_observation =
             timer(false, false, StdioExecutionPath::InProcess).finish(&invalid);
         assert!(!invalid_observation.success);
-        assert_eq!(invalid_observation.error_class, ToolErrorClass::InvalidParams);
+        assert_eq!(
+            invalid_observation.error_class,
+            ToolErrorClass::InvalidParams
+        );
         assert_eq!(invalid_observation.output_type, OutputType::Empty);
 
         let unknown = Response::ok(
@@ -688,7 +753,10 @@ mod observation_tests {
     #[test]
     fn structured_codes_map_without_error_text() {
         for (code, expected) in [
-            ("background_unavailable", ToolErrorClass::BackgroundUnavailable),
+            (
+                "background_unavailable",
+                ToolErrorClass::BackgroundUnavailable,
+            ),
             ("permission_denied", ToolErrorClass::PermissionDenied),
             ("private_custom_error", ToolErrorClass::InternalError),
         ] {
@@ -700,8 +768,7 @@ mod observation_tests {
                     "structuredContent": {"code": code, "detail": "private detail"}
                 }),
             );
-            let observation =
-                timer(true, true, StdioExecutionPath::InProcess).finish(&response);
+            let observation = timer(true, true, StdioExecutionPath::InProcess).finish(&response);
             assert_eq!(observation.error_class, expected, "code={code}");
             let debug = format!("{observation:?}");
             assert!(!debug.contains("private prose"));
