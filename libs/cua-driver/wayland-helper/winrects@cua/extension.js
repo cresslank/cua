@@ -6,7 +6,12 @@ import Clutter from 'gi://Clutter';
 import Cairo from 'cairo';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
-import {targetIsPainted, targetTokenMatches} from './policy.js';
+import {
+    captureAreaIsSafe,
+    captureContextIsSafe,
+    targetIsPainted,
+    targetTokenMatches,
+} from './policy.js';
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
 
@@ -147,6 +152,11 @@ export default class WinRectsExtension extends Extension {
     _isTargetVisible(window) {
         if (!window)
             return false;
+        if (!captureContextIsSafe({
+            overviewVisible: Main.overview?.visible,
+            sessionLocked: Main.sessionMode?.isLocked,
+        }))
+            return false;
         const actor = this._actorFor(window);
         let shellShowing = false;
         try {
@@ -253,17 +263,24 @@ export default class WinRectsExtension extends Extension {
                 throw new Error('stale_target: target belongs to another helper incarnation or no longer exists');
             if (!this._isTargetVisible(target))
                 throw new Error('capture_foreground_required: target is not currently painted on the GNOME stage');
+            const [displayWidth, displayHeight] = global.display.get_size();
+            const [stageWidth, stageHeight] = global.stage.get_size();
+            if (!captureAreaIsSafe({displayWidth, displayHeight, stageWidth, stageHeight}))
+                throw new Error(
+                    'capture_not_ready: refusing GNOME screenshot with invalid '
+                    + `display ${displayWidth}x${displayHeight} or stage ${stageWidth}x${stageHeight}`
+                );
+            const width = Math.floor(displayWidth);
+            const height = Math.floor(displayHeight);
             const shooter = new Shell.Screenshot();
             const stream = Gio.MemoryOutputStream.new_resizable();
-            const [width, height] = global.display.get_size();
-            if (width <= 0 || height <= 0)
-                throw new Error(`Invalid display size ${width}x${height}`);
-            // GNOME 50's screenshot_stage_to_content() copies the real cursor
-            // sprite after painting the stage. Remote/headless pointer seats
-            // can expose a 0x0 sprite, and that copy can crash Shell. The
-            // stream API has an explicit include_cursor flag, so keep cursor
-            // capture disabled; cua-driver draws its own agent cursor.
-            await shooter.screenshot(false, stream);
+            // Never call Shell.Screenshot.screenshot() here. GNOME 50 can pass
+            // an implicit 0x0 stage view into Cogl immediately after a window
+            // activation, which crashes Shell even when display.get_size() is
+            // positive. screenshot_area() allocates the explicit positive full-
+            // display rectangle and omits the real cursor; Rust keeps applying
+            // the exact target crop to this full-display PNG.
+            await shooter.screenshot_area(0, 0, width, height, stream);
             stream.close(null);
             const encoded = GLib.base64_encode(stream.steal_as_bytes().get_data());
             invocation.return_value(new GLib.Variant('(s)', [encoded]));

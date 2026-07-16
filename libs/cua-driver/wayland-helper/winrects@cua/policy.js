@@ -12,3 +12,12 @@ export function targetTokenMatches(epoch, targetId) {
         && typeof targetId === 'string'
         && targetId.startsWith(`${epoch}:`);
 }
+
+export function captureAreaIsSafe({displayWidth, displayHeight, stageWidth, stageHeight}) {
+    return [displayWidth, displayHeight, stageWidth, stageHeight]
+        .every(value => Number.isFinite(value) && value >= 1);
+}
+
+export function captureContextIsSafe({overviewVisible, sessionLocked}) {
+    return !Boolean(overviewVisible) && !Boolean(sessionLocked);
+}
