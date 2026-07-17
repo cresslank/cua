@@ -1,6 +1,7 @@
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Shell from 'gi://Shell';
+import Meta from 'gi://Meta';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
 import Cairo from 'cairo';
@@ -194,6 +195,7 @@ export default class WinRectsExtension extends Extension {
                 'target-stage-capture',
                 'keyed-target-cursors',
                 'foreground-transaction',
+                'transient-parent-v1',
             ],
         });
     }
@@ -226,6 +228,15 @@ export default class WinRectsExtension extends Extension {
             let workspaceIndex = -1;
             try { workspaceIndex = workspace?.index() ?? -1; } catch (_error) {}
             const captureCurrent = this._isTargetVisible(w);
+            let transientFor = null;
+            try { transientFor = w.get_transient_for(); } catch (_error) {}
+            if (transientFor && !actorByWindow.has(transientFor))
+                transientFor = null;
+            let attachedDialog = false;
+            try { attachedDialog = Boolean(w.is_attached_dialog()); } catch (_error) {}
+            let windowType = null;
+            try { windowType = w.get_window_type(); } catch (_error) {}
+            const isModal = windowType === Meta.WindowType.MODAL_DIALOG;
             out.push({
                 id: w.get_stable_sequence(),
                 target_id: this._targetId(w),
@@ -251,6 +262,10 @@ export default class WinRectsExtension extends Extension {
                 monitor: w.get_monitor(),
                 monitor_primary: w.get_monitor() === Main.layoutManager.primaryIndex,
                 stacking,
+                transient_for_target_id: transientFor ? this._targetId(transientFor) : null,
+                is_attached_dialog: attachedDialog,
+                is_modal: isModal,
+                window_type: windowType,
             });
         }
         return JSON.stringify(out);

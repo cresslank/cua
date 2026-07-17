@@ -28,6 +28,13 @@ pub struct WindowInfo {
     /// incarnation and therefore changes when the helper restarts.
     pub target_id: Option<String>,
     pub helper_epoch: Option<String>,
+    /// Exact compositor parent for a transient/modal window. These are `None`
+    /// unless one compositor snapshot proves the relationship.
+    pub transient_for_window_id: Option<u64>,
+    pub transient_for_target_id: Option<String>,
+    pub is_attached_dialog: Option<bool>,
+    pub is_modal: Option<bool>,
+    pub window_type: Option<u32>,
     /// Diagnostic workspace index only; never use it as durable identity.
     pub workspace_index: Option<i32>,
     pub workspace_active: Option<bool>,
@@ -96,6 +103,11 @@ fn list_windows_inner(filter_pid: Option<u32>) -> Result<Vec<WindowInfo>> {
             native_window_id: None,
             target_id: None,
             helper_epoch: None,
+            transient_for_window_id: None,
+            transient_for_target_id: None,
+            is_attached_dialog: None,
+            is_modal: None,
+            window_type: None,
             workspace_index: None,
             workspace_active: None,
             sticky: None,

@@ -448,6 +448,11 @@ fn window_record_json(w: &crate::x11::WindowInfo) -> Value {
         "native_window_id": w.native_window_id,
         "target_id": w.target_id,
         "helper_epoch": w.helper_epoch,
+        "transient_for_window_id": w.transient_for_window_id,
+        "transient_for_target_id": w.transient_for_target_id,
+        "is_attached_dialog": w.is_attached_dialog,
+        "is_modal": w.is_modal,
+        "window_type": w.window_type,
         // Workspace indexes are live diagnostic metadata, not durable IDs.
         "workspace_index": w.workspace_index,
         "workspace_active": w.workspace_active,
@@ -480,6 +485,11 @@ mod list_windows_tests {
             native_window_id: None,
             target_id: None,
             helper_epoch: None,
+            transient_for_window_id: None,
+            transient_for_target_id: None,
+            is_attached_dialog: None,
+            is_modal: None,
+            window_type: None,
             workspace_index: None,
             workspace_active: None,
             sticky: None,
@@ -508,6 +518,11 @@ mod list_windows_tests {
         assert_eq!(rec["is_on_screen"], json!(true));
         assert_eq!(rec["z_index"], json!(3));
         assert_eq!(rec["window_id"], json!(42));
+        assert!(rec["transient_for_window_id"].is_null());
+        assert!(rec["transient_for_target_id"].is_null());
+        assert!(rec["is_attached_dialog"].is_null());
+        assert!(rec["is_modal"].is_null());
+        assert!(rec["window_type"].is_null());
         assert_eq!(rec["title"], json!("Example"));
     }
 

@@ -660,6 +660,11 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
             helper_epoch: exact_private_target.then(|| {
                 tl.app_id.split(':').nth(1).unwrap_or_default().to_owned()
             }),
+            transient_for_window_id: None,
+            transient_for_target_id: None,
+            is_attached_dialog: None,
+            is_modal: None,
+            window_type: None,
             workspace_index: None,
             workspace_active: None,
             sticky: None,
@@ -3272,6 +3277,11 @@ mod tests {
             native_window_id: None,
             target_id: None,
             helper_epoch: None,
+            transient_for_window_id: None,
+            transient_for_target_id: None,
+            is_attached_dialog: None,
+            is_modal: None,
+            window_type: None,
             workspace_index: None,
             workspace_active: None,
             sticky: None,

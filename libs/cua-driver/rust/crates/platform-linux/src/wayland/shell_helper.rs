@@ -20,7 +20,7 @@
 //! there's no zbus blocking-feature or async-context coupling — the calls are
 //! infrequent (once per `get_window_state`, a few per click).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::time::Duration;
 
@@ -48,6 +48,11 @@ struct ShellWindow {
     native_id: u64,
     target_id: String,
     helper_epoch: String,
+    transient_for_window_id: Option<u64>,
+    transient_for_target_id: Option<String>,
+    is_attached_dialog: Option<bool>,
+    is_modal: Option<bool>,
+    window_type: Option<u32>,
     pid: u32,
     app_id: String,
     title: String,
@@ -340,6 +345,11 @@ pub fn list_windows(filter_pid: Option<u32>) -> Option<Vec<WindowInfo>> {
                 native_window_id: Some(window.native_id),
                 target_id: Some(window.target_id),
                 helper_epoch: Some(window.helper_epoch),
+                transient_for_window_id: window.transient_for_window_id,
+                transient_for_target_id: window.transient_for_target_id,
+                is_attached_dialog: window.is_attached_dialog,
+                is_modal: window.is_modal,
+                window_type: window.window_type,
                 workspace_index: window.workspace_index,
                 workspace_active: window.workspace_active,
                 sticky: window.sticky,
@@ -417,6 +427,11 @@ fn parse_windows(raw: &str, filter_pid: Option<u32>) -> Option<Vec<WindowInfo>> 
                 native_window_id: Some(window.native_id),
                 target_id: Some(window.target_id),
                 helper_epoch: Some(window.helper_epoch),
+                transient_for_window_id: window.transient_for_window_id,
+                transient_for_target_id: window.transient_for_target_id,
+                is_attached_dialog: window.is_attached_dialog,
+                is_modal: window.is_modal,
+                window_type: window.window_type,
                 workspace_index: window.workspace_index,
                 workspace_active: window.workspace_active,
                 sticky: window.sticky,
@@ -481,11 +496,30 @@ fn parse_shell_windows(raw: &str) -> Option<Vec<ShellWindow>> {
             .unwrap_or(y);
         let width = u32::try_from(window.get("w")?.as_u64()?).ok()?;
         let height = u32::try_from(window.get("h")?.as_u64()?).ok()?;
+        let transient_for_target_id = match window.get("transient_for_target_id") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value)) if !value.is_empty() => Some(value.clone()),
+            _ => return None,
+        };
+        if transient_for_target_id.as_deref() == Some(target_id.as_str()) {
+            return None;
+        }
+        let transient_for_window_id = transient_for_target_id.as_deref().map(public_window_id);
         parsed.push(ShellWindow {
             public_id,
             native_id,
             target_id,
             helper_epoch,
+            transient_for_window_id,
+            transient_for_target_id,
+            is_attached_dialog: window
+                .get("is_attached_dialog")
+                .and_then(serde_json::Value::as_bool),
+            is_modal: window.get("is_modal").and_then(serde_json::Value::as_bool),
+            window_type: window
+                .get("window_type")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok()),
             pid: u32::try_from(window.get("pid")?.as_u64()?).ok()?,
             app_id: window
                 .get("app_id")
@@ -532,6 +566,15 @@ fn parse_shell_windows(raw: &str) -> Option<Vec<ShellWindow>> {
                 .and_then(serde_json::Value::as_i64)
                 .and_then(|value| i32::try_from(value).ok()),
         });
+    }
+    let target_ids: HashSet<&str> = parsed.iter().map(|window| window.target_id.as_str()).collect();
+    if parsed.iter().any(|window| {
+        window.transient_for_target_id.as_deref().is_some_and(|parent| {
+            !parent.starts_with(&format!("{}:", window.helper_epoch))
+                || !target_ids.contains(parent)
+        })
+    }) {
+        return None;
     }
     Some(parsed)
 }
@@ -624,6 +667,30 @@ mod tests {
             public_window_id("epoch-a:46"),
             public_window_id("epoch-b:46")
         );
+    }
+
+    #[test]
+    fn preserves_only_proven_transient_parent_relationships() {
+        let valid = r#"('[{"id":46,"target_id":"epoch-a:46","helper_epoch":"epoch-a","protocol_version":2,"pid":6079,"app_id":"org.example.Editor","title":"Parent","x":0,"y":0,"w":100,"h":100},{"id":47,"target_id":"epoch-a:47","helper_epoch":"epoch-a","protocol_version":2,"pid":6080,"app_id":"org.example.Dialog","title":"Chooser","x":10,"y":10,"w":80,"h":80,"transient_for_target_id":"epoch-a:46","is_attached_dialog":true,"is_modal":true,"window_type":4}]',)"#;
+        let windows = parse_windows(valid, Some(6080)).expect("valid transient relationship");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(
+            windows[0].transient_for_window_id,
+            Some(public_window_id("epoch-a:46"))
+        );
+        assert_eq!(
+            windows[0].transient_for_target_id.as_deref(),
+            Some("epoch-a:46")
+        );
+        assert_eq!(windows[0].is_attached_dialog, Some(true));
+        assert_eq!(windows[0].is_modal, Some(true));
+        assert_eq!(windows[0].window_type, Some(4));
+
+        let missing_parent = valid.replace("epoch-a:46\",\"is_attached", "epoch-a:99\",\"is_attached");
+        assert!(parse_windows(&missing_parent, None).is_none());
+
+        let self_parent = valid.replace("epoch-a:46\",\"is_attached", "epoch-a:47\",\"is_attached");
+        assert!(parse_windows(&self_parent, None).is_none());
     }
 
     #[test]
