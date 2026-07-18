@@ -78,6 +78,23 @@ pub struct ForegroundTransaction {
 }
 
 impl ForegroundTransaction {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let raw = gdbus_call_with_timeout(
+            "ValidateForeground",
+            &[gvariant_string(&self.token)],
+            Duration::from_secs(2),
+        )
+        .ok_or_else(|| anyhow::anyhow!("foreground_unavailable: validation timed out"))?;
+        let valid = extract_json_object(&raw)
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .and_then(|value| value.get("valid").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
+        if !valid {
+            anyhow::bail!("stale_transaction: WinRects rejected foreground validation");
+        }
+        Ok(())
+    }
+
     pub fn finish(mut self) {
         finish_foreground_token(&std::mem::take(&mut self.token));
     }
@@ -117,7 +134,48 @@ pub fn available() -> bool {
                 .capabilities
                 .iter()
                 .any(|capability| capability == "exact-target-v2")
+            && capabilities
+                .capabilities
+                .iter()
+                .any(|capability| capability == "transient-parent-v1")
+            && capabilities
+                .capabilities
+                .iter()
+                .any(|capability| capability == "foreground-revalidate-v1")
+            && capabilities
+                .capabilities
+                .iter()
+                .any(|capability| capability == "unoccluded-target-v1")
+            && capabilities
+                .capabilities
+                .iter()
+                .any(|capability| capability == "trusted-cursor-overlay-v1")
+            && capabilities
+                .capabilities
+                .iter()
+                .any(|capability| capability == "exact-target-activation-v1")
+            && capabilities
+                .capabilities
+                .iter()
+                .any(|capability| capability == "shell-grab-classification-v1")
     })
+}
+
+fn exact_identity_capabilities() -> Option<Vec<String>> {
+    Some(
+        [
+            "exact-target-v2",
+            "transient-parent-v1",
+            "foreground-revalidate-v1",
+            "unoccluded-target-v1",
+            "trusted-cursor-overlay-v1",
+            "exact-target-activation-v1",
+            "shell-grab-classification-v1",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
+    )
 }
 
 /// Whether a WinRects D-Bus object is present at all, including an older or
@@ -355,6 +413,7 @@ pub fn list_windows(filter_pid: Option<u32>) -> Option<Vec<WindowInfo>> {
                 sticky: window.sticky,
                 monitor: window.monitor,
                 capture_current: Some(window.capture_current),
+                identity_capabilities: exact_identity_capabilities(),
             })
             .collect(),
     )
@@ -379,7 +438,11 @@ pub fn begin_foreground(window_id: u64) -> anyhow::Result<ForegroundTransaction>
     let payload = extract_json_object(&raw)
         .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
         .ok_or_else(|| anyhow::anyhow!("foreground_unavailable: invalid WinRects response"))?;
-    if payload.get("activated").and_then(serde_json::Value::as_bool) != Some(true) {
+    if payload
+        .get("activated")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
         anyhow::bail!(
             "foreground_unavailable: WinRects did not confirm exact window {window_id} activation"
         );
@@ -404,6 +467,7 @@ fn finish_foreground_token(token: &str) {
     );
 }
 
+#[cfg(test)]
 fn parse_windows(raw: &str, filter_pid: Option<u32>) -> Option<Vec<WindowInfo>> {
     let windows = parse_shell_windows(raw)?;
     Some(
@@ -437,6 +501,7 @@ fn parse_windows(raw: &str, filter_pid: Option<u32>) -> Option<Vec<WindowInfo>> 
                 sticky: window.sticky,
                 monitor: window.monitor,
                 capture_current: Some(window.capture_current),
+                identity_capabilities: exact_identity_capabilities(),
             })
             .collect(),
     )
@@ -466,13 +531,13 @@ fn parse_shell_windows(raw: &str) -> Option<Vec<ShellWindow>> {
         if protocol != REQUIRED_PROTOCOL {
             return None;
         }
-        let native_id = window.get("id")?.as_u64()?.max(1);
+        let native_id = window.get("id")?.as_u64()?;
+        if native_id == 0 {
+            return None;
+        }
         let helper_epoch = window.get("helper_epoch")?.as_str()?.to_owned();
         let target_id = window.get("target_id")?.as_str()?.to_owned();
-        if helper_epoch.is_empty()
-            || !target_id.starts_with(&format!("{helper_epoch}:"))
-            || !target_id.ends_with(&format!(":{native_id}"))
-        {
+        if helper_epoch.is_empty() || target_id != format!("{helper_epoch}:{native_id}") {
             return None;
         }
         let public_id = public_window_id(&target_id);
@@ -567,12 +632,18 @@ fn parse_shell_windows(raw: &str) -> Option<Vec<ShellWindow>> {
                 .and_then(|value| i32::try_from(value).ok()),
         });
     }
-    let target_ids: HashSet<&str> = parsed.iter().map(|window| window.target_id.as_str()).collect();
+    let target_ids: HashSet<&str> = parsed
+        .iter()
+        .map(|window| window.target_id.as_str())
+        .collect();
     if parsed.iter().any(|window| {
-        window.transient_for_target_id.as_deref().is_some_and(|parent| {
-            !parent.starts_with(&format!("{}:", window.helper_epoch))
-                || !target_ids.contains(parent)
-        })
+        window
+            .transient_for_target_id
+            .as_deref()
+            .is_some_and(|parent| {
+                !parent.starts_with(&format!("{}:", window.helper_epoch))
+                    || !target_ids.contains(parent)
+            })
     }) {
         return None;
     }
@@ -622,6 +693,22 @@ pub fn remove_cursor(owner: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_identity_records_advertise_all_delivery_invariants() {
+        assert_eq!(
+            exact_identity_capabilities().unwrap(),
+            vec![
+                "exact-target-v2".to_owned(),
+                "transient-parent-v1".to_owned(),
+                "foreground-revalidate-v1".to_owned(),
+                "unoccluded-target-v1".to_owned(),
+                "trusted-cursor-overlay-v1".to_owned(),
+                "exact-target-activation-v1".to_owned(),
+                "shell-grab-classification-v1".to_owned(),
+            ]
+        );
+    }
 
     #[test]
     fn parses_shell_logical_screen_size_property() {
@@ -686,7 +773,8 @@ mod tests {
         assert_eq!(windows[0].is_modal, Some(true));
         assert_eq!(windows[0].window_type, Some(4));
 
-        let missing_parent = valid.replace("epoch-a:46\",\"is_attached", "epoch-a:99\",\"is_attached");
+        let missing_parent =
+            valid.replace("epoch-a:46\",\"is_attached", "epoch-a:99\",\"is_attached");
         assert!(parse_windows(&missing_parent, None).is_none());
 
         let self_parent = valid.replace("epoch-a:46\",\"is_attached", "epoch-a:47\",\"is_attached");
@@ -700,5 +788,8 @@ mod tests {
 
         let mismatched = r#"('[{"id":46,"target_id":"other:46","helper_epoch":"epoch-a","protocol_version":2,"pid":6079,"title":"Bad","x":0,"y":0,"w":1,"h":1}]',)"#;
         assert!(parse_windows(mismatched, None).is_none());
+
+        let trailing = r#"('[{"id":46,"target_id":"epoch-a:garbage:46","helper_epoch":"epoch-a","protocol_version":2,"pid":6079,"title":"Bad","x":0,"y":0,"w":1,"h":1}]',)"#;
+        assert!(parse_windows(trailing, None).is_none());
     }
 }

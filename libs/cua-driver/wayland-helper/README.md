@@ -2,8 +2,9 @@
 
 A small GNOME Shell extension that lets cua-driver get **pixel coordinates**,
 address an incarnation-qualified target, perform a bounded foreground
-transaction, capture only when the target is actually painted on the current
-stage, and draw session-owned **agent cursors** on GNOME Mutter Wayland. A
+transaction, capture only when the target is painted and unoccluded on the
+current stage with no Shell input grab, and draw session-owned **agent cursors**
+on GNOME Mutter Wayland. A
 normal Wayland client cannot do these things globally.
 
 It exposes `org.cua.WinRects` on the session bus:
@@ -18,12 +19,19 @@ It exposes `org.cua.WinRects` on the session bus:
   `CoordType::Screen` is `(0,0)` for every widget on Mutter). Keeping the frame
   and buffer origins separate accounts for GTK client-side shadows.
 - `BeginForeground(target) -> json` / `EndForeground(transaction) -> json` —
-  activate one exact target, then restore the prior workspace/window only if
-  focus still belongs to the transaction. `CommitForeground` is reserved for
-  an explicit keep-focused action.
+  activate one exact current-workspace target even when another ordinary window
+  overlaps it, then require confirmed focus, visibility, no modal child, and no
+  remaining occlusion. Restore the prior workspace/window only if focus still
+  belongs to the transaction. `CommitForeground` is reserved for an explicit
+  keep-focused action. A Shell input grab means an active Shell modal count or
+  key focus inside `Main.uiGroup`; ordinary application-surface key focus is not
+  misclassified as Shell chrome.
 - `CaptureTarget(target) -> png_base64` — capture the compositor stage only when
-  the exact target is currently painted. Inactive-workspace requests return
-  `capture_foreground_required`; they are never cropped from unrelated pixels.
+  the exact target is currently painted, unoccluded by higher-stacked windows,
+  and free of Shell modal/input grabs. Cua's click-through cursor overlay is
+  non-occluding only after exact title/type/sticky state and `/proc/<pid>/exe`
+  proof. Unsafe requests fail closed; they are never cropped from unrelated
+  pixels.
 - `MoveCursorFor(owner,target,x,y)` / `ClickPulseFor` / `HideCursorFor` /
   `RemoveCursor` — render independently owned cursors and hide them whenever
   their target is not actually visible on the active workspace.

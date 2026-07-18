@@ -856,6 +856,7 @@ fn list_windows_blocking(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo>
                         sticky: None,
                         monitor: None,
                         capture_current: None,
+                        identity_capabilities: None,
                     });
                     emitted += 1;
                 }
@@ -886,6 +887,7 @@ fn list_windows_blocking(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo>
                         sticky: None,
                         monitor: None,
                         capture_current: None,
+                        identity_capabilities: None,
                     });
                 }
             }

@@ -254,6 +254,7 @@ fn merge_atspi_records(
             sticky: None,
             monitor: None,
             capture_current: None,
+            identity_capabilities: None,
         };
         if let Some(index) = matching_atspi {
             claimed[index] = true;
@@ -334,6 +335,7 @@ mod tests {
             sticky: None,
             monitor: None,
             capture_current: None,
+            identity_capabilities: None,
         }
     }
 

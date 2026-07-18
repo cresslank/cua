@@ -670,6 +670,7 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
             sticky: None,
             monitor: None,
             capture_current: None,
+            identity_capabilities: None,
         });
     }
     Ok(out)
@@ -1276,6 +1277,14 @@ struct HostRawInputLease {
 }
 
 impl ForegroundInputGuard {
+    /// Revalidate the exact GNOME target immediately before portal/libei input.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(transaction) = self._transaction.as_ref() {
+            transaction.validate()?;
+        }
+        Ok(())
+    }
+
     /// Keep the explicitly requested focus change rather than restoring the
     /// prior context. Raw input actions never call this; it is reserved for the
     /// dedicated bring_to_front tool.
@@ -1364,6 +1373,16 @@ pub fn activate_window_for_input(window_id: u64) -> anyhow::Result<ForegroundInp
     activate_window_for_input_target(window_id, pid)
 }
 
+fn exact_target_pair_matches(
+    windows: impl IntoIterator<Item = (u64, Option<u32>)>,
+    window_id: u64,
+    expected_pid: u32,
+) -> bool {
+    windows.into_iter().any(|(candidate_id, candidate_pid)| {
+        candidate_id == window_id && candidate_pid == Some(expected_pid)
+    })
+}
+
 /// Activate a Wayland target with an explicit process identity when available.
 /// The bundled compositor does not depend on connection-local Wayland object
 /// ids: its control protocol resolves the one mapped toplevel owned by `pid`.
@@ -1379,6 +1398,21 @@ pub fn activate_window_for_input_target(
             _transaction: None,
             _lease: None,
         });
+    }
+
+    if let Some(expected_pid) = target_pid {
+        let identity_matches = exact_target_pair_matches(
+            list_windows_dispatch(Some(expected_pid))
+                .into_iter()
+                .map(|window| (window.xid, window.pid)),
+            window_id,
+            expected_pid,
+        );
+        if !identity_matches {
+            anyhow::bail!(
+                "exact_target_mismatch: window {window_id} is not authoritatively owned by pid {expected_pid}"
+            );
+        }
     }
 
     let lease = acquire_host_raw_input_lease()?;
@@ -1489,7 +1523,8 @@ pub fn click(window_id: u64, x: i32, y: i32, count: u32, button: u8) -> anyhow::
         || click_vptr(Some(window_id), x, y, count, button),
         || {
             libei_wait_pointer_ready()?;
-            let _foreground = activate_window_for_input(window_id)?;
+            let foreground = activate_window_for_input(window_id)?;
+            foreground.validate()?;
             libei_click(x, y, count, button)
         },
     )
@@ -1662,7 +1697,8 @@ pub fn scroll_at(
         || scroll_vptr(window_id, point, &direction, amount),
         || {
             libei_wait_scroll_ready()?;
-            let _foreground = activate_window_for_input(window_id)?;
+            let foreground = activate_window_for_input(window_id)?;
+            foreground.validate()?;
             if let Some((x, y)) = point {
                 libei_move_absolute(x, y)?;
             }
@@ -1788,7 +1824,8 @@ pub fn drag(
         || drag_vptr(window_id, from_x, from_y, to_x, to_y, steps, button),
         || {
             libei_wait_pointer_ready()?;
-            let _foreground = activate_window_for_input(window_id)?;
+            let foreground = activate_window_for_input(window_id)?;
+            foreground.validate()?;
             libei_drag(from_x, from_y, to_x, to_y, steps, button)
         },
     )
@@ -1863,7 +1900,8 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
-    let _foreground = activate_window_for_input(window_id)?;
+    let foreground = activate_window_for_input(window_id)?;
+    foreground.validate()?;
     // Lead with a no-op Shift_L tap: on a freshly-focused window under a headless
     // seat (notably sway), the compositor needs the first virtual-keyboard event
     // to wire up keyboard routing, and that first key is dropped. Sacrificing a
@@ -1891,7 +1929,8 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
 
 /// Press a single named key into the focused Wayland surface via `wtype -k`.
 pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
-    let _foreground = activate_window_for_input(window_id)?;
+    let foreground = activate_window_for_input(window_id)?;
+    foreground.validate()?;
     let keysym = key_to_keysym(key);
     // Keep the sacrificial modifier and requested key in one virtual-keyboard
     // lifetime. Starting a second wtype process creates a fresh protocol object,
@@ -1917,7 +1956,8 @@ pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
 /// straight to wtype's `-k` so single-character keys and X keysym names work
 /// as-is. This is the Wayland equivalent of the X11 `send_key` modifier mask.
 pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
-    let _foreground = activate_window_for_input(window_id)?;
+    let foreground = activate_window_for_input(window_id)?;
+    foreground.validate()?;
     let (mods, final_key) = partition_modifiers(keys)?;
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
         return Ok(());
@@ -3262,6 +3302,14 @@ const _BTN_LEFT_ALIAS: u32 = BTN_LEFT;
 mod tests {
     use super::*;
 
+    #[test]
+    fn exact_target_pair_rejects_mixed_pid_and_window_membership() {
+        let windows = vec![(11, Some(101)), (22, Some(202))];
+        assert!(exact_target_pair_matches(windows.clone(), 11, 101));
+        assert!(!exact_target_pair_matches(windows.clone(), 11, 202));
+        assert!(!exact_target_pair_matches(windows, 22, 101));
+    }
+
     fn window(xid: u64, pid: Option<u32>, title: &str) -> WindowInfo {
         WindowInfo {
             xid,
@@ -3287,6 +3335,7 @@ mod tests {
             sticky: None,
             monitor: None,
             capture_current: None,
+            identity_capabilities: None,
         }
     }
 

@@ -7,10 +7,47 @@ export function targetIsPainted({ actorVisible, minimized, shellShowing }) {
 }
 
 export function targetTokenMatches(epoch, targetId) {
-    return typeof epoch === 'string'
-        && epoch.length > 0
-        && typeof targetId === 'string'
-        && targetId.startsWith(`${epoch}:`);
+    if (typeof epoch !== 'string' || epoch.length === 0 || typeof targetId !== 'string')
+        return false;
+    const prefix = `${epoch}:`;
+    if (!targetId.startsWith(prefix))
+        return false;
+    const sequence = targetId.slice(prefix.length);
+    return /^[1-9][0-9]*$/.test(sequence) && Number.isSafeInteger(Number(sequence));
+}
+
+export function trustedCursorOverlayIsSafe({
+    title,
+    appId,
+    windowType,
+    overrideOtherType,
+    sticky,
+    pid,
+    executable,
+}) {
+    return typeof title === 'string'
+        && title.startsWith('Cua.AgentCursorOverlay.')
+        && appId === ''
+        && windowType === overrideOtherType
+        && Boolean(sticky)
+        && Number.isSafeInteger(pid)
+        && pid > 0
+        && typeof executable === 'string'
+        && executable.startsWith('/')
+        && executable.split('/').pop() === 'cua-driver';
+}
+
+export function rectanglesOverlap(a, b) {
+    return [a?.x, a?.y, a?.width, a?.height, b?.x, b?.y, b?.width, b?.height]
+        .every(Number.isFinite)
+        && a.width > 0
+        && a.height > 0
+        && b.width > 0
+        && b.height > 0
+        && a.x < b.x + b.width
+        && a.x + a.width > b.x
+        && a.y < b.y + b.height
+        && a.y + a.height > b.y;
 }
 
 export function captureAreaIsSafe({displayWidth, displayHeight, stageWidth, stageHeight}) {
@@ -18,6 +55,40 @@ export function captureAreaIsSafe({displayWidth, displayHeight, stageWidth, stag
         .every(value => Number.isFinite(value) && value >= 1);
 }
 
-export function captureContextIsSafe({overviewVisible, sessionLocked}) {
-    return !Boolean(overviewVisible) && !Boolean(sessionLocked);
+export function captureContextIsSafe({overviewVisible, sessionLocked, shellInputGrabbed}) {
+    return !Boolean(overviewVisible)
+        && !Boolean(sessionLocked)
+        && !Boolean(shellInputGrabbed);
+}
+
+export function shellInputIsGrabbed({modalCount, keyFocusInShellUi}) {
+    return Number(modalCount || 0) > 0 || Boolean(keyFocusInShellUi);
+}
+
+export function foregroundTargetCanActivate({
+    targetResolved,
+    shellContextSafe,
+    minimized,
+    shellShowing,
+    modalChildPresent,
+}) {
+    return Boolean(targetResolved)
+        && Boolean(shellContextSafe)
+        && !Boolean(minimized)
+        && Boolean(shellShowing)
+        && !Boolean(modalChildPresent);
+}
+
+export function foregroundTargetIsSafe({
+    targetResolved,
+    focusMatches,
+    targetVisible,
+    targetUnoccluded,
+    modalChildPresent,
+}) {
+    return Boolean(targetResolved)
+        && Boolean(focusMatches)
+        && Boolean(targetVisible)
+        && Boolean(targetUnoccluded)
+        && !Boolean(modalChildPresent);
 }

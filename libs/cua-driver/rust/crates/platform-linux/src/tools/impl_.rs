@@ -459,6 +459,7 @@ fn window_record_json(w: &crate::x11::WindowInfo) -> Value {
         "sticky": w.sticky,
         "monitor": w.monitor,
         "capture_current": w.capture_current,
+        "identity_capabilities": w.identity_capabilities,
         // Legacy alias: flat fields kept inline for pre-existing callers.
         "x": w.x, "y": w.y,
         "width": w.width, "height": w.height,
@@ -495,6 +496,7 @@ mod list_windows_tests {
             sticky: None,
             monitor: None,
             capture_current: None,
+            identity_capabilities: None,
         };
         let rec = window_record_json(&w);
 
@@ -512,6 +514,7 @@ mod list_windows_tests {
         assert_eq!(rec["y"], json!(20));
         assert_eq!(rec["width"], json!(300));
         assert_eq!(rec["height"], json!(400));
+        assert_eq!(rec["identity_capabilities"], serde_json::Value::Null);
 
         // Cross-platform companions.
         assert_eq!(rec["app_name"], json!("example-app"));

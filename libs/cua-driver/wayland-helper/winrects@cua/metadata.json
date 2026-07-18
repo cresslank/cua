@@ -1,1 +1,1 @@
-{"uuid":"winrects@cua","name":"WinRects","description":"Expose incarnation-aware window geometry, exact capture gates, target-scoped cursors, and transactional activation for cua-driver on Wayland.","shell-version":["45","46","47","48","50"],"version":6}
+{"uuid":"winrects@cua","name":"WinRects","description":"Expose incarnation-aware window geometry, bounded exact-target activation, classified Shell grabs, unoccluded capture gates, verified cursor-overlay handling, and transactional input for cua-driver on Wayland.","shell-version":["45","46","47","48","50"],"version":10}

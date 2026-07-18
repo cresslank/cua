@@ -43,6 +43,9 @@ pub struct WindowInfo {
     /// True only when the compositor says a current stage crop can include the
     /// target. `None` means this capability was not advertised.
     pub capture_current: Option<bool>,
+    /// Capabilities asserted by the identity provider for this exact record.
+    /// Absent on X11, AT-SPI, and generic Wayland fallback records.
+    pub identity_capabilities: Option<Vec<String>>,
 }
 
 /// List top-level windows, optionally filtered by pid.
@@ -113,6 +116,7 @@ fn list_windows_inner(filter_pid: Option<u32>) -> Result<Vec<WindowInfo>> {
             sticky: None,
             monitor: None,
             capture_current: None,
+            identity_capabilities: None,
         });
     }
 

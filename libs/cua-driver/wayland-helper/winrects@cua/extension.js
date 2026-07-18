@@ -10,8 +10,13 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {
     captureAreaIsSafe,
     captureContextIsSafe,
+    foregroundTargetCanActivate,
+    foregroundTargetIsSafe,
+    rectanglesOverlap,
+    shellInputIsGrabbed,
     targetIsPainted,
     targetTokenMatches,
+    trustedCursorOverlayIsSafe,
 } from './policy.js';
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
@@ -24,6 +29,7 @@ const IFACE = `<node><interface name="org.cua.WinRects">
 <method name="GetRects"><arg type="s" direction="out" name="json"/></method>
 <method name="CaptureTarget"><arg type="s" direction="in" name="target"/><arg type="s" direction="out" name="png_base64"/></method>
 <method name="BeginForeground"><arg type="s" direction="in" name="target"/><arg type="s" direction="out" name="json"/></method>
+<method name="ValidateForeground"><arg type="s" direction="in" name="transaction"/><arg type="s" direction="out" name="json"/></method>
 <method name="EndForeground"><arg type="s" direction="in" name="transaction"/><arg type="s" direction="out" name="json"/></method>
 <method name="CommitForeground"><arg type="s" direction="in" name="transaction"/><arg type="s" direction="out" name="json"/></method>
 <method name="MoveCursorFor"><arg type="s" direction="in" name="owner"/><arg type="s" direction="in" name="target"/><arg type="i" direction="in" name="x"/><arg type="i" direction="in" name="y"/></method>
@@ -150,28 +156,140 @@ export default class WinRectsExtension extends Extension {
             .find(actor => actor.meta_window === window) ?? null;
     }
 
-    _isTargetVisible(window) {
-        if (!window)
-            return false;
-        if (!captureContextIsSafe({
+    _keyFocusInShellUi() {
+        let actor = global.stage.get_key_focus();
+        while (actor) {
+            if (actor === Main.uiGroup)
+                return true;
+            try {
+                actor = actor.get_parent();
+            } catch (_error) {
+                return false;
+            }
+        }
+        return false;
+    }
+
+    _captureContextIsSafe() {
+        return captureContextIsSafe({
             overviewVisible: Main.overview?.visible,
             sessionLocked: Main.sessionMode?.isLocked,
-        }))
-            return false;
-        const actor = this._actorFor(window);
-        let shellShowing = false;
+            shellInputGrabbed: shellInputIsGrabbed({
+                modalCount: Main.modalCount,
+                keyFocusInShellUi: this._keyFocusInShellUi(),
+            }),
+        });
+    }
+
+    _windowShowing(window) {
         try {
-            shellShowing = window.showing_on_its_workspace();
+            return window.showing_on_its_workspace();
         } catch (_error) {
             const workspace = window.get_workspace();
-            shellShowing = window.is_on_all_workspaces()
+            return window.is_on_all_workspaces()
                 || workspace === global.workspace_manager.get_active_workspace();
         }
+    }
+
+    _isTrustedCursorOverlay(window) {
+        try {
+            const pid = window.get_pid();
+            const executable = GLib.file_read_link(`/proc/${pid}/exe`);
+            return trustedCursorOverlayIsSafe({
+                title: window.get_title() || '',
+                appId: this._windowAppId(window),
+                windowType: window.get_window_type(),
+                overrideOtherType: Meta.WindowType.OVERRIDE_OTHER,
+                sticky: window.is_on_all_workspaces(),
+                pid,
+                executable,
+            });
+        } catch (_error) {
+            return false;
+        }
+    }
+
+    _onlyTrustedCursorOverlayAbove(window) {
+        const windows = global.display.sort_windows_by_stacking(
+            global.get_window_actors().map(actor => actor.meta_window).filter(Boolean)
+        );
+        const targetIndex = windows.indexOf(window);
+        if (targetIndex < 0)
+            return false;
+        const targetRect = window.get_frame_rect();
+        let trustedOverlayFound = false;
+        for (const candidate of windows.slice(targetIndex + 1)) {
+            if (candidate === window || candidate.minimized || !this._windowShowing(candidate))
+                continue;
+            if (!rectanglesOverlap(targetRect, candidate.get_frame_rect()))
+                continue;
+            if (!this._isTrustedCursorOverlay(candidate))
+                return false;
+            trustedOverlayFound = true;
+        }
+        return trustedOverlayFound;
+    }
+
+    _isTargetVisible(window) {
+        if (!window || !this._captureContextIsSafe())
+            return false;
+        const actor = this._actorFor(window);
         return targetIsPainted({
-            actorVisible: actor?.visible,
+            actorVisible: actor?.visible || this._onlyTrustedCursorOverlayAbove(window),
             minimized: window.minimized,
-            shellShowing,
+            shellShowing: this._windowShowing(window),
         });
+    }
+
+    _canActivateTarget(window) {
+        return foregroundTargetCanActivate({
+            targetResolved: Boolean(window),
+            shellContextSafe: this._captureContextIsSafe(),
+            minimized: window?.minimized,
+            shellShowing: window ? this._windowShowing(window) : false,
+            modalChildPresent: window ? Boolean(this._visibleModalChild(window)) : true,
+        });
+    }
+
+    _isTargetUnoccluded(window) {
+        if (!this._isTargetVisible(window))
+            return false;
+        const windows = global.display.sort_windows_by_stacking(
+            global.get_window_actors().map(actor => actor.meta_window).filter(Boolean)
+        );
+        const targetIndex = windows.indexOf(window);
+        if (targetIndex < 0)
+            return false;
+        const targetRect = window.get_frame_rect();
+        return !windows.slice(targetIndex + 1).some(candidate =>
+            candidate !== window
+            && !this._isTrustedCursorOverlay(candidate)
+            && !candidate.minimized
+            && this._windowShowing(candidate)
+            && rectanglesOverlap(targetRect, candidate.get_frame_rect())
+        );
+    }
+
+    _visibleModalChild(target) {
+        for (const actor of global.get_window_actors()) {
+            const window = actor.meta_window;
+            if (
+                !window
+                || window === target
+                || window.minimized
+                || !this._windowShowing(window)
+            )
+                continue;
+            let parent = null;
+            let attached = false;
+            let modal = false;
+            try { parent = window.get_transient_for(); } catch (_error) {}
+            try { attached = Boolean(window.is_attached_dialog()); } catch (_error) {}
+            try { modal = window.get_window_type() === Meta.WindowType.MODAL_DIALOG; } catch (_error) {}
+            if (parent === target && (attached || modal))
+                return window;
+        }
+        return null;
     }
 
     _windowAppId(window) {
@@ -195,7 +313,12 @@ export default class WinRectsExtension extends Extension {
                 'target-stage-capture',
                 'keyed-target-cursors',
                 'foreground-transaction',
+                'foreground-revalidate-v1',
                 'transient-parent-v1',
+                'unoccluded-target-v1',
+                'trusted-cursor-overlay-v1',
+                'exact-target-activation-v1',
+                'shell-grab-classification-v1',
             ],
         });
     }
@@ -227,7 +350,7 @@ export default class WinRectsExtension extends Extension {
             try { sticky = Boolean(w.is_on_all_workspaces()); } catch (_error) {}
             let workspaceIndex = -1;
             try { workspaceIndex = workspace?.index() ?? -1; } catch (_error) {}
-            const captureCurrent = this._isTargetVisible(w);
+            const captureCurrent = this._isTargetVisible(w) && this._isTargetUnoccluded(w);
             let transientFor = null;
             try { transientFor = w.get_transient_for(); } catch (_error) {}
             if (transientFor && !actorByWindow.has(transientFor))
@@ -278,6 +401,8 @@ export default class WinRectsExtension extends Extension {
                 throw new Error('stale_target: target belongs to another helper incarnation or no longer exists');
             if (!this._isTargetVisible(target))
                 throw new Error('capture_foreground_required: target is not currently painted on the GNOME stage');
+            if (!this._isTargetUnoccluded(target))
+                throw new Error('capture_occluded: target is overlapped by a higher-stacked window');
             const [displayWidth, displayHeight] = global.display.get_size();
             const [stageWidth, stageHeight] = global.stage.get_size();
             if (!captureAreaIsSafe({displayWidth, displayHeight, stageWidth, stageHeight}))
@@ -296,6 +421,14 @@ export default class WinRectsExtension extends Extension {
             // display rectangle and omits the real cursor; Rust keeps applying
             // the exact target crop to this full-display PNG.
             await shooter.screenshot_area(0, 0, width, height, stream);
+            if (this._resolveTarget(targetId) !== target)
+                throw new Error('target_changed_during_capture');
+            if (!this._isTargetVisible(target))
+                throw new Error('capture_context_changed');
+            if (this._visibleModalChild(target))
+                throw new Error('child_modal_appeared_during_capture');
+            if (!this._isTargetUnoccluded(target))
+                throw new Error('target_occluded_during_capture');
             stream.close(null);
             const encoded = GLib.base64_encode(stream.steal_as_bytes().get_data());
             invocation.return_value(new GLib.Variant('(s)', [encoded]));
@@ -317,6 +450,13 @@ export default class WinRectsExtension extends Extension {
             invocation.return_dbus_error(
                 'org.cua.WinRects.StaleTarget',
                 'stale_target: target belongs to another helper incarnation or no longer exists'
+            );
+            return;
+        }
+        if (!this._canActivateTarget(target)) {
+            invocation.return_dbus_error(
+                'org.cua.WinRects.TargetNotActivatable',
+                'target_not_activatable: target is minimized, off-workspace, modal-blocked, or Shell context is unsafe'
             );
             return;
         }
@@ -343,6 +483,22 @@ export default class WinRectsExtension extends Extension {
                 })]));
                 return GLib.SOURCE_REMOVE;
             }
+            if (this._visibleModalChild(target)) {
+                this._finishForeground(transaction, 'child-modal-present');
+                invocation.return_value(new GLib.Variant('(s)', [JSON.stringify({
+                    activated: false,
+                    reason: 'child_modal_present',
+                })]));
+                return GLib.SOURCE_REMOVE;
+            }
+            if (!this._isTargetUnoccluded(target)) {
+                this._finishForeground(transaction, 'target-occluded');
+                invocation.return_value(new GLib.Variant('(s)', [JSON.stringify({
+                    activated: false,
+                    reason: 'target_occluded',
+                })]));
+                return GLib.SOURCE_REMOVE;
+            }
             this._foreground.timeoutId = GLib.timeout_add(
                 GLib.PRIORITY_DEFAULT,
                 FOREGROUND_TIMEOUT_MS,
@@ -361,6 +517,42 @@ export default class WinRectsExtension extends Extension {
                 prior_window: priorWindow ? this._targetId(priorWindow) : null,
             })]));
             return GLib.SOURCE_REMOVE;
+        });
+    }
+
+    ValidateForeground(transaction) {
+        const foreground = this._foreground;
+        if (!foreground || foreground.transaction !== transaction)
+            return JSON.stringify({valid: false, reason: 'stale_transaction'});
+        const currentTarget = this._resolveTarget(foreground.targetId);
+        const modalChildPresent = Boolean(this._visibleModalChild(foreground.target));
+        const targetUnoccluded = this._isTargetUnoccluded(foreground.target);
+        const targetSafe = foregroundTargetIsSafe({
+            targetResolved: currentTarget === foreground.target,
+            focusMatches: global.display.focus_window === foreground.target,
+            targetVisible: this._isTargetVisible(foreground.target),
+            targetUnoccluded,
+            modalChildPresent,
+        });
+        let reason = null;
+        if (!targetSafe && currentTarget !== foreground.target)
+            reason = 'stale_target';
+        else if (!targetSafe && global.display.focus_window !== foreground.target)
+            reason = 'focus_changed';
+        else if (!targetSafe && !this._isTargetVisible(foreground.target))
+            reason = 'target_not_visible';
+        else if (!targetSafe && modalChildPresent)
+            reason = 'child_modal_present';
+        else if (!targetSafe && !targetUnoccluded)
+            reason = 'target_occluded';
+        if (reason) {
+            this._finishForeground(transaction, reason);
+            return JSON.stringify({valid: false, reason});
+        }
+        return JSON.stringify({
+            valid: true,
+            target: foreground.targetId,
+            transaction,
         });
     }
 

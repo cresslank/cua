@@ -7,6 +7,13 @@ set -euo pipefail
 UUID="winrects@cua"
 SRC="$(cd "$(dirname "$0")" && pwd)/$UUID"
 DEST="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/$UUID"
+VERSION=$(python3 - "$SRC/metadata.json" <<'PY'
+import json
+import sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    print(json.load(handle)["version"])
+PY
+)
 ENABLE=false
 if [[ "${1:-}" == "--enable" ]]; then
   ENABLE=true
@@ -16,7 +23,7 @@ elif [[ $# -gt 0 ]]; then
 fi
 mkdir -p "$DEST"
 cp -f "$SRC/metadata.json" "$SRC/extension.js" "$SRC/policy.js" "$DEST/"
-echo "Staged $UUID protocol v6 to $DEST."
+echo "Staged $UUID protocol v$VERSION to $DEST."
 
 if ! $ENABLE; then
   echo "Not enabling it automatically. Re-run with --enable after warning the user."
