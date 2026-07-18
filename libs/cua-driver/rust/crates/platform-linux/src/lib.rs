@@ -12,10 +12,10 @@
 
 use cua_driver_core::tool::ToolRegistry;
 
-pub mod tools;
+pub mod health_report;
 pub mod overlay;
 pub mod pip;
-pub mod health_report;
+pub mod tools;
 
 #[cfg(target_os = "linux")]
 pub mod x11;
@@ -31,6 +31,12 @@ pub mod proc_fs;
 
 #[cfg(target_os = "linux")]
 pub mod browser_platform;
+
+#[cfg(target_os = "linux")]
+mod browser_setup_ui;
+
+#[cfg(target_os = "linux")]
+mod browser_consent_ui;
 
 #[cfg(target_os = "linux")]
 pub mod installed_apps;

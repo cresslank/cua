@@ -18,13 +18,13 @@
 
 use cua_driver_core::tool::ToolRegistry;
 
-pub mod tools;
-pub mod overlay;
 pub mod diagnostics;
 pub mod health_report;
-pub mod recording_hooks;
+pub mod overlay;
 pub mod pip;
+pub mod recording_hooks;
 pub mod terminal;
+pub mod tools;
 
 // Cross-platform: pure math for MOUSEEVENTF_VIRTUALDESK absolute-coord
 // normalization. Lives outside the Windows-only `input` module so its
@@ -45,6 +45,11 @@ pub mod win32;
 
 #[cfg(target_os = "windows")]
 pub mod browser_platform;
+
+#[cfg(target_os = "windows")]
+mod browser_consent_ui;
+#[cfg(target_os = "windows")]
+mod browser_setup_ui;
 
 #[cfg(target_os = "windows")]
 pub mod uia;

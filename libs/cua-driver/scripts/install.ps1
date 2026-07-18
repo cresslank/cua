@@ -79,7 +79,7 @@ param(
     # Default-on: cua-driver-serve is what makes the agent flow work
     # across logon / reboot. Without the scheduled task the user has
     # to remember to run `cua-driver autostart kick` every time, and
-    # MCP-style flows go silently in-process. Opt out with
+    # CLI and MCP tool calls fail when no daemon is available. Opt out with
     # `-AutoStart:$false` or `-NoAutoStart` for CI / sandbox installs
     # that specifically don't want a scheduled task registered.
     [switch]$AutoStart = $true,
@@ -102,10 +102,9 @@ $TagPrefix  = "cua-driver-rs-v"
 $BinaryName = "cua-driver.exe"
 
 # Baked-version constant — kept in lock-step with the latest published
-# cua-driver-rs-v* release tag by the CD workflow's bake-version step
+# cua-driver-rs-v* release tag by the Release Please release pull request
 # (see .github/workflows/cd-rust-cua-driver.yml). The sentinel-block
-# markers must stay byte-identical to the matching block in install.sh
-# so the CD `sed` command can update both files with one pattern.
+# markers identify this line for Release Please's generic version updater.
 #
 # Precedence at resolve time: $env:CUA_DRIVER_RS_VERSION > -Release arg >
 # this baked value > GitHub Releases API. Baked means the `irm | iex`
@@ -113,8 +112,8 @@ $BinaryName = "cua-driver.exe"
 # only consulted as a fallback when this script is run from a branch
 # where the baked line hasn't been updated yet.
 #
-# ~~~ BAKED_VERSION: auto-updated by CD workflow after each release — do not edit ~~~
-$Script:CuaDriverRsBakedVersion = "0.8.3"
+# ~~~ BAKED_VERSION: auto-updated in the release PR — do not edit ~~~
+$Script:CuaDriverRsBakedVersion = "0.8.3" # x-release-please-version
 # ~~~ END_BAKED_VERSION ~~~
 
 # ---------- Path resolution ------------------------------------------------

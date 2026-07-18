@@ -98,9 +98,7 @@ pub fn bounded_cursor_outcome(
     } else {
         match icon.map(str::trim).filter(|value| !value.is_empty()) {
             None => CursorStyleCategory::Default,
-            Some(value) if value.eq_ignore_ascii_case("arrow") => {
-                CursorStyleCategory::BuiltinArrow
-            }
+            Some(value) if value.eq_ignore_ascii_case("arrow") => CursorStyleCategory::BuiltinArrow,
             Some(value) if value.eq_ignore_ascii_case("teardrop") => {
                 CursorStyleCategory::BuiltinTeardrop
             }
@@ -210,30 +208,6 @@ fn is_trackable(id: &str) -> bool {
     !id.is_empty() && id != "default"
 }
 
-fn is_computer_action(tool_name: &str, args: &serde_json::Value) -> bool {
-    if tool_name == "page" {
-        return matches!(
-            args.get("action").and_then(serde_json::Value::as_str),
-            Some(
-                "click_element"
-                    | "insert_text"
-                    | "type_keystrokes"
-                    | "enable_javascript_apple_events"
-            )
-        );
-    }
-    crate::tool::default_capabilities_for(tool_name)
-        .iter()
-        .any(|capability| {
-            capability.starts_with("input.pointer.")
-                || capability.starts_with("input.keyboard.")
-                || matches!(
-                    capability.as_str(),
-                    "app.launch" | "app.kill" | "window.activate"
-                )
-        })
-}
-
 /// Begin bounded observation for a known tool call carrying a public,
 /// caller-declared `session`. Reserved `_session_id` fallbacks and anonymous
 /// identities are deliberately ignored.
@@ -278,7 +252,10 @@ pub fn begin_tool_call(
     SESSION_OBSERVER.get().map(|_| SessionToolContext {
         session_id: session_id.to_owned(),
         transport,
-        computer_action: is_computer_action(tool_name, args),
+        computer_action: crate::server::is_computer_action(
+            tool_name,
+            crate::server::tool_operation(tool_name, Some(args)),
+        ),
     })
 }
 
@@ -327,6 +304,7 @@ pub fn fire_session_end(session_id: &str) -> bool {
             return false; // already ended — idempotent no-op.
         }
     }
+    crate::capture_scope::clear_session(session_id);
     for hook in hooks().lock().unwrap().iter() {
         hook(session_id);
     }
@@ -436,7 +414,10 @@ mod tests {
 
     impl SessionObserver for ProbeObserver {
         fn on_session_started(&self, id: &str, observation: SessionStartObservation) {
-            self.starts.lock().unwrap().push((id.to_owned(), observation));
+            self.starts
+                .lock()
+                .unwrap()
+                .push((id.to_owned(), observation));
         }
         fn on_tool_completed(
             &self,
@@ -471,6 +452,46 @@ mod tests {
     }
 
     #[test]
+    fn browser_mutations_are_computer_actions_but_reads_and_prepare_are_not() {
+        let args = serde_json::json!({"session": "test-session"});
+        for tool_name in [
+            "browser_navigate",
+            "browser_click",
+            "browser_type",
+            "browser_set_input_files",
+            "browser_download",
+            "browser_pointer",
+        ] {
+            let operation = crate::server::tool_operation(tool_name, Some(&args));
+            assert!(
+                crate::server::is_computer_action(tool_name, operation),
+                "tool={tool_name}"
+            );
+        }
+        for tool_name in ["get_browser_state", "browser_prepare"] {
+            let operation = crate::server::tool_operation(tool_name, Some(&args));
+            assert!(
+                !crate::server::is_computer_action(tool_name, operation),
+                "tool={tool_name}"
+            );
+        }
+        for action in ["accept", "dismiss"] {
+            let args = serde_json::json!({"action": action});
+            let operation = crate::server::tool_operation("browser_dialog", Some(&args));
+            assert!(crate::server::is_computer_action(
+                "browser_dialog",
+                operation
+            ));
+        }
+        let inspect = serde_json::json!({"action": "inspect"});
+        let operation = crate::server::tool_operation("browser_dialog", Some(&inspect));
+        assert!(!crate::server::is_computer_action(
+            "browser_dialog",
+            operation
+        ));
+    }
+
+    #[test]
     fn fire_session_end_is_idempotent_per_id() {
         // Distinct, test-local ids so we don't collide with other tests that
         // share the process-global ENDED_SESSIONS set.
@@ -502,10 +523,15 @@ mod tests {
         let sid = "test-ttl-session-DDEEFF";
         touch_session(sid);
         // A huge TTL leaves it alone (just touched).
-        assert!(evict_idle(Duration::from_secs(3600)).iter().all(|s| s != sid));
+        assert!(evict_idle(Duration::from_secs(3600))
+            .iter()
+            .all(|s| s != sid));
         // A zero TTL treats any prior activity as idle → evicts it.
         let evicted = evict_idle(Duration::ZERO);
-        assert!(evicted.iter().any(|s| s == sid), "zero-TTL must evict a touched session");
+        assert!(
+            evicted.iter().any(|s| s == sid),
+            "zero-TTL must evict a touched session"
+        );
         assert!(is_session_ended(sid), "evicted session is ended");
     }
 
@@ -536,7 +562,10 @@ mod tests {
         assert_eq!(custom.active_cursor_count, 7);
         let debug = format!("{custom:?}");
         for forbidden in ["/private/customer", "private-brand", "private agent"] {
-            assert!(!debug.contains(forbidden), "cursor outcome leaked {forbidden}: {debug}");
+            assert!(
+                !debug.contains(forbidden),
+                "cursor outcome leaked {forbidden}: {debug}"
+            );
         }
 
         let unknown = bounded_cursor_outcome(
@@ -710,20 +739,23 @@ mod tests {
                 && observation.declaration == SessionDeclaration::ImplicitFirstAction
                 && observation.transport == SessionTransport::McpHttp
         }));
-        assert!(starts.iter().any(|(id, observation)| id == revived && observation.revived));
+        assert!(starts
+            .iter()
+            .any(|(id, observation)| id == revived && observation.revived));
         drop(starts);
 
         let ends = probe.ends.lock().unwrap();
         assert!(ends.iter().any(|(id, reason, cursor)| {
-            id == explicit && *reason == SessionEndReason::Explicit
+            id == explicit
+                && *reason == SessionEndReason::Explicit
                 && cursor.is_some_and(|value| {
                     value.style == CursorStyleCategory::BuiltinArrow
                         && value.active_cursor_count == 2
                 })
         }));
-        assert!(ends.iter().any(|(id, reason, _)| {
-            id == idle && *reason == SessionEndReason::IdleTimeout
-        }));
+        assert!(ends
+            .iter()
+            .any(|(id, reason, _)| { id == idle && *reason == SessionEndReason::IdleTimeout }));
         assert!(!ends.iter().any(|(id, _, _)| id == control));
     }
 }

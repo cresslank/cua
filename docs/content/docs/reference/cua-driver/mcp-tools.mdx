@@ -12,7 +12,7 @@ description: Reference for every MCP tool Cua Driver exposes
 
 import { Callout } from 'fumadocs-ui/components/callout';
 
-`cua-driver` exposes 43 MCP tools through a single stdio server (`cua-driver mcp`). Every tool is also callable from the shell as `cua-driver <name> '<JSON-args>'`.
+`cua-driver` exposes 49 MCP tools through a single stdio server (`cua-driver mcp`). Every tool is also callable from the shell as `cua-driver <name> '<JSON-args>'`.
 
 Tool names are `snake_case`. Responses are MCP `CallTool.Result` envelopes: a text content block prefixed with a `✅` summary (or the error reason on failure), plus optional image or structured-content blocks on tools that produce them. See the [CLI reference](/reference/cua-driver/cli-reference) for CLI-specific options like `--socket` and `--screenshot-out-file`.
 
@@ -23,7 +23,7 @@ For the cross-cutting parameter contract (shared parameters, required-parameter 
 </Callout>
 
 <Callout type="info">
-  **TCC auto-delegation.** When an MCP client spawns `cua-driver mcp` from an IDE terminal (Claude Code, Cursor, VS Code, Warp), macOS attributes the subprocess to the parent terminal — not `CuaDriver.app` — so AX probes fail against the wrong bundle id. `mcp` detects this and auto-launches a `cua-driver serve` daemon via `open -n -g -a CuaDriver --args serve`, then proxies every tool call through the daemon's Unix socket. Tool semantics are identical to the in-process path; no Python bridge is needed. Pass `--no-daemon-relaunch` (or set `CUA_DRIVER_MCP_NO_RELAUNCH=1`) to force in-process execution. See the [process model](/reference/cua-driver/process-model) for the full lifecycle, failure modes, and wrapper-author guidance.
+  **Daemon delegation.** `cua-driver mcp` is always a stdio proxy to a `cua-driver serve` daemon. On macOS it can auto-launch the daemon via `open -n -g -a CuaDriver --args serve` so AX and Screen Recording grants attach to the app bundle. On Windows and Linux the daemon must already be running. See the [process model](/reference/cua-driver/process-model) for the full lifecycle and wrapper-author guidance.
 </Callout>
 
 ## Inspection tools
@@ -292,7 +292,8 @@ When `from_zoom` is true, coordinates are in the last zoom image for this pid; t
 - `from_y` (number, required): Drag-start Y in window-local screenshot pixels. Top-left origin.
 - `from_zoom` (boolean, optional): When true, coordinates are in the last zoom image for this pid; driver maps back to window coordinates.
 - `modifier` (array of string, optional): Modifier keys held across the entire gesture: cmd/shift/option/ctrl.
-- `pid` (integer, required): Target process ID.
+- `pid` (integer, optional): Target process ID.
+- `scope` (string, optional): Use desktop with no pid/window_id for native get_desktop_state screenshot coordinates.
 - `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
 - `steps` (integer, optional): Number of intermediate mouseDragged events linearly interpolated along the path. Default: 20.
 - `to_x` (number, required): Drag-end X in window-local screenshot pixels.
@@ -300,7 +301,7 @@ When `from_zoom` is true, coordinates are in the last zoom image for this pid; t
 - `window_id` (integer, optional): CGWindowID for the window the pixel coordinates were measured against. Optional — when omitted the driver picks the frontmost window of pid.
 
 ```json
-{"from_x":100,"from_y":200,"pid":844,"to_x":100,"to_y":200}
+{"from_x":100,"from_y":200,"to_x":100,"to_y":200}
 ```
 
 ### `type_text`
@@ -317,7 +318,8 @@ WEB CONTENT (Chromium/WebKit/Electron — browser tabs, Slack, VS Code, X's comp
 - `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": AX insert, then CGEvent keystrokes if needed — no focus steal; the driver verifies via an AXValue read-back and reports `verified`. "foreground": briefly front the window, type, restore the prior frontmost — the explicit last resort for focus-sensitive surfaces (e.g. WhatsApp/Catalyst) where background keystrokes don't land. Re-call with "foreground" when a background attempt returns `verified:false` and a screenshot shows the text didn't appear.
 - `element_index` (integer, optional): Element index from last get_window_state. Directs the write to a specific field. REQUIRES `pid` and `window_id` to be passed alongside it — element_index alone (no pid) fails fast with "Missing required integer field: pid"; it is not a silent no-op.
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. Takes precedence over element_index when both supplied. Returns an explicit "stale" error if the snapshot has been superseded.
-- `pid` (integer, required): Target process ID.
+- `pid` (integer, optional): Target process ID.
+- `scope` (string, optional): Use desktop with no pid/window_id to type into the frontmost application.
 - `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
 - `text` (string, required): Text to insert at the target's cursor.
 - `window_id` (integer, optional): CGWindowID. Required when element_index is used. Optional when element_token is supplied (the token carries it).
@@ -325,7 +327,7 @@ WEB CONTENT (Chromium/WebKit/Electron — browser tabs, Slack, VS Code, X's comp
 - `y` (number, optional): Screenshot-pixel Y of the field (see x).
 
 ```json
-{"pid":844,"text":"hello"}
+{"text":"hello"}
 ```
 
 ### `press_key`
@@ -343,14 +345,15 @@ A key press is never driver-verifiable → effect:"unverifiable"; confirm via sc
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. Takes precedence over element_index when both supplied. Returns an explicit "stale" error if the snapshot has been superseded.
 - `key` (string, required): Key name: return, tab, escape, up, down, etc.
 - `modifiers` (array of string, optional): Modifier keys: cmd, shift, option/alt, ctrl, fn.
-- `pid` (integer, required)
+- `pid` (integer, optional)
+- `scope` (string, optional): Use desktop with no pid/window_id to send the key to the frontmost application.
 - `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
 - `window_id` (integer, optional): Target window. Required for delivery_mode:"foreground". Does NOT itself raise the window — raising is gated on delivery_mode.
 - `x` (number, optional): Screenshot-pixel X — the element px action form: pixel-click there to focus, then send the key. Use when the key must go to a Chromium/Electron surface the AX path can't focus. Pass with y, no element_index.
 - `y` (number, optional): Screenshot-pixel Y (see x).
 
 ```json
-{"key":"return","pid":844}
+{"key":"return"}
 ```
 
 ### `hotkey`
@@ -367,14 +370,15 @@ Recognized modifiers: cmd/command, shift, option/alt, ctrl/control, fn. Non-modi
 
 - `delivery_mode` (string, optional): Best-effort-background ladder rung (default "background"). "background": inject without fronting or raising the target — no focus steal. "foreground": briefly front the target, act, then restore the prior frontmost — the explicit last resort when a background attempt didn't land. Re-call with "foreground" only for the action that needs it.
 - `keys` (array of string, required): Modifier(s) and one non-modifier key, e.g. ["cmd", "c"].
-- `pid` (integer, required): Target process ID.
+- `pid` (integer, optional): Target process ID.
+- `scope` (string, optional): Use desktop with no pid/window_id to send the chord to the frontmost application.
 - `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
 - `window_id` (integer, optional): Target window. Required for delivery_mode:"foreground" (the NSMenu activation needs a window). Does NOT itself raise the window — raising is gated on delivery_mode.
 - `x` (number, optional): Screenshot-pixel X — the element px action form: pixel-click there to focus, then send the combo (so e.g. Cmd+V pastes into that field). Pass with y. Use for Chromium/Electron surfaces the background combo can't reach.
 - `y` (number, optional): Screenshot-pixel Y (see x).
 
 ```json
-{"keys":["cmd","c"],"pid":844}
+{"keys":["cmd","c"]}
 ```
 
 ### `set_value`
@@ -419,22 +423,24 @@ Mapping: by='page' → larger step; by='line' → smaller step; amount = number 
 - `element_index` (integer, optional): Element from last get_window_state. Routes through the pixel-wheel path AT this element's center — use it to scroll a nested overflow region you located in the AX tree.
 - `element_token` (string, optional): Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. Takes precedence over element_index when both supplied. Returns an explicit "stale" error if the snapshot has been superseded. Routes through the pixel-wheel path at the element's center.
 - `pid` (integer, optional)
+- `scope` (string, optional): Use desktop with x,y and no pid/window_id for native get_desktop_state screenshot coordinates.
 - `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
 - `window_id` (integer, optional)
 - `x` (number, optional): Window-local screenshot X (top-left origin of the PNG from get_window_state). With `y`, routes through the pixel-wheel path at this point — use for a scrollable surface that isn't in the AX tree. Requires window_id to anchor the window→screen conversion.
 - `y` (number, optional): Window-local screenshot Y. See `x`.
 
 ```json
-{"direction":"down"}
+{"direction":"up"}
 ```
 
 ### `move_cursor`
 
-Move the agent cursor overlay to (x, y). Does NOT move the real mouse cursor — the user's cursor stays where it is. Useful for showing the agent's attention without interrupting the user.
+Move a cursor to (x, y). In window scope (default), moves only the agent cursor overlay. With scope=desktop, moves the real OS pointer in native get_desktop_state screenshot coordinates.
 
 **Arguments:**
 
 - `cursor_id` (string, optional): Cursor instance to move. Default: 'default'.
+- `scope` (string, optional)
 - `session` (string, optional): Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less.
 - `x` (number, required)
 - `y` (number, required)
@@ -493,7 +499,7 @@ Actions:
 - `window_id` (integer, optional): Target window ID from list_windows.
 
 ```json
-{"action":"get_text"}
+{"action":"execute_javascript"}
 ```
 
 ## Recording tools
@@ -514,7 +520,7 @@ Turn folders are named `turn-00001/`, `turn-00002/`, etc.  Turn numbering restar
 
 **Video is off by default.** Pass `record_video: true` to also capture the main display to `<output_dir>/recording.mp4` (H.264 / 30 fps) for the lifetime of the session. The recording is torn down automatically when the MCP client disconnects.
 
-**macOS uses native ScreenCaptureKit** (in-process SCStream + SCRecordingOutput) so video inherits Cua Driver's own Screen Recording grant — no extra TCC prompt, no ffmpeg subprocess. Requires macOS 15.0+.
+**macOS uses native ScreenCaptureKit** (daemon-owned SCStream + SCRecordingOutput) so video inherits the daemon's Screen Recording grant — no extra TCC prompt, no ffmpeg subprocess. Requires macOS 15.0+.
 
 **Windows + Linux use an ffmpeg subprocess** (`gdigrab` / `x11grab` + libx264). Requires ffmpeg on PATH (winget install Gyan.FFmpeg / apt install ffmpeg); when ffmpeg is missing or fails on startup the per-turn capture (screenshots + action.json) still runs and the session's `last_error` field carries the diagnostic.
 
@@ -560,13 +566,12 @@ Caveats:
 
 ### `set_config`
 
-Update cua-driver-rs configuration. Changes to max_image_dimension and capture_scope take effect immediately. The experimental_pip keys are persisted to ~/.cua-driver/config.json and take effect on the next daemon restart (the PiP backend is initialised once at startup).
+Update cua-driver-rs configuration. Changes to max_image_dimension take effect immediately. The experimental_pip keys are persisted to ~/.cua-driver/config.json and take effect on the next daemon restart (the PiP backend is initialised once at startup).
 
-Note: capture_mode is a per-call param (on get_window_state / click), not a stored setting. capture_scope IS a global setting: it gates get_desktop_state (full-display capture requires capture_scope=desktop).
+Note: capture_mode is a per-call param (on get_window_state / click), not a stored setting. Capture scope is selected by start_session, not set_config.
 
 **Arguments:**
 
-- `capture_scope` (string, optional): Capture scope: "window" (default) or "desktop". Desktop scope enables get_desktop_state (full-display capture) and window-less screen-absolute click/scroll. Global setting; takes effect immediately.
 - `experimental_pip` (boolean, optional): Enable the experimental picture-in-picture preview window. Applies on next daemon restart.
 - `experimental_pip_geometry` (string, optional): PiP window size + optional position in `WxH` or `WxH+X+Y` form (e.g. `320x200+24+24`). Applies on next daemon restart.
 - `key` (string, optional): Name of a single config field to write (&#123;key, value&#125; shape, matching the CLI `config set` and the Windows/Linux tools). Pair with `value`. Equivalent to passing the field directly.
@@ -575,10 +580,11 @@ Note: capture_mode is a per-call param (on get_window_state / click), not a stor
 
 ### `start_session`
 
-Declare a session — a named, color-coded identity for THIS agent run. Pass a stable `session` id; the agent cursor, per-session config, and recording all key on it, and it follows the run across any apps/windows. The cursor's color is derived from the id, so distinct runs are visually distinct. A cursor is shown only for a declared session — call this (or pass `session` on your first action) to opt in. Idempotent: re-calling with the same id just refreshes its idle-TTL. End it with `end_session` (or let the idle-TTL reclaim it). Concurrent runs/subagents each pass their own `session` to get their own cursor.
+Declare a session — a named, color-coded identity for THIS agent run. Pass a stable `session` id and choose capture_scope=auto|window|desktop; the agent cursor, capture policy, per-session config, and recording all key on it, and it follows the run across any apps/windows. The cursor's color is derived from the id, so distinct runs are visually distinct. A cursor is shown only for a declared session — call this (or pass `session` on your first action) to opt in. Idempotent: re-calling with the same id just refreshes its idle-TTL. End it with `end_session` (or let the idle-TTL reclaim it). Concurrent runs/subagents each pass their own `session` to get their own cursor.
 
 **Arguments:**
 
+- `capture_scope` (string, optional): Per-session perception/action modality. auto starts window-only and requires explicit escalation before desktop tools; window and desktop are strict. Immutable for the live session.
 - `session` (string, required): Stable session id for this run (e.g. "research-run-1").
 
 ```json
@@ -746,19 +752,23 @@ Install the ffmpeg binary used by start_recording's video capture (Linux/Windows
 
 ### `get_browser_state`
 
-Read-only browser inspection. Mode 1 (bind): pass pid + window_id of a native browser window to classify it, correlate it to a CDP target (exact-or-refuse), and mint a session-scoped target id plus tab ids. Mode 2 (snapshot): pass target_id + tab_id to snapshot the tab's composed DOM (main frame, shadow DOM, same-process iframes, and capability-tested out-of-process iframes) and mint p&lt;snapshot&gt;:&lt;index&gt; element refs for browser_click / browser_type; each ref reports its frame kind. Never performs setup — a missing endpoint is a structured browser_requires_setup refusal pointing at browser_prepare.
+Read-only browser inspection. Mode 1 (bind): pass pid + window_id of a native browser window to classify it, correlate it to a CDP target (exact-or-refuse), and mint a session-scoped target id plus tab ids. Mode 2 (snapshot): pass target_id + tab_id. The dom_refs_v1 compatibility format returns composed DOM refs. semantic_v2 joins accessibility, DOM, layout, and viewport state; ranks visible content before retained/offscreen state; and returns a semantic outline, typed action refs, content refs, scoped reads, and opaque continuation. Never performs setup — a missing endpoint is a structured browser_requires_setup refusal pointing at browser_prepare.
 
 **Arguments:**
 
+- `continuation` (string, optional): Opaque continuation minted by an earlier semantic_v2 response.
 - `pid` (integer, optional): Native browser process id (bind mode).
+- `query` (string, optional): Read-only semantic match over role, accessible name, and visible text.
+- `scope_ref` (string, optional): Current semantic/content ref whose subtree should be observed.
 - `session` (string, optional): Stable caller-declared session id. Browser targets, tabs, and refs are scoped to this session.
+- `snapshot_format` (string, optional): Versioned snapshot contract. dom_refs_v1 remains the compatibility default.
 - `tab_id` (string, optional): Opaque tab id from get_browser_state (session-scoped).
 - `target_id` (string, optional): Opaque browser target id minted by get_browser_state (session-scoped; never a CDP id).
 - `window_id` (integer, optional): Native window id owned by pid (bind mode).
 
 ### `browser_prepare`
 
-Explicitly prepare an owned DevTools endpoint for a browser pid. Existing endpoints are detected without side effects. Acting setup requires MCP-host approval or a short-lived token from the interactive browser-approve command, allow_launch=true, and a driver-owned isolated profile. It launches a separate browser and never copies, modifies, or terminates the requested user profile.
+Explicitly prepare an owned DevTools endpoint for a browser pid. Existing endpoints are detected without side effects. Acting setup requires MCP-host approval or a short-lived token from the interactive browser-approve command, allow_launch=true, and a driver-owned isolated profile. It launches a separate browser and never copies, modifies, or terminates the requested user profile. Existing-profile attachment is explicit, requires an exact interactive approval artifact, and never treats ordinary MCP transport approval as profile consent. On proven platforms, that approval also permits one bounded exact-window setup: open the recognized browser product's fixed remote-debugging page, toggle its uniquely matched per-instance checkbox, prove the PID-owned loopback endpoint, and close the temporary tab. Every visible effect is reported; ambiguity is refused.
 
 **Arguments:**
 
@@ -767,6 +777,8 @@ Explicitly prepare an owned DevTools endpoint for a browser pid. Existing endpoi
 - `pid` (integer, required): Browser process id to prepare.
 - `profile` (object, optional)
 - `session` (string, optional): Stable caller-declared session id. Browser targets, tabs, and refs are scoped to this session.
+- `strategy` (object, optional)
+- `window_id` (integer, optional): Exact native window approval anchor; required for strategy.kind=existing_profile.
 
 ```json
 {"pid":844}
@@ -820,4 +832,104 @@ Type text into an exactly-bound tab via the Input domain. mode="insert_text" (de
 
 ```json
 {"ref":"example","tab_id":"example","target_id":"example","text":"hello"}
+```
+
+### `browser_dialog`
+
+Inspect or resolve a page-owned JavaScript alert, confirm, prompt, or beforeunload dialog on one exactly-bound tab. This never handles browser permission UI, extension UI, native dialogs, or file pickers. Inspect returns an opaque dialog_id; accept/dismiss require that exact current id. Resolution defaults to background delivery; Linux callers must explicitly request foreground delivery because Chromium's native modal cannot be resolved there without changing foreground posture.
+
+**Arguments:**
+
+- `action` (string, required)
+- `delivery_mode` (string, optional): Requested foreground posture for accept/dismiss. Linux Chromium requires foreground; inspect is read-only.
+- `dialog_id` (string, optional): Opaque current dialog generation returned by action=inspect.
+- `prompt_text` (string, optional): Sensitive response text, valid only when accepting a prompt dialog.
+- `session` (string, optional): Stable caller-declared session id. Browser targets, tabs, and refs are scoped to this session.
+- `tab_id` (string, required): Opaque tab id from get_browser_state (session-scoped).
+- `target_id` (string, required): Opaque browser target id minted by get_browser_state (session-scoped; never a CDP id).
+
+```json
+{"action":"inspect","tab_id":"example","target_id":"example"}
+```
+
+### `browser_set_input_files`
+
+Assign one or more explicit absolute local files to an exact live &lt;input type=file&gt; ref through CDP. This bypasses native file pickers, rejects symlinks and non-regular files, and never returns local paths.
+
+**Arguments:**
+
+- `files` (array of string, required)
+- `ref` (string, required): Page element ref in the p&lt;snapshot&gt;:&lt;index&gt; namespace from get_browser_state. Refs are invalidated by navigation and by newer snapshots of the same tab.
+- `session` (string, optional): Stable caller-declared session id. Browser targets, tabs, and refs are scoped to this session.
+- `tab_id` (string, required): Opaque tab id from get_browser_state (session-scoped).
+- `target_id` (string, required): Opaque browser target id minted by get_browser_state (session-scoped; never a CDP id).
+
+```json
+{"files":["example"],"ref":"example","tab_id":"example","target_id":"example"}
+```
+
+### `browser_download`
+
+Trigger one download through an exact live browser ref and save it inside an explicitly approved directory. Requires MCP-host destructive-tool approval, refuses ambiguous or stale capabilities, and never returns the source URL, filename, or destination path.
+
+**Arguments:**
+
+- `destination_root` (string, required): Absolute, existing, canonical directory approved to receive the download.
+- `ref` (string, required): Live page ref whose activation initiates the download.
+- `session` (string, required): Explicit caller session owning the browser capabilities.
+- `tab_id` (string, required): Opaque exact tab id from get_browser_state.
+- `target_id` (string, required): Opaque exact browser target id from get_browser_state.
+
+```json
+{"destination_root":"example","ref":"example","session":"example","tab_id":"example","target_id":"example"}
+```
+
+### `browser_pointer`
+
+Perform hover, right-click, double-click, scroll, or drag in an exactly-bound browser tab. The trusted route uses CDP Input events and refuses if standalone background posture cannot be preserved. The explicit dom_event route requires a page ref and synthesizes full-background DOM events. Never activates or brings a tab to the foreground.
+
+**Arguments:**
+
+- `action` (string, required)
+- `delta_x` (number, optional): Horizontal scroll delta in CSS pixels.
+- `delta_y` (number, optional): Vertical scroll delta in CSS pixels.
+- `destination_ref` (string, optional): Drag destination page ref in the exact same frame.
+- `input_route` (string, optional)
+- `ref` (string, optional): Origin page ref. Alternative to x/y.
+- `session` (string, required): Explicit caller session owning the browser capabilities.
+- `tab_id` (string, required): Opaque tab id minted by get_browser_state.
+- `target_id` (string, required): Opaque target id minted by get_browser_state.
+- `to_x` (number, optional): Drag destination viewport x in CSS pixels.
+- `to_y` (number, optional): Drag destination viewport y in CSS pixels.
+- `x` (number, optional): Origin viewport x in CSS pixels.
+- `y` (number, optional): Origin viewport y in CSS pixels.
+
+```json
+{"action":"hover","session":"example","tab_id":"example","target_id":"example"}
+```
+
+### `escalate_session`
+
+Unlock the desktop phase of an auto capture-scope session after the window action ladder has been exhausted and verified. This is a one-way transition for the live session and records a bounded reason.
+
+**Arguments:**
+
+- `detail` (string, optional): Optional bounded diagnostic detail. Never use secrets or page content.
+- `reason` (string, required)
+- `session` (string, required)
+
+```json
+{"reason":"ax_tree_pixel_mismatch","session":"example"}
+```
+
+### `get_session_state`
+
+Read the live session's capture policy and effective scope.
+
+**Arguments:**
+
+- `session` (string, required)
+
+```json
+{"session":"example"}
 ```

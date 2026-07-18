@@ -76,6 +76,8 @@ export interface MCPPropertyDoc {
   type: string;
   description: string;
   items?: { type: string };
+  enum?: string[];
+  minItems?: number;
 }
 
 export interface MCPDocumentation {
@@ -593,7 +595,7 @@ export function generateMCPToolsMDX(docs: MCPDocumentation, releasedVersion: str
   lines.push('');
   lines.push('<Callout type="info">');
   lines.push(
-    "  **TCC auto-delegation.** When an MCP client spawns `cua-driver mcp` from an IDE terminal (Claude Code, Cursor, VS Code, Warp), macOS attributes the subprocess to the parent terminal — not `CuaDriver.app` — so AX probes fail against the wrong bundle id. `mcp` detects this and auto-launches a `cua-driver serve` daemon via `open -n -g -a CuaDriver --args serve`, then proxies every tool call through the daemon's Unix socket. Tool semantics are identical to the in-process path; no Python bridge is needed. Pass `--no-daemon-relaunch` (or set `CUA_DRIVER_MCP_NO_RELAUNCH=1`) to force in-process execution. See the [process model](/reference/cua-driver/process-model) for the full lifecycle, failure modes, and wrapper-author guidance."
+    "  **Daemon delegation.** `cua-driver mcp` is always a stdio proxy to a `cua-driver serve` daemon. On macOS it can auto-launch the daemon via `open -n -g -a CuaDriver --args serve` so AX and Screen Recording grants attach to the app bundle. On Windows and Linux the daemon must already be running. See the [process model](/reference/cua-driver/process-model) for the full lifecycle and wrapper-author guidance."
   );
   lines.push('</Callout>');
   lines.push('');
@@ -773,6 +775,9 @@ function formatPropertyType(prop: MCPPropertyDoc): string {
 }
 
 function syntheticExampleValue(name: string, prop: MCPPropertyDoc): unknown {
+  if (prop.enum?.length) {
+    return prop.enum[0];
+  }
   switch (prop.type) {
     case 'integer':
       if (name === 'pid') return 844;
@@ -794,6 +799,7 @@ function syntheticExampleValue(name: string, prop: MCPPropertyDoc): unknown {
     case 'array':
       if (name === 'keys') return ['cmd', 'c'];
       if (name === 'modifiers') return ['cmd'];
+      if (name === 'files' || (prop.minItems ?? 0) > 0) return ['example'];
       return [];
     case 'string':
       if (name === 'text') return 'hello';

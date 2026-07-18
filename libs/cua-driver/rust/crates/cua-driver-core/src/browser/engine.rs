@@ -23,21 +23,33 @@
 //! - Whenever a frame's identity cannot be proven, its content is
 //!   omitted from the snapshot — never guessed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::session::register_session_end_hook;
 
-use super::binding::{cardinality_exact_candidate, correlate, BindingOutcome, CdpWindowCandidate};
+use super::binding::{
+    cardinality_exact_candidate, correlate, selected_tab_target_id, BindingOutcome,
+    CdpWindowCandidate,
+};
 use super::cdp_ws::{CdpConnection, CdpPool};
-use super::platform::BrowserPlatform;
+use super::grant::{ExistingProfileGrant, ExistingProfileGrants, GrantLookup};
+use super::mutation::{MutationGates, MutationKey};
+use super::platform::{BrowserConsentOutcome, BrowserConsentRequest, BrowserPlatform};
 use super::prepare::ManagedBrowsers;
+use super::reconnect::ReconnectGates;
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
+use super::semantic::{
+    build_dom_index, build_layout_index, compose_accessibility_tree, parse_viewport,
+    OmissionCounts, SemanticDocument, SemanticNode, DEFAULT_SEMANTIC_NODE_BUDGET,
+    SEMANTIC_COMPUTED_STYLES,
+};
 use super::store::{
-    format_ref, BrowserStore, FrameIdentity, FrameKind, FrameRef, RefEntry, SnapshotRecord,
-    TabRecord, TargetRecord,
+    format_ref, BrowserStore, FrameIdentity, FrameKind, FrameRef, RefEntry, SemanticContinuation,
+    SnapshotRecord, TabRecord, TargetRecord,
 };
 use super::types::{BindingQuality, NativeWindowInfo, OwnedEndpoint, Rect};
 
@@ -54,6 +66,9 @@ pub struct BrowserEngine {
     pub(crate) store: BrowserStore,
     pub(crate) pool: CdpPool,
     pub(crate) managed_browsers: ManagedBrowsers,
+    pub(crate) existing_profile_grants: ExistingProfileGrants,
+    mutation_gates: MutationGates,
+    reconnect_gates: ReconnectGates,
 }
 
 fn refuse(code: BrowserRefusalCode, msg: impl Into<String>) -> BrowserRefusal {
@@ -86,6 +101,102 @@ fn is_method_unsupported(error: &anyhow::Error) -> bool {
     error.to_string().contains("(-32601)")
 }
 
+fn is_semantic_document_size_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    [
+        "maximum depth",
+        "object reference chain is too long",
+        "message is too large",
+        "serialization",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn is_semantic_document_fallback_error(error: &anyhow::Error) -> bool {
+    if is_semantic_document_size_error(error) {
+        return true;
+    }
+    is_semantic_document_timeout_error(error)
+}
+
+fn is_semantic_document_timeout_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("cdp dom.getdocument timed out after")
+}
+
+const SEMANTIC_DOM_FALLBACK_DEPTHS: &[i64] = &[256, 128, 64, 32, 16, 8, 4, 2, 1];
+const SEMANTIC_DOM_TIMEOUT_FALLBACK_DEPTHS: &[i64] = &[8, 4, 2, 1];
+const SEMANTIC_DOM_HYDRATION_DEPTH: i64 = 8;
+const MAX_SEMANTIC_DOM_HYDRATION_CALLS: usize = 64;
+const MAX_SEMANTIC_DOM_SCAN_NODES: usize = 50_000;
+
+#[derive(Default)]
+struct DomCoverageScan {
+    truncated: Vec<i64>,
+    visited_nodes: usize,
+    budget_exhausted: bool,
+}
+
+fn scan_dom_coverage(value: &Value, scan: &mut DomCoverageScan) {
+    if scan.budget_exhausted {
+        return;
+    }
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                scan_dom_coverage(value, scan);
+            }
+        }
+        Value::Object(object) => {
+            if object.contains_key("nodeType") {
+                scan.visited_nodes += 1;
+                if scan.visited_nodes > MAX_SEMANTIC_DOM_SCAN_NODES {
+                    scan.budget_exhausted = true;
+                    return;
+                }
+                let expected = object
+                    .get("childNodeCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize;
+                let present = object
+                    .get("children")
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len);
+                if expected > present {
+                    if let Some(backend_node_id) =
+                        object.get("backendNodeId").and_then(Value::as_i64)
+                    {
+                        scan.truncated.push(backend_node_id);
+                    }
+                }
+            }
+            for value in object.values() {
+                scan_dom_coverage(value, scan);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn replace_dom_node(value: &mut Value, backend_node_id: i64, replacement: &Value) -> bool {
+    match value {
+        Value::Array(values) => values
+            .iter_mut()
+            .any(|value| replace_dom_node(value, backend_node_id, replacement)),
+        Value::Object(object) => {
+            if object.get("backendNodeId").and_then(Value::as_i64) == Some(backend_node_id) {
+                *value = replacement.clone();
+                return true;
+            }
+            object
+                .values_mut()
+                .any(|value| replace_dom_node(value, backend_node_id, replacement))
+        }
+        _ => false,
+    }
+}
+
 /// Result of one tab snapshot: minted refs plus what was (and was not)
 /// composable.
 pub(crate) struct SnapshotOutcome {
@@ -93,6 +204,27 @@ pub(crate) struct SnapshotOutcome {
     pub url: String,
     pub refs: Vec<(String, RefEntry)>,
     pub truncated: bool,
+    pub oopif: OopifStatus,
+}
+
+pub(crate) struct SemanticListedRef {
+    pub external: String,
+    pub node: SemanticNode,
+}
+
+pub(crate) struct SemanticSnapshotOutcome {
+    pub snapshot_id: u64,
+    pub url: String,
+    pub title: String,
+    pub outline: String,
+    pub refs: Vec<SemanticListedRef>,
+    pub content_refs: Vec<SemanticListedRef>,
+    pub complete: bool,
+    pub scope: &'static str,
+    pub selected_nodes: usize,
+    pub total_nodes: usize,
+    pub omissions: OmissionCounts,
+    pub continuation: Option<String>,
     pub oopif: OopifStatus,
 }
 
@@ -149,6 +281,19 @@ impl LocalFrameTree {
     /// Whether a snapshot-time identity still names a live document.
     fn proves(&self, identity: &FrameIdentity) -> bool {
         self.frames.get(&identity.frame_id) == Some(&identity.loader_id)
+    }
+
+    fn identities(&self) -> Vec<FrameIdentity> {
+        let mut identities = self
+            .frames
+            .iter()
+            .map(|(frame_id, loader_id)| FrameIdentity {
+                frame_id: frame_id.clone(),
+                loader_id: loader_id.clone(),
+            })
+            .collect::<Vec<_>>();
+        identities.sort_by_key(|identity| identity.frame_id != self.main_frame_id);
+        identities
     }
 }
 
@@ -209,12 +354,26 @@ impl BrowserEngine {
             store: BrowserStore::new(),
             pool: CdpPool::new(),
             managed_browsers: Default::default(),
+            existing_profile_grants: ExistingProfileGrants::new(),
+            mutation_gates: MutationGates::new(),
+            reconnect_gates: ReconnectGates::new(),
         });
         let weak: Weak<Self> = Arc::downgrade(&engine);
         register_session_end_hook(move |session_id| {
             if let Some(engine) = weak.upgrade() {
                 engine.store.remove_session(session_id);
                 engine.cleanup_prepared_session(session_id);
+                for (endpoint, generation) in
+                    engine.existing_profile_grants.remove_session(session_id)
+                {
+                    engine.pool.release_claim_marker(&endpoint);
+                    if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                        let engine = engine.clone();
+                        runtime.spawn(async move {
+                            engine.pool.release_existing(&endpoint, generation).await;
+                        });
+                    }
+                }
             }
         });
         engine
@@ -222,7 +381,49 @@ impl BrowserEngine {
 
     // ── Endpoint / CDP plumbing ─────────────────────────────────────────
 
-    async fn connect(&self, ws_url: &str) -> Result<Arc<CdpConnection>, BrowserRefusal> {
+    pub(crate) async fn existing_profile_grant(
+        &self,
+        session: &str,
+        transport_session: Option<&str>,
+        pid: i64,
+    ) -> Result<Option<ExistingProfileGrant>, BrowserRefusal> {
+        match self
+            .existing_profile_grants
+            .lookup(session, transport_session, pid)
+        {
+            GrantLookup::Missing => Ok(None),
+            GrantLookup::Live(grant) => Ok(Some(grant)),
+            GrantLookup::Expired(grant) => {
+                self.pool.release_claim_marker(&grant.endpoint_ws_url);
+                self.pool
+                    .release_existing(&grant.endpoint_ws_url, grant.generation)
+                    .await;
+                Err(refuse(
+                    BrowserRefusalCode::BrowserConsentRequired,
+                    "the existing-profile grant expired; approve this attachment again",
+                ))
+            }
+        }
+    }
+
+    pub(crate) async fn revoke_existing_profile_grant(
+        &self,
+        session: &str,
+        transport_session: Option<&str>,
+        pid: i64,
+    ) {
+        if let Some(grant) = self
+            .existing_profile_grants
+            .revoke(session, transport_session, pid)
+        {
+            self.pool.release_claim_marker(&grant.endpoint_ws_url);
+            self.pool
+                .release_existing(&grant.endpoint_ws_url, grant.generation)
+                .await;
+        }
+    }
+
+    pub(crate) async fn connect(&self, ws_url: &str) -> Result<Arc<CdpConnection>, BrowserRefusal> {
         match self.pool.get(ws_url).await {
             Ok(conn) => Ok(conn),
             Err(first_err) => {
@@ -237,8 +438,204 @@ impl BrowserEngine {
         }
     }
 
+    async fn connect_existing_profile(
+        &self,
+        session: &str,
+        transport_session: Option<&str>,
+        pid: i64,
+    ) -> Result<(Arc<CdpConnection>, ExistingProfileGrant), BrowserRefusal> {
+        let grant = self
+            .existing_profile_grant(session, transport_session, pid)
+            .await?
+            .ok_or_else(|| {
+                refuse(
+                    BrowserRefusalCode::BrowserConsentRequired,
+                    "no live existing-profile grant remains for this browser session",
+                )
+            })?;
+        if let Ok(conn) = self
+            .pool
+            .get_existing(&grant.endpoint_ws_url, grant.generation)
+            .await
+        {
+            return Ok((conn, grant));
+        }
+
+        // One leader owns endpoint reproof and bounded redial. Followers
+        // re-check the generation after acquiring this gate and reuse its
+        // socket rather than opening another browser-level connection.
+        let _leader = self
+            .reconnect_gates
+            .lock(&grant.fingerprint, &grant.endpoint_ws_url)
+            .await;
+        let mut grant = self
+            .existing_profile_grant(session, transport_session, pid)
+            .await?
+            .ok_or_else(|| {
+                refuse(
+                    BrowserRefusalCode::BrowserConsentRequired,
+                    "the existing-profile grant ended while reconnecting",
+                )
+            })?;
+        if let Ok(conn) = self
+            .pool
+            .get_existing(&grant.endpoint_ws_url, grant.generation)
+            .await
+        {
+            return Ok((conn, grant));
+        }
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(32);
+        let mut last_error = None;
+        while tokio::time::Instant::now() < deadline && grant.reconnect_attempts_remaining > 0 {
+            if grant.pid != pid || grant.browser != "chromium" {
+                self.revoke_existing_profile_grant(session, transport_session, pid)
+                    .await;
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserConsentRequired,
+                    "the reconnect request no longer matches the approved browser identity",
+                ));
+            }
+            let classification = self.platform.classify_browser(pid).await?;
+            if !classification.supports_cdp
+                || classification.engine != super::types::BrowserEngineFamily::Chromium
+            {
+                self.revoke_existing_profile_grant(session, transport_session, pid)
+                    .await;
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserConsentRequired,
+                    "the approved process is no longer a supported Chromium browser",
+                ));
+            }
+            let fingerprint = self.platform.process_fingerprint(pid).await?;
+            if !grant.fingerprint.matches(&fingerprint) {
+                self.revoke_existing_profile_grant(session, transport_session, pid)
+                    .await;
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserConsentRequired,
+                    "the browser process changed; existing-profile attachment needs fresh approval",
+                ));
+            }
+            let endpoint = self
+                .platform
+                .reprove_existing_profile_endpoint(pid, &grant.endpoint_ws_url)
+                .await?
+                .ok_or_else(|| {
+                    refuse(
+                        BrowserRefusalCode::BrowserRequiresSetup,
+                        "the approved browser endpoint disappeared during reconnect",
+                    )
+                })?;
+            if endpoint.ownership.owner_pid != pid {
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                    "the reconnect endpoint is not owned by the approved browser process",
+                ));
+            }
+            if endpoint.ws_url != grant.endpoint_ws_url {
+                self.revoke_existing_profile_grant(session, transport_session, pid)
+                    .await;
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                    "the browser DevTools endpoint changed during reconnect",
+                ));
+            }
+
+            let old_generation = grant.generation;
+            let new_generation =
+                self.existing_profile_grants
+                    .bump_generation(session, transport_session, pid)?;
+            self.store
+                .invalidate_endpoint_generation(pid, old_generation);
+            let attempt = super::grant::MAX_RECONNECT_ATTEMPTS
+                .saturating_sub(grant.reconnect_attempts_remaining)
+                .saturating_add(1);
+            let mut reconnect = Box::pin(self.pool.reconnect_existing(
+                &endpoint.ws_url,
+                old_generation,
+                new_generation,
+            ));
+            let reconnected = tokio::select! {
+                result = &mut reconnect => result,
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    match self.platform.handle_existing_profile_consent(BrowserConsentRequest {
+                        pid,
+                        window_id: grant.window_id,
+                        attempt,
+                    }).await {
+                        Ok(BrowserConsentOutcome::Accepted | BrowserConsentOutcome::NotPresent) => {
+                            reconnect.await
+                        }
+                        Err(error) => {
+                            // The reconnect future may be waiting on browser
+                            // consent. Cancel it before grant revocation so no
+                            // socket-pool resource can outlive this refusal.
+                            drop(reconnect);
+                            if error.code == BrowserRefusalCode::BrowserConsentRevoked {
+                                self.revoke_existing_profile_grant(session, transport_session, pid)
+                                    .await;
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
+            };
+            match reconnected {
+                Ok(conn) => {
+                    grant = self
+                        .existing_profile_grant(session, transport_session, pid)
+                        .await?
+                        .expect("grant exists after successful generation bump");
+                    return Ok((conn, grant));
+                }
+                Err(error) => {
+                    last_error = Some(error.to_string());
+                    grant = self
+                        .existing_profile_grant(session, transport_session, pid)
+                        .await?
+                        .expect("grant exists while reconnect budget remains");
+                }
+            }
+        }
+        self.revoke_existing_profile_grant(session, transport_session, pid)
+            .await;
+        Err(refuse(
+            BrowserRefusalCode::BrowserReconnectExhausted,
+            "the bounded existing-profile reconnect attempts did not establish a proven browser socket",
+        )
+        .with_detail(json!({
+            "attempt_limit": super::grant::MAX_RECONNECT_ATTEMPTS,
+            "last_error": last_error.map(|_| "connection_failed"),
+            "retryable": false,
+        })))
+    }
+
+    async fn connection_for_record(
+        &self,
+        session: &str,
+        record: &TargetRecord,
+    ) -> Result<Arc<CdpConnection>, BrowserRefusal> {
+        if record.generation == 0 {
+            return self.connect(&record.ws_url).await;
+        }
+        let (conn, grant) = self
+            .connect_existing_profile(
+                session,
+                record.grant_transport_session.as_deref(),
+                record.pid,
+            )
+            .await?;
+        if grant.generation != record.generation {
+            return Err(refuse(
+                BrowserRefusalCode::BrowserBindingStale,
+                "the browser reconnected and invalidated this target; re-run get_browser_state",
+            ));
+        }
+        Ok(conn)
+    }
+
     /// Discover + ownership-check the endpoint for `pid`.
-    async fn owned_endpoint(&self, pid: i64) -> Result<OwnedEndpoint, BrowserRefusal> {
+    pub(crate) async fn owned_endpoint(&self, pid: i64) -> Result<OwnedEndpoint, BrowserRefusal> {
         let endpoint = self
             .platform
             .discover_owned_endpoint(pid)
@@ -260,6 +657,35 @@ impl BrowserEngine {
                      target is pid {pid}",
                     endpoint.ownership.owner_pid
                 ),
+            ));
+        }
+        Ok(endpoint)
+    }
+
+    /// Re-prove the endpoint exposed by an explicitly approved existing
+    /// profile. This route is intentionally separate from driver-managed
+    /// endpoint discovery: Chrome's per-instance remote-debugging toggle can
+    /// expose a PID-owned listener whose exact WebSocket path is available
+    /// only through the browser's default-profile DevToolsActivePort file.
+    async fn existing_profile_endpoint(
+        &self,
+        pid: i64,
+        expected_ws_url: &str,
+    ) -> Result<OwnedEndpoint, BrowserRefusal> {
+        let endpoint = self
+            .platform
+            .reprove_existing_profile_endpoint(pid, expected_ws_url)
+            .await?
+            .ok_or_else(|| {
+                refuse(
+                    BrowserRefusalCode::BrowserRequiresSetup,
+                    "the approved existing-profile DevTools endpoint is no longer available",
+                )
+            })?;
+        if endpoint.ownership.owner_pid != pid {
+            return Err(refuse(
+                BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                "the existing-profile endpoint is not owned by the approved browser process",
             ));
         }
         Ok(endpoint)
@@ -428,6 +854,7 @@ impl BrowserEngine {
     pub(crate) async fn bind_native(
         &self,
         session: &str,
+        transport_session: Option<&str>,
         pid: i64,
         window_id: u64,
     ) -> Result<(String, TargetRecord), BrowserRefusal> {
@@ -449,9 +876,36 @@ impl BrowserEngine {
         }
 
         let native = self.native_window_checked(pid, window_id).await?;
-        let endpoint = self.owned_endpoint(pid).await?;
         let fingerprint = self.platform.process_fingerprint(pid).await?;
-        let conn = self.connect(&endpoint.ws_url).await?;
+        let mut grant = self
+            .existing_profile_grant(session, transport_session, pid)
+            .await?;
+        let endpoint = if let Some(live_grant) = &grant {
+            self.existing_profile_endpoint(pid, &live_grant.endpoint_ws_url)
+                .await?
+        } else {
+            self.owned_endpoint(pid).await?
+        };
+        if let Some(grant) = &grant {
+            if !grant.fingerprint.matches(&fingerprint)
+                || grant.endpoint_ws_url != endpoint.ws_url
+                || grant.window_id != window_id
+            {
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserBindingStale,
+                    "the approved browser process, endpoint, or native window changed; approve the existing profile again",
+                ));
+            }
+        }
+        let conn = if grant.is_some() {
+            let (conn, live_grant) = self
+                .connect_existing_profile(session, transport_session, pid)
+                .await?;
+            grant = Some(live_grant);
+            conn
+        } else {
+            self.connect(&endpoint.ws_url).await?
+        };
         let candidates = self.window_candidates(&conn).await?;
 
         let correlation = correlate(&native, &candidates, BOUNDS_TOLERANCE_PX);
@@ -501,7 +955,11 @@ impl BrowserEngine {
             }
         };
 
-        // Tabs = page targets living in the bound CDP window.
+        // Tabs = page targets living in the bound CDP window. Selection is a
+        // separate proof from native-window correlation: a representative CDP
+        // target is only a window handle and must never be reported as active.
+        let selected_cdp_target_id =
+            selected_tab_target_id(&native.title, &candidates, candidate.cdp_window_id);
         let mut tabs = HashMap::new();
         for c in candidates.iter().filter(|c| match candidate.cdp_window_id {
             Some(window_id) => c.cdp_window_id == Some(window_id),
@@ -513,6 +971,10 @@ impl BrowserEngine {
                 TabRecord {
                     tab_id,
                     cdp_target_id: c.cdp_target_id.clone(),
+                    title: c.title.clone(),
+                    url: c.url.clone(),
+                    active: selected_cdp_target_id.map(|selected| selected == c.cdp_target_id),
+                    generation: grant.as_ref().map_or(0, |grant| grant.generation),
                     snapshots: HashMap::new(),
                 },
             );
@@ -524,6 +986,8 @@ impl BrowserEngine {
             window_id,
             ws_url: endpoint.ws_url.clone(),
             endpoint_owner_pid: endpoint.ownership.owner_pid,
+            generation: grant.as_ref().map_or(0, |grant| grant.generation),
+            grant_transport_session: grant.as_ref().map(|grant| grant.transport_session.clone()),
             fingerprint,
             native_title: native.title.clone(),
             native_bounds: native.bounds,
@@ -537,7 +1001,7 @@ impl BrowserEngine {
         Ok((target_id, record))
     }
 
-    async fn native_window_checked(
+    pub(crate) async fn native_window_checked(
         &self,
         pid: i64,
         window_id: u64,
@@ -590,6 +1054,34 @@ impl BrowserEngine {
             )
         })?;
 
+        if record.generation != tab.generation {
+            return Err(refuse(
+                BrowserRefusalCode::BrowserBindingStale,
+                "the tab capability belongs to an older browser connection generation",
+            ));
+        }
+        if record.generation > 0 {
+            let grant = self
+                .existing_profile_grant(
+                    session,
+                    record.grant_transport_session.as_deref(),
+                    record.pid,
+                )
+                .await?
+                .ok_or_else(|| {
+                    refuse(
+                        BrowserRefusalCode::BrowserConsentRequired,
+                        "the existing-profile grant ended; approve and bind the browser again",
+                    )
+                })?;
+            if grant.generation != record.generation {
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserBindingStale,
+                    "the browser connection generation changed; re-run get_browser_state",
+                ));
+            }
+        }
+
         // 1. Process fingerprint — pid reuse / restart detection.
         let fp_now = self.platform.process_fingerprint(record.pid).await?;
         if !record.fingerprint.matches(&fp_now) {
@@ -609,7 +1101,12 @@ impl BrowserEngine {
             .await?;
 
         // 3. Endpoint still owned and unchanged.
-        let endpoint = self.owned_endpoint(record.pid).await?;
+        let endpoint = if record.generation > 0 {
+            self.existing_profile_endpoint(record.pid, &record.ws_url)
+                .await?
+        } else {
+            self.owned_endpoint(record.pid).await?
+        };
         if endpoint.ws_url != record.ws_url {
             return Err(refuse(
                 BrowserRefusalCode::BrowserBindingStale,
@@ -620,7 +1117,7 @@ impl BrowserEngine {
 
         // 4. CDP target still a page in the bound CDP window, with either
         //    matching geometry or the same singleton cardinality proof.
-        let conn = self.connect(&record.ws_url).await?;
+        let conn = self.connection_for_record(session, &record).await?;
         let candidates = self.window_candidates(&conn).await?;
         let live = candidates
             .iter()
@@ -679,6 +1176,27 @@ impl BrowserEngine {
             tab,
             cdp_session,
         })
+    }
+
+    /// Serialize the full revalidate-dispatch-verify interval by the real CDP
+    /// target rather than by a caller-controlled session id.
+    pub(crate) async fn lock_mutation(
+        &self,
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, BrowserRefusal> {
+        let record = self.store.get_target(session, target_id)?;
+        let tab = record.tabs.get(tab_id).ok_or_else(|| {
+            refuse(
+                BrowserRefusalCode::BrowserTabNotFound,
+                format!("tab {tab_id} is not known for target {target_id}"),
+            )
+        })?;
+        Ok(self
+            .mutation_gates
+            .lock(MutationKey::new(&record.fingerprint, &tab.cdp_target_id))
+            .await)
     }
 
     // ── Frame identity / OOPIF plumbing ─────────────────────────────────
@@ -875,7 +1393,7 @@ impl BrowserEngine {
                 format!("tab {tab_id} is not known for target {target_id}"),
             )
         })?;
-        let conn = self.connect(&record.ws_url).await?;
+        let conn = self.connection_for_record(session, &record).await?;
         let cdp_session = self.attach(&conn, &tab.cdp_target_id).await?;
 
         let doc = conn
@@ -938,6 +1456,9 @@ impl BrowserEngine {
                 backend_node_id: c.backend_node_id,
                 node_name: c.node_name,
                 label: c.label,
+                actions: Vec::new(),
+                visibility: None,
+                semantic: false,
                 frame,
             });
         }
@@ -989,6 +1510,9 @@ impl BrowserEngine {
                                 backend_node_id: c.backend_node_id,
                                 node_name: c.node_name,
                                 label: c.label,
+                                actions: Vec::new(),
+                                visibility: None,
+                                semantic: false,
                                 frame: FrameRef {
                                     kind: FrameKind::Oopif,
                                     oopif_target_id: Some(child.target_id.clone()),
@@ -1057,8 +1581,12 @@ impl BrowserEngine {
                     snapshot_id,
                     SnapshotRecord {
                         id: snapshot_id,
+                        generation: record.generation,
                         url: url.clone(),
                         refs,
+                        semantic: None,
+                        semantic_root_identity: None,
+                        continuations: HashMap::new(),
                     },
                 );
             }
@@ -1070,6 +1598,529 @@ impl BrowserEngine {
             truncated,
             oopif,
         })
+    }
+
+    async fn collect_semantic_session(
+        &self,
+        conn: &Arc<CdpConnection>,
+        cdp_session: &str,
+        document: &Value,
+        tree: Option<&LocalFrameTree>,
+        oopif_target_id: Option<&str>,
+    ) -> Result<SemanticDocument, BrowserRefusal> {
+        let root = document.get("root").cloned().unwrap_or(Value::Null);
+        let styles = SEMANTIC_COMPUTED_STYLES
+            .iter()
+            .map(|value| Value::String((*value).to_owned()))
+            .collect::<Vec<_>>();
+        let (layout, metrics) = tokio::try_join!(
+            conn.call(
+                Some(cdp_session),
+                "DOMSnapshot.captureSnapshot",
+                json!({
+                    "computedStyles": styles,
+                    "includePaintOrder": true,
+                    "includeDOMRects": true
+                }),
+            ),
+            conn.call(Some(cdp_session), "Page.getLayoutMetrics", json!({})),
+        )
+        .map_err(|error| route_err("semantic layout collection failed", error))?;
+        let dom = build_dom_index(&root);
+        let layout = build_layout_index(&layout);
+        let viewport = parse_viewport(&metrics);
+
+        let identities = tree.map(LocalFrameTree::identities).unwrap_or_default();
+        let mut result = SemanticDocument::default();
+        if identities.is_empty() {
+            let ax = conn
+                .call(Some(cdp_session), "Accessibility.getFullAXTree", json!({}))
+                .await
+                .map_err(|error| route_err("Accessibility.getFullAXTree failed", error))?;
+            result = compose_accessibility_tree(
+                &ax,
+                &dom,
+                &layout,
+                &viewport,
+                FrameRef::main_unproven(),
+            );
+        } else {
+            for (index, identity) in identities.into_iter().enumerate() {
+                let ax = conn
+                    .call(
+                        Some(cdp_session),
+                        "Accessibility.getFullAXTree",
+                        json!({ "frameId": identity.frame_id }),
+                    )
+                    .await
+                    .map_err(|error| route_err("Accessibility.getFullAXTree failed", error))?;
+                let kind = if oopif_target_id.is_some() {
+                    FrameKind::Oopif
+                } else if index == 0 {
+                    FrameKind::Main
+                } else {
+                    FrameKind::Iframe
+                };
+                let mut frame_document = compose_accessibility_tree(
+                    &ax,
+                    &dom,
+                    &layout,
+                    &viewport,
+                    FrameRef {
+                        kind,
+                        oopif_target_id: oopif_target_id.map(str::to_owned),
+                        identity: Some(identity),
+                    },
+                );
+                if index > 0 {
+                    frame_document.css_hidden_dom_count = 0;
+                }
+                result.extend(frame_document);
+            }
+        }
+        Ok(result)
+    }
+
+    async fn semantic_document(
+        &self,
+        conn: &Arc<CdpConnection>,
+        cdp_session: &str,
+    ) -> Result<(Value, bool), BrowserRefusal> {
+        match conn
+            .call(
+                Some(cdp_session),
+                "DOM.getDocument",
+                json!({ "depth": -1, "pierce": true }),
+            )
+            .await
+        {
+            Ok(document) => Ok((document, true)),
+            Err(error) if is_semantic_document_fallback_error(&error) => {
+                let mut last_size_error = error.to_string();
+                let fallback_depths = if is_semantic_document_timeout_error(&error) {
+                    SEMANTIC_DOM_TIMEOUT_FALLBACK_DEPTHS
+                } else {
+                    SEMANTIC_DOM_FALLBACK_DEPTHS
+                };
+                for depth in fallback_depths {
+                    match conn
+                        .call(
+                            Some(cdp_session),
+                            "DOM.getDocument",
+                            json!({ "depth": depth, "pierce": true }),
+                        )
+                        .await
+                    {
+                        Ok(document) => {
+                            let document = self
+                                .hydrate_semantic_document(conn, cdp_session, document)
+                                .await?;
+                            return Ok((document, false));
+                        }
+                        Err(error) if is_semantic_document_fallback_error(&error) => {
+                            last_size_error = error.to_string();
+                        }
+                        Err(error) => {
+                            return Err(route_err("bounded DOM.getDocument fallback failed", error))
+                        }
+                    }
+                }
+                Err(route_err(
+                    "bounded DOM.getDocument fallback exhausted every accepted depth",
+                    last_size_error,
+                ))
+            }
+            Err(error) => Err(route_err("DOM.getDocument failed", error)),
+        }
+    }
+
+    async fn hydrate_semantic_document(
+        &self,
+        conn: &Arc<CdpConnection>,
+        cdp_session: &str,
+        mut document: Value,
+    ) -> Result<Value, BrowserRefusal> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut attempted = HashSet::new();
+        for _ in 0..MAX_SEMANTIC_DOM_HYDRATION_CALLS {
+            let mut scan = DomCoverageScan::default();
+            scan_dom_coverage(&document, &mut scan);
+            if scan.budget_exhausted {
+                break;
+            }
+            let Some(backend_node_id) = scan
+                .truncated
+                .into_iter()
+                .find(|backend_node_id| attempted.insert(*backend_node_id))
+            else {
+                break;
+            };
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let response = match tokio::time::timeout(
+                deadline - now,
+                conn.call(
+                    Some(cdp_session),
+                    "DOM.describeNode",
+                    json!({
+                        "backendNodeId": backend_node_id,
+                        "depth": SEMANTIC_DOM_HYDRATION_DEPTH,
+                        "pierce": true
+                    }),
+                ),
+            )
+            .await
+            {
+                Err(_) => break,
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) if is_semantic_document_size_error(&error) => continue,
+                Ok(Err(error)) => {
+                    return Err(route_err("DOM.describeNode hydration failed", error))
+                }
+            };
+            let Some(node) = response.get("node") else {
+                continue;
+            };
+            let _ = replace_dom_node(&mut document, backend_node_id, node);
+        }
+        Ok(document)
+    }
+
+    fn semantic_outcome(
+        &self,
+        snapshot_id: u64,
+        url: String,
+        title: String,
+        page: super::semantic::SemanticPage,
+        document_complete: bool,
+        scope: &'static str,
+        oopif: OopifStatus,
+        start_index: u32,
+    ) -> (SemanticSnapshotOutcome, HashMap<u32, RefEntry>) {
+        let mut stored_refs = HashMap::new();
+        let mut refs = Vec::new();
+        let mut content_refs = Vec::new();
+        for (position, node) in page.selected.iter().enumerate() {
+            let Some(entry) = node.to_ref_entry() else {
+                continue;
+            };
+            let index = start_index.saturating_add(position as u32);
+            let external = format_ref(snapshot_id, index);
+            stored_refs.insert(index, entry);
+            let listed = SemanticListedRef {
+                external,
+                node: node.clone(),
+            };
+            if node.actions.is_empty() {
+                content_refs.push(listed);
+            } else {
+                refs.push(listed);
+            }
+        }
+        let complete = document_complete && page.next_offset.is_none();
+        (
+            SemanticSnapshotOutcome {
+                snapshot_id,
+                url,
+                title,
+                outline: page.outline,
+                refs,
+                content_refs,
+                complete,
+                scope,
+                selected_nodes: page.selected_nodes,
+                total_nodes: page.total_nodes,
+                omissions: page.omissions,
+                continuation: page.next_offset.map(|_| format!("bc-{}", Uuid::new_v4())),
+                oopif,
+            },
+            stored_refs,
+        )
+    }
+
+    pub(crate) async fn snapshot_tab_semantic(
+        &self,
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+        scope_ref: Option<&str>,
+        query: Option<&str>,
+        continuation: Option<&str>,
+    ) -> Result<SemanticSnapshotOutcome, BrowserRefusal> {
+        if let Some(token) = continuation {
+            if scope_ref.is_some() || query.is_some() {
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserRefStale,
+                    "continuation cannot be combined with a new scope_ref or query",
+                ));
+            }
+            let (snapshot, continuation) = self
+                .store
+                .resolve_semantic_continuation(session, target_id, tab_id, token)?;
+            let record = self.store.get_target(session, target_id)?;
+            let tab = record.tabs.get(tab_id).cloned().ok_or_else(|| {
+                refuse(
+                    BrowserRefusalCode::BrowserTabNotFound,
+                    format!("tab {tab_id} is not known for target {target_id}"),
+                )
+            })?;
+            if let Some(identity) = &snapshot.semantic_root_identity {
+                let conn = self.connection_for_record(session, &record).await?;
+                let cdp_session = self.attach(&conn, &tab.cdp_target_id).await?;
+                let tree = self.local_frame_tree(&conn, &cdp_session).await.map_err(|error| {
+                    match error {
+                        FrameTreeError::Unsupported => refuse(
+                            BrowserRefusalCode::BrowserRouteUnavailable,
+                            "the browser no longer reports its frame tree, so the semantic \n+                             continuation's document identity cannot be re-proven",
+                        ),
+                        FrameTreeError::Failed(error) => route_err(
+                            "Page.getFrameTree failed during semantic continuation revalidation",
+                            error,
+                        ),
+                    }
+                })?;
+                if !tree.proves(identity) {
+                    self.store
+                        .invalidate_tab_snapshots(session, target_id, tab_id);
+                    return Err(refuse(
+                        BrowserRefusalCode::BrowserRefStale,
+                        "the page navigated since this semantic continuation was minted; \n+                         re-run get_browser_state to start a fresh snapshot",
+                    ));
+                }
+            }
+            let document = snapshot.semantic.clone().ok_or_else(|| {
+                refuse(
+                    BrowserRefusalCode::BrowserRefStale,
+                    "the continuation no longer has semantic snapshot state",
+                )
+            })?;
+            let page = document.page(
+                continuation.offset,
+                DEFAULT_SEMANTIC_NODE_BUDGET,
+                continuation.query.as_deref(),
+                continuation.scope_backend_node_id,
+            );
+            let start_index = snapshot
+                .refs
+                .keys()
+                .max()
+                .copied()
+                .map_or(0, |value| value.saturating_add(1));
+            let oopif = if continuation.oopif_supported {
+                OopifStatus::Attached(continuation.oopif_frames)
+            } else {
+                OopifStatus::Unsupported
+            };
+            let next_offset = page.next_offset;
+            let (outcome, new_refs) = self.semantic_outcome(
+                snapshot.id,
+                snapshot.url.clone(),
+                tab.title,
+                page,
+                document.complete,
+                "continuation",
+                oopif,
+                start_index,
+            );
+            let next_token = outcome.continuation.clone();
+            self.store.update_target(session, target_id, |record| {
+                if let Some(stored) = record
+                    .tabs
+                    .get_mut(tab_id)
+                    .and_then(|tab| tab.snapshots.get_mut(&snapshot.id))
+                {
+                    stored.continuations.remove(token);
+                    stored.refs.extend(new_refs);
+                    if let (Some(token), Some(offset)) = (next_token, next_offset) {
+                        stored.continuations.insert(
+                            token,
+                            SemanticContinuation {
+                                offset,
+                                query: continuation.query.clone(),
+                                scope_backend_node_id: continuation.scope_backend_node_id,
+                                oopif_supported: continuation.oopif_supported,
+                                oopif_frames: continuation.oopif_frames,
+                            },
+                        );
+                    }
+                }
+            });
+            return Ok(outcome);
+        }
+
+        let scope_backend_node_id = match scope_ref {
+            Some(external) => Some(
+                self.store
+                    .resolve_ref(session, target_id, tab_id, external)?
+                    .backend_node_id,
+            ),
+            None => None,
+        };
+        let record = self.store.get_target(session, target_id)?;
+        let tab = record.tabs.get(tab_id).cloned().ok_or_else(|| {
+            refuse(
+                BrowserRefusalCode::BrowserTabNotFound,
+                format!("tab {tab_id} is not known for target {target_id}"),
+            )
+        })?;
+        let conn = self.connection_for_record(session, &record).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id).await?;
+        let (document, document_complete) = self.semantic_document(&conn, &cdp_session).await?;
+        let root = document.get("root").cloned().unwrap_or(Value::Null);
+        let url = root
+            .get("documentURL")
+            .and_then(Value::as_str)
+            .unwrap_or(&tab.url)
+            .to_owned();
+        let local_tree = match self.local_frame_tree(&conn, &cdp_session).await {
+            Ok(tree) => Some(tree),
+            Err(FrameTreeError::Unsupported) => None,
+            Err(FrameTreeError::Failed(error)) => {
+                return Err(route_err("Page.getFrameTree failed", error))
+            }
+        };
+        let semantic_root_identity = local_tree.as_ref().map(LocalFrameTree::main_identity);
+        let mut semantic = self
+            .collect_semantic_session(&conn, &cdp_session, &document, local_tree.as_ref(), None)
+            .await?;
+        semantic.complete &= document_complete;
+
+        let oopif = if local_tree.is_some() {
+            match self.attached_iframe_children(&conn, &cdp_session).await {
+                Ok(children) => {
+                    let mut attached = 0;
+                    for child in &children {
+                        let child_tree = match self.local_frame_tree(&conn, &child.session_id).await
+                        {
+                            Ok(tree) => tree,
+                            Err(_) => {
+                                semantic.unprovable_frame_count += 1;
+                                semantic.complete = false;
+                                continue;
+                            }
+                        };
+                        let (child_document, child_complete) =
+                            match self.semantic_document(&conn, &child.session_id).await {
+                                Ok(document) => document,
+                                Err(_) => {
+                                    semantic.unprovable_frame_count += 1;
+                                    semantic.complete = false;
+                                    continue;
+                                }
+                            };
+                        match self
+                            .collect_semantic_session(
+                                &conn,
+                                &child.session_id,
+                                &child_document,
+                                Some(&child_tree),
+                                Some(&child.target_id),
+                            )
+                            .await
+                        {
+                            Ok(document) => {
+                                let mut document = document;
+                                document.complete &= child_complete;
+                                semantic.extend(document);
+                                attached += 1;
+                            }
+                            Err(_) => {
+                                semantic.unprovable_frame_count += 1;
+                                semantic.complete = false;
+                            }
+                        }
+                    }
+                    let _ = conn
+                        .call(
+                            Some(&cdp_session),
+                            "Target.setAutoAttach",
+                            json!({
+                                "autoAttach": false,
+                                "waitForDebuggerOnStart": false,
+                                "flatten": true
+                            }),
+                        )
+                        .await;
+                    for child in &children {
+                        let _ = conn
+                            .call(
+                                Some(&cdp_session),
+                                "Target.detachFromTarget",
+                                json!({ "sessionId": child.session_id }),
+                            )
+                            .await;
+                    }
+                    OopifStatus::Attached(attached)
+                }
+                Err(AttachError::Unsupported) => OopifStatus::Unsupported,
+                Err(AttachError::Failed(error)) => {
+                    return Err(route_err("Target.setAutoAttach failed", error))
+                }
+            }
+        } else {
+            OopifStatus::Unsupported
+        };
+
+        let page = semantic.page(
+            0,
+            DEFAULT_SEMANTIC_NODE_BUDGET,
+            query,
+            scope_backend_node_id,
+        );
+        let next_offset = page.next_offset;
+        let snapshot_id = self.store.mint_snapshot_id();
+        let scope = if scope_ref.is_some() {
+            "subtree"
+        } else if query.is_some() {
+            "query"
+        } else {
+            "viewport"
+        };
+        let (outcome, refs) = self.semantic_outcome(
+            snapshot_id,
+            url.clone(),
+            tab.title.clone(),
+            page,
+            semantic.complete,
+            scope,
+            oopif,
+            0,
+        );
+        let continuation_token = outcome.continuation.clone();
+        self.store
+            .update_target(session, target_id, |stored_target| {
+                if let Some(stored_tab) = stored_target.tabs.get_mut(tab_id) {
+                    let mut continuations = HashMap::new();
+                    if let (Some(token), Some(offset)) = (continuation_token, next_offset) {
+                        continuations.insert(
+                            token,
+                            SemanticContinuation {
+                                offset,
+                                query: query.map(str::to_owned),
+                                scope_backend_node_id,
+                                oopif_supported: matches!(oopif, OopifStatus::Attached(_)),
+                                oopif_frames: oopif.frames(),
+                            },
+                        );
+                    }
+                    stored_tab.snapshots.clear();
+                    stored_tab.snapshots.insert(
+                        snapshot_id,
+                        SnapshotRecord {
+                            id: snapshot_id,
+                            generation: record.generation,
+                            url,
+                            refs,
+                            semantic: Some(semantic),
+                            semantic_root_identity,
+                            continuations,
+                        },
+                    );
+                }
+            });
+        Ok(outcome)
     }
 }
 

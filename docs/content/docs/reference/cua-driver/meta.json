@@ -7,6 +7,8 @@
     "embedding",
     "mcp-tools",
     "mcp-tool-notes",
+    "browser-profile-attachment",
+    "browser-semantic-snapshots",
     "action-selection-policy",
     "permission-policies",
     "contracts",

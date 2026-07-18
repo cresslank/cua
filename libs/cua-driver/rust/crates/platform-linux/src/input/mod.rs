@@ -930,7 +930,19 @@ pub fn x11_activate_window_persistent(xid: u64) -> Result<Option<u64>> {
         prior.unwrap_or(0) as x11::xlib::Window,
     );
     unsafe {
+        // Some WMs honor `_NET_ACTIVE_WINDOW` as raise-only. Persistent
+        // activation must establish input focus too, just like the bounded
+        // foreground rung above, or `bring_to_front` can report success while
+        // keyboard focus remains on the previous window.
+        let previous_handler = x11::xlib::XSetErrorHandler(Some(ignore_x_error));
+        x11::xlib::XSetInputFocus(
+            display,
+            xid as x11::xlib::Window,
+            x11::xlib::RevertToParent,
+            x11::xlib::CurrentTime,
+        );
         x11::xlib::XSync(display, 0);
+        x11::xlib::XSetErrorHandler(previous_handler);
         x11::xlib::XCloseDisplay(display);
     }
     Ok(prior)
@@ -2036,6 +2048,40 @@ pub fn send_click_xtest_desktop(x: i32, y: i32, button: u8, count: usize) -> Res
     // short-lived connection drops. Pointer events happened to survive the close
     // under Xtigervnc where keyboard events did not (see send_key_xtest), but make
     // it explicit so the desktop click is reliable across X servers too.
+    let _ = conn.get_input_focus()?.reply();
+    Ok(())
+}
+
+/// Move the real X11 pointer to a screen-absolute desktop coordinate.
+pub fn send_move_xtest_desktop(x: i32, y: i32) -> Result<()> {
+    use x11rb::protocol::xtest::ConnectionExt as _;
+    let (conn, screen_num) = connect_x11_for_input()?;
+    let root = conn.setup().roots[screen_num].root;
+    conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, x as i16, y as i16, 0)?;
+    conn.flush()?;
+    let _ = conn.get_input_focus()?.reply();
+    Ok(())
+}
+
+/// Scroll the window under a screen-absolute point via real XTest wheel-button
+/// events. X11 buttons 4/5 are vertical up/down and 6/7 horizontal left/right.
+pub fn send_scroll_xtest_desktop(x: i32, y: i32, direction: &str, amount: usize) -> Result<()> {
+    use x11rb::protocol::xtest::ConnectionExt as _;
+    let button = match direction {
+        "up" => 4,
+        "down" => 5,
+        "left" => 6,
+        "right" => 7,
+        other => anyhow::bail!("unknown desktop scroll direction: {other}"),
+    };
+    let (conn, screen_num) = connect_x11_for_input()?;
+    let root = conn.setup().roots[screen_num].root;
+    conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, x as i16, y as i16, 0)?;
+    for _ in 0..amount.max(1) {
+        conn.xtest_fake_input(BUTTON_PRESS_EVENT, button, 0, root, x as i16, y as i16, 0)?;
+        conn.xtest_fake_input(BUTTON_RELEASE_EVENT, button, 0, root, x as i16, y as i16, 0)?;
+    }
+    conn.flush()?;
     let _ = conn.get_input_focus()?.reply();
     Ok(())
 }

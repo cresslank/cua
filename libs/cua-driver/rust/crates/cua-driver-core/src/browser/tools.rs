@@ -1,5 +1,4 @@
-//! The five browser tools: get_browser_state, browser_prepare,
-//! browser_navigate, browser_click, browser_type.
+//! Browser state, preparation, navigation, input, and page-owned dialog tools.
 //!
 //! Schemas, annotations, and exact-or-refused semantics live here; OS
 //! identity comes from the [`BrowserPlatform`] adapter; CDP mechanics
@@ -16,12 +15,15 @@ use crate::tool::{Tool, ToolDef, ToolRegistry};
 use crate::tool_args::ArgsExt;
 
 use super::approval::MCP_HOST_APPROVAL_ARG;
+use super::download::BrowserDownloadTool;
 use super::engine::BrowserEngine;
-use super::platform::{PrepareAuthorization, PrepareProfile, PrepareRequest};
+use super::platform::{PrepareAuthorization, PrepareProfile, PrepareRequest, PrepareStrategy};
+use super::pointer::BrowserPointerTool;
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
+use super::store::BrowserActionKind;
 use super::types::BindingQuality;
 
-/// Register all five browser tools against one shared engine. Platform
+/// Register the complete browser surface against one shared engine. Platform
 /// crates call this from their `register_all` after constructing the
 /// engine with their adapter.
 pub fn register_browser_tools(engine: &Arc<BrowserEngine>, registry: &mut ToolRegistry) {
@@ -30,6 +32,10 @@ pub fn register_browser_tools(engine: &Arc<BrowserEngine>, registry: &mut ToolRe
     registry.register(Box::new(BrowserNavigateTool::new(engine.clone())));
     registry.register(Box::new(BrowserClickTool::new(engine.clone())));
     registry.register(Box::new(BrowserTypeTool::new(engine.clone())));
+    registry.register(Box::new(BrowserDialogTool::new(engine.clone())));
+    registry.register(Box::new(BrowserSetInputFilesTool::new(engine.clone())));
+    registry.register(Box::new(BrowserDownloadTool::new(engine.clone())));
+    registry.register(Box::new(BrowserPointerTool::new(engine.clone())));
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -85,6 +91,19 @@ fn schema_session() -> Value {
     })
 }
 
+fn semantic_ref_value(listed: &super::engine::SemanticListedRef) -> Value {
+    json!({
+        "ref": listed.external,
+        "role": listed.node.role,
+        "name": listed.node.name,
+        "value": listed.node.value,
+        "states": listed.node.states,
+        "actions": listed.node.actions.iter().map(|action| action.as_str()).collect::<Vec<_>>(),
+        "frame": listed.node.frame.kind.as_str(),
+        "visibility": listed.node.visibility.as_str(),
+    })
+}
+
 // ── get_browser_state ────────────────────────────────────────────────────────
 
 pub struct GetBrowserStateTool {
@@ -99,11 +118,12 @@ impl GetBrowserStateTool {
             description: "Read-only browser inspection. Mode 1 (bind): pass pid + \
                 window_id of a native browser window to classify it, correlate it to \
                 a CDP target (exact-or-refuse), and mint a session-scoped target id \
-                plus tab ids. Mode 2 (snapshot): pass target_id + tab_id to snapshot \
-                the tab's composed DOM (main frame, shadow DOM, same-process iframes, \
-                and capability-tested out-of-process iframes) and mint \
-                p<snapshot>:<index> element refs for browser_click / browser_type; \
-                each ref reports its frame kind. Never performs setup — a missing \
+                plus tab ids. Mode 2 (snapshot): pass target_id + tab_id. The \
+                dom_refs_v1 compatibility format returns composed DOM refs. \
+                semantic_v2 joins accessibility, DOM, layout, and viewport state; \
+                ranks visible content before retained/offscreen state; and returns a \
+                semantic outline, typed action refs, content refs, scoped reads, and \
+                opaque continuation. Never performs setup — a missing \
                 endpoint is a structured browser_requires_setup refusal pointing at \
                 browser_prepare."
                 .into(),
@@ -115,6 +135,23 @@ impl GetBrowserStateTool {
                     "target_id": schema_target_id(),
                     "tab_id": schema_tab_id(),
                     "session": schema_session(),
+                    "snapshot_format": {
+                        "type": "string",
+                        "enum": ["dom_refs_v1", "semantic_v2"],
+                        "description": "Versioned snapshot contract. dom_refs_v1 remains the compatibility default."
+                    },
+                    "scope_ref": {
+                        "type": "string",
+                        "description": "Current semantic/content ref whose subtree should be observed."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Read-only semantic match over role, accessible name, and visible text."
+                    },
+                    "continuation": {
+                        "type": "string",
+                        "description": "Opaque continuation minted by an earlier semantic_v2 response."
+                    },
                 },
                 "additionalProperties": true
             }),
@@ -150,6 +187,94 @@ impl Tool for GetBrowserStateTool {
                     .to_tool_result()
                 }
             };
+            let snapshot_format = args
+                .opt_str("snapshot_format")
+                .unwrap_or_else(|| "dom_refs_v1".into());
+            if snapshot_format != "dom_refs_v1" && snapshot_format != "semantic_v2" {
+                return ToolResult::error(format!(
+                    "snapshot_format must be \"dom_refs_v1\" or \"semantic_v2\", got {snapshot_format:?}"
+                ));
+            }
+            if snapshot_format == "dom_refs_v1"
+                && (args.opt_str("scope_ref").is_some()
+                    || args.opt_str("query").is_some()
+                    || args.opt_str("continuation").is_some())
+            {
+                return ToolResult::error(
+                    "scope_ref, query, and continuation require snapshot_format=\"semantic_v2\"",
+                );
+            }
+            if snapshot_format == "semantic_v2" {
+                return match self
+                    .engine
+                    .snapshot_tab_semantic(
+                        &session,
+                        &target_id,
+                        &tab_id,
+                        args.opt_str("scope_ref").as_deref(),
+                        args.opt_str("query").as_deref(),
+                        args.opt_str("continuation").as_deref(),
+                    )
+                    .await
+                {
+                    Ok(outcome) => {
+                        let refs = outcome
+                            .refs
+                            .iter()
+                            .map(semantic_ref_value)
+                            .collect::<Vec<_>>();
+                        let content_refs = outcome
+                            .content_refs
+                            .iter()
+                            .map(semantic_ref_value)
+                            .collect::<Vec<_>>();
+                        ToolResult::text(format!(
+                            "semantic snapshot p{} of {}: {} action ref(s), {} content ref(s)",
+                            outcome.snapshot_id,
+                            outcome.url,
+                            refs.len(),
+                            content_refs.len()
+                        ))
+                        .with_structured(json!({
+                            "status": "ok",
+                            "mode": "snapshot",
+                            "target_id": target_id,
+                            "tab_id": tab_id,
+                            "snapshot": {
+                                "id": format!("p{}", outcome.snapshot_id),
+                                "format": "semantic_v2",
+                                "complete": outcome.complete,
+                                "scope": outcome.scope,
+                                "selected_nodes": outcome.selected_nodes,
+                                "total_nodes": outcome.total_nodes,
+                                "node_budget": super::semantic::DEFAULT_SEMANTIC_NODE_BUDGET,
+                                "omitted": {
+                                    "css_hidden": outcome.omissions.css_hidden,
+                                    "offscreen": outcome.omissions.offscreen,
+                                    "page_occluded": outcome.omissions.page_occluded,
+                                    "no_layout": outcome.omissions.no_layout,
+                                    "unknown": outcome.omissions.unknown,
+                                    "budget": outcome.omissions.budget,
+                                    "unprovable_frame": outcome.omissions.unprovable_frame,
+                                },
+                                "continuation": outcome.continuation,
+                            },
+                            "page": {
+                                "url": outcome.url,
+                                "title": outcome.title,
+                            },
+                            "outline": outcome.outline,
+                            "refs": refs,
+                            "content_refs": content_refs,
+                            "oopif": {
+                                "status": outcome.oopif.as_str(),
+                                "frames": outcome.oopif.frames(),
+                            },
+                        }))
+                    }
+                    Err(refusal) => refusal.to_tool_result(),
+                };
+            }
             return match self
                 .engine
                 .snapshot_tab(&session, &target_id, &tab_id)
@@ -207,7 +332,12 @@ impl Tool for GetBrowserStateTool {
             Err(e) => return e,
         };
 
-        match self.engine.bind_native(&session, pid, window_id).await {
+        let transport_session = args.opt_str("_transport_session_id");
+        match self
+            .engine
+            .bind_native(&session, transport_session.as_deref(), pid, window_id)
+            .await
+        {
             Ok((target_id, record)) => {
                 let tabs: Vec<Value> = record
                     .tabs
@@ -215,7 +345,9 @@ impl Tool for GetBrowserStateTool {
                     .map(|t| {
                         json!({
                             "tab_id": t.tab_id,
-                            "active": t.cdp_target_id == record.cdp_target_id,
+                            "title": t.title,
+                            "url": t.url,
+                            "active": t.active,
                         })
                     })
                     .collect();
@@ -264,12 +396,20 @@ impl BrowserPrepareTool {
                 requires MCP-host approval or a short-lived token from the interactive \
                 browser-approve command, allow_launch=true, and a driver-owned isolated \
                 profile. It launches a separate browser and never copies, modifies, or \
-                terminates the requested user profile."
+                terminates the requested user profile. Existing-profile attachment is \
+                explicit, requires an exact interactive approval artifact, and never \
+                treats ordinary MCP transport approval as profile consent. On proven \
+                platforms, that approval also permits one bounded exact-window setup: \
+                open the recognized browser product's fixed remote-debugging page, toggle \
+                its uniquely matched per-instance checkbox, prove the PID-owned loopback \
+                endpoint, and close the temporary tab. Every visible effect is reported; \
+                ambiguity is refused."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "pid": { "type": "integer", "description": "Browser process id to prepare." },
+                    "window_id": { "type": "integer", "description": "Exact native window approval anchor; required for strategy.kind=existing_profile." },
                     "approval_token": {
                         "type": "string",
                         "description": "Single-use token minted by `cua-driver browser-approve` for direct CLI/raw use. Omit for an MCP-host-approved call."
@@ -285,6 +425,14 @@ impl BrowserPrepareTool {
                             "name": { "type": "string", "description": "Required only for isolated_named; 1-64 path-safe ASCII characters." }
                         },
                         "required": ["mode"],
+                        "additionalProperties": false
+                    },
+                    "strategy": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "type": "string", "enum": ["existing_profile"] }
+                        },
+                        "required": ["kind"],
                         "additionalProperties": false
                     },
                     "session": schema_session(),
@@ -325,21 +473,36 @@ impl Tool for BrowserPrepareTool {
                 }
             },
         };
-        let authorization = if args
+        let strategy = match args.get("strategy") {
+            None | Some(Value::Null) => None,
+            Some(value) => match serde_json::from_value::<PrepareStrategy>(value.clone()) {
+                Ok(strategy) => Some(strategy),
+                Err(error) => {
+                    return ToolResult::error(format!(
+                        "invalid browser preparation strategy: {error}"
+                    ))
+                }
+            },
+        };
+        let approval_token = args.opt_str("approval_token");
+        let authorization = if strategy == Some(PrepareStrategy::ExistingProfile) {
+            approval_token.map(PrepareAuthorization::ApprovalArtifact)
+        } else if args
             .get(MCP_HOST_APPROVAL_ARG)
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
             Some(PrepareAuthorization::McpHost)
         } else {
-            args.opt_str("approval_token")
-                .map(PrepareAuthorization::ApprovalArtifact)
+            approval_token.map(PrepareAuthorization::ApprovalArtifact)
         };
         let request = PrepareRequest {
             pid,
+            window_id: args.opt_u64("window_id"),
             session,
             transport_session: args.opt_str("_transport_session_id"),
             authorization,
+            strategy,
             profile,
             allow_launch: args.opt_bool("allow_launch").unwrap_or(false),
         };
@@ -364,6 +527,7 @@ impl Tool for BrowserPrepareTool {
                     "endpoint_ownership": outcome.endpoint.map(|e| e.ownership),
                     "prepared_pid": outcome.prepared_pid,
                     "side_effects": outcome.side_effects,
+                    "attachment": outcome.attachment,
                 }))
             }
             Err(refusal) => refusal.to_tool_result(),
@@ -435,6 +599,14 @@ impl Tool for BrowserNavigateTool {
             ));
         }
 
+        let _mutation = match self
+            .engine
+            .lock_mutation(&session, &target_id, &tab_id)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(refusal) => return refusal.to_tool_result(),
+        };
         let validated = match self
             .engine
             .revalidate_for_mutation(&session, &target_id, Some(&tab_id))
@@ -562,6 +734,14 @@ impl Tool for BrowserClickTool {
 
         // Resolve the ref BEFORE revalidation? No — revalidate first so a
         // stale binding refuses before we touch the page at all.
+        let _mutation = match self
+            .engine
+            .lock_mutation(&session, &target_id, &tab_id)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(refusal) => return refusal.to_tool_result(),
+        };
         let validated = match self
             .engine
             .revalidate_for_mutation(&session, &target_id, Some(&tab_id))
@@ -598,6 +778,13 @@ impl Tool for BrowserClickTool {
                     Ok(entry) => entry,
                     Err(refusal) => return refusal.to_tool_result(),
                 };
+                if entry.semantic && !entry.actions.contains(&BrowserActionKind::Click) {
+                    return BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserActionUnavailable,
+                        format!("semantic ref {r} does not declare the click action"),
+                    )
+                    .to_tool_result();
+                }
                 let frame_session = match self
                     .engine
                     .frame_session_for_mutation(
@@ -728,8 +915,27 @@ impl Tool for BrowserClickTool {
             (None, None) => unreachable!("validated above"),
         };
 
+        if let Err(error) = conn
+            .call(
+                Some(cdp),
+                "Emulation.setFocusEmulationEnabled",
+                json!({ "enabled": true }),
+            )
+            .await
+        {
+            return BrowserRefusal::new(
+                BrowserRefusalCode::BrowserInputTrustUnavailable,
+                format!(
+                    "the target tab could not enter CDP focus emulation for trusted input: {error}"
+                ),
+            )
+            .to_tool_result();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+        let mut delivery_error = None;
         for (event_type, click_count) in [("mousePressed", 1), ("mouseReleased", 1)] {
-            if let Err(e) = conn
+            if let Err(error) = conn
                 .call(
                     Some(cdp),
                     "Input.dispatchMouseEvent",
@@ -743,17 +949,39 @@ impl Tool for BrowserClickTool {
                 )
                 .await
             {
-                // Trusted input is the contract; we never silently fall
-                // back to synthetic events.
-                return BrowserRefusal::new(
-                    BrowserRefusalCode::BrowserInputTrustUnavailable,
-                    format!(
-                        "trusted Input route failed ({e}) — re-run with \
-                         input_route=\"dom_event\" to explicitly request a synthetic click"
-                    ),
-                )
-                .to_tool_result();
+                delivery_error = Some(error);
+                break;
             }
+        }
+        let cleanup_error = conn
+            .call(
+                Some(cdp),
+                "Emulation.setFocusEmulationEnabled",
+                json!({ "enabled": false }),
+            )
+            .await
+            .err();
+        if let Some(error) = delivery_error {
+            // Trusted input is the contract; we never silently fall back to
+            // synthetic events. Focus emulation has already been unwound.
+            return BrowserRefusal::new(
+                BrowserRefusalCode::BrowserInputTrustUnavailable,
+                format!(
+                    "trusted Input route failed ({error}) — re-run with \
+                     input_route=\"dom_event\" to explicitly request a synthetic click"
+                ),
+            )
+            .to_tool_result();
+        }
+        if let Some(error) = cleanup_error {
+            return BrowserRefusal::new(
+                BrowserRefusalCode::BrowserInputTrustUnavailable,
+                format!(
+                    "trusted click was acknowledged but CDP focus emulation could not be restored ({error}); delivery is unknown and must not be retried automatically"
+                ),
+            )
+            .with_detail(json!({ "delivery": "unknown", "retryable": false }))
+            .to_tool_result();
         }
         ToolResult::text(format!("clicked ({x:.0}, {y:.0}) in {tab_id}")).with_structured(json!({
             "status": "ok",
@@ -799,6 +1027,12 @@ const EDITABLE_AND_FOCUSED_CHECK: &str = "function() { \
     return !this.disabled && !this.readOnly && \
         !['button','checkbox','color','file','hidden','image','radio','range','reset','submit']\
         .includes((this.type || 'text').toLowerCase()); \
+}";
+
+const FOCUS_EMULATION_READY_CHECK: &str = "function() { \
+    const root = this.getRootNode(); \
+    const active = ('activeElement' in root) ? root.activeElement : null; \
+    return document.hasFocus() && active === this; \
 }";
 
 pub struct BrowserTypeTool {
@@ -869,6 +1103,14 @@ impl Tool for BrowserTypeTool {
             ));
         }
 
+        let _mutation = match self
+            .engine
+            .lock_mutation(&session, &target_id, &tab_id)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(refusal) => return refusal.to_tool_result(),
+        };
         let validated = match self
             .engine
             .revalidate_for_mutation(&session, &target_id, Some(&tab_id))
@@ -890,6 +1132,13 @@ impl Tool for BrowserTypeTool {
             Ok(e) => e,
             Err(refusal) => return refusal.to_tool_result(),
         };
+        if entry.semantic && !entry.actions.contains(&BrowserActionKind::Type) {
+            return BrowserRefusal::new(
+                BrowserRefusalCode::BrowserActionUnavailable,
+                format!("semantic ref {ext_ref} does not declare the type action"),
+            )
+            .to_tool_result();
+        }
         // Re-prove the ref's frame identity; typing routes to the frame's
         // own session (tab, or the contained OOPIF child session).
         let cdp_session = match self
@@ -967,12 +1216,113 @@ impl Tool for BrowserTypeTool {
             .to_tool_result();
         }
 
-        let typed = if mode == "insert_text" {
-            conn.call(Some(cdp), "Input.insertText", json!({ "text": text }))
+        let requested_chars = text.chars().count();
+        let (typed, delivered_chars) = if mode == "insert_text" {
+            match conn
+                .call(Some(cdp), "Input.insertText", json!({ "text": text }))
                 .await
-                .map(|_| ())
+            {
+                Ok(_) => (Ok(()), requested_chars),
+                Err(error) => (Err(error), 0),
+            }
         } else {
+            if let Err(error) = conn
+                .call(
+                    Some(cdp),
+                    "Emulation.setFocusEmulationEnabled",
+                    json!({ "enabled": true }),
+                )
+                .await
+            {
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserInputTrustUnavailable,
+                    format!(
+                        "the inactive tab could not enter CDP focus emulation for trusted keystrokes: {error}"
+                    ),
+                )
+                .to_tool_result();
+            }
+            let mut focus_ready = false;
+            let mut focus_error = None;
+            for _ in 0..20 {
+                if let Err(error) = conn
+                    .call(
+                        Some(cdp),
+                        "DOM.focus",
+                        json!({ "backendNodeId": entry.backend_node_id }),
+                    )
+                    .await
+                {
+                    focus_error = Some(error);
+                    break;
+                }
+                let ready = conn
+                    .call(
+                        Some(cdp),
+                        "Runtime.callFunctionOn",
+                        json!({
+                            "objectId": object_id,
+                            "functionDeclaration": FOCUS_EMULATION_READY_CHECK,
+                            "returnByValue": true,
+                        }),
+                    )
+                    .await;
+                if matches!(
+                    ready,
+                    Ok(ref value) if value["result"]["value"].as_bool() == Some(true)
+                ) {
+                    focus_ready = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            if !focus_ready {
+                let _ = conn
+                    .call(
+                        Some(cdp),
+                        "Emulation.setFocusEmulationEnabled",
+                        json!({ "enabled": false }),
+                    )
+                    .await;
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserInputTrustUnavailable,
+                    format!(
+                        "the exact editable ref did not become focus-ready under CDP emulation{}",
+                        focus_error
+                            .as_ref()
+                            .map(|error| format!(": {error}"))
+                            .unwrap_or_default()
+                    ),
+                )
+                .to_tool_result();
+            }
+            // Chromium acknowledges focus emulation before every renderer's
+            // trusted-input path is ready. Edge on Linux can otherwise drop
+            // the first one or two characters while still returning success.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Err(error) = conn
+                .call(
+                    Some(cdp),
+                    "DOM.focus",
+                    json!({ "backendNodeId": entry.backend_node_id }),
+                )
+                .await
+            {
+                let _ = conn
+                    .call(
+                        Some(cdp),
+                        "Emulation.setFocusEmulationEnabled",
+                        json!({ "enabled": false }),
+                    )
+                    .await;
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserRefStale,
+                    format!("the exact editable ref became stale before trusted typing: {error}"),
+                )
+                .to_tool_result();
+            }
             let mut result = Ok(());
+            let mut delivered = 0;
             for ch in text.chars() {
                 let (key, key_text) = if ch == '\n' {
                     ("Enter".to_string(), "\r".to_string())
@@ -983,9 +1333,24 @@ impl Tool for BrowserTypeTool {
                     .call(
                         Some(cdp),
                         "Input.dispatchKeyEvent",
-                        json!({ "type": "keyDown", "key": key, "text": key_text }),
+                        json!({ "type": "keyDown", "key": key }),
                     )
                     .await;
+                let character = if down.is_ok() {
+                    conn.call(
+                        Some(cdp),
+                        "Input.dispatchKeyEvent",
+                        json!({
+                            "type": "char",
+                            "key": key,
+                            "text": key_text,
+                            "unmodifiedText": key_text,
+                        }),
+                    )
+                    .await
+                } else {
+                    Ok(json!({}))
+                };
                 let up = conn
                     .call(
                         Some(cdp),
@@ -993,18 +1358,30 @@ impl Tool for BrowserTypeTool {
                         json!({ "type": "keyUp", "key": key }),
                     )
                     .await;
-                if let Err(e) = down.and(up) {
+                if let Err(e) = down.and(character).and(up) {
                     result = Err(e);
                     break;
                 }
+                delivered += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(15)).await;
             }
-            result
+            if let Err(error) = conn
+                .call(
+                    Some(cdp),
+                    "Emulation.setFocusEmulationEnabled",
+                    json!({ "enabled": false }),
+                )
+                .await
+            {
+                result = Err(error);
+            }
+            (result, delivered)
         };
 
         match typed {
             Ok(()) => ToolResult::text(format!(
                 "typed {} char(s) into {tab_id}",
-                text.chars().count()
+                requested_chars
             ))
             .with_structured(json!({
                 "status": "ok",
@@ -1013,11 +1390,400 @@ impl Tool for BrowserTypeTool {
                 "ref": ext_ref,
                 "frame": entry.frame.kind.as_str(),
                 "mode": mode,
-                "chars": text.chars().count(),
+                "chars": requested_chars,
+                "requested_chars": requested_chars,
+                "delivered_chars": delivered_chars,
             })),
             Err(e) => BrowserRefusal::new(
+                BrowserRefusalCode::BrowserInputIncomplete,
+                format!(
+                    "trusted Input typing stopped after {delivered_chars} of {requested_chars} character(s): {e}"
+                ),
+            )
+            .with_detail(json!({
+                "requested_chars": requested_chars,
+                "delivered_chars": delivered_chars,
+                "retryable": false,
+            }))
+            .to_tool_result(),
+        }
+    }
+}
+
+// ── browser_dialog ──────────────────────────────────────────────────────────
+
+pub struct BrowserDialogTool {
+    def: ToolDef,
+    engine: Arc<BrowserEngine>,
+}
+
+impl BrowserDialogTool {
+    pub fn new(engine: Arc<BrowserEngine>) -> Self {
+        Self {
+            def: ToolDef {
+                name: "browser_dialog".into(),
+                description: "Inspect or resolve a page-owned JavaScript alert, confirm, prompt, or beforeunload dialog on one exactly-bound tab. This never handles browser permission UI, extension UI, native dialogs, or file pickers. Inspect returns an opaque dialog_id; accept/dismiss require that exact current id. Resolution defaults to background delivery; Linux callers must explicitly request foreground delivery because Chromium's native modal cannot be resolved there without changing foreground posture.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "target_id": schema_target_id(),
+                        "tab_id": schema_tab_id(),
+                        "session": schema_session(),
+                        "action": { "type": "string", "enum": ["inspect", "accept", "dismiss"] },
+                        "dialog_id": { "type": "string", "description": "Opaque current dialog generation returned by action=inspect." },
+                        "prompt_text": { "type": "string", "description": "Sensitive response text, valid only when accepting a prompt dialog." },
+                        "delivery_mode": {
+                            "type": "string",
+                            "enum": ["background", "foreground"],
+                            "default": "background",
+                            "description": "Requested foreground posture for accept/dismiss. Linux Chromium requires foreground; inspect is read-only."
+                        }
+                    },
+                    "required": ["target_id", "tab_id", "action"],
+                    "additionalProperties": true
+                }),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+            engine,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for BrowserDialogTool {
+    fn def(&self) -> &ToolDef {
+        &self.def
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        let (target_id, tab_id, action) = match (
+            args.require_str("target_id"),
+            args.require_str("tab_id"),
+            args.require_str("action"),
+        ) {
+            (Ok(target), Ok(tab), Ok(action)) => (target, tab, action),
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => return error,
+        };
+        if !matches!(action.as_str(), "inspect" | "accept" | "dismiss") {
+            return ToolResult::error("action must be inspect, accept, or dismiss");
+        }
+        let delivery_mode = args
+            .opt_str("delivery_mode")
+            .unwrap_or_else(|| "background".into());
+        if !matches!(delivery_mode.as_str(), "background" | "foreground") {
+            return ToolResult::error("delivery_mode must be background or foreground");
+        }
+        let session = match require_explicit_session(&args) {
+            Ok(session) => session,
+            Err(error) => return error,
+        };
+        let _mutation = match self
+            .engine
+            .lock_mutation(&session, &target_id, &tab_id)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(refusal) => return refusal.to_tool_result(),
+        };
+        let validated = match self
+            .engine
+            .revalidate_for_mutation(&session, &target_id, Some(&tab_id))
+            .await
+        {
+            Ok(validated) => validated,
+            Err(refusal) => return refusal.to_tool_result(),
+        };
+        if cfg!(target_os = "linux") && action != "inspect" && delivery_mode == "background" {
+            return BrowserRefusal::new(
                 BrowserRefusalCode::BrowserInputTrustUnavailable,
-                format!("trusted Input typing route failed: {e}"),
+                "Chromium's native JavaScript modal cannot be resolved on Linux without changing foreground posture; retry with delivery_mode=\"foreground\"",
+            )
+            .with_detail(json!({ "supported_delivery_mode": "foreground" }))
+            .to_tool_result();
+        }
+        let conn = &validated.conn;
+        let cdp_session = validated.cdp_session.as_str();
+        let cdp_target_id = validated.tab.cdp_target_id.as_str();
+        if conn.dialog_state(cdp_target_id).is_none() && !conn.has_dialog_session(cdp_target_id) {
+            // Register before Page.enable so an opening event delivered before
+            // the command reply is still attributed to the exact target.
+            conn.register_dialog_session(cdp_session, cdp_target_id);
+            if let Err(error) = conn.call(Some(cdp_session), "Page.enable", json!({})).await {
+                if conn.dialog_state(cdp_target_id).is_none() {
+                    conn.unregister_dialog_session(cdp_session, cdp_target_id);
+                    return BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserActionUnavailable,
+                        format!("the exact tab does not expose JavaScript dialog events: {error}"),
+                    )
+                    .to_tool_result();
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let Some(dialog) = conn.dialog_state(cdp_target_id) else {
+            return if action == "inspect" {
+                ToolResult::text(format!(
+                    "no page-owned JavaScript dialog is open in {tab_id}"
+                ))
+                .with_structured(json!({
+                    "status": "ok", "target_id": target_id, "tab_id": tab_id,
+                    "present": false
+                }))
+            } else {
+                BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserActionUnavailable,
+                    "no current page-owned JavaScript dialog exists on the exact tab",
+                )
+                .to_tool_result()
+            };
+        };
+        let dialog_id = format!("dialog-{}", dialog.generation);
+        if action == "inspect" {
+            return ToolResult::text(format!("{} dialog is open in {tab_id}", dialog.kind))
+                .with_structured(json!({
+                    "status": "ok", "target_id": target_id, "tab_id": tab_id,
+                    "present": true, "dialog_id": dialog_id, "kind": dialog.kind
+                }));
+        }
+
+        let supplied_id = match args.require_str("dialog_id") {
+            Ok(id) => id,
+            Err(error) => return error,
+        };
+        if supplied_id != dialog_id {
+            return BrowserRefusal::new(
+                BrowserRefusalCode::BrowserActionUnavailable,
+                "the dialog capability is stale or belongs to another dialog",
+            )
+            .to_tool_result();
+        }
+        let prompt_text = args.opt_str("prompt_text");
+        if prompt_text.is_some() && (action != "accept" || dialog.kind != "prompt") {
+            return ToolResult::error("prompt_text is valid only when accepting a prompt dialog");
+        }
+        let mut params = json!({ "accept": action == "accept" });
+        if let Some(text) = prompt_text {
+            params["promptText"] = Value::String(text);
+        }
+        match conn
+            .call(
+                Some(&dialog.session_id),
+                "Page.handleJavaScriptDialog",
+                params,
+            )
+            .await
+        {
+            Ok(_) => {
+                conn.clear_dialog_state(cdp_target_id, dialog.generation);
+                ToolResult::text(format!("{action}ed {} dialog in {tab_id}", dialog.kind))
+                    .with_structured(json!({
+                        "status": "ok", "target_id": target_id, "tab_id": tab_id,
+                        "dialog_id": dialog_id, "kind": dialog.kind, "action": action
+                    }))
+            }
+            Err(error) => BrowserRefusal::new(
+                BrowserRefusalCode::BrowserActionUnavailable,
+                format!("the exact JavaScript dialog could not be resolved: {error}"),
+            )
+            .to_tool_result(),
+        }
+    }
+}
+
+// ── browser_set_input_files ─────────────────────────────────────────────────
+
+pub struct BrowserSetInputFilesTool {
+    def: ToolDef,
+    engine: Arc<BrowserEngine>,
+}
+
+impl BrowserSetInputFilesTool {
+    pub fn new(engine: Arc<BrowserEngine>) -> Self {
+        Self {
+            def: ToolDef {
+                name: "browser_set_input_files".into(),
+                description: "Assign one or more explicit absolute local files to an exact live <input type=file> ref through CDP. This bypasses native file pickers, rejects symlinks and non-regular files, and never returns local paths.".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "target_id": schema_target_id(),
+                        "tab_id": schema_tab_id(),
+                        "session": schema_session(),
+                        "ref": schema_ref(),
+                        "files": {
+                            "type": "array", "minItems": 1, "maxItems": 32,
+                            "items": { "type": "string", "description": "Absolute path to one local regular file." }
+                        }
+                    },
+                    "required": ["target_id", "tab_id", "ref", "files"],
+                    "additionalProperties": true
+                }),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: true,
+            },
+            engine,
+        }
+    }
+}
+
+fn validated_upload_paths(args: &Value) -> Result<Vec<String>, ToolResult> {
+    let Some(files) = args.get("files").and_then(Value::as_array) else {
+        return Err(ToolResult::error(
+            "files must be a non-empty array of absolute paths",
+        ));
+    };
+    if files.is_empty() || files.len() > 32 {
+        return Err(ToolResult::error(
+            "files must contain between 1 and 32 paths",
+        ));
+    }
+    files
+        .iter()
+        .map(|value| {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| ToolResult::error("every files entry must be a string"))?;
+            let path = std::path::Path::new(raw);
+            if !path.is_absolute() {
+                return Err(ToolResult::error("every upload path must be absolute"));
+            }
+            let metadata = std::fs::symlink_metadata(path)
+                .map_err(|_| ToolResult::error("an approved upload path does not exist"))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(ToolResult::error(
+                    "upload paths must name regular files directly, not links or directories",
+                ));
+            }
+            std::fs::canonicalize(path)
+                .map(|path| path.to_string_lossy().into_owned())
+                .map_err(|_| ToolResult::error("an upload path could not be canonicalized"))
+        })
+        .collect()
+}
+
+#[async_trait]
+impl Tool for BrowserSetInputFilesTool {
+    fn def(&self) -> &ToolDef {
+        &self.def
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        let (target_id, tab_id, ext_ref) = match (
+            args.require_str("target_id"),
+            args.require_str("tab_id"),
+            args.require_str("ref"),
+        ) {
+            (Ok(target), Ok(tab), Ok(ext_ref)) => (target, tab, ext_ref),
+            (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => return error,
+        };
+        let files = match validated_upload_paths(&args) {
+            Ok(files) => files,
+            Err(error) => return error,
+        };
+        let session = match require_explicit_session(&args) {
+            Ok(session) => session,
+            Err(error) => return error,
+        };
+        let _mutation = match self
+            .engine
+            .lock_mutation(&session, &target_id, &tab_id)
+            .await
+        {
+            Ok(guard) => guard,
+            Err(refusal) => return refusal.to_tool_result(),
+        };
+        let validated = match self
+            .engine
+            .revalidate_for_mutation(&session, &target_id, Some(&tab_id))
+            .await
+        {
+            Ok(validated) => validated,
+            Err(refusal) => return refusal.to_tool_result(),
+        };
+        let entry = match self
+            .engine
+            .store
+            .resolve_ref(&session, &target_id, &tab_id, &ext_ref)
+        {
+            Ok(entry) => entry,
+            Err(refusal) => return refusal.to_tool_result(),
+        };
+        if entry.semantic && !entry.actions.contains(&BrowserActionKind::Upload) {
+            return BrowserRefusal::new(
+                BrowserRefusalCode::BrowserActionUnavailable,
+                "the semantic ref is not a file-upload control",
+            )
+            .to_tool_result();
+        }
+        let cdp_session = match self
+            .engine
+            .frame_session_for_mutation(&session, &target_id, &tab_id, &validated, &entry.frame)
+            .await
+        {
+            Ok(session) => session,
+            Err(refusal) => return refusal.to_tool_result(),
+        };
+        let described = match validated
+            .conn
+            .call(
+                Some(&cdp_session),
+                "DOM.describeNode",
+                json!({ "backendNodeId": entry.backend_node_id }),
+            )
+            .await
+        {
+            Ok(node) => node,
+            Err(_) => {
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserRefStale,
+                    "the upload ref no longer resolves in the live page",
+                )
+                .to_tool_result()
+            }
+        };
+        let node = &described["node"];
+        let attributes = node["attributes"].as_array().cloned().unwrap_or_default();
+        let is_file_input = node["nodeName"]
+            .as_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case("input"))
+            && attributes.chunks_exact(2).any(|pair| {
+                pair[0]
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("type"))
+                    && pair[1]
+                        .as_str()
+                        .is_some_and(|value| value.eq_ignore_ascii_case("file"))
+            });
+        if !is_file_input {
+            return BrowserRefusal::new(
+                BrowserRefusalCode::BrowserActionUnavailable,
+                "the live ref is not an input[type=file] element",
+            )
+            .to_tool_result();
+        }
+        match validated
+            .conn
+            .call(
+                Some(&cdp_session),
+                "DOM.setFileInputFiles",
+                json!({ "backendNodeId": entry.backend_node_id, "files": files }),
+            )
+            .await
+        {
+            Ok(_) => ToolResult::text(format!("assigned {} file(s) in {tab_id}", files.len()))
+                .with_structured(json!({
+                    "status": "ok", "target_id": target_id, "tab_id": tab_id,
+                    "ref": ext_ref, "frame": entry.frame.kind.as_str(), "file_count": files.len()
+                })),
+            Err(error) => BrowserRefusal::new(
+                BrowserRefusalCode::BrowserActionUnavailable,
+                format!("the browser refused the exact file input assignment: {error}"),
             )
             .to_tool_result(),
         }
@@ -1029,8 +1795,8 @@ mod tests {
     use super::*;
     use crate::browser::platform::{BrowserPlatform, PrepareOutcome, PrepareRequest};
     use crate::browser::types::{
-        BrowserClassification, BrowserEngineFamily, NativeWindowInfo, OwnedEndpoint,
-        ProcessFingerprint,
+        BrowserClassification, BrowserEngineFamily, BrowserProduct, NativeWindowInfo,
+        OwnedEndpoint, ProcessFingerprint,
     };
 
     /// Minimal adapter: pid 1 is a CDP-capable browser with no endpoint
@@ -1048,6 +1814,7 @@ mod tests {
                 1 => BrowserClassification {
                     is_browser: true,
                     engine: BrowserEngineFamily::Chromium,
+                    product_kind: BrowserProduct::GoogleChrome,
                     product: Some("MockChrome".into()),
                     channel: Some("stable".into()),
                     supports_cdp: true,
@@ -1055,6 +1822,7 @@ mod tests {
                 3 => BrowserClassification {
                     is_browser: true,
                     engine: BrowserEngineFamily::Webkit,
+                    product_kind: BrowserProduct::Safari,
                     product: Some("MockSafari".into()),
                     channel: None,
                     supports_cdp: false,
@@ -1062,6 +1830,7 @@ mod tests {
                 _ => BrowserClassification {
                     is_browser: false,
                     engine: BrowserEngineFamily::Unknown,
+                    product_kind: BrowserProduct::Other,
                     product: None,
                     channel: None,
                     supports_cdp: false,
@@ -1157,6 +1926,12 @@ mod tests {
         assert!(!prepare_properties.contains_key("allow_restart"));
         assert!(!prepare_properties.contains_key(MCP_HOST_APPROVAL_ARG));
 
+        let dialog = BrowserDialogTool::new(e.clone());
+        assert_eq!(
+            dialog.def().input_schema["properties"]["delivery_mode"]["default"],
+            "background"
+        );
+
         for (def, name) in [
             (
                 BrowserPrepareTool::new(e.clone()).def().clone(),
@@ -1174,18 +1949,37 @@ mod tests {
                 BrowserTypeTool::new(e.clone()).def().clone(),
                 "browser_type",
             ),
+            (
+                BrowserDialogTool::new(e.clone()).def().clone(),
+                "browser_dialog",
+            ),
+            (
+                BrowserSetInputFilesTool::new(e.clone()).def().clone(),
+                "browser_set_input_files",
+            ),
+            (
+                BrowserDownloadTool::new(e.clone()).def().clone(),
+                "browser_download",
+            ),
+            (
+                BrowserPointerTool::new(e.clone()).def().clone(),
+                "browser_pointer",
+            ),
         ] {
             assert_eq!(def.name, name);
             assert!(!def.read_only, "{name} is a mutation");
             assert!(def.input_schema["properties"].is_object(), "{name} schema");
         }
-        // Navigate reaches the open web; the input tools do not.
+        // Navigate and download reach the open web; ordinary input does not.
         assert!(BrowserNavigateTool::new(e.clone()).def().open_world);
-        assert!(!BrowserClickTool::new(e).def().open_world);
+        assert!(BrowserDownloadTool::new(e.clone()).def().open_world);
+        assert!(BrowserDownloadTool::new(e.clone()).def().destructive);
+        assert!(!BrowserClickTool::new(e.clone()).def().open_world);
+        assert!(!BrowserPointerTool::new(e).def().open_world);
     }
 
     #[test]
-    fn registration_registers_all_five() {
+    fn registration_registers_all_browser_tools() {
         let e = engine();
         let mut registry = ToolRegistry::new();
         register_browser_tools(&e, &mut registry);
@@ -1197,9 +1991,25 @@ mod tests {
                 "browser_prepare",
                 "browser_navigate",
                 "browser_click",
-                "browser_type"
+                "browser_type",
+                "browser_dialog",
+                "browser_set_input_files",
+                "browser_download",
+                "browser_pointer"
             ]
         );
+    }
+
+    #[test]
+    fn upload_paths_are_absolute_regular_files_and_outputs_need_no_path() {
+        let path = std::env::temp_dir().join(format!("cua-upload-{}.txt", uuid::Uuid::new_v4()));
+        std::fs::write(&path, b"fixture").unwrap();
+        let args = json!({ "files": [path.to_string_lossy()] });
+        let validated = validated_upload_paths(&args).unwrap();
+        assert_eq!(validated.len(), 1);
+        assert!(std::path::Path::new(&validated[0]).is_absolute());
+        assert!(validated_upload_paths(&json!({ "files": ["relative.txt"] })).is_err());
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
@@ -1285,6 +2095,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_mcp_marker_never_approves_an_existing_profile() {
+        let tool = BrowserPrepareTool::new(engine());
+        let result = tool
+            .invoke(json!({
+                "pid": 1,
+                "window_id": 7,
+                "strategy": { "kind": "existing_profile" },
+                "session": "existing-profile-run",
+                MCP_HOST_APPROVAL_ARG: true
+            }))
+            .await;
+        let structured = structured(&result);
+        assert_eq!(structured["refusal"]["code"], "browser_consent_required");
+        assert!(structured["refusal"]["detail"]["approval_request_id"]
+            .as_str()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn existing_strategy_conflicts_fail_before_platform_setup() {
+        let tool = BrowserPrepareTool::new(engine());
+        let token = crate::browser::approval::mint_existing_profile_approval(
+            crate::browser::approval::ExistingProfileApprovalScope {
+                pid: 1,
+                window_id: 7,
+                session: "existing-conflict".to_owned(),
+            },
+        )
+        .unwrap();
+        let result = tool
+            .invoke(json!({
+                "pid": 1,
+                "window_id": 7,
+                "strategy": { "kind": "existing_profile" },
+                "profile": { "mode": "isolated_new" },
+                "approval_token": token,
+                "session": "existing-conflict"
+            }))
+            .await;
+        assert_eq!(
+            structured(&result)["refusal"]["code"],
+            "browser_consent_required"
+        );
+    }
+
+    #[tokio::test]
     async fn mutations_on_unknown_targets_refuse_binding_stale() {
         let e = engine();
         for result in [
@@ -1349,6 +2205,10 @@ mod tests {
             crate::browser::store::TabRecord {
                 tab_id: tab_id.clone(),
                 cdp_target_id: "CDPX".into(),
+                title: "Mock".into(),
+                url: "https://example.test".into(),
+                active: Some(true),
+                generation: 0,
                 snapshots: HashMap::new(),
             },
         );
@@ -1360,6 +2220,8 @@ mod tests {
                 window_id: 7,
                 ws_url: "ws://127.0.0.1:9222/devtools/browser/x".into(),
                 endpoint_owner_pid: 1,
+                generation: 0,
+                grant_transport_session: None,
                 fingerprint: ProcessFingerprint {
                     pid: 1,
                     start_time: Some(1),
@@ -1400,6 +2262,10 @@ mod tests {
             crate::browser::store::TabRecord {
                 tab_id: tab_id.clone(),
                 cdp_target_id: "CDPX".into(),
+                title: "Mock".into(),
+                url: "https://example.test".into(),
+                active: Some(true),
+                generation: 0,
                 snapshots: HashMap::new(),
             },
         );
@@ -1412,6 +2278,8 @@ mod tests {
                 window_id: 7,
                 ws_url: "ws://127.0.0.1:9222/devtools/browser/x".into(),
                 endpoint_owner_pid: 1,
+                generation: 0,
+                grant_transport_session: None,
                 fingerprint: ProcessFingerprint {
                     pid: 1,
                     start_time: Some(999),
@@ -1453,6 +2321,8 @@ mod tests {
                 window_id: 7,
                 ws_url: "ws://127.0.0.1:9222/devtools/browser/x".into(),
                 endpoint_owner_pid: 1,
+                generation: 0,
+                grant_transport_session: None,
                 fingerprint: ProcessFingerprint {
                     pid: 1,
                     start_time: Some(1),

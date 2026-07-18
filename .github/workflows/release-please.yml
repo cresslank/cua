@@ -1,0 +1,106 @@
+name: "Release: Prepare component releases"
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please-main
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate release GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+
+      # release-please-action v4.4.1, embedding release-please ^17.3.0.
+      - name: Open or update release pull requests
+        id: release
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+      - name: Synchronize generated files on release pull requests
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          while read -r number; do
+            PR=$(gh pr view "$number" --json headRefName,headRepositoryOwner,files)
+            DRIVER=$(echo "$PR" | jq -r \
+              '.files | any(.path == "libs/cua-driver/rust/VERSION")')
+            LUME=$(echo "$PR" | jq -r \
+              '.files | any(.path == "libs/lume/VERSION")')
+            if [[ "$DRIVER" != "true" && "$LUME" != "true" ]]; then
+              continue
+            fi
+
+            OWNER=$(echo "$PR" | jq -r '.headRepositoryOwner.login')
+            BRANCH=$(echo "$PR" | jq -r '.headRefName')
+            if [[ "$OWNER" != "${GITHUB_REPOSITORY%/*}" || "$BRANCH" != release-please--branches--* ]]; then
+              echo "Refusing to run release-branch code from $OWNER:$BRANCH"
+              exit 1
+            fi
+
+            # Release Please can update an existing branch that predates the
+            # current workflow. Refresh it, then replay only this trusted bot
+            # branch onto main so validation uses the current release tooling.
+            git fetch origin "+refs/heads/main:refs/remotes/origin/main"
+            git fetch origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+            REMOTE_HEAD=$(git rev-parse "origin/$BRANCH")
+            git checkout -B "$BRANCH" "origin/$BRANCH"
+            git config user.name "trycua-release[bot]"
+            git config user.email "trycua-release[bot]@users.noreply.github.com"
+            git rebase origin/main
+            if [[ "$DRIVER" == "true" ]]; then
+              DRIVER_VERSION=$(tr -d '[:space:]' < libs/cua-driver/rust/VERSION)
+              cargo update --manifest-path libs/cua-driver/rust/Cargo.toml \
+                -p cua-driver --precise "$DRIVER_VERSION"
+              python3 .github/scripts/sync_driver_release_docs.py
+              python3 .github/scripts/validate_release_versions.py --product driver
+              git add libs/cua-driver/rust/Cargo.lock \
+                docs/content/docs/reference/cua-driver/cli-reference.mdx \
+                docs/content/docs/reference/cua-driver/mcp-tools.mdx
+              COMMIT_MESSAGE="chore(cua-driver-rs): synchronize generated release files"
+            else
+              python3 .github/scripts/sync_lume_release_docs.py
+              python3 .github/scripts/validate_release_versions.py --product lume
+              git add docs/content/docs/reference/lume/cli-reference.mdx \
+                docs/content/docs/reference/lume/http-api.mdx
+              COMMIT_MESSAGE="chore(lume): synchronize release documentation"
+            fi
+            if git diff --cached --quiet; then
+              echo "Generated files already match release PR #$number"
+            else
+              git commit -m "$COMMIT_MESSAGE"
+            fi
+            if [[ "$(git rev-parse HEAD)" != "$REMOTE_HEAD" ]]; then
+              git push --force-with-lease="refs/heads/$BRANCH:$REMOTE_HEAD" \
+                origin "HEAD:refs/heads/$BRANCH"
+            fi
+          done < <(gh pr list --state open --base main --limit 100 --json number --jq '.[].number')
+
+      - name: Verify repository release versions
+        if: steps.release.outputs.prs_created != 'true'
+        run: python3 .github/scripts/validate_release_versions.py --product all

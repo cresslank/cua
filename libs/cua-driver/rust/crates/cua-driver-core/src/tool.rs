@@ -95,7 +95,9 @@ impl ToolDef {
 ///   `system.permissions.tcc.accessibility`,
 ///   `system.permissions.tcc.screen_recording`
 /// - `system.config.read`, `system.config.write`
-/// - `session.lifecycle.start`, `session.lifecycle.end`
+/// - `session.lifecycle.start`, `session.lifecycle.end`,
+///   `session.capture_scope`, `session.capture_scope.read`,
+///   `session.capture_scope.escalate`
 /// - `agent_cursor.move`, `agent_cursor.set_enabled`,
 ///   `agent_cursor.set_motion`, `agent_cursor.set_style`,
 ///   `agent_cursor.state`
@@ -103,7 +105,8 @@ impl ToolDef {
 ///   `recording.replay`, `recording.install_dependency`
 /// - `page.action`
 /// - `browser.state`, `browser.prepare`, `browser.navigate`,
-///   `browser.input.click`, `browser.input.type`
+///   `browser.input.click`, `browser.input.type`, `browser.input.files`,
+///   `browser.dialog`
 /// - `driver.update_check`, `driver.probe`
 ///
 /// Tools with no entry get `[]` — that's fine, it just means
@@ -140,13 +143,10 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "mouse_button_up" => &["input.pointer.button"],
         "scroll" => &["input.pointer.scroll", "accessibility.element_tokens"],
         "move_cursor" => &[
-            // Visual overlay move, not a real OS pointer move on
-            // macOS/Windows — see SKILL.md. Surfaced as
-            // `agent_cursor.move` because the canonical name on the
-            // overlay side is "agent cursor"; `input.pointer.move` is
-            // intentionally omitted to avoid claiming we shift the
-            // real cursor.
+            // Window scope moves the agent overlay; explicit desktop scope
+            // moves the real OS pointer.
             "agent_cursor.move",
+            "input.pointer.move",
         ],
 
         // ── input.keyboard ───────────────────────────────────────────
@@ -236,7 +236,9 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "set_config" => &["system.config.write"],
 
         // ── sessions ─────────────────────────────────────────────────
-        "start_session" => &["session.lifecycle.start"],
+        "start_session" => &["session.lifecycle.start", "session.capture_scope"],
+        "escalate_session" => &["session.capture_scope.escalate"],
+        "get_session_state" => &["session.capture_scope.read"],
         "end_session" => &["session.lifecycle.end"],
 
         // ── agent cursor ─────────────────────────────────────────────
@@ -265,6 +267,10 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "browser_navigate" => &["browser.navigate"],
         "browser_click" => &["browser.input.click"],
         "browser_type" => &["browser.input.type"],
+        "browser_dialog" => &["browser.dialog"],
+        "browser_set_input_files" => &["browser.input.files"],
+        "browser_download" => &["browser.download"],
+        "browser_pointer" => &["browser.input.pointer"],
 
         // ── driver self-service ──────────────────────────────────────
         "check_for_update" => &["driver.update_check"],
@@ -322,8 +328,12 @@ impl ToolRegistry {
     /// (`start_session` / `end_session`). Call alongside
     /// `register_recording_tools` from each platform's `register_all`.
     pub fn register_session_tools(&mut self) {
-        use crate::session_tools::{EndSessionTool, StartSessionTool};
+        use crate::session_tools::{
+            EndSessionTool, EscalateSessionTool, GetSessionStateTool, StartSessionTool,
+        };
         self.register(Box::new(StartSessionTool));
+        self.register(Box::new(EscalateSessionTool));
+        self.register(Box::new(GetSessionStateTool));
         self.register(Box::new(EndSessionTool));
     }
 
@@ -380,9 +390,6 @@ impl ToolRegistry {
 
     /// Invoke a tool by name and (if recording is enabled) write its result to disk.
     pub async fn invoke(&self, name: &str, args: Value) -> ToolResult {
-        // Capture start time for recording timestamps.
-        let start_ms = now_ms();
-
         // Deprecated alias: `type_text_chars` → `type_text`.  Swift's
         // ToolRegistry.swift keeps the same alias (with stderr warning) for
         // backwards compatibility with hermes-agent builds that still emit
@@ -396,44 +403,43 @@ impl ToolRegistry {
             other => other,
         };
 
+        let Some(tool) = self.tools.get(resolved_name) else {
+            return ToolResult::error(format!("Unknown tool: {name}"));
+        };
+        // Reject modality violations before reserving a recording turn. A
+        // rejected action has no before/after evidence and must not leave a
+        // pending recorder entry behind.
+        if let Err(violation) = crate::capture_scope::enforce_tool(resolved_name, &args) {
+            let structured =
+                violation.as_json(args.get("session").and_then(Value::as_str).unwrap_or(""));
+            return ToolResult::error(violation.message).with_structured(structured);
+        }
+
+        // Capture start time for recording timestamps only after validation.
+        let start_ms = now_ms();
+
         // Reserve and capture the turn before dispatch so recorded evidence
         // shows the application immediately before the action changed it.
-        let should_record = self
-            .tools
-            .get(resolved_name)
-            .map(|tool| !tool.def().read_only)
-            .unwrap_or(false)
+        let should_record = !tool.def().read_only
             && !matches!(
                 resolved_name,
                 "start_recording" | "stop_recording" | "get_recording_state" | "replay_trajectory"
             );
-        let recording_args = if resolved_name == "browser_prepare" {
-            let mut redacted = args.clone();
-            if let Some(arguments) = redacted.as_object_mut() {
-                if arguments.contains_key("approval_token") {
-                    arguments.insert(
-                        "approval_token".to_owned(),
-                        Value::String("[redacted]".to_owned()),
-                    );
-                }
-                arguments.remove("_cua_browser_prepare_mcp_host_approved");
-                arguments.remove("_transport_session_id");
-            }
-            redacted
-        } else {
-            args.clone()
-        };
+        let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
+        let recording_args = recording_args_for(resolved_name, &args);
         let pending_turn = should_record
             .then(|| {
-                self.recording
-                    .begin_turn(resolved_name, &recording_args, start_ms)
+                if private_consent_turn {
+                    self.recording
+                        .begin_private_turn(resolved_name, &recording_args, start_ms)
+                } else {
+                    self.recording
+                        .begin_turn(resolved_name, &recording_args, start_ms)
+                }
             })
             .flatten();
 
-        let result = match self.tools.get(resolved_name) {
-            Some(tool) => tool.invoke(args.clone()).await,
-            None => return ToolResult::error(format!("Unknown tool: {name}")),
-        };
+        let result = tool.invoke(args.clone()).await;
         // Use the original name for downstream code paths below so the
         // exit-code matching and recording paths keep treating the alias
         // as a distinct call site.
@@ -464,7 +470,7 @@ impl ToolRegistry {
         // of action tools the recording pipeline cares about (non-read-only,
         // not the recording-control meta-tools) so the live view matches
         // what the recorder would have captured for the turn.
-        if pip_hook::pip_enabled() && should_record {
+        if pip_hook::pip_enabled() && should_record && !private_consent_turn {
             let window_id = args.opt_u64("window_id");
             let pid = args.opt_i64("pid");
             if let Some(png_bytes) = screenshot_for(window_id, pid) {
@@ -479,6 +485,62 @@ impl ToolRegistry {
 
         result
     }
+}
+
+fn is_existing_profile_prepare(tool_name: &str, args: &Value) -> bool {
+    tool_name == "browser_prepare"
+        && args
+            .get("strategy")
+            .and_then(|strategy| strategy.get("kind"))
+            .and_then(Value::as_str)
+            == Some("existing_profile")
+}
+
+fn recording_args_for(tool_name: &str, args: &Value) -> Value {
+    let mut redacted = args.clone();
+    if let Some(arguments) = redacted.as_object_mut() {
+        match tool_name {
+            "browser_prepare" => {
+                if arguments.contains_key("approval_token") {
+                    arguments.insert(
+                        "approval_token".to_owned(),
+                        Value::String("[redacted]".to_owned()),
+                    );
+                }
+                arguments.remove("_cua_browser_prepare_mcp_host_approved");
+                arguments.remove("_transport_session_id");
+            }
+            "browser_dialog" => {
+                if arguments.contains_key("prompt_text") {
+                    arguments.insert(
+                        "prompt_text".to_owned(),
+                        Value::String("[redacted]".to_owned()),
+                    );
+                }
+            }
+            "browser_set_input_files" => {
+                if let Some(count) = arguments
+                    .get("files")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                {
+                    arguments.insert("files".to_owned(), serde_json::json!({ "count": count }));
+                }
+            }
+            "browser_download" => {
+                arguments.remove("_cua_browser_download_mcp_host_approved");
+                if arguments.contains_key("destination_root") {
+                    arguments.insert(
+                        "destination_root".to_owned(),
+                        Value::String("[redacted]".to_owned()),
+                    );
+                }
+            }
+            "browser_pointer" => {}
+            _ => {}
+        }
+    }
+    redacted
 }
 
 impl Default for ToolRegistry {
@@ -542,6 +604,86 @@ mod capability_tests {
     //! of the registry response — no platform code involved.
     use super::*;
 
+    #[test]
+    fn browser_prepare_recording_redacts_authority_and_transport_secrets() {
+        let recorded = recording_args_for(
+            "browser_prepare",
+            &serde_json::json!({
+                "pid": 42,
+                "window_id": 7,
+                "session": "public-session",
+                "strategy": {"kind": "existing_profile"},
+                "approval_token": "one-use-secret",
+                "_cua_browser_prepare_mcp_host_approved": true,
+                "_transport_session_id": "private-transport",
+            }),
+        );
+        assert_eq!(recorded["approval_token"], "[redacted]");
+        assert!(recorded
+            .get("_cua_browser_prepare_mcp_host_approved")
+            .is_none());
+        assert!(recorded.get("_transport_session_id").is_none());
+        assert_eq!(recorded["pid"], 42);
+        assert_eq!(recorded["window_id"], 7);
+        assert_eq!(recorded["strategy"]["kind"], "existing_profile");
+    }
+
+    #[test]
+    fn browser_sensitive_recording_args_are_path_and_text_free() {
+        let dialog = recording_args_for(
+            "browser_dialog",
+            &serde_json::json!({"action": "accept", "prompt_text": "private reply"}),
+        );
+        assert_eq!(dialog["prompt_text"], "[redacted]");
+
+        let upload = recording_args_for(
+            "browser_set_input_files",
+            &serde_json::json!({"files": ["/private/one", "/private/two"]}),
+        );
+        assert_eq!(upload["files"], serde_json::json!({"count": 2}));
+
+        let download = recording_args_for(
+            "browser_download",
+            &serde_json::json!({
+                "destination_root": "/private/destination",
+                "_cua_browser_download_mcp_host_approved": true,
+            }),
+        );
+        assert_eq!(download["destination_root"], "[redacted]");
+        assert!(download
+            .get("_cua_browser_download_mcp_host_approved")
+            .is_none());
+
+        let serialized = serde_json::json!([dialog, upload, download]).to_string();
+        for forbidden in [
+            "private reply",
+            "/private/one",
+            "/private/two",
+            "/private/destination",
+        ] {
+            assert!(
+                !serialized.contains(forbidden),
+                "recording leaked {forbidden}"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_profile_prepare_is_a_private_consent_turn() {
+        assert!(is_existing_profile_prepare(
+            "browser_prepare",
+            &serde_json::json!({"strategy": {"kind": "existing_profile"}}),
+        ));
+        assert!(!is_existing_profile_prepare(
+            "browser_prepare",
+            &serde_json::json!({"profile": {"mode": "isolated_new"}}),
+        ));
+        assert!(!is_existing_profile_prepare(
+            "get_browser_state",
+            &serde_json::json!({"strategy": {"kind": "existing_profile"}}),
+        ));
+    }
+
     /// Tools whose `default_capabilities_for` mapping must NOT be
     /// empty. Mirrors the documented vocabulary above. Lives here
     /// rather than in an integration test because adding a new tool
@@ -587,6 +729,8 @@ mod capability_tests {
         "set_config",
         // sessions
         "start_session",
+        "escalate_session",
+        "get_session_state",
         "end_session",
         // agent cursor
         "set_agent_cursor_enabled",
@@ -609,6 +753,10 @@ mod capability_tests {
         "browser_navigate",
         "browser_click",
         "browser_type",
+        "browser_dialog",
+        "browser_set_input_files",
+        "browser_download",
+        "browser_pointer",
     ];
 
     /// All capability tokens in the canonical vocabulary. Any token
@@ -661,6 +809,9 @@ mod capability_tests {
         // sessions
         "session.lifecycle.start",
         "session.lifecycle.end",
+        "session.capture_scope",
+        "session.capture_scope.read",
+        "session.capture_scope.escalate",
         // agent cursor
         "agent_cursor.move",
         "agent_cursor.set_enabled",
@@ -681,6 +832,10 @@ mod capability_tests {
         "browser.navigate",
         "browser.input.click",
         "browser.input.type",
+        "browser.input.files",
+        "browser.dialog",
+        "browser.download",
+        "browser.input.pointer",
         // driver self
         "driver.update_check",
         "driver.probe",

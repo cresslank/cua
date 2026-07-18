@@ -1234,10 +1234,9 @@ pub fn open_vptr_session(activate_window_id: Option<u64>) -> anyhow::Result<Vptr
         anyhow::bail!("compositor does not expose zwlr_foreign_toplevel_manager_v1");
     }
 
-    let seat = state
-        .seat
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("compositor exposed no wl_seat for virtual-pointer input"))?;
+    let seat = state.seat.clone().ok_or_else(|| {
+        anyhow::anyhow!("compositor exposed no wl_seat for virtual-pointer input")
+    })?;
 
     if let Some(id) = activate_window_id {
         let handle = matching_handle(&state, id)
@@ -1572,8 +1571,7 @@ fn click_vptr(
         sess.vptr.frame();
         sess.queue.roundtrip(&mut sess.state)?;
         std::thread::sleep(std::time::Duration::from_millis(15));
-        sess.vptr
-            .button(event_time_ms(), btn, ButtonState::Pressed);
+        sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
         sess.vptr.frame();
         sess.queue.roundtrip(&mut sess.state)?;
         std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1602,9 +1600,7 @@ pub fn scroll(window_id: u64, direction: &str, amount: u32) -> anyhow::Result<()
 /// coordinates when the active compositor exposes the target geometry.
 pub fn window_local_to_output(window_id: u64, x: i32, y: i32) -> (i32, i32) {
     window_geometry(window_id)
-        .map(|(window_x, window_y, _, _)| {
-            (window_x.saturating_add(x), window_y.saturating_add(y))
-        })
+        .map(|(window_x, window_y, _, _)| (window_x.saturating_add(x), window_y.saturating_add(y)))
         .unwrap_or((x, y))
 }
 
@@ -1694,7 +1690,7 @@ pub fn scroll_at(
 ) -> anyhow::Result<()> {
     let direction = direction.to_string();
     with_libei_fallback(
-        || scroll_vptr(window_id, point, &direction, amount),
+        || scroll_vptr(Some(window_id), point, &direction, amount),
         || {
             libei_wait_scroll_ready()?;
             let foreground = activate_window_for_input(window_id)?;
@@ -1707,14 +1703,27 @@ pub fn scroll_at(
     )
 }
 
+/// Scroll at a desktop-absolute point without activating a named toplevel.
+pub fn scroll_desktop(x: i32, y: i32, direction: &str, amount: u32) -> anyhow::Result<()> {
+    let direction = direction.to_string();
+    with_libei_fallback(
+        || scroll_vptr(None, Some((x, y)), &direction, amount),
+        || {
+            libei_wait_scroll_ready()?;
+            libei_move_absolute(x, y)?;
+            libei_scroll(&direction, amount)
+        },
+    )
+}
+
 /// wlroots virtual-pointer implementation of [`scroll`].
 fn scroll_vptr(
-    window_id: u64,
+    window_id: Option<u64>,
     point: Option<(i32, i32)>,
     direction: &str,
     amount: u32,
 ) -> anyhow::Result<()> {
-    let mut sess = open_vptr_session(Some(window_id))?;
+    let mut sess = open_vptr_session(window_id)?;
     if let Some((x, y)) = point {
         let px = x.clamp(0, (sess.output_w as i32).saturating_sub(1)) as u32;
         let py = y.clamp(0, (sess.output_h as i32).saturating_sub(1)) as u32;
@@ -1740,8 +1749,7 @@ fn scroll_vptr(
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         sess.vptr.axis_source(AxisSource::Wheel);
-        sess.vptr
-            .axis_discrete(event_time_ms(), axis, value, sign);
+        sess.vptr.axis_discrete(event_time_ms(), axis, value, sign);
         sess.vptr.frame();
         sess.queue.roundtrip(&mut sess.state)?;
     }
@@ -1821,7 +1829,7 @@ pub fn drag(
     button: u8,
 ) -> anyhow::Result<()> {
     with_libei_fallback(
-        || drag_vptr(window_id, from_x, from_y, to_x, to_y, steps, button),
+        || drag_vptr(Some(window_id), from_x, from_y, to_x, to_y, steps, button),
         || {
             libei_wait_pointer_ready()?;
             let foreground = activate_window_for_input(window_id)?;
@@ -1831,10 +1839,8 @@ pub fn drag(
     )
 }
 
-/// wlroots virtual-pointer implementation of [`drag`].
-#[allow(clippy::too_many_arguments)]
-fn drag_vptr(
-    window_id: u64,
+/// Drag through desktop-absolute points without activating a named toplevel.
+pub fn drag_desktop(
     from_x: i32,
     from_y: i32,
     to_x: i32,
@@ -1842,7 +1848,27 @@ fn drag_vptr(
     steps: u32,
     button: u8,
 ) -> anyhow::Result<()> {
-    let mut sess = open_vptr_session(Some(window_id))?;
+    with_libei_fallback(
+        || drag_vptr(None, from_x, from_y, to_x, to_y, steps, button),
+        || {
+            libei_wait_pointer_ready()?;
+            libei_drag(from_x, from_y, to_x, to_y, steps, button)
+        },
+    )
+}
+
+/// wlroots virtual-pointer implementation of [`drag`].
+#[allow(clippy::too_many_arguments)]
+fn drag_vptr(
+    window_id: Option<u64>,
+    from_x: i32,
+    from_y: i32,
+    to_x: i32,
+    to_y: i32,
+    steps: u32,
+    button: u8,
+) -> anyhow::Result<()> {
+    let mut sess = open_vptr_session(window_id)?;
     std::thread::sleep(std::time::Duration::from_millis(40));
     let (w, h) = (sess.output_w, sess.output_h);
     let btn = evdev_pointer_button(button);
@@ -1857,8 +1883,7 @@ fn drag_vptr(
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
     std::thread::sleep(std::time::Duration::from_millis(15));
-    sess.vptr
-        .button(event_time_ms(), btn, ButtonState::Pressed);
+    sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
     sess.vptr.frame();
     sess.queue.roundtrip(&mut sess.state)?;
     let n = steps.max(1);
@@ -1867,8 +1892,7 @@ fn drag_vptr(
         let ix = (from_x as f64 + (to_x - from_x) as f64 * t).round() as i32;
         let iy = (from_y as f64 + (to_y - from_y) as f64 * t).round() as i32;
         let (cx, cy) = clamp_xy(ix, iy);
-        sess.vptr
-            .motion_absolute(event_time_ms(), cx, cy, w, h);
+        sess.vptr.motion_absolute(event_time_ms(), cx, cy, w, h);
         sess.vptr.frame();
         sess.queue.roundtrip(&mut sess.state)?;
         std::thread::sleep(std::time::Duration::from_millis(8));
@@ -1927,6 +1951,53 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
     }
 }
 
+/// Type into a surface whose exact Sway container is already held focused by
+/// the caller. This avoids re-resolving a title that can change mid-sequence
+/// (for example after opening a Chromium tab).
+pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let result = std::process::Command::new("wtype")
+        .args(["-k", "Shift_L", "--"])
+        .arg(text)
+        .output();
+    match result {
+        Ok(out) if out.status.success() => Ok(()),
+        other => with_wtype_libei_fallback(
+            || {
+                libei_wait_keyboard_ready()?;
+                libei_type_text(text)
+            },
+            other.map(|out| String::from_utf8_lossy(&out.stderr).into_owned()),
+        ),
+    }
+}
+
+/// Type text and press one key while an outer exact-container focus guard is
+/// active. Keeping both operations in one virtual-keyboard lifetime avoids a
+/// headless wlroots seat dropping the first event from a second `wtype`
+/// process after the text has landed.
+pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
+    let keysym = key_to_keysym(key);
+    let result = std::process::Command::new("wtype")
+        .args(["-k", "Shift_L", "-s", "30"])
+        .arg(text)
+        .args(["-s", "50", "-k", &keysym])
+        .output();
+    match result {
+        Ok(out) if out.status.success() => Ok(()),
+        other => with_wtype_libei_fallback(
+            || {
+                libei_wait_keyboard_ready()?;
+                libei_type_text(text)?;
+                libei_press_key(key)
+            },
+            other.map(|out| String::from_utf8_lossy(&out.stderr).into_owned()),
+        ),
+    }
+}
+
 /// Press a single named key into the focused Wayland surface via `wtype -k`.
 pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
     let foreground = activate_window_for_input(window_id)?;
@@ -1946,6 +2017,24 @@ pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
                 libei_press_key(key)
             },
             other.map(|o| String::from_utf8_lossy(&o.stderr).into_owned()),
+        ),
+    }
+}
+
+/// Press one key while an outer exact-container focus guard is active.
+pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
+    let keysym = key_to_keysym(key);
+    let result = std::process::Command::new("wtype")
+        .args(["-k", "Shift_L", "-k", &keysym])
+        .output();
+    match result {
+        Ok(out) if out.status.success() => Ok(()),
+        other => with_wtype_libei_fallback(
+            || {
+                libei_wait_keyboard_ready()?;
+                libei_press_key(key)
+            },
+            other.map(|out| String::from_utf8_lossy(&out.stderr).into_owned()),
         ),
     }
 }
@@ -1991,18 +2080,48 @@ pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
     }
 }
 
+/// Send a chord while an outer exact-container focus guard is active.
+pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
+    let (mods, final_key) = partition_modifiers(keys)?;
+    if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
+        return Ok(());
+    }
+    let keysym = key_to_keysym(&final_key);
+    let args = wtype_hotkey_args(&mods, &keysym);
+    let result = std::process::Command::new("wtype").args(&args).output();
+    match result {
+        Ok(out) if out.status.success() => Ok(()),
+        other => {
+            let stderr = other.map(|out| String::from_utf8_lossy(&out.stderr).into_owned());
+            #[cfg(feature = "portal-input")]
+            {
+                return with_wtype_libei_fallback(
+                    || {
+                        libei::wait_keyboard_ready()?;
+                        libei_hotkey(&mods, &final_key)
+                    },
+                    stderr,
+                );
+            }
+            #[cfg(not(feature = "portal-input"))]
+            {
+                anyhow::bail!(
+                    "wtype {} failed: {}",
+                    args.join(" "),
+                    stderr.unwrap_or_else(|_| "wtype unavailable".into())
+                );
+            }
+        }
+    }
+}
+
 fn wtype_hotkey_args(mods: &[String], keysym: &str) -> Vec<String> {
     // Keep the same harmless first-event primer used by `press_key`. A fresh
     // virtual-keyboard object on headless seats can drop its first event. Give
     // wlroots one event cycle after the primer and modifier transitions;
     // otherwise Chromium can miss a coalesced shortcut even though wtype exits
     // successfully.
-    let mut args: Vec<String> = vec![
-        "-k".into(),
-        "Shift_L".into(),
-        "-s".into(),
-        "30".into(),
-    ];
+    let mut args: Vec<String> = vec!["-k".into(), "Shift_L".into(), "-s".into(), "30".into()];
     for m in mods {
         args.push("-M".into());
         args.push(m.clone());
@@ -2091,12 +2210,12 @@ fn with_wtype_libei_fallback(
     #[cfg(feature = "portal-input")]
     {
         match wtype_err {
-            Ok(stderr) => tracing::info!(
-                "wtype failed ({stderr}); falling back to libei/portal typing"
-            ),
-            Err(e) => tracing::info!(
-                "wtype unavailable ({e}); falling back to libei/portal typing"
-            ),
+            Ok(stderr) => {
+                tracing::info!("wtype failed ({stderr}); falling back to libei/portal typing")
+            }
+            Err(e) => {
+                tracing::info!("wtype unavailable ({e}); falling back to libei/portal typing")
+            }
         }
         run()
     }
@@ -2304,59 +2423,59 @@ fn libei_hotkey(mods: &[String], key: &str) -> anyhow::Result<()> {
 /// known mapping so the caller can fail loudly.
 fn key_to_evdev(key: &str) -> Option<u32> {
     let code = match key.to_lowercase().as_str() {
-        "enter" | "return" => 28, // KEY_ENTER
-        "tab" => 15,              // KEY_TAB
-        "esc" | "escape" => 1,    // KEY_ESC
-        "space" => 57,            // KEY_SPACE
-        "backspace" => 14,        // KEY_BACKSPACE
-        "delete" | "del" => 111,  // KEY_DELETE
-        "up" => 103,              // KEY_UP
-        "down" => 108,            // KEY_DOWN
-        "left" => 105,            // KEY_LEFT
-        "right" => 106,           // KEY_RIGHT
-        "home" => 102,            // KEY_HOME
-        "end" => 107,             // KEY_END
-        "pageup" | "page_up" => 104,    // KEY_PAGEUP
+        "enter" | "return" => 28,        // KEY_ENTER
+        "tab" => 15,                     // KEY_TAB
+        "esc" | "escape" => 1,           // KEY_ESC
+        "space" => 57,                   // KEY_SPACE
+        "backspace" => 14,               // KEY_BACKSPACE
+        "delete" | "del" => 111,         // KEY_DELETE
+        "up" => 103,                     // KEY_UP
+        "down" => 108,                   // KEY_DOWN
+        "left" => 105,                   // KEY_LEFT
+        "right" => 106,                  // KEY_RIGHT
+        "home" => 102,                   // KEY_HOME
+        "end" => 107,                    // KEY_END
+        "pageup" | "page_up" => 104,     // KEY_PAGEUP
         "pagedown" | "page_down" => 109, // KEY_PAGEDOWN
         // Letters a-z. evdev codes follow the QWERTY scancode layout, not the
         // alphabet, so each is listed explicitly (linux/input-event-codes.h).
-        "a" => 30,  // KEY_A
-        "b" => 48,  // KEY_B
-        "c" => 46,  // KEY_C
-        "d" => 32,  // KEY_D
-        "e" => 18,  // KEY_E
-        "f" => 33,  // KEY_F
-        "g" => 34,  // KEY_G
-        "h" => 35,  // KEY_H
-        "i" => 23,  // KEY_I
-        "j" => 36,  // KEY_J
-        "k" => 37,  // KEY_K
-        "l" => 38,  // KEY_L
-        "m" => 50,  // KEY_M
-        "n" => 49,  // KEY_N
-        "o" => 24,  // KEY_O
-        "p" => 25,  // KEY_P
-        "q" => 16,  // KEY_Q
-        "r" => 19,  // KEY_R
-        "s" => 31,  // KEY_S
-        "t" => 20,  // KEY_T
-        "u" => 22,  // KEY_U
-        "v" => 47,  // KEY_V
-        "w" => 17,  // KEY_W
-        "x" => 45,  // KEY_X
-        "y" => 21,  // KEY_Y
-        "z" => 44,  // KEY_Z
+        "a" => 30, // KEY_A
+        "b" => 48, // KEY_B
+        "c" => 46, // KEY_C
+        "d" => 32, // KEY_D
+        "e" => 18, // KEY_E
+        "f" => 33, // KEY_F
+        "g" => 34, // KEY_G
+        "h" => 35, // KEY_H
+        "i" => 23, // KEY_I
+        "j" => 36, // KEY_J
+        "k" => 37, // KEY_K
+        "l" => 38, // KEY_L
+        "m" => 50, // KEY_M
+        "n" => 49, // KEY_N
+        "o" => 24, // KEY_O
+        "p" => 25, // KEY_P
+        "q" => 16, // KEY_Q
+        "r" => 19, // KEY_R
+        "s" => 31, // KEY_S
+        "t" => 20, // KEY_T
+        "u" => 22, // KEY_U
+        "v" => 47, // KEY_V
+        "w" => 17, // KEY_W
+        "x" => 45, // KEY_X
+        "y" => 21, // KEY_Y
+        "z" => 44, // KEY_Z
         // Digits. KEY_1=2 .. KEY_9=10, KEY_0=11 (input-event-codes.h).
-        "1" => 2,   // KEY_1
-        "2" => 3,   // KEY_2
-        "3" => 4,   // KEY_3
-        "4" => 5,   // KEY_4
-        "5" => 6,   // KEY_5
-        "6" => 7,   // KEY_6
-        "7" => 8,   // KEY_7
-        "8" => 9,   // KEY_8
-        "9" => 10,  // KEY_9
-        "0" => 11,  // KEY_0
+        "1" => 2,  // KEY_1
+        "2" => 3,  // KEY_2
+        "3" => 4,  // KEY_3
+        "4" => 5,  // KEY_4
+        "5" => 6,  // KEY_5
+        "6" => 7,  // KEY_6
+        "7" => 8,  // KEY_7
+        "8" => 9,  // KEY_8
+        "9" => 10, // KEY_9
+        "0" => 11, // KEY_0
         // Function keys. KEY_F1=59 .. KEY_F10=68, then KEY_F11=87, KEY_F12=88.
         "f1" => 59,
         "f2" => 60,
@@ -2399,8 +2518,29 @@ const INJECT_PROTO_HELLO: &str = "cua-inject v2";
 /// whitelist in `cua_key_named` (cua_compositor_patch.py). Compared
 /// case-insensitively, matching the compositor's `strcasecmp`.
 const INJECT_NAMED_KEYS: &[&str] = &[
-    "enter", "return", "tab", "escape", "esc", "backspace", "space", "up", "down", "left", "right",
-    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
+    "enter",
+    "return",
+    "tab",
+    "escape",
+    "esc",
+    "backspace",
+    "space",
+    "up",
+    "down",
+    "left",
+    "right",
+    "f1",
+    "f2",
+    "f3",
+    "f4",
+    "f5",
+    "f6",
+    "f7",
+    "f8",
+    "f9",
+    "f10",
+    "f11",
+    "f12",
 ];
 
 /// The control socket path, when running against the nested cua-compositor.
@@ -2686,7 +2826,10 @@ fn parse_inject_geometry(line: &str) -> anyhow::Result<((i32, i32), (i32, i32))>
     if let Some(reason) = line.trim().strip_prefix("err") {
         anyhow::bail!("cua-compositor geometry query failed: {}", reason.trim());
     }
-    anyhow::bail!("unexpected cua-compositor geometry response: {:?}", line.trim())
+    anyhow::bail!(
+        "unexpected cua-compositor geometry response: {:?}",
+        line.trim()
+    )
 }
 
 /// Return the offset that rebases native Wayland accessibility coordinates into
@@ -3047,8 +3190,7 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
                 }
             }
             Ok(_) => {
-                if let Some(ws) =
-                    shell_helper::list_windows(filter_pid).filter(|ws| !ws.is_empty())
+                if let Some(ws) = shell_helper::list_windows(filter_pid).filter(|ws| !ws.is_empty())
                 {
                     return ws;
                 }
@@ -3058,17 +3200,14 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
                 }
             }
             Err(e) => {
-                if let Some(ws) =
-                    shell_helper::list_windows(filter_pid).filter(|ws| !ws.is_empty())
+                if let Some(ws) = shell_helper::list_windows(filter_pid).filter(|ws| !ws.is_empty())
                 {
                     tracing::debug!(
                         "native Wayland protocols unavailable ({e}); using compositor helper"
                     );
                     return ws;
                 }
-                tracing::warn!(
-                    "native Wayland list_windows failed: {e}; trying AT-SPI registry"
-                );
+                tracing::warn!("native Wayland list_windows failed: {e}; trying AT-SPI registry");
                 let ws = wayland_atspi_windows(filter_pid);
                 if !ws.is_empty() {
                     return ws;
@@ -3407,7 +3546,12 @@ mod tests {
         assert_eq!(enriched[0].xid, 77);
         assert_eq!(enriched[0].pid, Some(123));
         assert_eq!(
-            (enriched[0].x, enriched[0].y, enriched[0].width, enriched[0].height),
+            (
+                enriched[0].x,
+                enriched[0].y,
+                enriched[0].width,
+                enriched[0].height
+            ),
             (20, 30, 800, 600)
         );
     }
@@ -3419,7 +3563,10 @@ mod tests {
         let enriched = enrich_native_windows(native, vec![accessible], true);
         assert_eq!(enriched[0].xid, 123 << 16);
         assert_eq!(enriched[0].pid, Some(123));
-        assert_eq!(identity_for(enriched[0].xid).unwrap().title, "CuaTestHarness");
+        assert_eq!(
+            identity_for(enriched[0].xid).unwrap().title,
+            "CuaTestHarness"
+        );
     }
 
     #[test]
@@ -3474,7 +3621,14 @@ mod tests {
 
     #[test]
     fn injectable_text_rejects_unicode_and_other_controls() {
-        for bad in ["café", "emoji 😀", "bell\u{07}", "null\u{00}", "delete\u{7f}", "cr\r"] {
+        for bad in [
+            "café",
+            "emoji 😀",
+            "bell\u{07}",
+            "null\u{00}",
+            "delete\u{7f}",
+            "cr\r",
+        ] {
             assert!(
                 validate_injectable_text(bad).is_err(),
                 "{bad:?} must be rejected before it reaches the compositor"
@@ -3484,7 +3638,9 @@ mod tests {
 
     #[test]
     fn injectable_key_accepts_whitelist_case_insensitively() {
-        for good in ["enter", "Enter", "RETURN", "tab", "Escape", "esc", "space", "up", "Left", "f1", "F12"] {
+        for good in [
+            "enter", "Enter", "RETURN", "tab", "Escape", "esc", "space", "up", "Left", "f1", "F12",
+        ] {
             validate_injectable_key(good).unwrap_or_else(|e| panic!("{good:?} should pass: {e}"));
         }
     }
@@ -3516,8 +3672,8 @@ mod tests {
         assert_eq!(
             args,
             [
-                "-k", "Shift_L", "-s", "30", "-M", "ctrl", "-M", "shift", "-s", "20",
-                "-k", "7", "-s", "20", "-m", "shift", "-m", "ctrl",
+                "-k", "Shift_L", "-s", "30", "-M", "ctrl", "-M", "shift", "-s", "20", "-k", "7",
+                "-s", "20", "-m", "shift", "-m", "ctrl",
             ]
         );
     }
