@@ -35,15 +35,9 @@ use cursor_overlay::{
 
 static CMD_TX: OnceLock<std::sync::mpsc::SyncSender<OverlayMsg>> = OnceLock::new();
 
-// Exact GNOME WinRects cursor targets keyed by Cua session/owner. PinAbove
-// records the incarnation-qualified window id; later move/pulse commands only
-// render when that exact target is known. Unkeyed global GNOME cursors are
-// intentionally unsupported.
-static GNOME_TARGETS: OnceLock<Mutex<HashMap<CursorKey, u64>>> = OnceLock::new();
-
-fn gnome_targets() -> &'static Mutex<HashMap<CursorKey, u64>> {
-    GNOME_TARGETS.get_or_init(|| Mutex::new(HashMap::new()))
-}
+// Linearizes accepted-state mutation with nonblocking enqueue. Exact target
+// mutation then occurs in FIFO order on the worker that owns the D-Bus caller.
+static GNOME_CURSOR_ORDER: Mutex<()> = Mutex::new(());
 
 static CMD_RX_CELL: Mutex<Option<std::sync::mpsc::Receiver<OverlayMsg>>> = Mutex::new(None);
 static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
@@ -137,7 +131,7 @@ pub fn send_command(cmd: OverlayCommand) {
     send_command_for("default".to_owned(), cmd);
 }
 
-fn apply_gnome_logical_command(key: &CursorKey, cmd: &OverlayCommand) {
+fn apply_gnome_logical_command(key: &CursorKey, cmd: &OverlayCommand) -> bool {
     // GNOME Shell performs the visual move itself. Keep only a snapped logical
     // position here so animation callers have deterministic state without ever
     // waking the external X11 renderer.
@@ -154,19 +148,22 @@ fn apply_gnome_logical_command(key: &CursorKey, cmd: &OverlayCommand) {
         other => other.clone(),
     };
     let Ok(mut render) = RENDER.lock() else {
-        return;
+        return false;
     };
-    if let Some(map) = render.as_mut() {
-        if let Some(active) = apply_msg(
-            map,
-            OverlayMsg::Cmd(KeyedOverlayCommand {
-                key: key.clone(),
-                cmd: logical,
-            }),
-        ) {
-            map.last_active = Some(active);
-        }
-    }
+    let Some(map) = render.as_mut() else {
+        return false;
+    };
+    let Some(active) = apply_msg(
+        map,
+        OverlayMsg::Cmd(KeyedOverlayCommand {
+            key: key.clone(),
+            cmd: logical,
+        }),
+    ) else {
+        return false;
+    };
+    map.last_active = Some(active);
+    true
 }
 
 pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
@@ -176,47 +173,37 @@ pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
     #[cfg(target_os = "linux")]
     {
         if crate::wayland::is_gnome_wayland_session() {
-            apply_gnome_logical_command(&key, &cmd);
-            if crate::wayland::shell_helper::available() {
-                // GNOME has no layer-shell. WinRects owns one Shell actor per
-                // cursor key, bound to an exact incarnation-qualified target.
-                // Never send an unpinned cursor command: a global actor without
-                // a target visibility scope is intentionally unsupported.
-                match &cmd {
-                    cursor_overlay::OverlayCommand::PinAbove(window_id) => {
-                        if let Ok(mut targets) = gnome_targets().lock() {
-                            targets.insert(key.clone(), *window_id);
-                        }
-                    }
-                    cursor_overlay::OverlayCommand::MoveTo { x, y, .. }
-                    | cursor_overlay::OverlayCommand::SnapTo { x, y, .. } => {
-                        let window_id = gnome_targets()
-                            .lock()
-                            .ok()
-                            .and_then(|targets| targets.get(&key).copied());
-                        if let Some(window_id) = window_id {
-                            let _ = crate::wayland::shell_helper::move_cursor(
-                                &key, window_id, *x as i32, *y as i32,
-                            );
-                            arrival_fire(&key);
-                        }
-                    }
-                    cursor_overlay::OverlayCommand::ClickPulse { x, y } => {
-                        let window_id = gnome_targets()
-                            .lock()
-                            .ok()
-                            .and_then(|targets| targets.get(&key).copied());
-                        if let Some(window_id) = window_id {
-                            let _ = crate::wayland::shell_helper::click_pulse(
-                                &key, window_id, *x as i32, *y as i32,
-                            );
-                        }
-                    }
-                    cursor_overlay::OverlayCommand::SetEnabled(false) => {
-                        crate::wayland::shell_helper::hide_cursor(&key);
-                    }
-                    _ => {}
+            if key == "default" {
+                arrival_fire(&key);
+                return;
+            }
+            let Ok(_order) = GNOME_CURSOR_ORDER.lock() else {
+                arrival_fire(&key);
+                return;
+            };
+            if !apply_gnome_logical_command(&key, &cmd) {
+                arrival_fire(&key);
+                return;
+            }
+            // GNOME has no layer-shell. WinRects owns one Shell actor per cursor
+            // key, bound to an exact incarnation-qualified target. Never send an
+            // unpinned cursor command: a global actor without a target visibility
+            // scope is intentionally unsupported.
+            match &cmd {
+                cursor_overlay::OverlayCommand::PinAbove(window_id) => {
+                    let _ = crate::wayland::shell_helper::pin_cursor(&key, *window_id);
                 }
+                cursor_overlay::OverlayCommand::MoveTo { x, y, .. }
+                | cursor_overlay::OverlayCommand::SnapTo { x, y, .. } => {
+                    let _ = crate::wayland::shell_helper::move_cursor(&key, *x as i32, *y as i32);
+                }
+                cursor_overlay::OverlayCommand::ClickPulse { x, y } => {
+                    let _ = crate::wayland::shell_helper::click_pulse(&key, *x as i32, *y as i32);
+                }
+                cursor_overlay::OverlayCommand::SetEnabled(false) => {
+                    crate::wayland::shell_helper::hide_cursor(&key);
+                }
+                _ => {}
             }
             // No external X11 overlay is permitted in a GNOME Wayland session,
             // including helper skew/unavailability. Avoid hanging animation
@@ -362,26 +349,21 @@ pub fn remove_cursor(key: CursorKey) {
         return;
     }
     if crate::wayland::is_gnome_wayland_session() {
+        let Ok(_order) = GNOME_CURSOR_ORDER.lock() else {
+            return;
+        };
         if let Ok(mut render) = RENDER.lock() {
             if let Some(map) = render.as_mut() {
                 let _ = apply_msg(map, OverlayMsg::Remove(key.clone()));
             }
         }
-        if let Ok(mut targets) = gnome_targets().lock() {
-            targets.remove(&key);
-        }
-        if crate::wayland::shell_helper::available() {
-            crate::wayland::shell_helper::remove_cursor(&key);
-        }
+        crate::wayland::shell_helper::remove_cursor(&key);
         return;
     }
     if let Some(tx) = CMD_TX.get() {
         let _ = tx.try_send(OverlayMsg::Remove(key.clone()));
     }
-    if crate::wayland::is_wayland() && crate::wayland::shell_helper::available() {
-        if let Ok(mut targets) = gnome_targets().lock() {
-            targets.remove(&key);
-        }
+    if crate::wayland::is_wayland() {
         crate::wayland::shell_helper::remove_cursor(&key);
     }
 }
@@ -1219,6 +1201,36 @@ mod tests {
             key: "default".to_owned(),
             cmd: OverlayCommand::SetEnabled(true),
         })
+    }
+
+    #[test]
+    fn removed_cursor_rejects_late_commands() {
+        let mut map = default_render_map();
+        let key = "ended-owner".to_owned();
+        assert_eq!(
+            apply_msg(
+                &mut map,
+                OverlayMsg::Cmd(KeyedOverlayCommand {
+                    key: key.clone(),
+                    cmd: OverlayCommand::SetEnabled(true),
+                })
+            ),
+            Some(key.clone())
+        );
+
+        assert_eq!(apply_msg(&mut map, OverlayMsg::Remove(key.clone())), None);
+        assert_eq!(
+            apply_msg(
+                &mut map,
+                OverlayMsg::Cmd(KeyedOverlayCommand {
+                    key: key.clone(),
+                    cmd: OverlayCommand::PinAbove(1),
+                })
+            ),
+            None
+        );
+        assert!(map.ended.contains(&key));
+        assert!(!map.cursors.contains_key(&key));
     }
 
     #[test]

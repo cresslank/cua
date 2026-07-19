@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::x11::WindowInfo;
 
@@ -42,27 +42,27 @@ static FOREGROUND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PENDING_FOREGROUND: Mutex<Option<String>> = Mutex::new(None);
 
 const OVERLAY_DISPATCH_CAPACITY: usize = 4096;
+const OVERLAY_HELPER_PROBE_TTL: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 enum OverlayDispatchRequest {
-    Move {
-        owner: String,
-        window_id: u64,
-        x: i32,
-        y: i32,
-    },
-    ClickPulse {
-        owner: String,
-        window_id: u64,
-        x: i32,
-        y: i32,
-    },
-    Hide {
-        owner: String,
-    },
-    Remove {
-        owner: String,
-    },
+    Pin { owner: String, window_id: u64 },
+    Move { owner: String, x: i32, y: i32 },
+    ClickPulse { owner: String, x: i32, y: i32 },
+    Hide { owner: String },
+    Remove { owner: String },
+}
+
+impl OverlayDispatchRequest {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Pin { .. } => "pin",
+            Self::Move { .. } => "move",
+            Self::ClickPulse { .. } => "click_pulse",
+            Self::Hide { .. } => "hide",
+            Self::Remove { .. } => "remove",
+        }
+    }
 }
 
 fn spawn_overlay_dispatcher<F>(
@@ -85,15 +85,15 @@ where
 
 fn dispatch_overlay_request(
     connection: &zbus::blocking::Connection,
+    targets: &HashMap<String, u64>,
     request: OverlayDispatchRequest,
 ) {
     match request {
-        OverlayDispatchRequest::Move {
-            owner,
-            window_id,
-            x,
-            y,
-        } => {
+        OverlayDispatchRequest::Pin { .. } => {}
+        OverlayDispatchRequest::Move { owner, x, y } => {
+            let Some(window_id) = targets.get(&owner).copied() else {
+                return;
+            };
             let Some(target) = resolve_target(window_id) else {
                 return;
             };
@@ -105,12 +105,10 @@ fn dispatch_overlay_request(
                 &(owner.as_str(), target.target_id.as_str(), x, y),
             );
         }
-        OverlayDispatchRequest::ClickPulse {
-            owner,
-            window_id,
-            x,
-            y,
-        } => {
+        OverlayDispatchRequest::ClickPulse { owner, x, y } => {
+            let Some(window_id) = targets.get(&owner).copied() else {
+                return;
+            };
             let Some(target) = resolve_target(window_id) else {
                 return;
             };
@@ -143,26 +141,101 @@ fn dispatch_overlay_request(
     }
 }
 
+fn prepare_overlay_dispatch(
+    targets: &mut HashMap<String, u64>,
+    request: &OverlayDispatchRequest,
+) -> bool {
+    match request {
+        OverlayDispatchRequest::Pin { owner, window_id } => {
+            targets.insert(owner.clone(), *window_id);
+            false
+        }
+        OverlayDispatchRequest::Move { owner, .. }
+        | OverlayDispatchRequest::ClickPulse { owner, .. }
+        | OverlayDispatchRequest::Hide { owner } => targets.contains_key(owner),
+        OverlayDispatchRequest::Remove { owner } => {
+            targets.remove(owner);
+            true
+        }
+    }
+}
+
 pub fn start_overlay_dispatcher() {
     let _ = OVERLAY_DISPATCH_TX.get_or_init(|| {
         let mut connection: Option<zbus::blocking::Connection> = None;
+        let mut helper_compatible: Option<(Instant, bool)> = None;
+        let mut targets = HashMap::new();
         spawn_overlay_dispatcher(move |request| {
+            if !prepare_overlay_dispatch(&mut targets, &request) {
+                return;
+            }
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tracing::error!(
+                    request = request.kind(),
+                    "refusing blocking GNOME cursor dispatch on a Tokio runtime"
+                );
+                return;
+            }
+            let now = Instant::now();
+            let compatible = match helper_compatible {
+                Some((checked_at, compatible))
+                    if now.duration_since(checked_at) < OVERLAY_HELPER_PROBE_TTL =>
+                {
+                    compatible
+                }
+                _ => {
+                    let compatible = available();
+                    helper_compatible = Some((now, compatible));
+                    compatible
+                }
+            };
+            if !compatible {
+                return;
+            }
             if connection.is_none() {
                 connection = zbus::blocking::Connection::session().ok();
             }
             if let Some(connection) = connection.as_ref() {
-                dispatch_overlay_request(connection, request);
+                dispatch_overlay_request(connection, &targets, request);
             }
         })
     });
 }
 
+fn try_enqueue_overlay_request(
+    sender: &std::sync::mpsc::SyncSender<OverlayDispatchRequest>,
+    request: OverlayDispatchRequest,
+) -> bool {
+    match sender.try_send(request) {
+        Ok(()) => true,
+        Err(std::sync::mpsc::TrySendError::Full(request)) => {
+            tracing::warn!(
+                request = request.kind(),
+                capacity = OVERLAY_DISPATCH_CAPACITY,
+                "GNOME cursor dispatcher queue is full; dropping best-effort visual command"
+            );
+            false
+        }
+        Err(std::sync::mpsc::TrySendError::Disconnected(request)) => {
+            tracing::warn!(
+                request = request.kind(),
+                "GNOME cursor dispatcher disconnected; dropping best-effort visual command"
+            );
+            false
+        }
+    }
+}
+
 fn enqueue_overlay_request(request: OverlayDispatchRequest) -> bool {
     start_overlay_dispatcher();
-    OVERLAY_DISPATCH_TX
-        .get()
-        .and_then(Option::as_ref)
-        .is_some_and(|sender| sender.try_send(request).is_ok())
+    let Some(sender) = OVERLAY_DISPATCH_TX.get().and_then(Option::as_ref) else {
+        tracing::warn!(
+            request = request.kind(),
+            "GNOME cursor dispatcher is unavailable"
+        );
+        return false;
+    };
+    try_enqueue_overlay_request(sender, request)
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -960,19 +1033,24 @@ fn parse_shell_windows(raw: &str) -> Option<Vec<ShellWindow>> {
     Some(parsed)
 }
 
-pub fn move_cursor(owner: &str, window_id: u64, x: i32, y: i32) -> bool {
-    enqueue_overlay_request(OverlayDispatchRequest::Move {
+pub fn pin_cursor(owner: &str, window_id: u64) -> bool {
+    enqueue_overlay_request(OverlayDispatchRequest::Pin {
         owner: owner.to_owned(),
         window_id,
+    })
+}
+
+pub fn move_cursor(owner: &str, x: i32, y: i32) -> bool {
+    enqueue_overlay_request(OverlayDispatchRequest::Move {
+        owner: owner.to_owned(),
         x,
         y,
     })
 }
 
-pub fn click_pulse(owner: &str, window_id: u64, x: i32, y: i32) -> bool {
+pub fn click_pulse(owner: &str, x: i32, y: i32) -> bool {
     enqueue_overlay_request(OverlayDispatchRequest::ClickPulse {
         owner: owner.to_owned(),
-        window_id,
         x,
         y,
     })
@@ -1034,6 +1112,139 @@ mod tests {
         });
 
         assert_eq!(observed_rx.recv_timeout(Duration::from_secs(1)), Ok(true));
+    }
+
+    #[test]
+    fn public_overlay_enqueue_returns_from_a_current_thread_tokio_runtime() {
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                let owner = "tokio-public-route";
+                assert!(pin_cursor(owner, 1));
+            });
+            done_tx.send(()).expect("report completion");
+        });
+
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(1)), Ok(()));
+    }
+
+    #[test]
+    fn overlay_dispatcher_preserves_fifo_order() {
+        let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(5);
+        let sender = spawn_overlay_dispatcher(move |request| {
+            observed_tx.send(request.kind()).expect("record request");
+        })
+        .expect("dispatcher thread");
+
+        for request in [
+            OverlayDispatchRequest::Pin {
+                owner: "test-owner".to_owned(),
+                window_id: 1,
+            },
+            OverlayDispatchRequest::Move {
+                owner: "test-owner".to_owned(),
+                x: 10,
+                y: 20,
+            },
+            OverlayDispatchRequest::ClickPulse {
+                owner: "test-owner".to_owned(),
+                x: 10,
+                y: 20,
+            },
+            OverlayDispatchRequest::Hide {
+                owner: "test-owner".to_owned(),
+            },
+            OverlayDispatchRequest::Remove {
+                owner: "test-owner".to_owned(),
+            },
+        ] {
+            sender.try_send(request).expect("queue cursor request");
+        }
+
+        let observed: Vec<_> = (0..5)
+            .map(|_| {
+                observed_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("receive cursor request")
+            })
+            .collect();
+        assert_eq!(observed, ["pin", "move", "click_pulse", "hide", "remove"]);
+    }
+
+    #[test]
+    fn overlay_dispatcher_owns_ordered_target_lifecycle() {
+        let owner = "test-owner".to_owned();
+        let mut targets = HashMap::new();
+
+        assert!(!prepare_overlay_dispatch(
+            &mut targets,
+            &OverlayDispatchRequest::Pin {
+                owner: owner.clone(),
+                window_id: 1,
+            }
+        ));
+        assert_eq!(targets.get(&owner), Some(&1));
+        assert!(prepare_overlay_dispatch(
+            &mut targets,
+            &OverlayDispatchRequest::Move {
+                owner: owner.clone(),
+                x: 10,
+                y: 20,
+            }
+        ));
+
+        assert!(!prepare_overlay_dispatch(
+            &mut targets,
+            &OverlayDispatchRequest::Pin {
+                owner: owner.clone(),
+                window_id: 2,
+            }
+        ));
+        assert_eq!(targets.get(&owner), Some(&2));
+        assert!(prepare_overlay_dispatch(
+            &mut targets,
+            &OverlayDispatchRequest::Remove {
+                owner: owner.clone(),
+            }
+        ));
+        assert!(!prepare_overlay_dispatch(
+            &mut targets,
+            &OverlayDispatchRequest::Move {
+                owner,
+                x: 30,
+                y: 40,
+            }
+        ));
+    }
+
+    #[test]
+    fn overlay_dispatcher_queue_failures_are_nonblocking_and_explicit() {
+        let (full_tx, _full_rx) = std::sync::mpsc::sync_channel(1);
+        assert!(try_enqueue_overlay_request(
+            &full_tx,
+            OverlayDispatchRequest::Hide {
+                owner: "test-owner".to_owned(),
+            }
+        ));
+        assert!(!try_enqueue_overlay_request(
+            &full_tx,
+            OverlayDispatchRequest::Remove {
+                owner: "test-owner".to_owned(),
+            }
+        ));
+
+        let (disconnected_tx, disconnected_rx) = std::sync::mpsc::sync_channel(1);
+        drop(disconnected_rx);
+        assert!(!try_enqueue_overlay_request(
+            &disconnected_tx,
+            OverlayDispatchRequest::Remove {
+                owner: "test-owner".to_owned(),
+            }
+        ));
     }
 
     #[test]
