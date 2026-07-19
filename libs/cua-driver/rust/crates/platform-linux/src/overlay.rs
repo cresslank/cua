@@ -153,7 +153,10 @@ fn apply_gnome_logical_command(key: &CursorKey, cmd: &OverlayCommand) {
         },
         other => other.clone(),
     };
-    if let Some(map) = RENDER.lock().unwrap().as_mut() {
+    let Ok(mut render) = RENDER.lock() else {
+        return;
+    };
+    if let Some(map) = render.as_mut() {
         if let Some(active) = apply_msg(
             map,
             OverlayMsg::Cmd(KeyedOverlayCommand {
@@ -181,15 +184,17 @@ pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
                 // a target visibility scope is intentionally unsupported.
                 match &cmd {
                     cursor_overlay::OverlayCommand::PinAbove(window_id) => {
-                        gnome_targets()
-                            .lock()
-                            .unwrap()
-                            .insert(key.clone(), *window_id);
+                        if let Ok(mut targets) = gnome_targets().lock() {
+                            targets.insert(key.clone(), *window_id);
+                        }
                     }
                     cursor_overlay::OverlayCommand::MoveTo { x, y, .. }
                     | cursor_overlay::OverlayCommand::SnapTo { x, y, .. } => {
-                        if let Some(window_id) = gnome_targets().lock().unwrap().get(&key).copied()
-                        {
+                        let window_id = gnome_targets()
+                            .lock()
+                            .ok()
+                            .and_then(|targets| targets.get(&key).copied());
+                        if let Some(window_id) = window_id {
                             let _ = crate::wayland::shell_helper::move_cursor(
                                 &key, window_id, *x as i32, *y as i32,
                             );
@@ -197,8 +202,11 @@ pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
                         }
                     }
                     cursor_overlay::OverlayCommand::ClickPulse { x, y } => {
-                        if let Some(window_id) = gnome_targets().lock().unwrap().get(&key).copied()
-                        {
+                        let window_id = gnome_targets()
+                            .lock()
+                            .ok()
+                            .and_then(|targets| targets.get(&key).copied());
+                        if let Some(window_id) = window_id {
                             let _ = crate::wayland::shell_helper::click_pulse(
                                 &key, window_id, *x as i32, *y as i32,
                             );
@@ -354,10 +362,14 @@ pub fn remove_cursor(key: CursorKey) {
         return;
     }
     if crate::wayland::is_gnome_wayland_session() {
-        if let Some(map) = RENDER.lock().unwrap().as_mut() {
-            let _ = apply_msg(map, OverlayMsg::Remove(key.clone()));
+        if let Ok(mut render) = RENDER.lock() {
+            if let Some(map) = render.as_mut() {
+                let _ = apply_msg(map, OverlayMsg::Remove(key.clone()));
+            }
         }
-        gnome_targets().lock().unwrap().remove(&key);
+        if let Ok(mut targets) = gnome_targets().lock() {
+            targets.remove(&key);
+        }
         if crate::wayland::shell_helper::available() {
             crate::wayland::shell_helper::remove_cursor(&key);
         }
@@ -367,7 +379,9 @@ pub fn remove_cursor(key: CursorKey) {
         let _ = tx.try_send(OverlayMsg::Remove(key.clone()));
     }
     if crate::wayland::is_wayland() && crate::wayland::shell_helper::available() {
-        gnome_targets().lock().unwrap().remove(&key);
+        if let Ok(mut targets) = gnome_targets().lock() {
+            targets.remove(&key);
+        }
         crate::wayland::shell_helper::remove_cursor(&key);
     }
 }

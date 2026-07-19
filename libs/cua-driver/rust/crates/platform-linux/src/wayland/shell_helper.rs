@@ -16,9 +16,10 @@
 //!
 //! Everything here is **best-effort**: if the extension isn't installed/enabled
 //! the calls return `None` / no-op and callers keep the prior behaviour (no
-//! screen coords, no Wayland cursor). Uses a short-lived `gdbus` subprocess so
-//! there's no zbus blocking-feature or async-context coupling — the calls are
-//! infrequent (once per `get_window_state`, a few per click).
+//! screen coords, no Wayland cursor). Most calls use a short-lived `gdbus`
+//! subprocess. Cursor calls need one persistent D-Bus connection so Shell can
+//! bind actor lifetime to its unique name; a dedicated non-Tokio thread owns
+//! that blocking zbus connection and serializes those calls.
 
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
@@ -35,9 +36,134 @@ const INTROSPECT_DEST: &str = "org.gnome.Shell.Introspect";
 const INTROSPECT_PATH: &str = "/org/gnome/Shell/Introspect";
 const INTROSPECT_IFACE: &str = "org.gnome.Shell.Introspect";
 const REQUIRED_PROTOCOL: u64 = 4;
-static OVERLAY_CONNECTION: OnceLock<Option<zbus::blocking::Connection>> = OnceLock::new();
+static OVERLAY_DISPATCH_TX: OnceLock<Option<std::sync::mpsc::SyncSender<OverlayDispatchRequest>>> =
+    OnceLock::new();
 static FOREGROUND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PENDING_FOREGROUND: Mutex<Option<String>> = Mutex::new(None);
+
+const OVERLAY_DISPATCH_CAPACITY: usize = 4096;
+
+#[derive(Debug)]
+enum OverlayDispatchRequest {
+    Move {
+        owner: String,
+        window_id: u64,
+        x: i32,
+        y: i32,
+    },
+    ClickPulse {
+        owner: String,
+        window_id: u64,
+        x: i32,
+        y: i32,
+    },
+    Hide {
+        owner: String,
+    },
+    Remove {
+        owner: String,
+    },
+}
+
+fn spawn_overlay_dispatcher<F>(
+    mut dispatch: F,
+) -> Option<std::sync::mpsc::SyncSender<OverlayDispatchRequest>>
+where
+    F: FnMut(OverlayDispatchRequest) + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(OVERLAY_DISPATCH_CAPACITY);
+    std::thread::Builder::new()
+        .name("cua-gnome-cursor-dbus".to_owned())
+        .spawn(move || {
+            while let Ok(request) = rx.recv() {
+                dispatch(request);
+            }
+        })
+        .ok()?;
+    Some(tx)
+}
+
+fn dispatch_overlay_request(
+    connection: &zbus::blocking::Connection,
+    request: OverlayDispatchRequest,
+) {
+    match request {
+        OverlayDispatchRequest::Move {
+            owner,
+            window_id,
+            x,
+            y,
+        } => {
+            let Some(target) = resolve_target(window_id) else {
+                return;
+            };
+            let _ = connection.call_method(
+                Some(DEST),
+                PATH,
+                Some(IFACE),
+                "MoveCursorFor",
+                &(owner.as_str(), target.target_id.as_str(), x, y),
+            );
+        }
+        OverlayDispatchRequest::ClickPulse {
+            owner,
+            window_id,
+            x,
+            y,
+        } => {
+            let Some(target) = resolve_target(window_id) else {
+                return;
+            };
+            let _ = connection.call_method(
+                Some(DEST),
+                PATH,
+                Some(IFACE),
+                "ClickPulseFor",
+                &(owner.as_str(), target.target_id.as_str(), x, y),
+            );
+        }
+        OverlayDispatchRequest::Hide { owner } => {
+            let _ = connection.call_method(
+                Some(DEST),
+                PATH,
+                Some(IFACE),
+                "HideCursorFor",
+                &(owner.as_str(),),
+            );
+        }
+        OverlayDispatchRequest::Remove { owner } => {
+            let _ = connection.call_method(
+                Some(DEST),
+                PATH,
+                Some(IFACE),
+                "RemoveCursor",
+                &(owner.as_str(),),
+            );
+        }
+    }
+}
+
+pub fn start_overlay_dispatcher() {
+    let _ = OVERLAY_DISPATCH_TX.get_or_init(|| {
+        let mut connection: Option<zbus::blocking::Connection> = None;
+        spawn_overlay_dispatcher(move |request| {
+            if connection.is_none() {
+                connection = zbus::blocking::Connection::session().ok();
+            }
+            if let Some(connection) = connection.as_ref() {
+                dispatch_overlay_request(connection, request);
+            }
+        })
+    });
+}
+
+fn enqueue_overlay_request(request: OverlayDispatchRequest) -> bool {
+    start_overlay_dispatcher();
+    OVERLAY_DISPATCH_TX
+        .get()
+        .and_then(Option::as_ref)
+        .is_some_and(|sender| sender.try_send(request).is_ok())
+}
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct Capabilities {
@@ -835,55 +961,33 @@ fn parse_shell_windows(raw: &str) -> Option<Vec<ShellWindow>> {
 }
 
 pub fn move_cursor(owner: &str, window_id: u64, x: i32, y: i32) -> bool {
-    let Some(target) = resolve_target(window_id) else {
-        return false;
-    };
-    persistent_overlay_connection().is_some_and(|connection| {
-        connection
-            .call_method(
-                Some(DEST),
-                PATH,
-                Some(IFACE),
-                "MoveCursorFor",
-                &(owner, target.target_id.as_str(), x, y),
-            )
-            .is_ok()
+    enqueue_overlay_request(OverlayDispatchRequest::Move {
+        owner: owner.to_owned(),
+        window_id,
+        x,
+        y,
     })
 }
 
 pub fn click_pulse(owner: &str, window_id: u64, x: i32, y: i32) -> bool {
-    let Some(target) = resolve_target(window_id) else {
-        return false;
-    };
-    persistent_overlay_connection().is_some_and(|connection| {
-        connection
-            .call_method(
-                Some(DEST),
-                PATH,
-                Some(IFACE),
-                "ClickPulseFor",
-                &(owner, target.target_id.as_str(), x, y),
-            )
-            .is_ok()
+    enqueue_overlay_request(OverlayDispatchRequest::ClickPulse {
+        owner: owner.to_owned(),
+        window_id,
+        x,
+        y,
     })
 }
 
 pub fn hide_cursor(owner: &str) {
-    if let Some(connection) = persistent_overlay_connection() {
-        let _ = connection.call_method(Some(DEST), PATH, Some(IFACE), "HideCursorFor", &(owner,));
-    }
+    let _ = enqueue_overlay_request(OverlayDispatchRequest::Hide {
+        owner: owner.to_owned(),
+    });
 }
 
 pub fn remove_cursor(owner: &str) {
-    if let Some(connection) = persistent_overlay_connection() {
-        let _ = connection.call_method(Some(DEST), PATH, Some(IFACE), "RemoveCursor", &(owner,));
-    }
-}
-
-fn persistent_overlay_connection() -> Option<&'static zbus::blocking::Connection> {
-    OVERLAY_CONNECTION
-        .get_or_init(|| zbus::blocking::Connection::session().ok())
-        .as_ref()
+    let _ = enqueue_overlay_request(OverlayDispatchRequest::Remove {
+        owner: owner.to_owned(),
+    });
 }
 
 #[cfg(test)]
@@ -907,6 +1011,29 @@ mod tests {
                 "connection-owned-cursors-v1".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn overlay_dispatcher_runs_outside_the_callers_tokio_runtime() {
+        let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(1);
+        let sender = spawn_overlay_dispatcher(move |_request| {
+            let _ = observed_tx.send(tokio::runtime::Handle::try_current().is_err());
+        })
+        .expect("dispatcher thread");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+
+        runtime.block_on(async {
+            sender
+                .try_send(OverlayDispatchRequest::Hide {
+                    owner: "test-owner".to_owned(),
+                })
+                .expect("queue cursor request");
+        });
+
+        assert_eq!(observed_rx.recv_timeout(Duration::from_secs(1)), Ok(true));
     }
 
     #[test]
