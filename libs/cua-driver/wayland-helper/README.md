@@ -18,23 +18,29 @@ It exposes `org.cua.WinRects` on the session bus:
   the GNOME analogue of the X11 `_GTK_FRAME_EXTENTS` reconstruction (AT-SPI's
   `CoordType::Screen` is `(0,0)` for every widget on Mutter). Keeping the frame
   and buffer origins separate accounts for GTK client-side shadows.
-- `BeginForeground(target) -> json` / `EndForeground(transaction) -> json` —
-  activate one exact current-workspace target even when another ordinary window
+- `BeginForeground(transaction,target) -> json` / `QueryForeground(transaction)` /
+  `AbortForeground(transaction)` / `EndForeground(transaction)` — the caller
+  allocates the transaction ID before activation, so a lost or delayed reply can
+  be queried and reconciled before the host-wide raw-input lease is released.
+  Activate one exact current-workspace target even when another ordinary window
   overlaps it, then require confirmed focus, visibility, no modal child, and no
-  remaining occlusion. Restore the prior workspace/window only if focus still
-  belongs to the transaction. `CommitForeground` is reserved for an explicit
+  remaining occlusion. Restoration is terminal only after readback confirms the
+  prior workspace/window, or after a third-party focus change is preserved.
+  `CommitForeground` is reserved for an explicit
   keep-focused action. A Shell input grab means an active Shell modal count or
   key focus inside `Main.uiGroup`; ordinary application-surface key focus is not
   misclassified as Shell chrome.
-- `CaptureTarget(target) -> png_base64` — capture the compositor stage only when
-  the exact target is currently painted, unoccluded by higher-stacked windows,
-  and free of Shell modal/input grabs. Cua's click-through cursor overlay is
-  non-occluding only after exact title/type/sticky state and `/proc/<pid>/exe`
-  proof. Unsafe requests fail closed; they are never cropped from unrelated
-  pixels.
+- `CaptureTarget(target) -> capture_json` — capture only the
+  exact target rectangle when it is painted, unoccluded by higher-stacked
+  windows, and free of Shell modal/input grabs. The JSON result binds target
+  id, epoch, geometry, stage size, and target-only PNG bytes to one Shell-side
+  operation; no caller receives a broader stage image. Cua's in-process cursor
+  actor is explicitly non-occluding. Unsafe requests fail closed.
 - `MoveCursorFor(owner,target,x,y)` / `ClickPulseFor` / `HideCursorFor` /
   `RemoveCursor` — render independently owned cursors and hide them whenever
-  their target is not actually visible on the active workspace.
+  their target is not actually visible on the active workspace. The D-Bus
+  connection's unique owner, not the caller label alone, owns those actors;
+  `NameOwnerChanged` cleanup reaps them after normal or abnormal process exit.
 
 It runs in the shell's privileged context, so **no xdg-desktop-portal grant** is
 needed (unlike libei/RemoteDesktop).

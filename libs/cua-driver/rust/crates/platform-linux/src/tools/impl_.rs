@@ -1023,6 +1023,25 @@ fn chromium_family_program(program: &str) -> bool {
 
 // ── shared helpers ────────────────────────────────────────────────────────────
 
+fn with_foreground_diagnostics(
+    mut structured: serde_json::Value,
+    outcome: Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
+) -> serde_json::Value {
+    let Some(outcome) = outcome else {
+        return structured;
+    };
+    structured["transport_prepared"] = json!(true);
+    structured["activation_required"] = json!(outcome.activation_required);
+    structured["target_activation_verified"] = json!(outcome.target_activation_verified);
+    structured["restoration_attempted"] = json!(outcome.restoration_attempted);
+    structured["prior_context_restored"] = json!(outcome.restoration_succeeded);
+    structured["focus_preserved_for_explicit_action"] = json!(false);
+    structured["foreground_terminal"] = json!(outcome.terminal && outcome.state == "terminal");
+    structured["restoration_outcome"] = json!(outcome.outcome);
+    structured["restoration_reason"] = json!(outcome.reason);
+    structured
+}
+
 /// Resolve an AT-SPI element's center in window-local coordinates.
 ///
 /// Returns `(xid, window_local_x, window_local_y)`.
@@ -1896,6 +1915,28 @@ impl Tool for ClickTool {
             cua_driver_core::element_token::ResolvedElement::None => window_id_arg,
         };
 
+        if crate::wayland::is_gnome_wayland_session() && window_id_resolved.is_none() {
+            return ToolResult::error(
+                "exact_target_required: click on host GNOME requires caller-approved pid and window_id",
+            )
+            .with_structured(json!({
+                "code": "exact_target_required",
+                "required": ["pid", "window_id"],
+            }));
+        }
+        if crate::wayland::is_gnome_wayland_session() {
+            let exact_window_id = window_id_resolved.expect("checked above");
+            match tokio::task::spawn_blocking(move || {
+                crate::wayland::establish_exact_target(pid, exact_window_id)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => return ToolResult::error(error.to_string()),
+                Err(error) => return ToolResult::error(format!("Task error: {error}")),
+            }
+        }
+
         if let Some(idx) = elem_idx_resolved {
             let xid_hint = window_id_resolved;
             // Resolve the element's screen center + its window FIRST, so the
@@ -2044,7 +2085,10 @@ impl Tool for ClickTool {
         // delivery_mode: background (default) = no-focus-steal injection;
         // foreground = activate the target window (EWMH) first, then inject,
         // then restore prior active. Mirrors macOS/Windows.
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<&'static str> {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(
+            &'static str,
+            Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
+        )> {
             if crate::wayland::wayland_input_enabled() {
                 // Vision/pixel click on native Wayland. Mutter drops synthetic
                 // virtual-pointer events (the `wayland::click` warp doesn't land),
@@ -2057,21 +2101,28 @@ impl Tool for ClickTool {
                     if let Ok(Some(_)) =
                         crate::atspi::perform_action_at_screen_point(pid, xid, output_x, output_y)
                     {
-                        return Ok("wayland_atspi");
+                        return Ok(("wayland_atspi", None));
                     }
                 }
                 if crate::wayland::is_inject_mode() {
                     crate::wayland::inject_click(xid, x, y, count as u32, button)?;
-                    return Ok("wayland_cua_compositor");
+                    return Ok(("wayland_cua_compositor", None));
                 }
                 if !delivery.is_foreground() {
-                    return Ok("background_unavailable");
+                    return Ok(("background_unavailable", None));
                 }
                 // Native Wayland: focus+raise the target toplevel
                 // (foreign-toplevel `activate`), then drive `count` virtual-pointer
                 // button events. Wayland injection routes to the compositor focus.
-                crate::wayland::click(xid, output_x, output_y, count as u32, button)?;
-                return Ok("wayland_activate");
+                let target = crate::wayland::establish_exact_target(pid, xid)?;
+                let outcome = crate::wayland::click_with_outcome(
+                    target,
+                    output_x,
+                    output_y,
+                    count as u32,
+                    button,
+                )?;
+                return Ok(("wayland_activate", outcome));
             }
             // X11 injection. Tiered no-focus-steal delivery (background):
             //   1. Plain left single-click → AT-SPI doAction at that point.
@@ -2107,11 +2158,12 @@ impl Tool for ClickTool {
                 x11_pixel_click_no_focus_steal(&cursor_id_for_task, xid, xi, yi, button, count)?;
                 Ok(if fg { "x11_pixel_fg" } else { "x11_pixel" })
             };
-            if delivery.is_foreground() {
+            let path = if delivery.is_foreground() {
                 crate::input::with_x11_foreground(xid, 80, || inject(true))
             } else {
                 inject(false)
-            }
+            }?;
+            Ok((path, None))
         })
         .await;
         let mode_label = if delivery.is_foreground() {
@@ -2120,7 +2172,7 @@ impl Tool for ClickTool {
             "background"
         };
         match result {
-            Ok(Ok("background_unavailable")) => {
+            Ok(Ok(("background_unavailable", _))) => {
                 crate::input::delivery::background_unavailable_error(
                     crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
                 )
@@ -2128,10 +2180,13 @@ impl Tool for ClickTool {
             // A pixel/coordinate click is never driver-verifiable (no read-back) —
             // verified:false, effect:"unverifiable"; the caller confirms via
             // screenshot. path reports the rung taken.
-            Ok(Ok(path)) => ToolResult::text(format!(
+            Ok(Ok((path, outcome))) => ToolResult::text(format!(
                 "✅ Clicked at ({x:.1}, {y:.1}) × {count} (delivery_mode={mode_label})."
             ))
-            .with_structured(json!({ "path": path, "verified": false, "effect": "unverifiable" })),
+            .with_structured(with_foreground_diagnostics(
+                json!({ "path": path, "verified": false, "effect": "unverifiable" }),
+                outcome,
+            )),
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
@@ -2315,6 +2370,16 @@ impl Tool for TypeTextTool {
         };
         let xid_opt = args.opt_u64("window_id").or(resolved_window_id);
 
+        if crate::wayland::is_gnome_wayland_session() && xid_opt.is_none() {
+            return ToolResult::error(
+                "exact_target_required: type_text on host GNOME requires caller-approved pid and window_id",
+            )
+            .with_structured(json!({
+                "code": "exact_target_required",
+                "required": ["pid", "window_id"],
+            }));
+        }
+
         // Resolve XID: use window_id if given, else first window for pid.
         let xid = match xid_opt {
             Some(x) => x,
@@ -2460,17 +2525,18 @@ impl Tool for TypeTextTool {
                 }
 
                 let text_w = text.clone();
-                let result =
-                    tokio::task::spawn_blocking(move || crate::wayland::type_text(xid, &text_w))
-                        .await;
+                let result = tokio::task::spawn_blocking(move || {
+                    let target = crate::wayland::establish_exact_target(pid, xid)?;
+                    crate::wayland::type_text_with_outcome(target, &text_w)
+                })
+                .await;
                 return match result {
-                    Ok(Ok(())) => ToolResult::text(format!(
+                    Ok(Ok(outcome)) => ToolResult::text(format!(
                         "Typed {text_len} character(s) (via Wayland virtual-keyboard)."
                     ))
-                    .with_structured(type_text_structured(
-                        "key_events",
-                        text_len,
-                        false,
+                    .with_structured(with_foreground_diagnostics(
+                        type_text_structured("key_events", text_len, false),
+                        outcome,
                     )),
                     Ok(Err(error)) => ToolResult::error(error.to_string()),
                     Err(error) => ToolResult::error(format!("Task error: {error}")),
@@ -2512,16 +2578,18 @@ impl Tool for TypeTextTool {
                 );
             }
             let text_w = text.clone();
-            let result =
-                tokio::task::spawn_blocking(move || crate::wayland::type_text(xid, &text_w)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                let target = crate::wayland::establish_exact_target(pid, xid)?;
+                crate::wayland::type_text_with_outcome(target, &text_w)
+            })
+            .await;
             return match result {
-                Ok(Ok(())) => ToolResult::text(format!(
+                Ok(Ok(outcome)) => ToolResult::text(format!(
                     "Typed {text_len} character(s) (via Wayland virtual-keyboard)."
                 ))
-                .with_structured(type_text_structured(
-                    "key_events",
-                    text_len,
-                    false,
+                .with_structured(with_foreground_diagnostics(
+                    type_text_structured("key_events", text_len, false),
+                    outcome,
                 )),
                 Ok(Err(e)) => ToolResult::error(e.to_string()),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -2895,6 +2963,15 @@ impl Tool for PressKeyTool {
             }
             cua_driver_core::element_token::ResolvedElement::None => window_id_arg,
         };
+        if crate::wayland::is_gnome_wayland_session() && xid_opt.is_none() {
+            return ToolResult::error(
+                "exact_target_required: press_key on host GNOME requires caller-approved pid and window_id",
+            )
+            .with_structured(json!({
+                "code": "exact_target_required",
+                "required": ["pid", "window_id"],
+            }));
+        }
         let xid = match xid_opt {
             Some(x) => x,
             None => {
@@ -3018,12 +3095,16 @@ impl Tool for PressKeyTool {
         // Native Wayland: send the key to the focused surface via virtual-keyboard.
         if crate::wayland::wayland_input_enabled() {
             let key_w = key.clone();
-            let result =
-                tokio::task::spawn_blocking(move || crate::wayland::press_key(xid, &key_w)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                let target = crate::wayland::establish_exact_target(pid, xid)?;
+                crate::wayland::press_key_with_outcome(target, &key_w)
+            })
+            .await;
             return match result {
-                Ok(Ok(())) => ToolResult::text(format!(
+                Ok(Ok(outcome)) => ToolResult::text(format!(
                     "Pressed key '{key}' (via Wayland virtual-keyboard)."
-                )),
+                ))
+                .with_structured(with_foreground_diagnostics(json!({}), outcome)),
                 Ok(Err(e)) => ToolResult::error(e.to_string()),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
@@ -3181,6 +3262,16 @@ impl Tool for HotkeyTool {
             }
             cua_driver_core::element_token::ResolvedElement::None => window_id_arg,
         };
+
+        if crate::wayland::is_gnome_wayland_session() && xid_opt.is_none() {
+            return ToolResult::error(
+                "exact_target_required: hotkey on host GNOME requires caller-approved pid and window_id",
+            )
+            .with_structured(json!({
+                "code": "exact_target_required",
+                "required": ["pid", "window_id"],
+            }));
+        }
 
         // Resolve XID: use window_id if given, else first window for pid.
         let xid = match xid_opt {
@@ -3350,14 +3441,17 @@ impl Tool for HotkeyTool {
         };
         let deliver_fg = delivery.is_foreground();
 
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<
+            Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
+        > {
             if crate::wayland::wayland_input_enabled() {
                 // Native Wayland: route the modifier combo through wtype's
                 // -M/-k/-m sequence — the closest equivalent to the X11
                 // state-mask path. window_id is irrelevant once focused.
                 let mut combo: Vec<String> = mods_for_wayland.clone();
                 combo.push(key_for_wayland.clone());
-                return crate::wayland::hotkey(xid, &combo);
+                let target = crate::wayland::establish_exact_target(pid, xid)?;
+                return crate::wayland::hotkey_with_outcome(target, &combo);
             }
             let m: Vec<&str> = mods.iter().map(String::as_str).collect();
             // foreground: activate the target first, then inject the accelerator
@@ -3367,13 +3461,15 @@ impl Tool for HotkeyTool {
             if deliver_fg {
                 return crate::input::with_x11_foreground(xid, 80, || {
                     crate::input::send_key_xtest(&key, &m)
-                });
+                })
+                .map(|()| None);
             }
             if let Some((x, y)) = px_target {
                 crate::input::send_key_at(xid, x, y, &key, &m)
             } else {
                 crate::input::send_key(xid, &key, &m)
-            }
+            }?;
+            Ok(None)
         })
         .await;
         let mode_label = if deliver_fg {
@@ -3382,10 +3478,13 @@ impl Tool for HotkeyTool {
             "background"
         };
         match result {
-            Ok(Ok(())) => ToolResult::text(format!(
+            Ok(Ok(outcome)) => ToolResult::text(format!(
                 "Pressed {key_display} on pid {pid} (delivery_mode={mode_label})."
             ))
-            .with_structured(json!({ "verified": false, "delivery_mode": mode_label })),
+            .with_structured(with_foreground_diagnostics(
+                json!({ "verified": false, "delivery_mode": mode_label }),
+                outcome,
+            )),
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
@@ -3438,14 +3537,38 @@ impl Tool for SetValueTool {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let idx = match resolved {
-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
-                element_index
-            }
+        let (idx, resolved_window_id) = match resolved {
+            cua_driver_core::element_token::ResolvedElement::Element {
+                element_index,
+                window_id,
+                ..
+            } => (element_index, window_id.map(u64::from)),
             cua_driver_core::element_token::ResolvedElement::None => return ToolResult::error(
                 "set_value requires element_index or element_token to address the target element.",
             ),
         };
+        let exact_window_id = args.opt_u64("window_id").or(resolved_window_id);
+        if crate::wayland::is_gnome_wayland_session() && exact_window_id.is_none() {
+            return ToolResult::error(
+                "exact_target_required: set_value on host GNOME requires caller-approved pid and window_id",
+            )
+            .with_structured(json!({
+                "code": "exact_target_required",
+                "required": ["pid", "window_id"],
+            }));
+        }
+        if crate::wayland::is_gnome_wayland_session() {
+            let exact_window_id = exact_window_id.expect("checked above");
+            match tokio::task::spawn_blocking(move || {
+                crate::wayland::establish_exact_target(pid, exact_window_id)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => return ToolResult::error(error.to_string()),
+                Err(error) => return ToolResult::error(format!("Task error: {error}")),
+            }
+        }
         let value_for_task = value.clone();
         // Pulse the agent cursor onto the target element before writing, so a
         // value write gets the same visual feedback as a click — the viewer can
@@ -3454,7 +3577,7 @@ impl Tool for SetValueTool {
         if let Ok(Ok((sx, sy))) =
             tokio::task::spawn_blocking(move || element_screen_center(pid, idx)).await
         {
-            let window_id = args.u64_or("window_id", 0);
+            let window_id = exact_window_id.unwrap_or(0);
             if window_id != 0 {
                 crate::overlay::send_command(cursor_overlay::OverlayCommand::PinAbove(window_id));
             }
@@ -3580,6 +3703,28 @@ impl Tool for ScrollTool {
                 .or_else(|| args.opt_u64("window_id")),
             cua_driver_core::element_token::ResolvedElement::None => args.opt_u64("window_id"),
         };
+
+        if crate::wayland::is_gnome_wayland_session() && xid_opt.is_none() {
+            return ToolResult::error(
+                "exact_target_required: scroll on host GNOME requires caller-approved pid and window_id",
+            )
+            .with_structured(json!({
+                "code": "exact_target_required",
+                "required": ["pid", "window_id"],
+            }));
+        }
+        if crate::wayland::is_gnome_wayland_session() {
+            let exact_window_id = xid_opt.expect("checked above");
+            match tokio::task::spawn_blocking(move || {
+                crate::wayland::establish_exact_target(pid, exact_window_id)
+            })
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => return ToolResult::error(error.to_string()),
+                Err(error) => return ToolResult::error(format!("Task error: {error}")),
+            }
+        }
 
         // Resolve XID: use window_id if given, else first window for pid.
         let xid = match xid_opt {
@@ -3718,14 +3863,23 @@ impl Tool for ScrollTool {
                 crate::wayland::window_local_to_output(xid, x.round() as i32, y.round() as i32)
             });
             let result = tokio::task::spawn_blocking(move || {
-                crate::wayland::scroll_at(xid, output_point, &direction_for_wayland, amount as u32)
+                let target = crate::wayland::establish_exact_target(pid, xid)?;
+                crate::wayland::scroll_at_with_outcome(
+                    target,
+                    output_point,
+                    &direction_for_wayland,
+                    amount as u32,
+                )
             })
             .await;
             return match result {
-                Ok(Ok(())) => ToolResult::text(format!(
+                Ok(Ok(outcome)) => ToolResult::text(format!(
                     "Scrolled {direction} {amount} ticks (delivery_mode=foreground)."
                 ))
-                .with_structured(json!({ "verified": false, "delivery_mode": "foreground" })),
+                .with_structured(with_foreground_diagnostics(
+                    json!({ "verified": false, "delivery_mode": "foreground" }),
+                    outcome,
+                )),
                 Ok(Err(error)) => ToolResult::error(error.to_string()),
                 Err(error) => ToolResult::error(format!("Task error: {error}")),
             };
@@ -3783,9 +3937,16 @@ impl Tool for ScrollTool {
         let cursor_id_for_task = cursor_id.clone();
         let direction_for_wayland = direction.clone();
         let amount_u32 = amount as u32;
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<
+            Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
+        > {
             if crate::wayland::wayland_input_enabled() {
-                return crate::wayland::scroll(xid, &direction_for_wayland, amount_u32);
+                let target = crate::wayland::establish_exact_target(pid, xid)?;
+                return crate::wayland::scroll_with_outcome(
+                    target,
+                    &direction_for_wayland,
+                    amount_u32,
+                );
             }
             // foreground: activate the window, then scroll, then restore — for
             // surfaces that only route wheel events to the active window.
@@ -3843,10 +4004,11 @@ impl Tool for ScrollTool {
                         button,
                         amount,
                     )
-                })
+                })?;
             } else {
-                x11_scroll()
+                x11_scroll()?
             }
+            Ok(None)
         })
         .await;
         let mode_label = if delivery.is_foreground() {
@@ -3855,10 +4017,13 @@ impl Tool for ScrollTool {
             "background"
         };
         match result {
-            Ok(Ok(())) => ToolResult::text(format!(
+            Ok(Ok(outcome)) => ToolResult::text(format!(
                 "Scrolled {direction} {amount} ticks (delivery_mode={mode_label})."
             ))
-            .with_structured(json!({ "verified": false, "delivery_mode": mode_label })),
+            .with_structured(with_foreground_diagnostics(
+                json!({ "verified": false, "delivery_mode": mode_label }),
+                outcome,
+            )),
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
@@ -3943,6 +4108,15 @@ impl Tool for DoubleClickTool {
                 .or_else(|| window_id.map(|v| v as u64)),
             cua_driver_core::element_token::ResolvedElement::None => args.opt_u64("window_id"),
         };
+        if crate::wayland::is_gnome_wayland_session() && window_id_resolved.is_none() {
+            return ToolResult::error(
+                "exact_target_required: double_click on host GNOME requires caller-approved pid and window_id",
+            )
+            .with_structured(json!({
+                "code": "exact_target_required",
+                "required": ["pid", "window_id"],
+            }));
+        }
         if let Some(idx) = elem_idx_resolved {
             let xid_hint = window_id_resolved;
             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, f64, f64)> {
@@ -3969,13 +4143,19 @@ impl Tool for DoubleClickTool {
                     let wayland_point = crate::wayland::wayland_input_enabled()
                         .then(|| crate::wayland::window_local_to_output(xid, lxi, lyi));
                     let cursor_id_for_task = cursor_id.clone();
-                    let click_result = tokio::task::spawn_blocking(move || {
+                    let click_result = tokio::task::spawn_blocking(move || -> anyhow::Result<
+                        Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
+                    > {
                         if crate::wayland::is_inject_mode() {
-                            return crate::wayland::inject_click(xid, lx, ly, 2, 1);
+                            return crate::wayland::inject_click(xid, lx, ly, 2, 1)
+                                .map(|()| None);
                         }
                         if crate::wayland::wayland_input_enabled() {
                             let (output_x, output_y) = wayland_point.unwrap_or((lxi, lyi));
-                            return crate::wayland::click(xid, output_x, output_y, 2, 1);
+                            let target = crate::wayland::establish_exact_target(pid, xid)?;
+                            return crate::wayland::click_with_outcome(
+                                target, output_x, output_y, 2, 1,
+                            );
                         }
                         if delivery.is_foreground() {
                             return crate::input::with_x11_foreground(xid, 80, || {
@@ -3986,14 +4166,17 @@ impl Tool for DoubleClickTool {
                                     1,
                                     2,
                                 )
-                            });
+                            })
+                            .map(|()| None);
                         }
                         x11_pixel_click_no_focus_steal(&cursor_id_for_task, xid, lxi, lyi, 1, 2)
+                            .map(|()| None)
                     })
                     .await;
                     match click_result {
-                        Ok(Ok(())) => {
+                        Ok(Ok(outcome)) => {
                             ToolResult::text(format!("✅ Double-clicked element [{idx}]."))
+                                .with_structured(with_foreground_diagnostics(json!({}), outcome))
                         }
                         Ok(Err(e)) => ToolResult::error(e.to_string()),
                         Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -4057,13 +4240,16 @@ impl Tool for DoubleClickTool {
         }
         let (xi, yi) = (x as i32, y as i32);
         let cursor_id_for_task = cursor_id.clone();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<
+            Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
+        > {
             if crate::wayland::is_inject_mode() {
-                return crate::wayland::inject_click(xid, x, y, 2, 1);
+                return crate::wayland::inject_click(xid, x, y, 2, 1).map(|()| None);
             }
             if crate::wayland::wayland_input_enabled() {
                 let (output_x, output_y) = wayland_output_point.unwrap_or((xi, yi));
-                return crate::wayland::click(xid, output_x, output_y, 2, 1);
+                let target = crate::wayland::establish_exact_target(pid, xid)?;
+                return crate::wayland::click_with_outcome(target, output_x, output_y, 2, 1);
             }
             if delivery.is_foreground() {
                 return crate::input::with_x11_foreground(xid, 80, || {
@@ -4081,9 +4267,11 @@ impl Tool for DoubleClickTool {
                         return Ok(());
                     }
                     x11_pixel_click_no_focus_steal(&cursor_id_for_task, xid, xi, yi, 1, 2)
-                });
+                })
+                .map(|()| None);
             }
             x11_pixel_click_no_focus_steal(&cursor_id_for_task, xid, xi, yi, 1, 2)
+                .map(|()| None)
         })
         .await;
         let mode_label = if delivery.is_foreground() {
@@ -4092,10 +4280,13 @@ impl Tool for DoubleClickTool {
             "background"
         };
         match result {
-            Ok(Ok(())) => ToolResult::text(format!(
+            Ok(Ok(outcome)) => ToolResult::text(format!(
                 "✅ Double-clicked at ({x:.1}, {y:.1}) (delivery_mode={mode_label})."
             ))
-            .with_structured(json!({ "verified": false, "delivery_mode": mode_label })),
+            .with_structured(with_foreground_diagnostics(
+                json!({ "verified": false, "delivery_mode": mode_label }),
+                outcome,
+            )),
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
@@ -4175,6 +4366,15 @@ impl Tool for RightClickTool {
                 .or_else(|| window_id.map(|v| v as u64)),
             cua_driver_core::element_token::ResolvedElement::None => args.opt_u64("window_id"),
         };
+        if crate::wayland::is_gnome_wayland_session() && window_id_resolved.is_none() {
+            return ToolResult::error(
+                "exact_target_required: right_click on host GNOME requires caller-approved pid and window_id",
+            )
+            .with_structured(json!({
+                "code": "exact_target_required",
+                "required": ["pid", "window_id"],
+            }));
+        }
         if let Some(idx) = elem_idx_resolved {
             let xid_hint = window_id_resolved;
             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, f64, f64)> {
@@ -4201,13 +4401,19 @@ impl Tool for RightClickTool {
                     let wayland_point = crate::wayland::wayland_input_enabled()
                         .then(|| crate::wayland::window_local_to_output(xid, lxi, lyi));
                     let cursor_id_for_task = cursor_id.clone();
-                    let click_result = tokio::task::spawn_blocking(move || {
+                    let click_result = tokio::task::spawn_blocking(move || -> anyhow::Result<
+                        Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
+                    > {
                         if crate::wayland::is_inject_mode() {
-                            return crate::wayland::inject_click(xid, lx, ly, 1, 3);
+                            return crate::wayland::inject_click(xid, lx, ly, 1, 3)
+                                .map(|()| None);
                         }
                         if crate::wayland::wayland_input_enabled() {
                             let (output_x, output_y) = wayland_point.unwrap_or((lxi, lyi));
-                            return crate::wayland::click(xid, output_x, output_y, 1, 3);
+                            let target = crate::wayland::establish_exact_target(pid, xid)?;
+                            return crate::wayland::click_with_outcome(
+                                target, output_x, output_y, 1, 3,
+                            );
                         }
                         if delivery.is_foreground() {
                             return crate::input::with_x11_foreground(xid, 80, || {
@@ -4218,14 +4424,17 @@ impl Tool for RightClickTool {
                                     3,
                                     1,
                                 )
-                            });
+                            })
+                            .map(|()| None);
                         }
                         x11_pixel_click_no_focus_steal(&cursor_id_for_task, xid, lxi, lyi, 3, 1)
+                            .map(|()| None)
                     })
                     .await;
                     match click_result {
-                        Ok(Ok(())) => {
+                        Ok(Ok(outcome)) => {
                             ToolResult::text(format!("✅ Right-clicked element [{idx}]."))
+                                .with_structured(with_foreground_diagnostics(json!({}), outcome))
                         }
                         Ok(Err(e)) => ToolResult::error(e.to_string()),
                         Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -4289,13 +4498,16 @@ impl Tool for RightClickTool {
         }
         let (xi, yi) = (x as i32, y as i32);
         let cursor_id_for_task = cursor_id.clone();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<
+            Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
+        > {
             if crate::wayland::is_inject_mode() {
-                return crate::wayland::inject_click(xid, x, y, 1, 3);
+                return crate::wayland::inject_click(xid, x, y, 1, 3).map(|()| None);
             }
             if crate::wayland::wayland_input_enabled() {
                 let (output_x, output_y) = wayland_output_point.unwrap_or((xi, yi));
-                return crate::wayland::click(xid, output_x, output_y, 1, 3);
+                let target = crate::wayland::establish_exact_target(pid, xid)?;
+                return crate::wayland::click_with_outcome(target, output_x, output_y, 1, 3);
             }
             if delivery.is_foreground() {
                 return crate::input::with_x11_foreground(xid, 80, || {
@@ -4312,9 +4524,11 @@ impl Tool for RightClickTool {
                         return Ok(());
                     }
                     x11_pixel_click_no_focus_steal(&cursor_id_for_task, xid, xi, yi, 3, 1)
-                });
+                })
+                .map(|()| None);
             }
             x11_pixel_click_no_focus_steal(&cursor_id_for_task, xid, xi, yi, 3, 1)
+                .map(|()| None)
         })
         .await;
         let mode_label = if delivery.is_foreground() {
@@ -4323,10 +4537,13 @@ impl Tool for RightClickTool {
             "background"
         };
         match result {
-            Ok(Ok(())) => ToolResult::text(format!(
+            Ok(Ok(outcome)) => ToolResult::text(format!(
                 "✅ Right-clicked at ({x:.1}, {y:.1}) (delivery_mode={mode_label})."
             ))
-            .with_structured(json!({ "verified": false, "delivery_mode": mode_label })),
+            .with_structured(with_foreground_diagnostics(
+                json!({ "verified": false, "delivery_mode": mode_label }),
+                outcome,
+            )),
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
@@ -4557,6 +4774,7 @@ impl Tool for DragTool {
                         steps,
                         button as u32,
                     )
+                    .map(|()| None)
                 })
                 .await
             } else {
@@ -4565,7 +4783,8 @@ impl Tool for DragTool {
                     (to_x.round() as i32, to_y.round() as i32),
                 ));
                 tokio::task::spawn_blocking(move || {
-                    crate::wayland::drag(xid, fxi, fyi, txi, tyi, steps_u32, button)
+                    let target = crate::wayland::establish_exact_target(pid, xid)?;
+                    crate::wayland::drag_with_outcome(target, fxi, fyi, txi, tyi, steps_u32, button)
                 })
                 .await
             };
@@ -4574,11 +4793,12 @@ impl Tool for DragTool {
                 cursor_overlay::OverlayCommand::SetPressed(false),
             );
             return match drag_result {
-                Ok(Ok(())) => ToolResult::text(format!(
+                Ok(Ok(outcome)) => ToolResult::text(format!(
                     "✅ Posted drag ({button_str}) to pid {pid} \
                      from ({from_x:.0}, {from_y:.0}) → ({to_x:.0}, {to_y:.0}) \
                      in {duration_ms}ms / {steps} steps."
-                )),
+                ))
+                .with_structured(with_foreground_diagnostics(json!({}), outcome)),
                 Ok(Err(e)) => ToolResult::error(e.to_string()),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
@@ -5809,7 +6029,7 @@ impl Tool for MoveCursorTool {
             name: "move_cursor".into(),
             description: "Move the agent cursor overlay, or with scope=desktop move the real OS pointer in get_desktop_state coordinates.".into(),
             input_schema: json!({"type":"object","required":["x","y"],"properties":{
-                "x":{"type":"number"},"y":{"type":"number"},"session": cua_driver_core::tool_schema::session_schema(),"cursor_id":{"type":"string"},"scope":{"type":"string","enum":["window","desktop"],"default":"window"}
+                "x":{"type":"number"},"y":{"type":"number"},"pid":{"type":"integer","minimum":1},"window_id":{"type":"integer","minimum":1},"session": cua_driver_core::tool_schema::session_schema(),"cursor_id":{"type":"string"},"scope":{"type":"string","enum":["window","desktop"],"default":"window"}
             },"additionalProperties":false}),
             read_only: false, destructive: false, idempotent: true, open_world: false,
         })
@@ -5842,16 +6062,63 @@ impl Tool for MoveCursorTool {
             };
         }
         let window_id = args.get("window_id").and_then(|v| v.as_u64());
+        let pid = args.get("pid").and_then(|v| v.as_u64());
+        if crate::wayland::is_gnome_wayland_session() && (pid.is_none() || window_id.is_none()) {
+            return ToolResult::error(
+                "exact_target_required: scope=window on host GNOME requires caller-approved pid and window_id",
+            );
+        }
+        let target = match (pid, window_id) {
+            (Some(pid), Some(window_id)) => {
+                let pid = match u32::try_from(pid) {
+                    Ok(pid) => pid,
+                    Err(_) => return ToolResult::error("pid exceeds the supported range"),
+                };
+                match tokio::task::spawn_blocking(move || {
+                    crate::wayland::establish_exact_target(pid, window_id)
+                })
+                .await
+                {
+                    Ok(Ok(target)) => Some(target),
+                    Ok(Err(error)) => return ToolResult::error(error.to_string()),
+                    Err(error) => return ToolResult::error(format!("Task error: {error}")),
+                }
+            }
+            (None, None) => None,
+            _ => {
+                return ToolResult::error(
+                    "exact_target_required: pid and window_id must be supplied together",
+                )
+            }
+        };
         let cursor_id = resolve_cursor_key(&args);
-        self.state.cursor_registry.update_position(&cursor_id, x, y);
+        let (output_x, output_y) = if let Some(target) = target.as_ref() {
+            let (output_x, output_y) = crate::wayland::window_local_to_output(
+                target.window_id,
+                x.round() as i32,
+                y.round() as i32,
+            );
+            (f64::from(output_x), f64::from(output_y))
+        } else {
+            (x, y)
+        };
+        self.state
+            .cursor_registry
+            .update_position(&cursor_id, output_x, output_y);
+        if let Some(target) = target.as_ref() {
+            crate::overlay::send_command_for(
+                cursor_id.clone(),
+                cursor_overlay::OverlayCommand::PinAbove(target.window_id),
+            );
+        }
         // End pointing upper-left (45°) — matches Swift's
         // `AgentCursor.animateAndWait(endAngleDegrees: 45)` convention so the
         // overlay arrow settles to the natural macOS-style pose.
         crate::overlay::send_command_for(
             cursor_id.clone(),
             cursor_overlay::OverlayCommand::MoveTo {
-                x,
-                y,
+                x: output_x,
+                y: output_y,
                 end_heading_radians: std::f64::consts::FRAC_PI_4,
             },
         );
@@ -5859,22 +6126,27 @@ impl Tool for MoveCursorTool {
         // Off-thread because the wayland-client roundtrip is blocking. Best-effort
         // — overlay update + registry write already succeeded; surface a warning
         // only if the warp itself failed.
-        let real_warp_note = if crate::wayland::wayland_input_enabled() {
-            let xi = x.round() as i32;
-            let yi = y.round() as i32;
+        let (real_warp_note, foreground_outcome) = if crate::wayland::wayland_input_enabled() {
+            let xi = output_x.round() as i32;
+            let yi = output_y.round() as i32;
+            let target = target.clone();
             match tokio::task::spawn_blocking(move || {
-                crate::wayland::move_cursor_absolute(window_id, xi, yi)
+                crate::wayland::move_cursor_absolute_with_outcome(target, xi, yi)
             })
             .await
             {
-                Ok(Ok(())) => " (real cursor warped via virtual-pointer)",
-                Ok(Err(_)) | Err(_) => " (overlay updated; real-cursor warp failed)",
+                Ok(Ok(outcome)) => (" (real cursor warped via virtual-pointer)", outcome),
+                Ok(Err(_)) | Err(_) => (" (overlay updated; real-cursor warp failed)", None),
             }
         } else {
-            ""
+            ("", None)
         };
         ToolResult::text(format!(
-            "Agent cursor '{cursor_id}' moved to ({x:.1}, {y:.1}).{real_warp_note}"
+            "Agent cursor '{cursor_id}' moved to ({output_x:.1}, {output_y:.1}).{real_warp_note}"
+        ))
+        .with_structured(with_foreground_diagnostics(
+            json!({ "verified": false }),
+            foreground_outcome,
         ))
     }
 }
@@ -6793,7 +7065,8 @@ impl Tool for TypeTextCharsTool {
                 let mut buf = [0u8; 4];
                 for ch in text.chars() {
                     let s = ch.encode_utf8(&mut buf);
-                    crate::wayland::type_text(xid, s)?;
+                    let target = crate::wayland::establish_exact_target(pid, xid)?;
+                    crate::wayland::type_text(target, s)?;
                     if delay_ms > 0 {
                         std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                     }
@@ -6917,7 +7190,8 @@ impl Tool for BringToFrontTool {
                 },
             };
             let result = tokio::task::spawn_blocking(move || {
-                crate::wayland::activate_window_for_input_target(window_id, Some(pid))
+                let target = crate::wayland::establish_exact_target(pid, window_id)?;
+                crate::wayland::activate_window_for_input_target(&target)
                     .and_then(crate::wayland::ForegroundInputGuard::keep_focus)
             })
             .await;

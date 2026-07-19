@@ -22,6 +22,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::x11::WindowInfo;
@@ -32,7 +34,10 @@ const IFACE: &str = "org.cua.WinRects";
 const INTROSPECT_DEST: &str = "org.gnome.Shell.Introspect";
 const INTROSPECT_PATH: &str = "/org/gnome/Shell/Introspect";
 const INTROSPECT_IFACE: &str = "org.gnome.Shell.Introspect";
-const REQUIRED_PROTOCOL: u64 = 2;
+const REQUIRED_PROTOCOL: u64 = 4;
+static OVERLAY_CONNECTION: OnceLock<Option<zbus::blocking::Connection>> = OnceLock::new();
+static FOREGROUND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static PENDING_FOREGROUND: Mutex<Option<String>> = Mutex::new(None);
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct Capabilities {
@@ -72,9 +77,50 @@ struct ShellWindow {
     monitor: Option<i32>,
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct CaptureRect {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CaptureLogicalSize {
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CapturePayload {
+    protocol_version: u64,
+    target: String,
+    rect: CaptureRect,
+    logical_size: CaptureLogicalSize,
+    png_base64: String,
+}
+
 #[derive(Debug)]
 pub struct ForegroundTransaction {
     token: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct ForegroundTerminalOutcome {
+    pub terminal: bool,
+    pub state: String,
+    #[serde(default)]
+    pub activation_required: Option<bool>,
+    #[serde(default)]
+    pub target_activation_verified: Option<bool>,
+    #[serde(default)]
+    pub restoration_attempted: Option<bool>,
+    #[serde(default)]
+    pub restoration_succeeded: Option<bool>,
+    #[serde(default)]
+    pub outcome: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 impl ForegroundTransaction {
@@ -95,12 +141,17 @@ impl ForegroundTransaction {
         Ok(())
     }
 
-    pub fn finish(mut self) {
-        finish_foreground_token(&std::mem::take(&mut self.token));
+    pub fn finish(mut self) -> anyhow::Result<ForegroundTerminalOutcome> {
+        let token = std::mem::take(&mut self.token);
+        set_pending_foreground(Some(token.clone()));
+        let outcome = terminalize_foreground("EndForeground", &token)?;
+        set_pending_foreground(None);
+        Ok(outcome)
     }
 
     pub fn commit(mut self) -> anyhow::Result<()> {
         let token = std::mem::take(&mut self.token);
+        set_pending_foreground(Some(token.clone()));
         let raw = gdbus_call_with_timeout(
             "CommitForeground",
             &[gvariant_string(&token)],
@@ -114,6 +165,7 @@ impl ForegroundTransaction {
         if !committed {
             anyhow::bail!("stale_transaction: WinRects rejected foreground commit");
         }
+        set_pending_foreground(None);
         Ok(())
     }
 }
@@ -121,7 +173,11 @@ impl ForegroundTransaction {
 impl Drop for ForegroundTransaction {
     fn drop(&mut self) {
         if !self.token.is_empty() {
-            finish_foreground_token(&std::mem::take(&mut self.token));
+            let token = std::mem::take(&mut self.token);
+            set_pending_foreground(Some(token.clone()));
+            if terminalize_foreground("AbortForeground", &token).is_ok() {
+                set_pending_foreground(None);
+            }
         }
     }
 }
@@ -145,6 +201,10 @@ pub fn available() -> bool {
             && capabilities
                 .capabilities
                 .iter()
+                .any(|capability| capability == "foreground-reconcile-v1")
+            && capabilities
+                .capabilities
+                .iter()
                 .any(|capability| capability == "unoccluded-target-v1")
             && capabilities
                 .capabilities
@@ -158,6 +218,14 @@ pub fn available() -> bool {
                 .capabilities
                 .iter()
                 .any(|capability| capability == "shell-grab-classification-v1")
+            && capabilities
+                .capabilities
+                .iter()
+                .any(|capability| capability == "atomic-target-capture-v1")
+            && capabilities
+                .capabilities
+                .iter()
+                .any(|capability| capability == "connection-owned-cursors-v1")
     })
 }
 
@@ -167,10 +235,13 @@ fn exact_identity_capabilities() -> Option<Vec<String>> {
             "exact-target-v2",
             "transient-parent-v1",
             "foreground-revalidate-v1",
+            "foreground-reconcile-v1",
             "unoccluded-target-v1",
             "trusted-cursor-overlay-v1",
             "exact-target-activation-v1",
             "shell-grab-classification-v1",
+            "atomic-target-capture-v1",
+            "connection-owned-cursors-v1",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -254,11 +325,9 @@ fn gdbus_call_target(
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Capture the GNOME stage only after WinRects v2 confirms that the exact
-/// incarnation-qualified target is currently painted there.
+/// Capture one exact GNOME target using the rectangle and logical display
+/// dimensions returned by the same Shell transaction as the target-only pixels.
 pub fn screenshot_window(window_id: u64) -> anyhow::Result<Vec<u8>> {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-
     let target = resolve_target(window_id).ok_or_else(|| {
         anyhow::anyhow!(
             "stale_target: GNOME window {window_id} belongs to another helper incarnation or no longer exists"
@@ -275,18 +344,54 @@ pub fn screenshot_window(window_id: u64) -> anyhow::Result<Vec<u8>> {
         Duration::from_secs(5),
     )
     .ok_or_else(|| anyhow::anyhow!("GNOME exact-target capture failed for window {window_id}"))?;
-    let start = raw
-        .find('\'')
-        .ok_or_else(|| anyhow::anyhow!("GNOME capture returned an invalid payload"))?
-        + 1;
-    let end = raw
-        .rfind('\'')
-        .ok_or_else(|| anyhow::anyhow!("GNOME capture returned an invalid payload"))?;
-    if end <= start {
-        anyhow::bail!("GNOME capture returned an empty payload");
+    decode_capture_payload(&raw, &target.target_id)
+}
+
+fn decode_capture_payload(raw: &str, expected_target: &str) -> anyhow::Result<Vec<u8>> {
+    use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+
+    let payload = extract_json_object(&raw)
+        .and_then(|json| serde_json::from_str::<CapturePayload>(json).ok())
+        .ok_or_else(|| anyhow::anyhow!("GNOME capture returned an invalid atomic payload"))?;
+    if payload.protocol_version != REQUIRED_PROTOCOL || payload.target != expected_target {
+        anyhow::bail!("target_changed_during_capture: GNOME capture proof did not match request");
     }
-    B64.decode(&raw[start..end])
-        .map_err(|error| anyhow::anyhow!("GNOME capture returned invalid base64: {error}"))
+    if payload.rect.width == 0
+        || payload.rect.height == 0
+        || payload.logical_size.width == 0
+        || payload.logical_size.height == 0
+        || payload.rect.x < 0
+        || payload.rect.y < 0
+        || u32::try_from(payload.rect.x)
+            .ok()
+            .and_then(|x| x.checked_add(payload.rect.width))
+            .is_none_or(|right| right > payload.logical_size.width)
+        || u32::try_from(payload.rect.y)
+            .ok()
+            .and_then(|y| y.checked_add(payload.rect.height))
+            .is_none_or(|bottom| bottom > payload.logical_size.height)
+    {
+        anyhow::bail!("capture_geometry_invalid: GNOME returned an unsafe target rectangle");
+    }
+    let target_png = B64
+        .decode(payload.png_base64)
+        .map_err(|error| anyhow::anyhow!("GNOME capture returned invalid base64: {error}"))?;
+    let image = image::load_from_memory(&target_png)
+        .map_err(|error| anyhow::anyhow!("GNOME exact-target PNG is invalid: {error}"))?;
+    if image.width() < payload.rect.width
+        || image.height() < payload.rect.height
+        || image.width() > payload.rect.width.saturating_mul(8)
+        || image.height() > payload.rect.height.saturating_mul(8)
+    {
+        anyhow::bail!(
+            "capture_geometry_invalid: GNOME target PNG dimensions {}x{} do not match logical rectangle {}x{}",
+            image.width(),
+            image.height(),
+            payload.rect.width,
+            payload.rect.height
+        );
+    }
+    Ok(target_png)
 }
 
 /// GNOME's logical desktop size. Shell screenshots are encoded in physical
@@ -425,16 +530,23 @@ pub fn begin_foreground(window_id: u64) -> anyhow::Result<ForegroundTransaction>
             "stale_target: GNOME window {window_id} belongs to another helper incarnation or no longer exists"
         )
     })?;
+    let token = new_foreground_token();
+    set_pending_foreground(Some(token.clone()));
     let raw = gdbus_call_with_timeout(
         "BeginForeground",
-        &[gvariant_string(&target.target_id)],
+        &[gvariant_string(&token), gvariant_string(&target.target_id)],
         Duration::from_secs(2),
-    )
-    .ok_or_else(|| {
-        anyhow::anyhow!(
-            "foreground_unavailable: GNOME rejected or timed out activating exact window {window_id}"
-        )
-    })?;
+    );
+    let Some(raw) = raw else {
+        let recovery = terminalize_foreground("AbortForeground", &token);
+        if recovery.is_ok() {
+            set_pending_foreground(None);
+        }
+        anyhow::bail!(
+            "foreground_unavailable: GNOME BeginForeground timed out for exact window {window_id}; reconciliation {}",
+            if recovery.is_ok() { "reached a terminal state" } else { "remains required" }
+        );
+    };
     let payload = extract_json_object(&raw)
         .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
         .ok_or_else(|| anyhow::anyhow!("foreground_unavailable: invalid WinRects response"))?;
@@ -443,28 +555,100 @@ pub fn begin_foreground(window_id: u64) -> anyhow::Result<ForegroundTransaction>
         .and_then(serde_json::Value::as_bool)
         != Some(true)
     {
+        let reason = payload
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("activation_not_confirmed");
+        let recovery = terminalize_foreground("AbortForeground", &token);
+        if recovery.is_ok() {
+            set_pending_foreground(None);
+        }
         anyhow::bail!(
-            "foreground_unavailable: WinRects did not confirm exact window {window_id} activation"
+            "foreground_unavailable: WinRects did not confirm exact window {window_id} activation ({reason}); reconciliation {}",
+            if recovery.is_ok() { "reached a terminal state" } else { "remains required" }
         );
+    }
+    let returned_token = payload
+        .get("transaction")
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| !token.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("foreground_unavailable: missing WinRects transaction"))?;
+    if returned_token != token {
+        anyhow::bail!("foreground_unavailable: WinRects returned a mismatched transaction ID");
+    }
+    set_pending_foreground(None);
+    Ok(ForegroundTransaction { token })
+}
+
+fn new_foreground_token() -> String {
+    let sequence = FOREGROUND_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("cua-fg-{}-{nanos:x}-{sequence:x}", std::process::id())
+}
+
+fn set_pending_foreground(token: Option<String>) {
+    if let Ok(mut pending) = PENDING_FOREGROUND.lock() {
+        *pending = token;
+    }
+}
+
+fn parse_foreground_outcome(raw: &str) -> anyhow::Result<ForegroundTerminalOutcome> {
+    let outcome = extract_json_object(raw)
+        .and_then(|json| serde_json::from_str::<ForegroundTerminalOutcome>(json).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("foreground_recovery_required: invalid terminal response")
+        })?;
+    if !outcome.terminal || outcome.state != "terminal" {
+        anyhow::bail!("foreground_recovery_required: helper restoration is not terminal");
+    }
+    if outcome.outcome.as_deref() == Some("restoration_unresolved") {
+        anyhow::bail!("foreground_recovery_required: helper could not verify restoration");
+    }
+    Ok(outcome)
+}
+
+fn terminalize_foreground(method: &str, token: &str) -> anyhow::Result<ForegroundTerminalOutcome> {
+    if token.is_empty() {
+        anyhow::bail!("foreground_recovery_required: missing transaction ID");
+    }
+    let raw = gdbus_call_with_timeout(method, &[gvariant_string(token)], Duration::from_secs(2))
+        .ok_or_else(|| anyhow::anyhow!("foreground_recovery_required: {method} timed out"))?;
+    parse_foreground_outcome(&raw)
+}
+
+pub fn reconcile_orphaned_foreground() -> anyhow::Result<()> {
+    let local_pending = PENDING_FOREGROUND
+        .lock()
+        .ok()
+        .and_then(|pending| pending.clone());
+    let raw = gdbus_call_with_timeout(
+        "QueryForeground",
+        &[gvariant_string(local_pending.as_deref().unwrap_or(""))],
+        Duration::from_secs(2),
+    )
+    .ok_or_else(|| anyhow::anyhow!("foreground_recovery_required: QueryForeground timed out"))?;
+    let payload = extract_json_object(&raw)
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!("foreground_recovery_required: invalid QueryForeground response")
+        })?;
+    if payload.get("terminal").and_then(serde_json::Value::as_bool) == Some(true) {
+        set_pending_foreground(None);
+        return Ok(());
     }
     let token = payload
         .get("transaction")
         .and_then(serde_json::Value::as_str)
         .filter(|token| !token.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("foreground_unavailable: missing WinRects transaction"))?
-        .to_owned();
-    Ok(ForegroundTransaction { token })
-}
-
-fn finish_foreground_token(token: &str) {
-    if token.is_empty() {
-        return;
-    }
-    let _ = gdbus_call_with_timeout(
-        "EndForeground",
-        &[gvariant_string(token)],
-        Duration::from_secs(2),
-    );
+        .ok_or_else(|| {
+            anyhow::anyhow!("foreground_recovery_required: active helper transaction has no ID")
+        })?;
+    terminalize_foreground("AbortForeground", token)?;
+    set_pending_foreground(None);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -654,40 +838,52 @@ pub fn move_cursor(owner: &str, window_id: u64, x: i32, y: i32) -> bool {
     let Some(target) = resolve_target(window_id) else {
         return false;
     };
-    gdbus_call(
-        "MoveCursorFor",
-        &[
-            gvariant_string(owner),
-            gvariant_string(&target.target_id),
-            x.to_string(),
-            y.to_string(),
-        ],
-    )
-    .is_some()
+    persistent_overlay_connection().is_some_and(|connection| {
+        connection
+            .call_method(
+                Some(DEST),
+                PATH,
+                Some(IFACE),
+                "MoveCursorFor",
+                &(owner, target.target_id.as_str(), x, y),
+            )
+            .is_ok()
+    })
 }
 
 pub fn click_pulse(owner: &str, window_id: u64, x: i32, y: i32) -> bool {
     let Some(target) = resolve_target(window_id) else {
         return false;
     };
-    gdbus_call(
-        "ClickPulseFor",
-        &[
-            gvariant_string(owner),
-            gvariant_string(&target.target_id),
-            x.to_string(),
-            y.to_string(),
-        ],
-    )
-    .is_some()
+    persistent_overlay_connection().is_some_and(|connection| {
+        connection
+            .call_method(
+                Some(DEST),
+                PATH,
+                Some(IFACE),
+                "ClickPulseFor",
+                &(owner, target.target_id.as_str(), x, y),
+            )
+            .is_ok()
+    })
 }
 
 pub fn hide_cursor(owner: &str) {
-    let _ = gdbus_call("HideCursorFor", &[gvariant_string(owner)]);
+    if let Some(connection) = persistent_overlay_connection() {
+        let _ = connection.call_method(Some(DEST), PATH, Some(IFACE), "HideCursorFor", &(owner,));
+    }
 }
 
 pub fn remove_cursor(owner: &str) {
-    let _ = gdbus_call("RemoveCursor", &[gvariant_string(owner)]);
+    if let Some(connection) = persistent_overlay_connection() {
+        let _ = connection.call_method(Some(DEST), PATH, Some(IFACE), "RemoveCursor", &(owner,));
+    }
+}
+
+fn persistent_overlay_connection() -> Option<&'static zbus::blocking::Connection> {
+    OVERLAY_CONNECTION
+        .get_or_init(|| zbus::blocking::Connection::session().ok())
+        .as_ref()
 }
 
 #[cfg(test)]
@@ -702,10 +898,13 @@ mod tests {
                 "exact-target-v2".to_owned(),
                 "transient-parent-v1".to_owned(),
                 "foreground-revalidate-v1".to_owned(),
+                "foreground-reconcile-v1".to_owned(),
                 "unoccluded-target-v1".to_owned(),
                 "trusted-cursor-overlay-v1".to_owned(),
                 "exact-target-activation-v1".to_owned(),
                 "shell-grab-classification-v1".to_owned(),
+                "atomic-target-capture-v1".to_owned(),
+                "connection-owned-cursors-v1".to_owned(),
             ]
         );
     }
@@ -718,7 +917,7 @@ mod tests {
 
     #[test]
     fn parses_and_filters_shell_windows() {
-        let raw = r#"('[{"id":46,"target_id":"epoch-a:46","helper_epoch":"epoch-a","protocol_version":2,"pid":6079,"app_id":"org.example.Editor","title":"Sentinel's window","x":66,"y":32,"buffer_x":60,"buffer_y":28,"w":958,"h":736,"focused":true,"minimized":false,"visible":true,"capture_current":true,"workspace_index":7,"workspace_active":true,"sticky":false,"monitor":1,"stacking":2},{"id":47,"target_id":"epoch-a:47","helper_epoch":"epoch-a","protocol_version":2,"pid":6080,"app_id":"org.example.Hidden","title":"Hidden","x":0,"y":0,"w":100,"h":100,"minimized":true,"visible":false,"capture_current":false,"workspace_index":11,"workspace_active":false,"sticky":false,"monitor":0,"stacking":1}]',)"#;
+        let raw = r#"('[{"id":46,"target_id":"epoch-a:46","helper_epoch":"epoch-a","protocol_version":4,"pid":6079,"app_id":"org.example.Editor","title":"Sentinel's window","x":66,"y":32,"buffer_x":60,"buffer_y":28,"w":958,"h":736,"focused":true,"minimized":false,"visible":true,"capture_current":true,"workspace_index":7,"workspace_active":true,"sticky":false,"monitor":1,"stacking":2},{"id":47,"target_id":"epoch-a:47","helper_epoch":"epoch-a","protocol_version":4,"pid":6080,"app_id":"org.example.Hidden","title":"Hidden","x":0,"y":0,"w":100,"h":100,"minimized":true,"visible":false,"capture_current":false,"workspace_index":11,"workspace_active":false,"sticky":false,"monitor":0,"stacking":1}]',)"#;
         let windows = parse_windows(raw, Some(6079)).expect("valid helper response");
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].xid, public_window_id("epoch-a:46"));
@@ -741,7 +940,7 @@ mod tests {
 
     #[test]
     fn marks_minimized_shell_windows_off_screen() {
-        let raw = r#"('[{"id":47,"target_id":"epoch-a:47","helper_epoch":"epoch-a","protocol_version":2,"pid":6080,"app_id":"org.example.Hidden","title":"Hidden","x":0,"y":0,"w":100,"h":100,"minimized":true,"visible":false,"capture_current":false,"stacking":1}]',)"#;
+        let raw = r#"('[{"id":47,"target_id":"epoch-a:47","helper_epoch":"epoch-a","protocol_version":4,"pid":6080,"app_id":"org.example.Hidden","title":"Hidden","x":0,"y":0,"w":100,"h":100,"minimized":true,"visible":false,"capture_current":false,"stacking":1}]',)"#;
         let windows = parse_windows(raw, None).expect("valid helper response");
         assert_eq!(windows.len(), 1);
         assert!(!windows[0].is_on_screen);
@@ -758,7 +957,7 @@ mod tests {
 
     #[test]
     fn preserves_only_proven_transient_parent_relationships() {
-        let valid = r#"('[{"id":46,"target_id":"epoch-a:46","helper_epoch":"epoch-a","protocol_version":2,"pid":6079,"app_id":"org.example.Editor","title":"Parent","x":0,"y":0,"w":100,"h":100},{"id":47,"target_id":"epoch-a:47","helper_epoch":"epoch-a","protocol_version":2,"pid":6080,"app_id":"org.example.Dialog","title":"Chooser","x":10,"y":10,"w":80,"h":80,"transient_for_target_id":"epoch-a:46","is_attached_dialog":true,"is_modal":true,"window_type":4}]',)"#;
+        let valid = r#"('[{"id":46,"target_id":"epoch-a:46","helper_epoch":"epoch-a","protocol_version":4,"pid":6079,"app_id":"org.example.Editor","title":"Parent","x":0,"y":0,"w":100,"h":100},{"id":47,"target_id":"epoch-a:47","helper_epoch":"epoch-a","protocol_version":4,"pid":6080,"app_id":"org.example.Dialog","title":"Chooser","x":10,"y":10,"w":80,"h":80,"transient_for_target_id":"epoch-a:46","is_attached_dialog":true,"is_modal":true,"window_type":4}]',)"#;
         let windows = parse_windows(valid, Some(6080)).expect("valid transient relationship");
         assert_eq!(windows.len(), 1);
         assert_eq!(
@@ -786,10 +985,58 @@ mod tests {
         let unversioned = r#"('[{"id":46,"pid":6079,"title":"Old","x":0,"y":0,"w":1,"h":1}]',)"#;
         assert!(parse_windows(unversioned, None).is_none());
 
-        let mismatched = r#"('[{"id":46,"target_id":"other:46","helper_epoch":"epoch-a","protocol_version":2,"pid":6079,"title":"Bad","x":0,"y":0,"w":1,"h":1}]',)"#;
+        let mismatched = r#"('[{"id":46,"target_id":"other:46","helper_epoch":"epoch-a","protocol_version":4,"pid":6079,"title":"Bad","x":0,"y":0,"w":1,"h":1}]',)"#;
         assert!(parse_windows(mismatched, None).is_none());
 
-        let trailing = r#"('[{"id":46,"target_id":"epoch-a:garbage:46","helper_epoch":"epoch-a","protocol_version":2,"pid":6079,"title":"Bad","x":0,"y":0,"w":1,"h":1}]',)"#;
+        let trailing = r#"('[{"id":46,"target_id":"epoch-a:garbage:46","helper_epoch":"epoch-a","protocol_version":4,"pid":6079,"title":"Bad","x":0,"y":0,"w":1,"h":1}]',)"#;
         assert!(parse_windows(trailing, None).is_none());
+    }
+
+    #[test]
+    fn atomic_capture_payload_is_bound_to_target_geometry_and_png() {
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        let valid = format!(
+            r#"{{"protocol_version":4,"target":"epoch-a:46","rect":{{"x":4,"y":5,"width":1,"height":1}},"logical_size":{{"width":100,"height":100}},"png_base64":"{png}"}}"#
+        );
+
+        assert!(decode_capture_payload(&valid, "epoch-a:46").is_ok());
+        assert!(decode_capture_payload(&valid, "epoch-a:47")
+            .unwrap_err()
+            .to_string()
+            .contains("target_changed_during_capture"));
+
+        let escaped = valid.replace("\"x\":4", "\"x\":100");
+        assert!(decode_capture_payload(&escaped, "epoch-a:46")
+            .unwrap_err()
+            .to_string()
+            .contains("capture_geometry_invalid"));
+    }
+
+    #[test]
+    fn foreground_tokens_are_caller_allocated_and_unique() {
+        let first = new_foreground_token();
+        let second = new_foreground_token();
+        assert!(first.starts_with("cua-fg-"));
+        assert_ne!(first, second);
+        assert!(first.len() <= 167);
+    }
+
+    #[test]
+    fn foreground_restoration_requires_a_terminal_resolved_outcome() {
+        let restored = r#"('{"terminal":true,"state":"terminal","activation_required":true,"target_activation_verified":true,"restoration_attempted":true,"restoration_succeeded":true,"outcome":"restored_prior_context","reason":"complete"}',)"#;
+        let outcome = parse_foreground_outcome(restored).expect("terminal restoration");
+        assert_eq!(outcome.restoration_succeeded, Some(true));
+
+        let unresolved = r#"('{"terminal":true,"state":"terminal","restoration_attempted":true,"restoration_succeeded":false,"outcome":"restoration_unresolved","reason":"prior_window_not_confirmed"}',)"#;
+        assert!(parse_foreground_outcome(unresolved)
+            .unwrap_err()
+            .to_string()
+            .contains("could not verify restoration"));
+
+        let in_progress = r#"('{"terminal":false,"state":"restoring"}',)"#;
+        assert!(parse_foreground_outcome(in_progress)
+            .unwrap_err()
+            .to_string()
+            .contains("not terminal"));
     }
 }

@@ -9,13 +9,14 @@ const policySource = await readFile(
 const {
     captureAreaIsSafe,
     captureContextIsSafe,
+    captureRectangleIsSafe,
     foregroundTargetCanActivate,
     foregroundTargetIsSafe,
     rectanglesOverlap,
+    rectanglesEqual,
     shellInputIsGrabbed,
     targetIsPainted,
     targetTokenMatches,
-    trustedCursorOverlayIsSafe,
 } = await import(
     `data:text/javascript;base64,${Buffer.from(policySource).toString('base64')}`
 );
@@ -61,30 +62,6 @@ test('target tokens are bound to the helper epoch', () => {
     assert.equal(targetTokenMatches('epoch-a', 'epoch-a:+42'), false);
 });
 
-test('only the exact sticky cua-driver cursor overlay is trusted', () => {
-    const valid = {
-        title: 'Cua.AgentCursorOverlay.default',
-        appId: '',
-        windowType: 15,
-        overrideOtherType: 15,
-        sticky: true,
-        pid: 4104720,
-        executable: '/home/user/.cua-driver/packages/releases/hardened/cua-driver',
-    };
-    assert.equal(trustedCursorOverlayIsSafe(valid), true);
-    for (const invalid of [
-        {...valid, title: 'Cua.AgentCursorOverlay'},
-        {...valid, appId: 'spoofed.app'},
-        {...valid, windowType: 0},
-        {...valid, sticky: false},
-        {...valid, pid: 0},
-        {...valid, executable: '/tmp/not-cua-driver'},
-        {...valid, executable: 'cua-driver'},
-    ]) {
-        assert.equal(trustedCursorOverlayIsSafe(invalid), false);
-    }
-});
-
 test('overlap proof rejects only positive-area intersections', () => {
     const target = {x: 10, y: 10, width: 100, height: 100};
     assert.equal(rectanglesOverlap(target, {x: 50, y: 50, width: 20, height: 20}), true);
@@ -117,13 +94,34 @@ test('capture rejects zero-sized or non-finite display and stage geometry', () =
     }
 });
 
+test('atomic capture geometry accepts only a bounded positive target rectangle', () => {
+    const display = {displayWidth: 1920, displayHeight: 1080};
+    assert.equal(captureRectangleIsSafe({x: 100, y: 80, width: 640, height: 480}, display), true);
+    assert.equal(captureRectangleIsSafe({x: -1, y: 80, width: 640, height: 480}, display), false);
+    assert.equal(captureRectangleIsSafe({x: 100, y: 80, width: 0, height: 480}, display), false);
+    assert.equal(captureRectangleIsSafe({x: 1800, y: 80, width: 640, height: 480}, display), false);
+    assert.equal(captureRectangleIsSafe({x: 100, y: 1000, width: 640, height: 480}, display), false);
+});
+
+test('atomic capture rejects geometry drift after pixels are produced', () => {
+    const before = {x: 100, y: 80, width: 640, height: 480};
+    assert.equal(rectanglesEqual(before, {...before}), true);
+    assert.equal(rectanglesEqual(before, {...before, x: 101}), false);
+    assert.equal(rectanglesEqual(before, {...before, width: 641}), false);
+});
+
 test('extension uses an explicit positive area and never implicit stage capture', async () => {
     const extensionSource = await readFile(
         new URL('../winrects@cua/extension.js', import.meta.url),
         'utf8',
     );
-    assert.match(extensionSource, /screenshot_area\(0, 0, width, height, stream\)/);
+    assert.match(
+        extensionSource,
+        /screenshot_area\(\s*captureRect\.x,\s*captureRect\.y,\s*captureRect\.width,\s*captureRect\.height,\s*stream\s*\)/s,
+    );
+    assert.doesNotMatch(extensionSource, /screenshot_area\(0, 0, width, height, stream\)/);
     assert.match(extensionSource, /target_changed_during_capture/);
+    assert.match(extensionSource, /target_geometry_changed_during_capture/);
     assert.match(extensionSource, /target_occluded_during_capture/);
     assert.doesNotMatch(extensionSource, /\.screenshot\(false, stream\)/);
 });
@@ -201,15 +199,54 @@ test('extension advertises and implements transaction revalidation', async () =>
         'utf8',
     );
     assert.match(extensionSource, /foreground-revalidate-v1/);
+    assert.match(extensionSource, /foreground-reconcile-v1/);
     assert.match(extensionSource, /unoccluded-target-v1/);
     assert.match(extensionSource, /trusted-cursor-overlay-v1/);
     assert.match(extensionSource, /exact-target-activation-v1/);
     assert.match(extensionSource, /shell-grab-classification-v1/);
     assert.match(extensionSource, /_canActivateTarget/);
     assert.match(extensionSource, /_keyFocusInShellUi/);
-    assert.match(policySource, /Cua\.AgentCursorOverlay/);
-    assert.match(extensionSource, /GLib\.file_read_link/);
+    assert.doesNotMatch(policySource, /Cua\.AgentCursorOverlay/);
+    assert.doesNotMatch(extensionSource, /_isTrustedCursorOverlay/);
+    assert.doesNotMatch(extensionSource, /GLib\.file_read_link/);
     assert.match(extensionSource, /ValidateForeground\(transaction\)/);
+    assert.match(extensionSource, /BeginForegroundAsync\(\[transaction, targetId\], invocation\)/);
+    assert.match(extensionSource, /QueryForeground\(transaction\)/);
+    assert.match(extensionSource, /AbortForegroundAsync\(\[transaction\], invocation\)/);
+    assert.match(extensionSource, /caller must allocate a bounded transaction ID/);
+    assert.match(extensionSource, /prior_window_not_confirmed/);
+    assert.match(extensionSource, /prior_workspace_not_confirmed/);
+    assert.match(extensionSource, /preserved_user_context/);
     assert.match(extensionSource, /child_modal_present/);
     assert.match(extensionSource, /target_occluded/);
+});
+
+test('cursor ownership is connection-derived with disconnect and bounded-idle cleanup', async () => {
+    const extensionSource = await readFile(
+        new URL('../winrects@cua/extension.js', import.meta.url),
+        'utf8',
+    );
+    assert.match(extensionSource, /connection-owned-cursors-v1/);
+    assert.match(extensionSource, /invocation\.get_sender\(\)/);
+    assert.match(extensionSource, /NameOwnerChanged/);
+    assert.match(extensionSource, /_removeCursorsForConnection\(name\)/);
+    assert.match(extensionSource, /CURSOR_IDLE_TIMEOUT_US/);
+    assert.match(extensionSource, /record\.lastUsedAt < cutoff/);
+    assert.match(extensionSource, /MoveCursorForAsync/);
+    assert.doesNotMatch(extensionSource, /\n\s*MoveCursorFor\(owner,/);
+});
+
+test('capture protocol exposes one exact target and one atomic result', async () => {
+    const extensionSource = await readFile(
+        new URL('../winrects@cua/extension.js', import.meta.url),
+        'utf8',
+    );
+    assert.match(
+        extensionSource,
+        /<method name="CaptureTarget"><arg type="s" direction="in" name="target"\/><arg type="s" direction="out" name="capture_json"\/><\/method>/,
+    );
+    assert.match(extensionSource, /async CaptureTargetAsync\(\[targetId\], invocation\)/);
+    assert.match(extensionSource, /screenshot_area\(\s*captureRect\.x,/);
+    assert.match(extensionSource, /target: targetId,\s*rect: captureRect,/);
+    assert.doesNotMatch(extensionSource, /screenshot_area\(\s*0,\s*0,/);
 });

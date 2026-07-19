@@ -10,25 +10,29 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {
     captureAreaIsSafe,
     captureContextIsSafe,
+    captureRectangleIsSafe,
     foregroundTargetCanActivate,
     foregroundTargetIsSafe,
     rectanglesOverlap,
+    rectanglesEqual,
     shellInputIsGrabbed,
     targetIsPainted,
     targetTokenMatches,
-    trustedCursorOverlayIsSafe,
 } from './policy.js';
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
 
-const PROTOCOL_VERSION = 2;
+const PROTOCOL_VERSION = 4;
 const FOREGROUND_TIMEOUT_MS = 30_000;
+const CURSOR_IDLE_TIMEOUT_US = 5 * 60 * 1_000_000;
 
 const IFACE = `<node><interface name="org.cua.WinRects">
 <method name="GetCapabilities"><arg type="s" direction="out" name="json"/></method>
 <method name="GetRects"><arg type="s" direction="out" name="json"/></method>
-<method name="CaptureTarget"><arg type="s" direction="in" name="target"/><arg type="s" direction="out" name="png_base64"/></method>
-<method name="BeginForeground"><arg type="s" direction="in" name="target"/><arg type="s" direction="out" name="json"/></method>
+<method name="CaptureTarget"><arg type="s" direction="in" name="target"/><arg type="s" direction="out" name="capture_json"/></method>
+<method name="BeginForeground"><arg type="s" direction="in" name="transaction"/><arg type="s" direction="in" name="target"/><arg type="s" direction="out" name="json"/></method>
+<method name="QueryForeground"><arg type="s" direction="in" name="transaction"/><arg type="s" direction="out" name="json"/></method>
+<method name="AbortForeground"><arg type="s" direction="in" name="transaction"/><arg type="s" direction="out" name="json"/></method>
 <method name="ValidateForeground"><arg type="s" direction="in" name="transaction"/><arg type="s" direction="out" name="json"/></method>
 <method name="EndForeground"><arg type="s" direction="in" name="transaction"/><arg type="s" direction="out" name="json"/></method>
 <method name="CommitForeground"><arg type="s" direction="in" name="transaction"/><arg type="s" direction="out" name="json"/></method>
@@ -69,6 +73,19 @@ export default class WinRectsExtension extends Extension {
         this._impl.export(Gio.DBus.session, '/org/cua/WinRects');
         this._nameId = Gio.bus_own_name(Gio.BusType.SESSION, 'org.cua.WinRects',
             Gio.BusNameOwnerFlags.REPLACE, null, null, null);
+        this._nameOwnerSignalId = Gio.DBus.session.signal_subscribe(
+            'org.freedesktop.DBus',
+            'org.freedesktop.DBus',
+            'NameOwnerChanged',
+            '/org/freedesktop/DBus',
+            null,
+            Gio.DBusSignalFlags.NONE,
+            (_connection, _sender, _path, _interface, _signal, parameters) => {
+                const [name, oldOwner, newOwner] = parameters.deep_unpack();
+                if (name.startsWith(':') && oldOwner && !newOwner)
+                    this._removeCursorsForConnection(name);
+            }
+        );
 
         const update = () => this._scheduleCursorVisibilityUpdate();
         this._connect(global.workspace_manager, 'active-workspace-changed', update);
@@ -77,11 +94,19 @@ export default class WinRectsExtension extends Extension {
         this._connect(global.display, 'window-entered-monitor', update);
         this._connect(global.display, 'window-left-monitor', update);
         this._connect(Main.layoutManager, 'monitors-changed', update);
+        this._cursorReaperId = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 60, () => {
+            const cutoff = GLib.get_monotonic_time() - CURSOR_IDLE_TIMEOUT_US;
+            for (const [key, record] of this._cursors) {
+                if (record.lastUsedAt < cutoff)
+                    this._removeCursor(key);
+            }
+            return GLib.SOURCE_CONTINUE;
+        });
     }
 
     disable() {
         if (this._foreground)
-            this._finishForeground(this._foreground.transaction, 'extension-disabled');
+            this._finishForegroundAsync(this._foreground.transaction, 'extension-disabled', null);
         for (const [object, id] of this._signals) {
             try { object.disconnect(id); } catch (_error) {}
         }
@@ -89,6 +114,14 @@ export default class WinRectsExtension extends Extension {
         for (const owner of [...this._cursors.keys()])
             this._removeCursor(owner);
         this._cursors.clear();
+        if (this._cursorReaperId) {
+            try { GLib.source_remove(this._cursorReaperId); } catch (_error) {}
+            this._cursorReaperId = 0;
+        }
+        if (this._nameOwnerSignalId) {
+            Gio.DBus.session.signal_unsubscribe(this._nameOwnerSignalId);
+            this._nameOwnerSignalId = 0;
+        }
         if (this._impl) { this._impl.unexport(); this._impl = null; }
         if (this._nameId) { Gio.bus_unown_name(this._nameId); this._nameId = 0; }
     }
@@ -191,51 +224,12 @@ export default class WinRectsExtension extends Extension {
         }
     }
 
-    _isTrustedCursorOverlay(window) {
-        try {
-            const pid = window.get_pid();
-            const executable = GLib.file_read_link(`/proc/${pid}/exe`);
-            return trustedCursorOverlayIsSafe({
-                title: window.get_title() || '',
-                appId: this._windowAppId(window),
-                windowType: window.get_window_type(),
-                overrideOtherType: Meta.WindowType.OVERRIDE_OTHER,
-                sticky: window.is_on_all_workspaces(),
-                pid,
-                executable,
-            });
-        } catch (_error) {
-            return false;
-        }
-    }
-
-    _onlyTrustedCursorOverlayAbove(window) {
-        const windows = global.display.sort_windows_by_stacking(
-            global.get_window_actors().map(actor => actor.meta_window).filter(Boolean)
-        );
-        const targetIndex = windows.indexOf(window);
-        if (targetIndex < 0)
-            return false;
-        const targetRect = window.get_frame_rect();
-        let trustedOverlayFound = false;
-        for (const candidate of windows.slice(targetIndex + 1)) {
-            if (candidate === window || candidate.minimized || !this._windowShowing(candidate))
-                continue;
-            if (!rectanglesOverlap(targetRect, candidate.get_frame_rect()))
-                continue;
-            if (!this._isTrustedCursorOverlay(candidate))
-                return false;
-            trustedOverlayFound = true;
-        }
-        return trustedOverlayFound;
-    }
-
     _isTargetVisible(window) {
         if (!window || !this._captureContextIsSafe())
             return false;
         const actor = this._actorFor(window);
         return targetIsPainted({
-            actorVisible: actor?.visible || this._onlyTrustedCursorOverlayAbove(window),
+            actorVisible: Boolean(actor?.visible),
             minimized: window.minimized,
             shellShowing: this._windowShowing(window),
         });
@@ -263,7 +257,6 @@ export default class WinRectsExtension extends Extension {
         const targetRect = window.get_frame_rect();
         return !windows.slice(targetIndex + 1).some(candidate =>
             candidate !== window
-            && !this._isTrustedCursorOverlay(candidate)
             && !candidate.minimized
             && this._windowShowing(candidate)
             && rectanglesOverlap(targetRect, candidate.get_frame_rect())
@@ -311,8 +304,11 @@ export default class WinRectsExtension extends Extension {
                 'exact-target-v2',
                 'workspace-metadata',
                 'target-stage-capture',
+                'atomic-target-capture-v1',
                 'keyed-target-cursors',
+                'connection-owned-cursors-v1',
                 'foreground-transaction',
+                'foreground-reconcile-v1',
                 'foreground-revalidate-v1',
                 'transient-parent-v1',
                 'unoccluded-target-v1',
@@ -412,17 +408,39 @@ export default class WinRectsExtension extends Extension {
                 );
             const width = Math.floor(displayWidth);
             const height = Math.floor(displayHeight);
+            const frame = target.get_frame_rect();
+            const captureRect = {
+                x: Math.floor(frame.x),
+                y: Math.floor(frame.y),
+                width: Math.floor(frame.width),
+                height: Math.floor(frame.height),
+            };
+            if (!captureRectangleIsSafe(captureRect, {displayWidth: width, displayHeight: height}))
+                throw new Error('capture_geometry_invalid: target rectangle is outside the captured stage');
             const shooter = new Shell.Screenshot();
             const stream = Gio.MemoryOutputStream.new_resizable();
             // Never call Shell.Screenshot.screenshot() here. GNOME 50 can pass
             // an implicit 0x0 stage view into Cogl immediately after a window
-            // activation, which crashes Shell even when display.get_size() is
-            // positive. screenshot_area() allocates the explicit positive full-
-            // display rectangle and omits the real cursor; Rust keeps applying
-            // the exact target crop to this full-display PNG.
-            await shooter.screenshot_area(0, 0, width, height, stream);
+            // activation. Capture only the exact positive target rectangle so
+            // this target API can never emit broad stage pixels to its caller.
+            await shooter.screenshot_area(
+                captureRect.x,
+                captureRect.y,
+                captureRect.width,
+                captureRect.height,
+                stream
+            );
             if (this._resolveTarget(targetId) !== target)
                 throw new Error('target_changed_during_capture');
+            const currentFrame = target.get_frame_rect();
+            const currentRect = {
+                x: Math.floor(currentFrame.x),
+                y: Math.floor(currentFrame.y),
+                width: Math.floor(currentFrame.width),
+                height: Math.floor(currentFrame.height),
+            };
+            if (!rectanglesEqual(captureRect, currentRect))
+                throw new Error('target_geometry_changed_during_capture');
             if (!this._isTargetVisible(target))
                 throw new Error('capture_context_changed');
             if (this._visibleModalChild(target))
@@ -431,14 +449,33 @@ export default class WinRectsExtension extends Extension {
                 throw new Error('target_occluded_during_capture');
             stream.close(null);
             const encoded = GLib.base64_encode(stream.steal_as_bytes().get_data());
-            invocation.return_value(new GLib.Variant('(s)', [encoded]));
+            invocation.return_value(new GLib.Variant('(s)', [JSON.stringify({
+                protocol_version: PROTOCOL_VERSION,
+                target: targetId,
+                rect: captureRect,
+                logical_size: {width, height},
+                png_base64: encoded,
+            })]));
         } catch (error) {
             invocation.return_dbus_error('org.cua.WinRects.CaptureFailed', String(error));
         }
     }
 
-    BeginForegroundAsync([targetId], invocation) {
+    BeginForegroundAsync([transaction, targetId], invocation) {
+        if (typeof transaction !== 'string' || !/^cua-fg-[A-Za-z0-9._:-]{8,160}$/.test(transaction)) {
+            invocation.return_dbus_error(
+                'org.cua.WinRects.InvalidTransaction',
+                'invalid_transaction: caller must allocate a bounded transaction ID before BeginForeground'
+            );
+            return;
+        }
         if (this._foreground) {
+            if (this._foreground.transaction === transaction && this._foreground.targetId === targetId) {
+                invocation.return_value(new GLib.Variant('(s)', [
+                    JSON.stringify(this._foregroundStatus(this._foreground)),
+                ]));
+                return;
+            }
             invocation.return_dbus_error(
                 'org.cua.WinRects.InputBusy',
                 'input_busy: another GNOME foreground transaction is active'
@@ -462,7 +499,6 @@ export default class WinRectsExtension extends Extension {
         }
         const priorWindow = global.display.focus_window;
         const priorWorkspace = global.workspace_manager.get_active_workspace();
-        const transaction = GLib.uuid_string_random();
         this._foreground = {
             transaction,
             target,
@@ -470,54 +506,93 @@ export default class WinRectsExtension extends Extension {
             priorWindow,
             priorWorkspace,
             timeoutId: 0,
+            state: priorWindow === target ? 'active' : 'activating',
+            activationRequired: priorWindow !== target,
+            activated: priorWindow === target,
         };
-        target.activate(global.get_current_time());
+        if (priorWindow !== target)
+            target.activate(global.get_current_time());
         GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
-            const active = this._foreground?.transaction === transaction &&
-                global.display.focus_window === target;
-            if (!active) {
-                this._foreground = null;
+            const foreground = this._foreground;
+            if (!foreground || foreground.transaction !== transaction) {
                 invocation.return_value(new GLib.Variant('(s)', [JSON.stringify({
+                    terminal: true,
+                    state: 'terminal',
                     activated: false,
-                    reason: 'activation_not_confirmed',
+                    reason: 'stale_transaction',
                 })]));
                 return GLib.SOURCE_REMOVE;
             }
-            if (this._visibleModalChild(target)) {
-                this._finishForeground(transaction, 'child-modal-present');
+            if (global.display.focus_window === target) {
+                foreground.state = 'active';
+                foreground.activated = true;
+            } else {
+                // Keep the transaction queryable. The caller may have lost this
+                // reply while Mutter completes activation later; AbortForeground
+                // reconciles by the caller-supplied ID before the raw lease ends.
+                foreground.state = 'reconciling';
+            }
+            if (foreground.activated && this._visibleModalChild(target)) {
+                foreground.state = 'reconciling';
                 invocation.return_value(new GLib.Variant('(s)', [JSON.stringify({
                     activated: false,
+                    terminal: false,
+                    state: 'reconciling',
+                    transaction,
                     reason: 'child_modal_present',
                 })]));
                 return GLib.SOURCE_REMOVE;
             }
-            if (!this._isTargetUnoccluded(target)) {
-                this._finishForeground(transaction, 'target-occluded');
+            if (foreground.activated && !this._isTargetUnoccluded(target)) {
+                foreground.state = 'reconciling';
                 invocation.return_value(new GLib.Variant('(s)', [JSON.stringify({
                     activated: false,
+                    terminal: false,
+                    state: 'reconciling',
+                    transaction,
                     reason: 'target_occluded',
                 })]));
                 return GLib.SOURCE_REMOVE;
             }
-            this._foreground.timeoutId = GLib.timeout_add(
+            foreground.timeoutId = GLib.timeout_add(
                 GLib.PRIORITY_DEFAULT,
                 FOREGROUND_TIMEOUT_MS,
                 () => {
-                    this._finishForeground(transaction, 'deadline');
+                    this._finishForegroundAsync(transaction, 'deadline', null);
                     return GLib.SOURCE_REMOVE;
                 }
             );
-            let priorWorkspaceIndex = -1;
-            try { priorWorkspaceIndex = priorWorkspace?.index() ?? -1; } catch (_error) {}
-            invocation.return_value(new GLib.Variant('(s)', [JSON.stringify({
-                activated: true,
-                transaction,
-                target: targetId,
-                prior_workspace_index: priorWorkspaceIndex,
-                prior_window: priorWindow ? this._targetId(priorWindow) : null,
-            })]));
+            invocation.return_value(new GLib.Variant('(s)', [
+                JSON.stringify(this._foregroundStatus(foreground)),
+            ]));
             return GLib.SOURCE_REMOVE;
         });
+    }
+
+    _foregroundStatus(foreground) {
+        if (foreground.state !== 'restoring' && global.display.focus_window === foreground.target) {
+            foreground.state = 'active';
+            foreground.activated = true;
+        }
+        let priorWorkspaceIndex = -1;
+        try { priorWorkspaceIndex = foreground.priorWorkspace?.index() ?? -1; } catch (_error) {}
+        return {
+            terminal: false,
+            state: foreground.state,
+            activated: foreground.activated,
+            activation_required: foreground.activationRequired,
+            transaction: foreground.transaction,
+            target: foreground.targetId,
+            prior_workspace_index: priorWorkspaceIndex,
+            prior_window: foreground.priorWindow ? this._targetId(foreground.priorWindow) : null,
+        };
+    }
+
+    QueryForeground(transaction) {
+        const foreground = this._foreground;
+        if (!foreground || (transaction && foreground.transaction !== transaction))
+            return JSON.stringify({terminal: true, state: 'terminal', reason: 'stale_transaction'});
+        return JSON.stringify(this._foregroundStatus(foreground));
     }
 
     ValidateForeground(transaction) {
@@ -545,10 +620,8 @@ export default class WinRectsExtension extends Extension {
             reason = 'child_modal_present';
         else if (!targetSafe && !targetUnoccluded)
             reason = 'target_occluded';
-        if (reason) {
-            this._finishForeground(transaction, reason);
-            return JSON.stringify({valid: false, reason});
-        }
+        if (reason)
+            return JSON.stringify({valid: false, terminal: false, state: 'reconciling', reason});
         return JSON.stringify({
             valid: true,
             target: foreground.targetId,
@@ -556,8 +629,16 @@ export default class WinRectsExtension extends Extension {
         });
     }
 
-    EndForeground(transaction) {
-        return JSON.stringify(this._finishForeground(transaction, 'complete'));
+    EndForegroundAsync([transaction], invocation) {
+        this._finishForegroundAsync(transaction, 'complete', result => {
+            invocation.return_value(new GLib.Variant('(s)', [JSON.stringify(result)]));
+        });
+    }
+
+    AbortForegroundAsync([transaction], invocation) {
+        this._finishForegroundAsync(transaction, 'aborted', result => {
+            invocation.return_value(new GLib.Variant('(s)', [JSON.stringify(result)]));
+        });
     }
 
     CommitForeground(transaction) {
@@ -571,47 +652,128 @@ export default class WinRectsExtension extends Extension {
         return JSON.stringify({committed: true});
     }
 
-    _finishForeground(transaction, reason) {
+    _finishForegroundAsync(transaction, reason, callback) {
         const foreground = this._foreground;
         if (!foreground || foreground.transaction !== transaction)
-            return {restored: false, reason: 'stale_transaction'};
-        this._foreground = null;
+            return callback?.({terminal: true, state: 'terminal', restored: false, reason: 'stale_transaction'});
+        if (foreground.state === 'restoring')
+            return callback?.({terminal: false, state: 'restoring', restored: false, reason: 'restoration_in_progress'});
+        foreground.state = 'restoring';
         if (foreground.timeoutId) {
             try { GLib.source_remove(foreground.timeoutId); } catch (_error) {}
+            foreground.timeoutId = 0;
         }
-        if (global.display.focus_window !== foreground.target)
-            return {restored: false, reason: 'user_focus_changed'};
+
+        const complete = result => {
+            if (this._foreground?.transaction === transaction)
+                this._foreground = null;
+            callback?.({
+                terminal: true,
+                state: 'terminal',
+                activation_required: foreground.activationRequired,
+                target_activation_verified: foreground.activated,
+                ...result,
+            });
+        };
+
+        const currentFocus = global.display.focus_window;
+        if (currentFocus && currentFocus !== foreground.target) {
+            complete({
+                restored: false,
+                restoration_attempted: false,
+                restoration_succeeded: false,
+                outcome: 'preserved_user_context',
+                reason: 'user_focus_changed',
+            });
+            return;
+        }
 
         const windows = global.get_window_actors().map(actor => actor.meta_window);
         if (foreground.priorWindow && foreground.priorWindow !== foreground.target &&
             windows.includes(foreground.priorWindow)) {
             foreground.priorWindow.activate(global.get_current_time());
-            return {restored: true, reason, restored_to: 'window'};
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+                const succeeded = global.display.focus_window === foreground.priorWindow;
+                complete({
+                    restored: succeeded,
+                    restoration_attempted: true,
+                    restoration_succeeded: succeeded,
+                    outcome: succeeded ? 'restored_prior_context' : 'restoration_unresolved',
+                    reason: succeeded ? reason : 'prior_window_not_confirmed',
+                    restored_to: 'window',
+                });
+                return GLib.SOURCE_REMOVE;
+            });
+            return;
         }
-        if (foreground.priorWindow === foreground.target)
-            return {restored: false, reason: 'target_was_already_focused'};
+        if (foreground.priorWindow === foreground.target) {
+            complete({
+                restored: false,
+                restoration_attempted: false,
+                restoration_succeeded: true,
+                outcome: 'no_activation_required',
+                reason: 'target_was_already_focused',
+            });
+            return;
+        }
         try {
-            foreground.priorWorkspace?.activate(global.get_current_time());
-            return {restored: true, reason, restored_to: 'workspace'};
+            if (!foreground.priorWorkspace)
+                throw new Error('missing prior workspace');
+            foreground.priorWorkspace.activate(global.get_current_time());
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
+                const succeeded = global.workspace_manager.get_active_workspace() === foreground.priorWorkspace;
+                complete({
+                    restored: succeeded,
+                    restoration_attempted: true,
+                    restoration_succeeded: succeeded,
+                    outcome: succeeded ? 'restored_prior_context' : 'restoration_unresolved',
+                    reason: succeeded ? reason : 'prior_workspace_not_confirmed',
+                    restored_to: 'workspace',
+                });
+                return GLib.SOURCE_REMOVE;
+            });
         } catch (_error) {
-            return {restored: false, reason: 'prior_context_unavailable'};
+            complete({
+                restored: false,
+                restoration_attempted: true,
+                restoration_succeeded: false,
+                outcome: 'restoration_unresolved',
+                reason: 'prior_context_unavailable',
+            });
         }
     }
 
+    _cursorOwner(owner, invocation) {
+        const connectionOwner = invocation.get_sender();
+        if (
+            typeof connectionOwner !== 'string'
+            || !connectionOwner.startsWith(':')
+            || typeof owner !== 'string'
+            || owner.length < 1
+            || owner.length > 256
+        )
+            throw new Error('cursor_owner_invalid: a live D-Bus connection and bounded label are required');
+        return {
+            connectionOwner,
+            key: JSON.stringify([connectionOwner, owner]),
+        };
+    }
+
     _cursorFor(owner) {
-        if (!owner)
-            return null;
-        let record = this._cursors.get(owner);
+        let record = this._cursors.get(owner.key);
         if (!record) {
             record = {
                 actor: this._createCursorActor(),
+                connectionOwner: owner.connectionOwner,
                 targetId: null,
                 requestedVisible: false,
+                lastUsedAt: GLib.get_monotonic_time(),
                 targetSignals: [],
                 targetWindow: null,
             };
-            this._cursors.set(owner, record);
+            this._cursors.set(owner.key, record);
         }
+        record.lastUsedAt = GLib.get_monotonic_time();
         return record;
     }
 
@@ -655,51 +817,77 @@ export default class WinRectsExtension extends Extension {
         });
     }
 
-    MoveCursorFor(owner, targetId, x, y) {
-        const record = this._cursorFor(owner);
-        if (!record)
-            return;
-        record.targetId = targetId;
-        record.requestedVisible = true;
-        this._syncCursorVisibility(record);
-        record.actor.ease({
-            x: x - TIPX,
-            y: y - TIPY,
-            duration: 480,
-            mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
-        });
+    MoveCursorForAsync([owner, targetId, x, y], invocation) {
+        try {
+            const record = this._cursorFor(this._cursorOwner(owner, invocation));
+            record.targetId = targetId;
+            record.requestedVisible = true;
+            this._syncCursorVisibility(record);
+            record.actor.ease({
+                x: x - TIPX,
+                y: y - TIPY,
+                duration: 480,
+                mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+            });
+            invocation.return_value(null);
+        } catch (error) {
+            invocation.return_dbus_error('org.cua.WinRects.CursorRejected', String(error));
+        }
     }
 
-    ClickPulseFor(owner, targetId, x, y) {
-        const record = this._cursorFor(owner);
-        if (!record)
-            return;
-        record.targetId = targetId;
-        record.requestedVisible = true;
-        record.actor.set_position(x - TIPX, y - TIPY);
-        this._syncCursorVisibility(record);
-        record.actor.ease({
-            scale_x: 1.5,
-            scale_y: 1.5,
-            duration: 130,
-            mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-            onComplete: () => {
-                if (record.actor)
-                    record.actor.ease({scale_x: 1, scale_y: 1, duration: 130});
-            },
-        });
+    ClickPulseForAsync([owner, targetId, x, y], invocation) {
+        try {
+            const record = this._cursorFor(this._cursorOwner(owner, invocation));
+            record.targetId = targetId;
+            record.requestedVisible = true;
+            record.actor.set_position(x - TIPX, y - TIPY);
+            this._syncCursorVisibility(record);
+            record.actor.ease({
+                scale_x: 1.5,
+                scale_y: 1.5,
+                duration: 130,
+                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
+                onComplete: () => {
+                    if (record.actor)
+                        record.actor.ease({scale_x: 1, scale_y: 1, duration: 130});
+                },
+            });
+            invocation.return_value(null);
+        } catch (error) {
+            invocation.return_dbus_error('org.cua.WinRects.CursorRejected', String(error));
+        }
     }
 
-    HideCursorFor(owner) {
-        const record = this._cursors.get(owner);
-        if (!record)
-            return;
-        record.requestedVisible = false;
-        record.actor.hide();
+    HideCursorForAsync([owner], invocation) {
+        try {
+            const cursorOwner = this._cursorOwner(owner, invocation);
+            const record = this._cursors.get(cursorOwner.key);
+            if (record) {
+                record.lastUsedAt = GLib.get_monotonic_time();
+                record.requestedVisible = false;
+                record.actor.hide();
+            }
+            invocation.return_value(null);
+        } catch (error) {
+            invocation.return_dbus_error('org.cua.WinRects.CursorRejected', String(error));
+        }
     }
 
-    RemoveCursor(owner) {
-        this._removeCursor(owner);
+    RemoveCursorAsync([owner], invocation) {
+        try {
+            const cursorOwner = this._cursorOwner(owner, invocation);
+            this._removeCursor(cursorOwner.key);
+            invocation.return_value(null);
+        } catch (error) {
+            invocation.return_dbus_error('org.cua.WinRects.CursorRejected', String(error));
+        }
+    }
+
+    _removeCursorsForConnection(connectionOwner) {
+        for (const [owner, record] of [...this._cursors]) {
+            if (record.connectionOwner === connectionOwner)
+                this._removeCursor(owner);
+        }
     }
 
     _removeCursor(owner) {

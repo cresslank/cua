@@ -35,7 +35,6 @@ use cursor_overlay::{
 
 static CMD_TX: OnceLock<std::sync::mpsc::SyncSender<OverlayMsg>> = OnceLock::new();
 
-
 // Exact GNOME WinRects cursor targets keyed by Cua session/owner. PinAbove
 // records the incarnation-qualified window id; later move/pulse commands only
 // render when that exact target is known. Unkeyed global GNOME cursors are
@@ -138,25 +137,45 @@ pub fn send_command(cmd: OverlayCommand) {
     send_command_for("default".to_owned(), cmd);
 }
 
+fn apply_gnome_logical_command(key: &CursorKey, cmd: &OverlayCommand) {
+    // GNOME Shell performs the visual move itself. Keep only a snapped logical
+    // position here so animation callers have deterministic state without ever
+    // waking the external X11 renderer.
+    let logical = match cmd {
+        OverlayCommand::MoveTo {
+            x,
+            y,
+            end_heading_radians,
+        } => OverlayCommand::SnapTo {
+            x: *x,
+            y: *y,
+            heading_radians: Some(*end_heading_radians),
+        },
+        other => other.clone(),
+    };
+    if let Some(map) = RENDER.lock().unwrap().as_mut() {
+        if let Some(active) = apply_msg(
+            map,
+            OverlayMsg::Cmd(KeyedOverlayCommand {
+                key: key.clone(),
+                cmd: logical,
+            }),
+        ) {
+            map.last_active = Some(active);
+        }
+    }
+}
+
 pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
     if key.is_empty() {
         return;
     }
-    let msg = OverlayMsg::Cmd(KeyedOverlayCommand {
-        key: key.clone(),
-        cmd: cmd.clone(),
-    });
-    if let Some(tx) = CMD_TX.get() {
-        let _ = tx.try_send(msg.clone());
-    }
-    // Also forward to the native-Wayland layer-shell overlay when Wayland
-    // is opted in. The wayland overlay's `forward` is a no-op when its
-    // owner thread isn't started yet (which is the normal X11-only case).
     #[cfg(target_os = "linux")]
     {
-        if crate::wayland::is_wayland() {
+        if crate::wayland::is_gnome_wayland_session() {
+            apply_gnome_logical_command(&key, &cmd);
             if crate::wayland::shell_helper::available() {
-                // GNOME has no layer-shell. WinRects v2 owns one Shell actor per
+                // GNOME has no layer-shell. WinRects owns one Shell actor per
                 // cursor key, bound to an exact incarnation-qualified target.
                 // Never send an unpinned cursor command: a global actor without
                 // a target visibility scope is intentionally unsupported.
@@ -190,10 +209,28 @@ pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
                     }
                     _ => {}
                 }
-            } else {
-                let _ = crate::wayland::overlay::forward(&msg);
             }
+            // No external X11 overlay is permitted in a GNOME Wayland session,
+            // including helper skew/unavailability. Avoid hanging animation
+            // waiters when the compositor path fails closed.
+            arrival_fire(&key);
+            return;
         }
+    }
+
+    let msg = OverlayMsg::Cmd(KeyedOverlayCommand {
+        key: key.clone(),
+        cmd: cmd.clone(),
+    });
+    if let Some(tx) = CMD_TX.get() {
+        let _ = tx.try_send(msg.clone());
+    }
+    // Also forward to the native-Wayland layer-shell overlay when Wayland
+    // is opted in. The wayland overlay's `forward` is a no-op when its
+    // owner thread isn't started yet (which is the normal X11-only case).
+    #[cfg(target_os = "linux")]
+    if crate::wayland::is_wayland() {
+        let _ = crate::wayland::overlay::forward(&msg);
     }
 }
 
@@ -316,6 +353,16 @@ pub fn remove_cursor(key: CursorKey) {
     if key.is_empty() {
         return;
     }
+    if crate::wayland::is_gnome_wayland_session() {
+        if let Some(map) = RENDER.lock().unwrap().as_mut() {
+            let _ = apply_msg(map, OverlayMsg::Remove(key.clone()));
+        }
+        gnome_targets().lock().unwrap().remove(&key);
+        if crate::wayland::shell_helper::available() {
+            crate::wayland::shell_helper::remove_cursor(&key);
+        }
+        return;
+    }
     if let Some(tx) = CMD_TX.get() {
         let _ = tx.try_send(OverlayMsg::Remove(key.clone()));
     }
@@ -327,6 +374,10 @@ pub fn remove_cursor(key: CursorKey) {
 
 /// Spawn the overlay on a dedicated thread.  Non-blocking.
 pub fn run_on_thread() {
+    if crate::wayland::is_gnome_wayland_session() {
+        tracing::debug!("GNOME Wayland session: external X11 cursor overlay disabled");
+        return;
+    }
     let rx = match CMD_RX_CELL.lock().unwrap().take() {
         Some(r) => r,
         None => return,

@@ -16,27 +16,6 @@ export function targetTokenMatches(epoch, targetId) {
     return /^[1-9][0-9]*$/.test(sequence) && Number.isSafeInteger(Number(sequence));
 }
 
-export function trustedCursorOverlayIsSafe({
-    title,
-    appId,
-    windowType,
-    overrideOtherType,
-    sticky,
-    pid,
-    executable,
-}) {
-    return typeof title === 'string'
-        && title.startsWith('Cua.AgentCursorOverlay.')
-        && appId === ''
-        && windowType === overrideOtherType
-        && Boolean(sticky)
-        && Number.isSafeInteger(pid)
-        && pid > 0
-        && typeof executable === 'string'
-        && executable.startsWith('/')
-        && executable.split('/').pop() === 'cua-driver';
-}
-
 export function rectanglesOverlap(a, b) {
     return [a?.x, a?.y, a?.width, a?.height, b?.x, b?.y, b?.width, b?.height]
         .every(Number.isFinite)
@@ -53,6 +32,25 @@ export function rectanglesOverlap(a, b) {
 export function captureAreaIsSafe({displayWidth, displayHeight, stageWidth, stageHeight}) {
     return [displayWidth, displayHeight, stageWidth, stageHeight]
         .every(value => Number.isFinite(value) && value >= 1);
+}
+
+export function captureRectangleIsSafe(rect, {displayWidth, displayHeight}) {
+    return [rect?.x, rect?.y, rect?.width, rect?.height, displayWidth, displayHeight]
+        .every(Number.isFinite)
+        && rect.width >= 1
+        && rect.height >= 1
+        && rect.x >= 0
+        && rect.y >= 0
+        && rect.x + rect.width <= displayWidth
+        && rect.y + rect.height <= displayHeight;
+}
+
+export function rectanglesEqual(a, b) {
+    return Boolean(a) && Boolean(b)
+        && a.x === b.x
+        && a.y === b.y
+        && a.width === b.width
+        && a.height === b.height;
 }
 
 export function captureContextIsSafe({overviewVisible, sessionLocked, shellInputGrabbed}) {

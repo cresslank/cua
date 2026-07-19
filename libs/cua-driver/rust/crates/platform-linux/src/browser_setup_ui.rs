@@ -155,7 +155,8 @@ fn with_target_foreground<T>(
 fn close_tab(pid: u32, window_id: u64) -> anyhow::Result<()> {
     with_target_foreground(pid, window_id, || {
         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            crate::wayland::hotkey(window_id, &["ctrl".to_owned(), "w".to_owned()])
+            let target = crate::wayland::establish_exact_target(pid as u32, window_id)?;
+            crate::wayland::hotkey(target, &["ctrl".to_owned(), "w".to_owned()])
         } else {
             crate::input::send_key_xtest("w", &["ctrl"])
         }
