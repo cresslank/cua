@@ -2,6 +2,7 @@ import GdkPixbuf from 'gi://GdkPixbuf';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 
+import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Scripting from 'resource:///org/gnome/shell/ui/scripting.js';
 
 const BUS = GLib.getenv('CUA_GNOME_TEST_BUS') || 'org.cua.WinRects';
@@ -9,7 +10,6 @@ const PATH = '/org/cua/WinRects';
 const IFACE = 'org.cua.WinRects';
 
 export var METRICS = {};
-const fixtureProcesses = [];
 
 function assert(condition, message) {
     if (!condition)
@@ -60,40 +60,144 @@ function decodePng(base64) {
     return loader.get_pixbuf();
 }
 
-function spawnFixtureWindow(title) {
-    const launcher = new Gio.SubprocessLauncher({
-        flags: Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE,
-    });
-    launcher.setenv('GDK_BACKEND', 'x11', true);
-    launcher.unsetenv('WAYLAND_DISPLAY');
-    launcher.setenv('DISPLAY', GLib.getenv('CUA_GNOME_TEST_DISPLAY') || ':2', true);
-    const process = launcher.spawnv([
-        '/usr/bin/zenity',
-        '--info',
-        `--title=${title}`,
-        `--text=${title}`,
-        '--no-wrap',
-    ]);
-    fixtureProcesses.push(process);
+async function waitUntil(predicate, failure, timeoutMs = 5000) {
+    const deadline = GLib.get_monotonic_time() + timeoutMs * 1000;
+    do {
+        if (predicate())
+            return;
+        await Scripting.sleep(50);
+    } while (GLib.get_monotonic_time() < deadline);
+    throw new Error(typeof failure === 'function' ? failure() : failure);
+}
+
+function windowActor(window) {
+    return global.get_window_actors()
+        .find(actor => actor.meta_window === window) ?? null;
+}
+
+function windowRect(window) {
+    const rect = window.get_frame_rect();
+    return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
 }
 
 export async function run() {
-    spawnFixtureWindow('CUA fixture bottom');
-    spawnFixtureWindow('CUA fixture top');
-    await Scripting.sleep(500);
-
-    const windows = global.display.sort_windows_by_stacking(
-        global.get_window_actors()
-            .map(actor => actor.meta_window)
-            .filter(window => window?.get_title()?.startsWith('CUA fixture'))
+    Main.overview.hide();
+    await waitUntil(
+        () => !Main.overview.visible,
+        'GNOME dev-kit overview did not close'
     );
-    assert(windows.length >= 2, 'GNOME dev-kit did not create two test windows');
-    const bottomWindow = windows.at(-2);
-    const topWindow = windows.at(-1);
-    bottomWindow.move_frame(true, 100, 100);
-    topWindow.move_frame(true, 100, 100);
+
+    const existingIds = new Set(global.get_window_actors()
+        .map(actor => actor.meta_window?.get_stable_sequence())
+        .filter(id => id !== undefined));
+    await Scripting.createTestWindow({width: 300, height: 220});
+    let bottomWindow = null;
+    await waitUntil(
+        () => {
+            const windows = global.get_window_actors()
+                .map(actor => actor.meta_window)
+                .filter(window =>
+                    window && !existingIds.has(window.get_stable_sequence())
+                );
+            if (windows.length !== 1)
+                return false;
+            [bottomWindow] = windows;
+            return true;
+        },
+        'GNOME dev-kit did not publish the first test window'
+    );
+    await Scripting.waitTestWindows();
+    // GNOME 50's no-X11 dev-kit does not expose a perf-helper actor until
+    // input arrives. WaitWindows proves that the client mapped and painted;
+    // show() stages that painted actor without involving the live desktop.
+    windowActor(bottomWindow).show();
+    bottomWindow.unminimize();
+    bottomWindow.raise();
+    await waitUntil(
+        () => windowActor(bottomWindow)?.visible
+            && windowActor(bottomWindow)?.mapped,
+        () => `GNOME dev-kit did not paint the first test window: ${JSON.stringify({
+            focus: global.display.focus_window?.get_stable_sequence() ?? null,
+            window: bottomWindow.get_stable_sequence(),
+            visible: windowActor(bottomWindow)?.visible ?? null,
+            mapped: windowActor(bottomWindow)?.mapped ?? null,
+            showing: bottomWindow.showing_on_its_workspace(),
+            rect: windowRect(bottomWindow),
+            modalCount: Main.modalCount,
+            overviewVisible: Main.overview.visible,
+            stageKeyFocus: global.stage.get_key_focus()?.toString() ?? null,
+        })}`
+    );
+    bottomWindow.move_frame(false, 100, 100);
+    await waitUntil(
+        () => windowRect(bottomWindow).x === 100 && windowRect(bottomWindow).y === 100,
+        () => `GNOME dev-kit could not place the lower test window: ${JSON.stringify(windowRect(bottomWindow))}`
+    );
+
+    await Scripting.createTestWindow({width: 300, height: 220});
+    let topWindow = null;
+    await waitUntil(
+        () => {
+            const windows = global.get_window_actors()
+                .map(actor => actor.meta_window)
+                .filter(window =>
+                    window
+                    && window !== bottomWindow
+                    && !existingIds.has(window.get_stable_sequence())
+                );
+            if (windows.length !== 1)
+                return false;
+            [topWindow] = windows;
+            return true;
+        },
+        'GNOME dev-kit did not publish the second test window'
+    );
+    await Scripting.waitTestWindows();
+    // Stage the second mapped client actor for the same contained fixture.
+    windowActor(topWindow).show();
+    topWindow.unminimize();
+    topWindow.raise();
+    await waitUntil(
+        () => windowActor(topWindow)?.visible
+            && windowActor(topWindow)?.mapped,
+        'GNOME dev-kit did not paint the second test window'
+    );
+    topWindow.move_frame(false, 200, 150);
+    await waitUntil(
+        () => windowRect(topWindow).x === 200 && windowRect(topWindow).y === 150,
+        () => `GNOME dev-kit could not place the top test window: ${JSON.stringify(windowRect(topWindow))}`
+    );
+    const fixtureIds = new Set([
+        bottomWindow.get_stable_sequence(),
+        topWindow.get_stable_sequence(),
+    ]);
+    bottomWindow.lower();
+    topWindow.raise();
     topWindow.activate(global.get_current_time());
-    await Scripting.sleep(250);
+    await waitUntil(
+        () =>
+            windowActor(bottomWindow)?.visible
+            && windowActor(topWindow)?.visible
+            && bottomWindow.showing_on_its_workspace()
+            && topWindow.showing_on_its_workspace(),
+        () => `GNOME dev-kit test windows did not become focused and paintable: ${JSON.stringify({
+            focus: global.display.focus_window?.get_stable_sequence() ?? null,
+            bottom: {
+                id: bottomWindow.get_stable_sequence(),
+                visible: windowActor(bottomWindow)?.visible ?? null,
+                mapped: windowActor(bottomWindow)?.mapped ?? null,
+                showing: bottomWindow.showing_on_its_workspace(),
+                rect: windowRect(bottomWindow),
+            },
+            top: {
+                id: topWindow.get_stable_sequence(),
+                visible: windowActor(topWindow)?.visible ?? null,
+                mapped: windowActor(topWindow)?.mapped ?? null,
+                showing: topWindow.showing_on_its_workspace(),
+                rect: windowRect(topWindow),
+            },
+        })}`
+    );
 
     const [capabilitiesJson] = await call('GetCapabilities', null);
     const capabilities = JSON.parse(capabilitiesJson);
@@ -111,11 +215,24 @@ export async function run() {
     const [rectsJson] = await call('GetRects', null);
     const records = JSON.parse(rectsJson);
     const byNativeId = new Map(records.map(record => [record.id, record]));
-    const bottom = byNativeId.get(bottomWindow.get_stable_sequence());
-    const top = byNativeId.get(topWindow.get_stable_sequence());
-    assert(bottom && top, 'helper did not publish exact test-window identities');
+    const fixtureWindows = new Map([
+        [bottomWindow.get_stable_sequence(), bottomWindow],
+        [topWindow.get_stable_sequence(), topWindow],
+    ]);
+    const fixtureRecords = [...fixtureWindows.keys()]
+        .map(id => byNativeId.get(id))
+        .filter(Boolean);
+    assert(fixtureRecords.length === 2, 'helper did not publish exact test-window identities');
+    const currentRecords = fixtureRecords.filter(record => record.capture_current);
+    assert(
+        currentRecords.length === 1,
+        `helper did not publish exactly one capture-current fixture: ${JSON.stringify(fixtureRecords)}`
+    );
+    const top = currentRecords[0];
+    const bottom = fixtureRecords.find(record => record !== top);
+    topWindow = fixtureWindows.get(top.id);
+    bottomWindow = fixtureWindows.get(bottom.id);
     assert(top.target_id.startsWith(`${top.helper_epoch}:`), 'top target is not epoch-bound');
-    assert(top.capture_current === true, 'focused top target is not capture-current');
     assert(bottom.capture_current === false, 'overlapped lower target was marked capture-current');
 
     const [captureJson] = await call(
@@ -144,6 +261,7 @@ export async function run() {
         new GLib.Variant('(s)', [`wrong-epoch:${top.id}`]),
         'stale_target'
     );
+    print('Milestone A: exact target capture and occlusion proof PASS');
 
     const firstTransaction = 'cua-fg-devkit-first-0001';
     const [beginJson] = await call(
@@ -159,7 +277,10 @@ export async function run() {
     );
     assert(JSON.parse(validatedJson).valid === true, 'exact foreground validation failed');
     bottomWindow.activate(global.get_current_time());
-    await Scripting.sleep(100);
+    await waitUntil(
+        () => global.display.focus_window === bottomWindow,
+        'fixture focus did not drift to the lower target'
+    );
     const [driftedJson] = await call(
         'ValidateForeground',
         new GLib.Variant('(s)', [begin.transaction])
@@ -198,6 +319,7 @@ export async function run() {
         new GLib.Variant('(s)', [secondBegin.transaction])
     );
     assert(JSON.parse(committedJson).committed === true, 'foreground commit failed');
+    print('Milestone B: foreground transaction lifecycle PASS');
 
     const owner = 'gnome-devkit-fixture';
     await call(
@@ -216,16 +338,34 @@ export async function run() {
         global.get_current_time()
     );
     topWindow.change_workspace(workspace);
-    await Scripting.sleep(200);
+    // The fixture actors were explicitly exposed above, so stage Mutter's
+    // inactive-workspace paint state before checking the fail-closed path.
+    windowActor(topWindow).hide();
+    await waitUntil(
+        () => topWindow.get_workspace() === workspace
+            && !windowActor(topWindow)?.visible,
+        () => `fixture target remained painted after moving to an inactive workspace: ${JSON.stringify({
+            activeWorkspace: global.workspace_manager.get_active_workspace_index(),
+            targetWorkspace: workspace.index(),
+            windowWorkspace: topWindow.get_workspace().index(),
+            showing: topWindow.showing_on_its_workspace(),
+            visible: windowActor(topWindow)?.visible ?? null,
+        })}`
+    );
     await expectRefusal(
         'CaptureTarget',
         new GLib.Variant('(s)', [top.target_id]),
         'capture_foreground_required'
     );
+    print('Milestone C: target-bound cursor and inactive-workspace refusal PASS');
 
-    for (const process of fixtureProcesses)
-        process.force_exit();
-    await Scripting.sleep(100);
+    await Scripting.destroyTestWindows();
+    await waitUntil(
+        () => global.get_window_actors().every(actor =>
+            !fixtureIds.has(actor.meta_window?.get_stable_sequence())
+        ),
+        'GNOME dev-kit test windows did not close'
+    );
 }
 
 export function finish() {}
