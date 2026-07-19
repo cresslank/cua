@@ -56,6 +56,8 @@ INCLUDES = r"""#include <stdint.h>
 #include <wlr/types/wlr_xdg_output_v1.h>
 
 #define CUA_MAXDEV 64
+#define CUA_MAX_CLICK_COUNT 3
+#define CUA_MAX_PRESSED_BUTTONS 8
 struct tinywl_server;
 struct tinywl_toplevel;
 struct cua_conn {
@@ -64,6 +66,7 @@ struct cua_conn {
 	struct wl_event_source *capture_timer;
 	struct tinywl_toplevel *action_target;
 	uint64_t capture_lease;
+	int desktop_batch;
 	int hello;
 	char buf[16384];
 	size_t len;
@@ -71,8 +74,19 @@ struct cua_conn {
 static void cua_assign_target(struct tinywl_toplevel *t);
 static void cua_ftl_request_activate(struct wl_listener *listener, void *data);
 /* Per-cursor / per-keyboard enter bookkeeping (idx = logical device). */
-struct cua_devstate { struct wlr_surface *entered; };
+struct cua_devstate {
+	struct wlr_surface *entered;
+	struct tinywl_toplevel *entered_target;
+	struct tinywl_server *pointer_server;
+	int pointer_idx;
+	uint32_t pressed_buttons[CUA_MAX_PRESSED_BUTTONS];
+	size_t pressed_count;
+	struct wl_listener surface_destroy;
+	int surface_destroy_linked;
+};
 static struct cua_devstate cua_ptr[CUA_MAXDEV];
+static struct cua_conn *cua_ptr_owner[CUA_MAXDEV];
+static struct tinywl_toplevel *cua_ptr_target[CUA_MAXDEV];
 static struct cua_devstate cua_kbd_state[CUA_MAXDEV];
 static int g_keymap_fd = -1;
 static size_t g_keymap_size = 0;
@@ -86,8 +100,15 @@ static struct cua_keyent g_chartab[128];
 static struct wlr_foreign_toplevel_manager_v1 *g_ftl_mgr = NULL;
 static uint64_t g_cua_epoch = 0;
 static uint64_t g_cua_next_id = 1;
+static struct cua_conn *g_capture_owner = NULL;
+static struct tinywl_toplevel *g_capture_target = NULL;
 static void cua_ftl_request_activate(struct wl_listener *listener, void *data);
 static void cua_maybe_focus_new_toplevel(struct tinywl_toplevel *toplevel);
+static void cua_capture_restore(struct cua_conn *c);
+static void cua_devstate_set_surface(struct cua_devstate *state, struct wlr_surface *surface);
+static void cua_ptr_set_surface(struct tinywl_server *server, int idx,
+	struct wlr_surface *surface, struct tinywl_toplevel *target);
+static void cua_ptr_release_index(struct tinywl_server *server, int idx);
 static pid_t cua_toplevel_pid(struct tinywl_toplevel *t);
 static bool cua_pid_in_family(pid_t pid, pid_t root_pid);
 
@@ -109,7 +130,6 @@ FUNCS = r"""
  * target command. The token includes this compositor instance's epoch. */
 #define CUA_PROTO_HELLO "cua-inject v2"
 struct cua_conn;
-static struct cua_conn *g_capture_owner = NULL;
 
 static uint64_t g_capture_lease_seq = 1;
 static void cua_focus_toplevel(struct tinywl_toplevel *toplevel) {
@@ -289,6 +309,39 @@ static const char *cua_query_geometry(struct tinywl_server *server, const char *
 	snprintf(out, out_len, "geometry %d %d %d %d", x, y, scene_x, scene_y);
 	return NULL;
 }
+static void cua_devstate_surface_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct cua_devstate *state = wl_container_of(listener, state, surface_destroy);
+	/* The wl_surface is still valid while its destroy signal is emitted. Release
+	 * any synthetic buttons to that original client before dropping identity;
+	 * wlroots clears seat focus first without clearing button bookkeeping, so
+	 * cua_ptr_release_index reconciles the seat then directly delivers release. */
+	if (state->pointer_server)
+		cua_ptr_release_index(state->pointer_server, state->pointer_idx);
+	if (state->surface_destroy_linked) wl_list_remove(&state->surface_destroy.link);
+	state->surface_destroy_linked = 0;
+	state->entered = NULL;
+	state->entered_target = NULL;
+	state->pointer_server = NULL;
+}
+static void cua_devstate_set_surface(struct cua_devstate *state, struct wlr_surface *surface) {
+	if (state->entered == surface) return;
+	if (state->surface_destroy_linked) wl_list_remove(&state->surface_destroy.link);
+	state->surface_destroy_linked = 0;
+	state->entered = surface;
+	state->entered_target = NULL;
+	if (!surface) return;
+	state->surface_destroy.notify = cua_devstate_surface_destroy;
+	wl_signal_add(&surface->events.destroy, &state->surface_destroy);
+	state->surface_destroy_linked = 1;
+}
+static void cua_ptr_set_surface(struct tinywl_server *server, int idx,
+		struct wlr_surface *surface, struct tinywl_toplevel *target) {
+	cua_ptr[idx].pointer_server = surface ? server : NULL;
+	cua_ptr[idx].pointer_idx = idx;
+	cua_devstate_set_surface(&cua_ptr[idx], surface);
+	cua_ptr[idx].entered_target = surface ? target : NULL;
+}
 static void cua_ptr_leave(struct wlr_seat *seat, struct wlr_surface *surf) {
 	if (!surf) return;
 	struct wlr_seat_client *sc = wlr_seat_client_for_wl_client(seat, wl_resource_get_client(surf->resource));
@@ -297,14 +350,39 @@ static void cua_ptr_leave(struct wlr_seat *seat, struct wlr_surface *surf) {
 	struct wl_resource *res;
 	wl_resource_for_each(res, &sc->pointers) { wl_pointer_send_leave(res, serial, surf->resource); cua_pframe(res); }
 }
+/* A logical pointer is compositor-global, so one action connection must own it
+ * for the whole batch. Different exact targets may run concurrently only on
+ * different logical indices; an interleaving batch fails closed instead of
+ * inheriting another target's entered surface or wlroots seat pointer focus. */
+static bool cua_ptr_claim(struct cua_conn *c, struct tinywl_toplevel *t, int idx) {
+	if (!c || !t || idx < 0 || idx >= CUA_MAXDEV) return false;
+	if (cua_ptr_owner[idx] && cua_ptr_owner[idx] != c) return false;
+	if (cua_ptr_target[idx] && cua_ptr_target[idx] != t) return false;
+	cua_ptr_owner[idx] = c;
+	cua_ptr_target[idx] = t;
+	return true;
+}
+static bool cua_ptr_owned(struct cua_conn *c, struct tinywl_toplevel *t, int idx) {
+	if (!c || !t || idx < 0 || idx >= CUA_MAXDEV ||
+		cua_ptr_owner[idx] != c || cua_ptr_target[idx] != t || !cua_ptr[idx].entered ||
+		cua_ptr[idx].entered_target != t)
+		return false;
+	return true;
+}
+static void cua_ptr_release(struct cua_conn *c) {
+	for (int idx = 0; idx < CUA_MAXDEV; idx++) {
+		if (cua_ptr_owner[idx] != c) continue;
+		cua_ptr_release_index(c->server, idx);
+	}
+}
 /* Inject pointer motion from logical cursor `idx` into window `t` at window-
  * local (x,y). enter/leave is tracked per idx, so several idx values can drive
  * independent cursors against the same or different surfaces. Device zero may
  * update this private compositor's pointer focus for protocol-complete Chromium
  * delivery; it does not change keyboard focus, activate another toplevel, move a
  * host cursor, or weaken the exact v2 surface selection. */
-static bool cua_motion(struct tinywl_server *server, struct tinywl_toplevel *t, int idx, double x, double y) {
-	if (!t || idx < 0 || idx >= CUA_MAXDEV) return false;
+static bool cua_motion(struct tinywl_server *server, struct cua_conn *c, struct tinywl_toplevel *t, int idx, double x, double y) {
+	if (!cua_ptr_claim(c, t, idx)) return false;
 	/* Public PX coordinates come from the cropped root-surface screenshot. Hit
 	 * test that point through the scene so Chromium/WebKit child surfaces receive
 	 * enter/motion in their own local coordinates instead of the top-level root. */
@@ -330,6 +408,11 @@ static bool cua_motion(struct tinywl_server *server, struct tinywl_toplevel *t, 
 		sc = wlr_seat_client_for_wl_client(server->seat, wl_resource_get_client(surface->resource));
 		if (!sc || wl_list_empty(&sc->pointers)) return false;
 	}
+	/* wlroots resets button bookkeeping when pointer focus changes. Keep an
+	 * active synthetic press pinned to its exact child/root surface; a drag that
+	 * crosses a popup/subsurface boundary fails closed and batch cleanup releases
+	 * the original client instead of silently stranding its pressed state. */
+	if (cua_ptr[idx].pressed_count && cua_ptr[idx].entered != surface) return false;
 	/* Chromium consumes pointer input through wlroots' seat pointer state. Raw
 	 * wl_pointer resource sends are sufficient for GTK, but Chromium can ACK
 	 * them without dispatching DOM mouse events because the compositor-side
@@ -343,7 +426,7 @@ static bool cua_motion(struct tinywl_server *server, struct tinywl_toplevel *t, 
 		 * Synthetic commands have no cursor-frame signal, so terminate the
 		 * protocol batch here; Chromium buffers motion/button events until it. */
 		wlr_seat_pointer_notify_frame(server->seat);
-		cua_ptr[idx].entered = surface;
+		cua_ptr_set_surface(server, idx, surface, t);
 		return true;
 	}
 	wl_fixed_t sx = wl_fixed_from_double(local_x), sy = wl_fixed_from_double(local_y);
@@ -352,7 +435,7 @@ static bool cua_motion(struct tinywl_server *server, struct tinywl_toplevel *t, 
 		if (cua_ptr[idx].entered) cua_ptr_leave(server->seat, cua_ptr[idx].entered);
 		uint32_t es = wlr_seat_client_next_serial(sc);
 		wl_resource_for_each(res, &sc->pointers) { wl_pointer_send_enter(res, es, surface->resource, sx, sy); cua_pframe(res); }
-		cua_ptr[idx].entered = surface;
+		cua_ptr_set_surface(server, idx, surface, t);
 	}
 	uint32_t tm = cua_now_ms();
 	wl_resource_for_each(res, &sc->pointers) { wl_pointer_send_motion(res, tm, sx, sy); cua_pframe(res); }
@@ -360,13 +443,25 @@ static bool cua_motion(struct tinywl_server *server, struct tinywl_toplevel *t, 
 }
 /* Resolve an output-layout point through the compositor scene, preserving
  * subsurface offsets and output scaling. This is the desktop-scope path. */
-static struct tinywl_toplevel *cua_desktop_motion(struct tinywl_server *server, double x, double y) {
+static struct tinywl_toplevel *cua_desktop_motion(struct tinywl_server *server, struct cua_conn *c, double x, double y) {
 	double sx = 0, sy = 0;
 	struct wlr_surface *surface = NULL;
 	struct tinywl_toplevel *t = desktop_toplevel_at(server, x, y, &surface, &sx, &sy);
 	if (!t || !surface) return NULL;
+	if (!cua_ptr_claim(c, t, 0)) return NULL;
 	struct wlr_seat_client *sc = wlr_seat_client_for_wl_client(server->seat, wl_resource_get_client(surface->resource));
-	if (!sc || wl_list_empty(&sc->pointers)) return NULL;
+	if (!sc || wl_list_empty(&sc->pointers)) {
+		/* Match exact-target motion: renderer-owned child surfaces may not have
+		 * bound wl_pointer even though the owning toplevel client has. Rebase the
+		 * desktop-global point into root-surface coordinates for that fallback. */
+		surface = t->xdg_toplevel->base->surface;
+		int scene_x = 0, scene_y = 0;
+		if (!wlr_scene_node_coords(&t->scene_tree->node, &scene_x, &scene_y)) return NULL;
+		sx = x - scene_x; sy = y - scene_y;
+		sc = wlr_seat_client_for_wl_client(server->seat, wl_resource_get_client(surface->resource));
+		if (!sc || wl_list_empty(&sc->pointers)) return NULL;
+	}
+	if (cua_ptr[0].pressed_count && cua_ptr[0].entered != surface) return NULL;
 	/* Desktop scope also uses logical device 0. Keep wlroots' seat pointer
 	 * focus in sync before cua_button() sends its protocol-complete seat
 	 * notification; raw resource enters here would leave the seat targeting a stale
@@ -374,35 +469,89 @@ static struct tinywl_toplevel *cua_desktop_motion(struct tinywl_server *server, 
 	wlr_seat_pointer_notify_enter(server->seat, surface, sx, sy);
 	wlr_seat_pointer_notify_motion(server->seat, cua_now_ms(), sx, sy);
 	wlr_seat_pointer_notify_frame(server->seat);
-	cua_ptr[0].entered = surface;
+	cua_ptr_set_surface(server, 0, surface, t);
 	return t;
 }
-static bool cua_button(struct tinywl_server *server, struct tinywl_toplevel *t, int idx, uint32_t button, bool pressed) {
-	if (!t || idx < 0 || idx >= CUA_MAXDEV) return false;
+static int cua_pressed_button_index(struct cua_devstate *state, uint32_t button) {
+	for (size_t i = 0; i < state->pressed_count; i++)
+		if (state->pressed_buttons[i] == button) return (int)i;
+	return -1;
+}
+static bool cua_button(struct tinywl_server *server, struct cua_conn *c, struct tinywl_toplevel *t, int idx, uint32_t button, bool pressed) {
+	if (!cua_ptr_owned(c, t, idx)) return false;
 	/* `cua_motion` establishes the exact child or root surface for this logical
 	 * pointer. Button and axis events must use that same wl_pointer resource. */
-	struct wlr_surface *surface = cua_ptr[idx].entered ? cua_ptr[idx].entered : t->xdg_toplevel->base->surface;
+	struct cua_devstate *state = &cua_ptr[idx];
+	int pressed_idx = cua_pressed_button_index(state, button);
+	if ((pressed && (pressed_idx >= 0 || state->pressed_count >= CUA_MAX_PRESSED_BUTTONS)) ||
+		(!pressed && pressed_idx < 0)) return false;
+	struct wlr_surface *surface = cua_ptr[idx].entered;
 	struct wlr_seat_client *sc = wlr_seat_client_for_wl_client(server->seat, wl_resource_get_client(surface->resource));
 	if (!sc || wl_list_empty(&sc->pointers)) return false;
 	if (idx == 0) {
+		if (server->seat->pointer_state.focused_surface != surface) return false;
 		wlr_seat_pointer_notify_button(server->seat, cua_now_ms(), button,
-			pressed ? WLR_BUTTON_PRESSED : WLR_BUTTON_RELEASED);
+			pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
 		/* See cua_motion: there is no hardware cursor-frame callback for the
 		 * virtual device, so each injected command must close its own batch. */
 		wlr_seat_pointer_notify_frame(server->seat);
-		return true;
+	} else {
+		uint32_t tm = cua_now_ms(), bs = wlr_seat_client_next_serial(sc);
+		struct wl_resource *res;
+		wl_resource_for_each(res, &sc->pointers) {
+			wl_pointer_send_button(res, bs, tm, button, pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
+			cua_pframe(res);
+		}
 	}
-	uint32_t tm = cua_now_ms(), bs = wlr_seat_client_next_serial(sc);
-	struct wl_resource *res;
-	wl_resource_for_each(res, &sc->pointers) {
-		wl_pointer_send_button(res, bs, tm, button, pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
-		cua_pframe(res);
+	if (pressed) state->pressed_buttons[state->pressed_count++] = button;
+	else {
+		state->pressed_count--;
+		state->pressed_buttons[pressed_idx] = state->pressed_buttons[state->pressed_count];
 	}
 	return true;
 }
-static bool cua_axis(struct tinywl_server *server, struct tinywl_toplevel *t, int idx, uint32_t axis, double value) {
-	if (!t || idx < 0 || idx >= CUA_MAXDEV) return false;
-	struct wlr_surface *surface = cua_ptr[idx].entered ? cua_ptr[idx].entered : t->xdg_toplevel->base->surface;
+static void cua_ptr_release_index(struct tinywl_server *server, int idx) {
+	if (!server || idx < 0 || idx >= CUA_MAXDEV) return;
+	struct cua_devstate *state = &cua_ptr[idx];
+	if (state->pressed_count && state->entered) {
+		struct wlr_seat_client *sc = wlr_seat_client_for_wl_client(server->seat,
+			wl_resource_get_client(state->entered->resource));
+		struct wl_resource *res;
+		bool notified = false;
+		for (size_t i = 0; i < state->pressed_count; i++) {
+			uint32_t button = state->pressed_buttons[i], tm = cua_now_ms();
+			bool sent = false;
+			/* wlroots' focus-surface destroy listener runs before ours and uses
+			 * raw clear_focus(), which leaves button_count/grab state intact.
+			 * Reconcile through notify_button while focus is still the original
+			 * surface or has already been cleared; never notify a different
+			 * focused client. With NULL focus notify_button consumes the tracked
+			 * button and updates the active grab but cannot wire-deliver, so the
+			 * original client still needs the direct release below. */
+			if (idx == 0 &&
+					(server->seat->pointer_state.focused_surface == state->entered ||
+					 server->seat->pointer_state.focused_surface == NULL))
+				sent = wlr_seat_pointer_notify_button(server->seat, tm, button,
+					WL_POINTER_BUTTON_STATE_RELEASED) != 0;
+			if (sent) notified = true;
+			if (!sent && sc) {
+				uint32_t bs = wlr_seat_client_next_serial(sc);
+				wl_resource_for_each(res, &sc->pointers) {
+					wl_pointer_send_button(res, bs, tm, button,
+						WL_POINTER_BUTTON_STATE_RELEASED);
+					cua_pframe(res);
+				}
+			}
+		}
+		if (notified) wlr_seat_pointer_notify_frame(server->seat);
+	}
+	state->pressed_count = 0;
+	cua_ptr_owner[idx] = NULL;
+	cua_ptr_target[idx] = NULL;
+}
+static bool cua_axis(struct tinywl_server *server, struct cua_conn *c, struct tinywl_toplevel *t, int idx, uint32_t axis, double value) {
+	if (!cua_ptr_owned(c, t, idx)) return false;
+	struct wlr_surface *surface = cua_ptr[idx].entered;
 	struct wlr_seat_client *sc = wlr_seat_client_for_wl_client(server->seat, wl_resource_get_client(surface->resource));
 	if (!sc || wl_list_empty(&sc->pointers)) return false;
 	uint32_t tm = cua_now_ms();
@@ -479,7 +628,8 @@ static struct wlr_seat_client *cua_kbd_enter(struct tinywl_server *server, struc
 	if (focused && wlr_surface_get_root_surface(focused) == surface) {
 		/* Foreground delivery already has a protocol-complete seat enter. The
 		 * key path below uses wlr_seat_keyboard_notify_key for this target. */
-		cua_kbd_state[0].entered = surface;
+		cua_devstate_set_surface(&cua_kbd_state[0], surface);
+		cua_kbd_state[0].entered_target = t;
 		return sc;
 	}
 	if (cua_kbd_state[0].entered != surface) {
@@ -490,7 +640,8 @@ static struct wlr_seat_client *cua_kbd_enter(struct tinywl_server *server, struc
 			wl_keyboard_send_modifiers(res, wlr_seat_client_next_serial(sc), 0, 0, 0, 0);
 		}
 		wl_array_release(&keys);
-		cua_kbd_state[0].entered = surface;
+		cua_devstate_set_surface(&cua_kbd_state[0], surface);
+		cua_kbd_state[0].entered_target = t;
 	}
 	return sc;
 }
@@ -605,11 +756,24 @@ static int cua_hotkey(struct tinywl_server *server, struct tinywl_toplevel *t, c
 /* Process one command line. Returns NULL on success, else a stable error token
  * the caller sends back as `err <token>`. The command is only acknowledged
  * after it has been resolved and applied — never before. */
-static const char *cua_handle_cmd(struct tinywl_server *server, char *line, struct tinywl_toplevel *batch_target) {
+static const char *cua_handle_cmd(struct tinywl_server *server, char *line, struct cua_conn *c) {
 	char cmd[8], app[128];
 	if (sscanf(line, "%7s", cmd) != 1) return "empty";
-	if (!batch_target) return "batch-required";
-	if (!strcmp(cmd, "d")) return "exact-target-required";
+	struct tinywl_toplevel *batch_target = c->action_target;
+	if (!strcmp(cmd, "d")) {
+		double x, y; unsigned count, btn;
+		if (!c->desktop_batch || batch_target) return "desktop-batch-required";
+		if (sscanf(line, "d %lf %lf %u %u", &x, &y, &count, &btn) != 4) return "bad-args";
+		if (count < 1 || count > CUA_MAX_CLICK_COUNT) return "click-count-out-of-range";
+		struct tinywl_toplevel *t = cua_desktop_motion(server, c, x, y);
+		if (!t) return "no-surface-or-pointer-busy";
+		for (unsigned i = 0; i < count; i++) {
+			if (!cua_button(server, c, t, 0, btn, true)) return "no-pointer-resource";
+			if (!cua_button(server, c, t, 0, btn, false)) return "no-pointer-resource";
+		}
+		return NULL;
+	}
+	if (c->desktop_batch || !batch_target) return "batch-required";
 	if (sscanf(line, "%*7s %127s", app) != 1) return "bad-args";
 	if (strcmp(app, batch_target->cua_target)) return "batch-target-mismatch";
 	const char *err = NULL;
@@ -618,13 +782,13 @@ static const char *cua_handle_cmd(struct tinywl_server *server, char *line, stru
 		int idx; double x, y;
 		if (sscanf(line, "m %127s %d %lf %lf", app, &idx, &x, &y) != 4) return "bad-args";
 		if (!(t = cua_resolve_target(server, app, &err))) return err;
-		if (!cua_motion(server, t, idx, x, y)) return "no-pointer-resource";
+		if (!cua_motion(server, c, t, idx, x, y)) return "no-pointer-resource-or-busy";
 		return NULL;
 	} else if (!strcmp(cmd, "b")) {
 		int idx; unsigned btn, pr;
 		if (sscanf(line, "b %127s %d %u %u", app, &idx, &btn, &pr) != 4) return "bad-args";
 		if (!(t = cua_resolve_target(server, app, &err))) return err;
-		if (!cua_button(server, t, idx, btn, pr != 0)) return "no-pointer-resource";
+		if (!cua_button(server, c, t, idx, btn, pr != 0)) return "pointer-not-owned-by-batch";
 		return NULL;
 	} else if (!strcmp(cmd, "t")) {
 		char hex[8192];
@@ -652,7 +816,7 @@ static const char *cua_handle_cmd(struct tinywl_server *server, char *line, stru
 		int idx; unsigned axis; double value;
 		if (sscanf(line, "a %127s %d %u %lf", app, &idx, &axis, &value) != 4) return "bad-args";
 		if (!(t = cua_resolve_target(server, app, &err))) return err;
-		if (!cua_axis(server, t, idx, axis, value)) return "no-pointer-resource";
+		if (!cua_axis(server, c, t, idx, axis, value)) return "pointer-not-owned-by-batch";
 		return NULL;
 	}
 	return "unknown-command";
@@ -668,11 +832,11 @@ static void cua_capture_restore(struct cua_conn *c) {
 	if (c->capture_timer) { wl_event_source_remove(c->capture_timer); c->capture_timer = NULL; }
 	c->capture_lease = 0;
 	g_capture_owner = NULL;
+	g_capture_target = NULL;
 	cua_schedule_frames(c->server);
 }
 static int cua_capture_timeout(void *data) {
 	struct cua_conn *c = data;
-	c->capture_timer = NULL;
 	cua_capture_restore(c);
 	return 0;
 }
@@ -687,8 +851,12 @@ static const char *cua_capture_begin(struct cua_conn *c, const char *target, cha
 	c->capture_lease = g_capture_lease_seq++;
 	if (!c->capture_lease) c->capture_lease = g_capture_lease_seq++;
 	g_capture_owner = c;
+	g_capture_target = wanted;
 	c->capture_timer = wl_event_loop_add_timer(wl_display_get_event_loop(c->server->wl_display), cua_capture_timeout, c);
-	if (c->capture_timer) wl_event_source_timer_update(c->capture_timer, 10000);
+	if (!c->capture_timer || wl_event_source_timer_update(c->capture_timer, 10000) < 0) {
+		cua_capture_restore(c);
+		return "capture-timer-unavailable";
+	}
 	cua_schedule_frames(c->server);
 	snprintf(out, out_len, "capture %llu", (unsigned long long)c->capture_lease);
 	return NULL;
@@ -697,6 +865,7 @@ static const char *cua_capture_begin(struct cua_conn *c, const char *target, cha
  * again on freed data -> double free), close the fd, free the state. */
 static int cua_conn_drop(struct cua_conn *c, int fd) {
 	cua_capture_restore(c);
+	cua_ptr_release(c);
 	if (c->action_target && c->action_target->cua_action_owner == c)
 		c->action_target->cua_action_owner = NULL;
 	if (c->src) wl_event_source_remove(c->src);
@@ -725,12 +894,16 @@ static int cua_conn_readable(int fd, uint32_t mask, void *data) {
 			}
 		} else {
 			int query_pid;
+			char dispatch_cmd[8];
 			char geometry_target[128];
 			char activate_target[128];
 			char capture_target[128];
 			char begin_target[128];
 			unsigned long long restore_lease;
-			if (sscanf(p, "q %d", &query_pid) == 1) {
+			int desktop_data = sscanf(p, "%7s", dispatch_cmd) == 1 && !strcmp(dispatch_cmd, "d");
+			if (c->desktop_batch && strcmp(p, "end") && !desktop_data) {
+				cua_reply(fd, "err desktop-command-required");
+			} else if (sscanf(p, "q %d", &query_pid) == 1) {
 				char msg[128]; cua_query_state(c->server, (pid_t)query_pid, msg, sizeof msg);
 				cua_reply(fd, msg);
 			} else if (sscanf(p, "g %127s", geometry_target) == 1) {
@@ -751,15 +924,28 @@ static int cua_conn_readable(int fd, uint32_t mask, void *data) {
 				if (g_capture_owner != c || c->capture_lease != (uint64_t)restore_lease) cua_reply(fd, "err stale-capture-lease");
 				else { cua_capture_restore(c); cua_reply(fd, "ok"); }
 			} else if (sscanf(p, "begin %127s", begin_target) == 1) {
-				const char *resolve_err = NULL;
-				struct tinywl_toplevel *batch_target = cua_resolve_target(c->server, begin_target, &resolve_err);
-				if (!batch_target) { char msg[128]; snprintf(msg, sizeof msg, "err %s", resolve_err); cua_reply(fd, msg); }
-				else if (c->action_target) cua_reply(fd, "err nested-batch");
-				else if (batch_target->cua_action_owner && batch_target->cua_action_owner != c) cua_reply(fd, "err target-busy");
-				else { c->action_target = batch_target; batch_target->cua_action_owner = c; cua_reply(fd, "ok"); }
+				if (c->action_target || c->desktop_batch) {
+					cua_reply(fd, "err nested-batch");
+				} else if (!strcmp(begin_target, "desktop")) {
+					c->desktop_batch = 1;
+					cua_reply(fd, "ok");
+				} else {
+					const char *resolve_err = NULL;
+					struct tinywl_toplevel *batch_target = cua_resolve_target(c->server, begin_target, &resolve_err);
+					if (!batch_target) { char msg[128]; snprintf(msg, sizeof msg, "err %s", resolve_err); cua_reply(fd, msg); }
+					else if (batch_target->cua_action_owner && batch_target->cua_action_owner != c) cua_reply(fd, "err target-busy");
+					else { c->action_target = batch_target; batch_target->cua_action_owner = c; cua_reply(fd, "ok"); }
+				}
 			} else if (!strcmp(p, "end")) {
-				if (!c->action_target) cua_reply(fd, "err no-active-batch");
-				else { c->action_target->cua_action_owner = NULL; c->action_target = NULL; cua_reply(fd, "ok"); }
+				if (!c->action_target && !c->desktop_batch) {
+					cua_reply(fd, "err no-active-batch");
+				} else {
+					cua_ptr_release(c);
+					if (c->action_target) c->action_target->cua_action_owner = NULL;
+					c->action_target = NULL;
+					c->desktop_batch = 0;
+					cua_reply(fd, "ok");
+				}
 			} else if (sscanf(p, "f %127s", activate_target) == 1) {
 				const char *err = !c->action_target ? "batch-required" :
 					(strcmp(activate_target, c->action_target->cua_target) ? "batch-target-mismatch" : cua_activate_target(c->server, activate_target));
@@ -770,7 +956,7 @@ static int cua_conn_readable(int fd, uint32_t mask, void *data) {
 					cua_reply(fd, "ok");
 				}
 			} else {
-				const char *err = c->action_target ? cua_handle_cmd(c->server, p, c->action_target) : "batch-required";
+				const char *err = cua_handle_cmd(c->server, p, c);
 				/* Deliver injected events before acking so `ok` means "processed",
 				 * never merely "parsed". */
 				wl_display_flush_clients(c->server->wl_display);
@@ -884,16 +1070,26 @@ src = repl(src,
     "\t\twlr_foreign_toplevel_handle_v1_set_app_id(toplevel->ftl, toplevel->cua_target);\n"
     "\t\ttoplevel->ftl_request_activate.notify = cua_ftl_request_activate;\n"
     "\t\twl_signal_add(&toplevel->ftl->events.request_activate, &toplevel->ftl_request_activate);\n"
-    "\t}\n\n\tcua_maybe_focus_new_toplevel(toplevel);",
+    "\t}\n"
+    "\t/* A lease is exact for its full lifetime, including toplevels mapped\n"
+    "\t * after it begins. New non-target scene trees never become capturable. */\n"
+    "\tif (g_capture_owner && toplevel != g_capture_target)\n"
+    "\t\twlr_scene_node_set_enabled(&toplevel->scene_tree->node, false);\n"
+    "\tif (!g_capture_owner || toplevel == g_capture_target)\n"
+    "\t\tcua_maybe_focus_new_toplevel(toplevel);",
     "ftl-on-map")
 
 # 4) On unmap: drop the foreign-toplevel handle.
 src = repl(src,
     "\twl_list_remove(&toplevel->link);\n}",
-    "\tstruct wlr_surface *cua_surface = toplevel->xdg_toplevel->base->surface;\n"
+    "\tif (g_capture_target == toplevel) cua_capture_restore(g_capture_owner);\n"
     "\tfor (int i = 0; i < CUA_MAXDEV; i++) {\n"
-    "\t\tif (cua_ptr[i].entered && wlr_surface_get_root_surface(cua_ptr[i].entered) == cua_surface) cua_ptr[i].entered = NULL;\n"
-    "\t\tif (cua_kbd_state[i].entered && wlr_surface_get_root_surface(cua_kbd_state[i].entered) == cua_surface) cua_kbd_state[i].entered = NULL;\n"
+    "\t\tif (cua_ptr_target[i] == toplevel) {\n"
+    "\t\t\tcua_ptr_release_index(toplevel->server, i); cua_ptr_set_surface(toplevel->server, i, NULL, NULL);\n"
+    "\t\t} else if (cua_ptr[i].entered_target == toplevel) {\n"
+    "\t\t\tcua_ptr_release_index(toplevel->server, i); cua_ptr_set_surface(toplevel->server, i, NULL, NULL);\n"
+    "\t\t}\n"
+    "\t\tif (cua_kbd_state[i].entered_target == toplevel) cua_devstate_set_surface(&cua_kbd_state[i], NULL);\n"
     "\t}\n"
     "\tif (toplevel->cua_action_owner) { toplevel->cua_action_owner->action_target = NULL; toplevel->cua_action_owner = NULL; }\n"
     "\tif (toplevel->ftl) { wl_list_remove(&toplevel->ftl_request_activate.link); wlr_foreign_toplevel_handle_v1_destroy(toplevel->ftl); toplevel->ftl = NULL; }\n"

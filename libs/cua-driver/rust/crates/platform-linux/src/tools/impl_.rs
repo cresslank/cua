@@ -1746,6 +1746,20 @@ fn inject_terminal_input(pid: u32, xid: u64, text: &str) -> anyhow::Result<bool>
 
 // ── click ─────────────────────────────────────────────────────────────────────
 
+fn bounded_click_count_arg(args: &Value) -> Result<u32, ToolResult> {
+    let count = match args.opt_u32("count") {
+        Ok(Some(count)) => count,
+        Ok(None) => 1,
+        Err(err) => return Err(err),
+    };
+    if !(1..=3).contains(&count) {
+        return Err(ToolResult::error(
+            "click: count must be between 1 and 3".to_string(),
+        ));
+    }
+    Ok(count)
+}
+
 pub struct ClickTool {
     state: Arc<ToolState>,
 }
@@ -1790,7 +1804,7 @@ impl Tool for ClickTool {
                     // [left,right,middle]); kept inline to carry the Linux/Wayland
                     // back-compat prose the click button-schema test asserts on.
                     "button":{"type":"string","enum":["left","right","middle"],"description":"Mouse button. Default: \"left\" (legacy back-compat). X11: routed via ButtonPress/Release with the matching evdev code. Native Wayland: only left-button is supported via the virtual-pointer protocol; right/middle return an error."},
-                    "count":{"type":"integer"},
+                    "count":{"type":"integer","minimum":1,"maximum":3,"description":"Click count — 1 (single), 2 (double), or 3 (triple). Default 1."},
                     "from_zoom":{"type":"boolean","description":"Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space."},
                     "scope":{"type":"string","enum":["window","desktop"],"default":"window"},
                     "delivery_mode": crate::input::delivery::delivery_mode_schema()
@@ -1837,7 +1851,10 @@ impl Tool for ClickTool {
             });
             let sx = args.f64_or("x", 0.0) as i32;
             let sy = args.f64_or("y", 0.0) as i32;
-            let n = args.u64_or("count", 1) as usize;
+            let n = match bounded_click_count_arg(&args) {
+                Ok(n) => n as usize,
+                Err(err) => return err,
+            };
             // Glide the agent-cursor overlay to the click point first (the macOS
             // / Windows desktop paths already do this). Without it the overlay
             // sits idle elsewhere while only the real pointer warps, so a viewer
@@ -1870,7 +1887,10 @@ impl Tool for ClickTool {
             Err(e) => return e,
         };
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
-        let count = args.u64_or("count", 1) as usize;
+        let count = match bounded_click_count_arg(&args) {
+            Ok(count) => count as usize,
+            Err(err) => return err,
+        };
         // Surface 5: reject unknown buttons so a typo can't silently fall through
         // to a left-click. Empty string keeps back-compat with old clients.
         let button_str_raw = args.str_or("button", "left").to_lowercase();
@@ -7404,7 +7424,9 @@ pub fn build_registry(compat: bool) -> ToolRegistry {
 
 #[cfg(test)]
 mod click_button_schema_tests {
-    use super::{chromium_background_must_refuse, maps_indicate_gtk, ClickTool};
+    use super::{
+        bounded_click_count_arg, chromium_background_must_refuse, maps_indicate_gtk, ClickTool,
+    };
     use cua_driver_core::tool::Tool;
 
     /// Surface 5: schema must advertise the three canonical button values and
@@ -7439,6 +7461,28 @@ mod click_button_schema_tests {
             lc.contains("wayland"),
             "description should call out wayland fallback"
         );
+        let count = props.get("count").expect("count field present");
+        assert_eq!(count.get("minimum").and_then(|v| v.as_u64()), Some(1));
+        assert_eq!(count.get("maximum").and_then(|v| v.as_u64()), Some(3));
+    }
+
+    #[test]
+    fn click_count_parser_is_strict_and_bounded() {
+        assert_eq!(bounded_click_count_arg(&serde_json::json!({})).unwrap(), 1);
+        for count in 1..=3 {
+            assert_eq!(
+                bounded_click_count_arg(&serde_json::json!({ "count": count })).unwrap(),
+                count
+            );
+        }
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(4),
+            serde_json::json!(-1),
+            serde_json::json!("2"),
+        ] {
+            assert!(bounded_click_count_arg(&serde_json::json!({ "count": bad })).is_err());
+        }
     }
 
     #[test]

@@ -1707,6 +1707,16 @@ pub fn click(
     click_with_outcome(target, x, y, count, button).map(|_| ())
 }
 
+const MAX_CLICK_COUNT: u32 = 3;
+
+fn bounded_click_count(count: u32) -> anyhow::Result<u32> {
+    let count = count.max(1);
+    if count > MAX_CLICK_COUNT {
+        anyhow::bail!("click count must be between 1 and {MAX_CLICK_COUNT}");
+    }
+    Ok(count)
+}
+
 pub fn click_with_outcome(
     target: ExactTargetProof,
     x: i32,
@@ -1715,6 +1725,7 @@ pub fn click_with_outcome(
     button: u8,
 ) -> anyhow::Result<Option<shell_helper::ForegroundTerminalOutcome>> {
     validate_exact_target(&target)?;
+    let count = bounded_click_count(count)?;
     if is_gnome_wayland_session() {
         require_gnome_pointer_transport_ready()?;
         return with_foreground_input(&target, || libei_click(x, y, count, button));
@@ -1737,9 +1748,10 @@ pub fn click_with_outcome(
 /// the explicit desktop capture scope.
 pub fn click_desktop(x: i32, y: i32, count: u32, button: u8) -> anyhow::Result<()> {
     reject_unsafe_gnome_desktop_input("click")?;
+    let count = bounded_click_count(count)?;
     if is_inject_mode() {
         let btn = evdev_button(button as u32);
-        return inject_send(&[format!("d {x} {y} {} {btn}", count.max(1))]);
+        return inject_send(&[format!("d {x} {y} {count} {btn}")]);
     }
     with_libei_fallback(
         || click_vptr(None, x, y, count, button),
@@ -3057,7 +3069,17 @@ fn inject_exchange(lines: &[String]) -> anyhow::Result<Vec<String>> {
     Ok(replies)
 }
 
-fn inject_batch_target(lines: &[String]) -> anyhow::Result<&str> {
+fn inject_batch_target(lines: &[String]) -> anyhow::Result<Option<&str>> {
+    let first_command = lines
+        .first()
+        .and_then(|line| line.split_whitespace().next())
+        .ok_or_else(|| anyhow::anyhow!("private input batch cannot be empty"))?;
+    if first_command == "d" {
+        if lines.len() == 1 {
+            return Ok(None);
+        }
+        anyhow::bail!("a desktop private input batch must contain exactly one command");
+    }
     let batch_target = lines
         .first()
         .and_then(|line| line.split_whitespace().nth(1))
@@ -3072,14 +3094,17 @@ fn inject_batch_target(lines: &[String]) -> anyhow::Result<&str> {
             anyhow::bail!("one private input batch cannot span multiple targets");
         }
     }
-    Ok(batch_target)
+    Ok(Some(batch_target))
 }
 
 fn inject_send(lines: &[String]) -> anyhow::Result<()> {
     use std::io::Write;
     let batch_target = inject_batch_target(lines)?;
     let (mut writer, mut reader) = open_inject_connection()?;
-    writeln!(writer, "begin {batch_target}")?;
+    match batch_target {
+        Some(target) => writeln!(writer, "begin {target}")?,
+        None => writeln!(writer, "begin desktop")?,
+    }
     writer.flush()?;
     parse_inject_reply(&read_inject_line(&mut reader)?)?;
     for line in lines {
@@ -3307,7 +3332,7 @@ pub fn inject_scroll(
 pub fn inject_click(window_id: u64, x: f64, y: f64, count: u32, button: u8) -> anyhow::Result<()> {
     let app = inject_target_for_window(window_id)?;
     let btn = evdev_button(button as u32);
-    let n = count.max(1);
+    let n = bounded_click_count(count)?;
     let mut lines = Vec::with_capacity((n as usize) * 4);
     for i in 0..n {
         if i > 0 {
@@ -4067,18 +4092,43 @@ mod tests {
     }
 
     #[test]
-    fn private_input_batches_require_one_exact_surface() {
+    fn click_count_is_bounded_before_private_protocol_construction() {
+        assert_eq!(bounded_click_count(0).unwrap(), 1);
+        assert_eq!(bounded_click_count(1).unwrap(), 1);
+        assert_eq!(bounded_click_count(3).unwrap(), 3);
+        assert!(bounded_click_count(4).is_err());
+        assert!(bounded_click_count(u32::MAX).is_err());
+    }
+
+    #[test]
+    fn private_input_batches_are_exact_surface_or_explicit_desktop() {
         let one = vec![
             "m surface:epoch-a:0001 0 1 2".to_string(),
             "b surface:epoch-a:0001 0 272 1".to_string(),
         ];
-        assert_eq!(inject_batch_target(&one).unwrap(), "surface:epoch-a:0001");
+        assert_eq!(
+            inject_batch_target(&one).unwrap(),
+            Some("surface:epoch-a:0001")
+        );
         assert!(inject_batch_target(&[
             "m surface:epoch-a:0001 0 1 2".to_string(),
             "b surface:epoch-a:0002 0 272 1".to_string(),
         ])
         .is_err());
-        assert!(inject_batch_target(&["d 1 2 1 272".to_string()]).is_err());
+        assert_eq!(
+            inject_batch_target(&["d 1 2 1 272".to_string()]).unwrap(),
+            None
+        );
+        assert!(inject_batch_target(&[
+            "d 1 2 1 272".to_string(),
+            "m surface:epoch-a:0001 0 1 2".to_string(),
+        ])
+        .is_err());
+        assert!(
+            inject_batch_target(&["d 1 2 1 272".to_string(), "d 3 4 1 272".to_string(),]).is_err()
+        );
+        assert!(inject_batch_target(&["q 123".to_string()]).is_err());
+        assert!(inject_batch_target(&[]).is_err());
     }
 
     #[test]
