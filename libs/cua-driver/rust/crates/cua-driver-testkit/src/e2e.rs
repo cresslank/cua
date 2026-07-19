@@ -109,6 +109,7 @@ pub enum Scope {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriverRoute {
+    CaptureScopeGate,
     AxRead,
     WindowState,
     UiaInvoke,
@@ -1361,7 +1362,7 @@ impl CatalogPolicy {
 fn case_requires_action_turn(case: &CaseSpec) -> bool {
     !matches!(
         case.driver_route,
-        DriverRoute::AxRead | DriverRoute::WindowState
+        DriverRoute::CaptureScopeGate | DriverRoute::AxRead | DriverRoute::WindowState
     ) && case.action != "screenshot"
 }
 
@@ -2017,6 +2018,22 @@ mod tests {
     }
 
     #[test]
+    fn strict_capture_scope_gate_does_not_invent_an_action_turn() {
+        let case = CaseSpec::delivered(
+            "window-scope-gate",
+            "desktop",
+            "x11",
+            "window_scope_gate",
+            Targeting::Px,
+            Delivery::NotApplicable,
+            Scope::Window,
+            DriverRoute::CaptureScopeGate,
+            vec![OracleKind::Protocol],
+        );
+        assert!(!case_requires_action_turn(&case));
+    }
+
+    #[test]
     fn validator_exposes_missing_legacy_modal_images() {
         let (root, case, result, turn) = complete_turn_fixture();
         std::fs::remove_file(turn.join("screenshot.png")).expect("remove screenshot fixture");
@@ -2408,11 +2425,14 @@ mod tests {
             OracleKind::FixtureState,
             OracleKind::Focus,
             OracleKind::ZOrder,
-            OracleKind::Cursor,
             OracleKind::NoLeakedInput,
         ] {
             assert!(background.oracles.contains(&oracle));
         }
+        assert_eq!(
+            background.oracles.contains(&OracleKind::Cursor),
+            DisplayServer::current() != DisplayServer::Wayland
+        );
         background.validate().expect("background case is valid");
 
         let foreground = native_foreground_case(

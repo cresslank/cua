@@ -137,6 +137,7 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
         self.assertIn('"path": "python/src/cua_driver/__init__.py"', config)
         self.assertIn('"path": "scripts/_install-rust.sh"', config)
         self.assertIn('"path": "scripts/install.ps1"', config)
+        self.assertIn('"path": "rust/Skills/cua-driver/SKILL.md"', config)
 
     def test_installers_preserve_legacy_telemetry_state_before_cleanup(self) -> None:
         for relative_path in (
@@ -173,9 +174,10 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
         installer = self.read("libs/cua-driver/scripts/_install-local-rust.sh")
 
         self.assertIn(
-            'security find-identity -v -p codesigning "$kc"',
+            'security find-identity -p codesigning "$kc"',
             installer,
         )
+        self.assertNotIn('security find-identity -v -p codesigning "$kc"', installer)
         self.assertIn('SIGN_ID="$(ensure_local_signing_identity)"', installer)
         self.assertIn(
             'codesign_bounded 20 --force --deep --sign "$SIGN_ID" "$APP_STAGE"',
@@ -220,6 +222,39 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
         windows_skill = self.read("libs/cua-driver/rust/Skills/cua-driver/WINDOWS.md")
         self.assertIn("https://cua.ai/driver/install.ps1", windows_skill)
         self.assertNotIn("/releases/latest/download/install.ps1", windows_skill)
+
+    def test_driver_cd_can_recover_an_existing_tag_with_cross_targets(self) -> None:
+        workflow = self.read(".github/workflows/cd-rust-cua-driver.yml")
+
+        immutable_ref = (
+            "github.event_name == 'workflow_dispatch' && inputs.publish && "
+            "format('refs/tags/cua-driver-rs-v{0}', inputs.version) || github.ref"
+        )
+        self.assertEqual(workflow.count(immutable_ref), 4)
+        self.assertIn(
+            "name: Ensure Rust target is installed\n"
+            "        working-directory: libs/cua-driver/rust",
+            workflow,
+        )
+        self.assertIn('rustup target add "${{ matrix.target }}"', workflow)
+        self.assertIn(
+            "rustup target add \\\n"
+            "            aarch64-apple-darwin x86_64-apple-darwin",
+            workflow,
+        )
+        self.assertIn("inputs.publish == true", workflow)
+        self.assertIn('--tag "${{ steps.version.outputs.tag }}"', workflow)
+        self.assertIn('--sha "${{ steps.version.outputs.sha }}"', workflow)
+
+    def test_driver_release_publishes_checksums_for_python_wheels(self) -> None:
+        workflow = self.read(".github/workflows/cd-rust-cua-driver.yml")
+
+        self.assertIn("name: Generate SHA256 checksums", workflow)
+        self.assertIn(
+            "shasum -a 256 cua-driver-rs-*.{tar.gz,zip}",
+            workflow,
+        )
+        self.assertIn("} > checksums.txt", workflow)
 
     def test_lume_uses_the_same_draft_finalizer(self) -> None:
         workflow = self.read(".github/workflows/cd-swift-lume.yml")
