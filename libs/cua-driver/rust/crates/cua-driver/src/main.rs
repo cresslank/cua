@@ -833,10 +833,11 @@ fn build_registry(
         // process before the a11y advertise (which itself needs the bus). No-op
         // when already set.
         platform_linux::session_bus::ensure_session_bus_discovered();
-        // Turn on Chromium/Electron (and GTK/Qt) accessibility for the session
-        // so their AT-SPI trees are visible to get_window_state. Best-effort and
-        // idempotent; only on the serve path, not for short-lived CLI calls.
-        platform_linux::a11y::ensure_chromium_accessibility_enabled();
+        // Advertise generic accessibility so GTK/Qt expose their AT-SPI trees.
+        // Chromium's global screen-reader signal requires an explicit opt-in.
+        // Best-effort and idempotent; only on the serve path, not for
+        // short-lived CLI calls.
+        platform_linux::a11y::ensure_accessibility_enabled();
         if let Err(error) = platform_linux::atspi::ensure_listener_active() {
             tracing::warn!("could not activate the persistent AT-SPI listener: {error}");
         }
@@ -894,7 +895,7 @@ fn build_registry_no_cursor() -> cua_driver_core::tool::ToolRegistry {
     {
         platform_linux::xauth::ensure_xauthority_discovered();
         platform_linux::session_bus::ensure_session_bus_discovered();
-        platform_linux::a11y::ensure_chromium_accessibility_enabled();
+        platform_linux::a11y::ensure_accessibility_enabled();
         if let Err(error) = platform_linux::atspi::ensure_listener_active() {
             tracing::warn!("could not activate the persistent AT-SPI listener: {error}");
         }

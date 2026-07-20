@@ -1,4 +1,5 @@
-//! Switch on Chromium / Electron accessibility for the whole desktop session.
+//! Advertise Linux accessibility status without implicitly claiming a screen
+//! reader.
 //!
 //! Chromium — and therefore every Electron, CEF, and Chrome-based app — ships
 //! its accessibility tree disabled and only builds it once it believes an
@@ -14,10 +15,10 @@
 //!
 //! A real screen reader turns the Chromium signal on. Doing that ourselves is
 //! unsafe on GNOME: its settings daemon treats the signal as a user request and
-//! launches Orca. GNOME therefore gets only the generic `IsEnabled` signal by
-//! default. Other desktops retain the Chromium signal for compatibility, and a
-//! caller can choose either policy explicitly with
-//! `CUA_DRIVER_RS_A11Y_ADVERTISE_MODE`.
+//! launches Orca. Daemon launch environments can omit desktop identity, so Cua
+//! defaults every desktop to only the generic `IsEnabled` signal. A caller that
+//! deliberately needs the global Chromium signal can opt in explicitly with
+//! `CUA_DRIVER_RS_A11Y_ADVERTISE_MODE=all`.
 //!
 //! Everything here is best-effort. A session without an accessibility bus (some
 //! headless or minimal setups) just yields an error we log and ignore; enabling
@@ -47,22 +48,17 @@ enum AdvertiseMode {
     None,
 }
 
-/// Advertise an assistive technology to the session exactly once per daemon
-/// process, so Chromium/Electron (including Electron AppImages), GTK, and Qt
-/// expose their accessibility trees to [`crate::atspi`]. Idempotent and
-/// best-effort: repeated calls do nothing, and any failure is logged and
+/// Advertise generic accessibility to the session exactly once per daemon
+/// process so GTK and Qt expose their trees to [`crate::atspi`]. The explicit
+/// `all` mode also advertises a screen reader for Chromium/Electron. Idempotent
+/// and best-effort: repeated calls do nothing, and any failure is logged and
 /// swallowed so it can never block startup.
-pub fn ensure_chromium_accessibility_enabled() {
+pub fn ensure_accessibility_enabled() {
     static ADVERTISED: Once = Once::new();
     ADVERTISED.call_once(|| {
         let mode = advertise_mode_from(
             std::env::var_os("CUA_DRIVER_RS_DISABLE_A11Y_ADVERTISE").is_some(),
             std::env::var("CUA_DRIVER_RS_A11Y_ADVERTISE_MODE")
-                .ok()
-                .as_deref(),
-            std::env::var("XDG_CURRENT_DESKTOP")
-                .or_else(|_| std::env::var("XDG_SESSION_DESKTOP"))
-                .or_else(|_| std::env::var("DESKTOP_SESSION"))
                 .ok()
                 .as_deref(),
         );
@@ -125,11 +121,7 @@ async fn advertise_accessibility(mode: AdvertiseMode) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn advertise_mode_from(
-    disabled: bool,
-    configured: Option<&str>,
-    desktop: Option<&str>,
-) -> AdvertiseMode {
+fn advertise_mode_from(disabled: bool, configured: Option<&str>) -> AdvertiseMode {
     if disabled {
         return AdvertiseMode::None;
     }
@@ -144,24 +136,11 @@ fn advertise_mode_from(
         Some(other) => {
             tracing::warn!(
                 mode = other,
-                "unknown CUA_DRIVER_RS_A11Y_ADVERTISE_MODE; using desktop default"
+                "unknown CUA_DRIVER_RS_A11Y_ADVERTISE_MODE; using safe default"
             );
-            desktop_default_mode(desktop)
+            AdvertiseMode::IsEnabledOnly
         }
-        None => desktop_default_mode(desktop),
-    }
-}
-
-fn desktop_default_mode(desktop: Option<&str>) -> AdvertiseMode {
-    let is_gnome = desktop.is_some_and(|desktop| {
-        desktop
-            .split([':', ';'])
-            .any(|part| part.trim().eq_ignore_ascii_case("gnome"))
-    });
-    if is_gnome {
-        AdvertiseMode::IsEnabledOnly
-    } else {
-        AdvertiseMode::All
+        None => AdvertiseMode::IsEnabledOnly,
     }
 }
 
@@ -176,42 +155,40 @@ mod tests {
     use super::{advertise_mode_from, AdvertiseMode};
 
     #[test]
-    fn gnome_default_does_not_claim_a_screen_reader() {
+    fn default_does_not_claim_a_screen_reader() {
         assert_eq!(
-            advertise_mode_from(false, None, Some("ubuntu:GNOME")),
+            advertise_mode_from(false, None),
             AdvertiseMode::IsEnabledOnly
         );
     }
 
     #[test]
-    fn non_gnome_default_preserves_chromium_compatibility() {
-        assert_eq!(
-            advertise_mode_from(false, None, Some("KDE")),
-            AdvertiseMode::All
-        );
+    fn screen_reader_claim_requires_explicit_all_mode() {
+        assert_eq!(advertise_mode_from(false, Some("all")), AdvertiseMode::All);
     }
 
     #[test]
-    fn explicit_mode_overrides_desktop_default() {
+    fn explicit_safe_modes_override_the_default() {
         assert_eq!(
-            advertise_mode_from(false, Some("all"), Some("GNOME")),
-            AdvertiseMode::All
-        );
-        assert_eq!(
-            advertise_mode_from(false, Some("is_enabled_only"), Some("KDE")),
+            advertise_mode_from(false, Some("is_enabled_only")),
             AdvertiseMode::IsEnabledOnly
         );
         assert_eq!(
-            advertise_mode_from(false, Some("none"), Some("KDE")),
+            advertise_mode_from(false, Some("none")),
             AdvertiseMode::None
+        );
+    }
+
+    #[test]
+    fn unknown_mode_fails_closed() {
+        assert_eq!(
+            advertise_mode_from(false, Some("unexpected")),
+            AdvertiseMode::IsEnabledOnly
         );
     }
 
     #[test]
     fn legacy_disable_wins_over_explicit_mode() {
-        assert_eq!(
-            advertise_mode_from(true, Some("all"), Some("KDE")),
-            AdvertiseMode::None
-        );
+        assert_eq!(advertise_mode_from(true, Some("all")), AdvertiseMode::None);
     }
 }
