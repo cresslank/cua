@@ -389,7 +389,11 @@ impl Drop for ForegroundTransaction {
 }
 
 pub fn available() -> bool {
-    shell_owner(true).is_some()
+    // Protocol-v4 helpers already attest the exact contract through
+    // GetCapabilities. GetVersion was added later as an upstream compatibility
+    // method, so requiring it would unnecessarily disable a currently loaded
+    // v4 helper until the next GNOME login after an extension-file update.
+    shell_owner(false).is_some()
         && capabilities().is_some_and(|capabilities| {
             capabilities.protocol_version == REQUIRED_PROTOCOL
                 && !capabilities.epoch.is_empty()
