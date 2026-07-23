@@ -4,15 +4,18 @@
 //! revalidation, navigation invalidation, and unproven-capability
 //! omission/refusal.
 
+use std::io::Cursor;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex as StdMutex,
 };
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
 use serde_json::{json, Value};
 
-use crate::protocol::ToolResult;
+use crate::protocol::{Content, ToolResult};
 use crate::tool::Tool;
 
 use super::engine::BrowserEngine;
@@ -53,6 +56,9 @@ struct FixtureState {
     semantic_full_dom_fails: bool,
     semantic_full_dom_times_out: bool,
     semantic_truncated_dom: bool,
+    screenshot_data: String,
+    viewport_css_width: f64,
+    viewport_css_height: f64,
     /// Every incoming CDP call: (sessionId, method, params).
     calls: Vec<(Option<String>, String, Value)>,
 }
@@ -74,9 +80,21 @@ impl Default for FixtureState {
             semantic_full_dom_fails: false,
             semantic_full_dom_times_out: false,
             semantic_truncated_dom: false,
+            screenshot_data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZJrAAAAAASUVORK5CYII=".into(),
+            viewport_css_width: 800.0,
+            viewport_css_height: 600.0,
             calls: Vec::new(),
         }
     }
+}
+
+fn screenshot_png_base64(width: u32, height: u32) -> String {
+    let image = RgbaImage::from_pixel(width, height, Rgba([18, 171, 52, 255]));
+    let mut encoded = Cursor::new(Vec::new());
+    DynamicImage::ImageRgba8(image)
+        .write_to(&mut encoded, ImageFormat::Png)
+        .expect("encode screenshot fixture PNG");
+    BASE64.encode(encoded.into_inner())
 }
 
 type SharedState = Arc<StdMutex<FixtureState>>;
@@ -509,10 +527,13 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 "cssVisualViewport": {
                     "pageX": 0.0,
                     "pageY": 0.0,
-                    "clientWidth": 800.0,
-                    "clientHeight": 600.0
+                    "clientWidth": st.viewport_css_width,
+                    "clientHeight": st.viewport_css_height
                 }
             })),
+            "Page.captureScreenshot" if is_tab => {
+                MockReply::ok(json!({"data": st.screenshot_data.clone()}))
+            }
             "Page.navigate" if is_tab => MockReply::ok(json!({
                 "frameId": "F_MAIN",
                 "loaderId": "L_MAIN_NAVIGATED",
@@ -866,6 +887,74 @@ async fn existing_profile_only_fixture() -> Fixture {
     }
 }
 
+struct FixtureProtectedProvider {
+    consent_seen: AtomicBool,
+    stopped: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl crate::consent::ProtectedConsentProvider for FixtureProtectedProvider {
+    fn provider_id(&self) -> &'static str {
+        "test.browser-protected-provider"
+    }
+
+    async fn request_consent(
+        &self,
+        request: &crate::consent::ConsentRequest,
+    ) -> Result<crate::consent::ProviderDecision, String> {
+        self.consent_seen.store(true, Ordering::SeqCst);
+        Ok(crate::consent::ProviderDecision {
+            action: crate::consent::ConsentAction::Accept,
+            request_digest: request.request_digest.clone(),
+        })
+    }
+
+    async fn activate_indicator(
+        &self,
+        _request: &crate::consent::ConsentRequest,
+    ) -> Result<crate::consent::IndicatorLease, String> {
+        Ok(crate::consent::IndicatorLease::new(
+            "browser-indicator",
+            self.stopped.clone(),
+        ))
+    }
+
+    async fn deactivate_indicator(&self, _indicator_id: &str) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+}
+
+async fn protected_existing_profile_fixture() -> (Fixture, Arc<FixtureProtectedProvider>) {
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state.clone())).await;
+    let setup_invoked = Arc::new(AtomicBool::new(false));
+    let provider = Arc::new(FixtureProtectedProvider {
+        consent_seen: AtomicBool::new(false),
+        stopped: Arc::new(AtomicBool::new(false)),
+    });
+    let engine = BrowserEngine::new_with_protected_consent_provider(
+        Arc::new(FixturePlatform {
+            ws_url: server.ws_url(),
+            trusted_input_limited: false,
+            managed_endpoint_visible: false,
+            existing_endpoint_visible: Arc::new(AtomicBool::new(true)),
+            setup_invoked: setup_invoked.clone(),
+            setup_aborted: Arc::new(AtomicBool::new(false)),
+            stall_consent: false,
+        }),
+        Some(provider.clone()),
+    );
+    (
+        Fixture {
+            state,
+            _server: server,
+            engine,
+            setup_invoked,
+        },
+        provider,
+    )
+}
+
 async fn existing_profile_setup_fixture() -> (Fixture, Arc<AtomicBool>) {
     let state = Arc::new(StdMutex::new(FixtureState::default()));
     let server = MockCdpServer::start(fixture_handler(state.clone())).await;
@@ -953,6 +1042,44 @@ async fn approved_existing_profile_attach_claims_then_binds_one_generation() {
         .await;
     assert_eq!(structured(&state)["status"], "ok", "{}", structured(&state));
     crate::session::fire_session_end("transport-v2-attach");
+}
+
+#[tokio::test]
+async fn protected_provider_accepts_exact_attach_and_stop_revokes_the_grant() {
+    const PROTECTED_SESSION: &str = "protected-provider-v2";
+    const PROTECTED_TRANSPORT: &str = "protected-transport-v2";
+    let (f, provider) = protected_existing_profile_fixture().await;
+    let prepare = BrowserPrepareTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": PROTECTED_SESSION,
+            "_transport_session_id": PROTECTED_TRANSPORT,
+            "strategy": { "kind": "existing_profile" }
+        }))
+        .await;
+    assert_eq!(
+        structured(&prepare)["status"],
+        "ok",
+        "{}",
+        structured(&prepare)
+    );
+    assert!(provider.consent_seen.load(Ordering::SeqCst));
+    assert!(!provider.stopped.load(Ordering::SeqCst));
+
+    crate::session::fire_session_end(PROTECTED_TRANSPORT);
+    tokio::task::yield_now().await;
+    assert!(provider.stopped.load(Ordering::SeqCst));
+
+    let state = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": PROTECTED_SESSION,
+            "_transport_session_id": PROTECTED_TRANSPORT
+        }))
+        .await;
+    assert_eq!(structured(&state)["status"], "refused");
 }
 
 #[tokio::test]
@@ -1237,6 +1364,146 @@ async fn semantic_snapshot_keeps_visible_content_after_hidden_node_pressure() {
         "CSS-hidden retained controls leaked into refs: {snap}"
     );
     assert_eq!(snap["snapshot"]["omitted"]["css_hidden"], 320);
+}
+
+#[tokio::test]
+async fn semantic_snapshot_can_capture_an_inactive_tab_without_activation_calls() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let result = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target,
+            "tab_id": tab,
+            "session": SESSION,
+            "snapshot_format": "semantic_v2",
+            "include_screenshot": true
+        }))
+        .await;
+    let snapshot = structured(&result);
+    assert_eq!(snapshot["status"], "ok", "{snapshot}");
+    assert_eq!(snapshot["screenshot"]["mime_type"], "image/png");
+    assert_eq!(snapshot["screenshot"]["width"], 1);
+    assert_eq!(snapshot["screenshot"]["height"], 1);
+    assert_eq!(snapshot["screenshot"]["source"], "cdp_tab");
+    assert_eq!(snapshot["screenshot_width"], 1);
+    assert_eq!(snapshot["screenshot_height"], 1);
+    assert_eq!(snapshot["screenshot_mime_type"], "image/png");
+    assert_eq!(
+        snapshot["screenshot"]["coordinate_space"],
+        "viewport_css_px"
+    );
+    assert_eq!(snapshot["screenshot"]["viewport_css_width"], 800.0);
+    assert_eq!(snapshot["screenshot"]["viewport_css_height"], 600.0);
+    assert_eq!(snapshot["screenshot"]["pixel_to_css_scale_x"], 800.0);
+    assert_eq!(snapshot["screenshot"]["pixel_to_css_scale_y"], 600.0);
+    assert!(result.content.iter().any(|content| matches!(
+        content,
+        Content::Image { mime_type, .. } if mime_type == "image/png"
+    )));
+
+    let state = f.state.lock().unwrap();
+    assert!(state.calls.iter().any(|(_, method, params)| {
+        method == "Page.captureScreenshot"
+            && params["format"] == "png"
+            && params["fromSurface"] == true
+            && params["captureBeyondViewport"] == false
+            && params["clip"]["x"] == 0.0
+            && params["clip"]["y"] == 0.0
+            && params["clip"]["width"] == 800.0
+            && params["clip"]["height"] == 600.0
+            && params["clip"]["scale"] == 1.0
+    }));
+    assert!(state.calls.iter().all(|(_, method, _)| {
+        method != "Target.activateTarget" && method != "Page.bringToFront"
+    }));
+}
+
+#[tokio::test]
+async fn semantic_snapshot_does_not_capture_unless_requested() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snapshot = semantic_snapshot(&f, &target, &tab).await;
+    assert_eq!(snapshot["status"], "ok", "{snapshot}");
+    assert_eq!(snapshot["screenshot"], Value::Null);
+    assert_eq!(snapshot["screenshot_width"], Value::Null);
+    assert_eq!(snapshot["screenshot_height"], Value::Null);
+    assert_eq!(snapshot["screenshot_mime_type"], Value::Null);
+    assert!(recorded_calls(&f, "Page.captureScreenshot").is_empty());
+}
+
+#[tokio::test]
+async fn requested_tab_screenshot_maps_non_unit_png_pixels_to_viewport_css() {
+    let f = fixture_with(|state| {
+        state.viewport_css_width = 2.0;
+        state.viewport_css_height = 1.0;
+        state.screenshot_data = screenshot_png_base64(4, 2);
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let result = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target,
+            "tab_id": tab,
+            "session": SESSION,
+            "snapshot_format": "dom_refs_v1",
+            "include_screenshot": true
+        }))
+        .await;
+    let snapshot = structured(&result);
+    assert_eq!(snapshot["status"], "ok", "{snapshot}");
+    assert_eq!(snapshot["screenshot_width"], 4);
+    assert_eq!(snapshot["screenshot_height"], 2);
+    assert_eq!(snapshot["screenshot_mime_type"], "image/png");
+    assert_eq!(snapshot["screenshot"]["viewport_css_width"], 2.0);
+    assert_eq!(snapshot["screenshot"]["viewport_css_height"], 1.0);
+    assert_eq!(snapshot["screenshot"]["pixel_to_css_scale_x"], 0.5);
+    assert_eq!(snapshot["screenshot"]["pixel_to_css_scale_y"], 0.5);
+    let capture = recorded_calls(&f, "Page.captureScreenshot");
+    assert_eq!(capture.len(), 1, "{capture:?}");
+    assert_eq!(capture[0].1["clip"]["width"], 2.0);
+    assert_eq!(capture[0].1["clip"]["height"], 1.0);
+    assert_eq!(capture[0].1["clip"]["scale"], 1.0);
+}
+
+#[tokio::test]
+async fn requested_tab_screenshot_refuses_invalid_viewport_metrics_before_capture() {
+    let f = fixture_with(|state| state.viewport_css_width = 0.0).await;
+    let (target, tab) = bind(&f).await;
+    let result = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target,
+            "tab_id": tab,
+            "session": SESSION,
+            "snapshot_format": "dom_refs_v1",
+            "include_screenshot": true
+        }))
+        .await;
+    let refusal = structured(&result);
+    assert_eq!(refusal["status"], "refused", "{refusal}");
+    assert_eq!(refusal["refusal"]["code"], "browser_route_unavailable");
+    assert!(recorded_calls(&f, "Page.captureScreenshot").is_empty());
+}
+
+#[tokio::test]
+async fn requested_tab_screenshot_refuses_malformed_image_data() {
+    let f = fixture_with(|state| state.screenshot_data = "not-base64".into()).await;
+    let (target, tab) = bind(&f).await;
+    let result = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target,
+            "tab_id": tab,
+            "session": SESSION,
+            "snapshot_format": "semantic_v2",
+            "include_screenshot": true
+        }))
+        .await;
+    let refusal = structured(&result);
+    assert_eq!(refusal["status"], "refused", "{refusal}");
+    assert_eq!(refusal["refusal"]["code"], "browser_route_unavailable");
+    assert!(result
+        .content
+        .iter()
+        .all(|content| !matches!(content, Content::Image { .. })));
 }
 
 #[tokio::test]
@@ -1646,6 +1913,14 @@ async fn trusted_click_refuses_when_standalone_background_posture_is_unavailable
     assert_eq!(
         structured(&trusted)["refusal"]["code"],
         "browser_input_trust_unavailable"
+    );
+    assert_eq!(
+        structured(&trusted)["refusal"]["detail"]["alternative_route"],
+        "dom_event"
+    );
+    assert_eq!(
+        structured(&trusted)["refusal"]["detail"]["trusted_delivery_attempted"],
+        false
     );
     assert!(recorded_calls(&f, "Input.dispatchMouseEvent").is_empty());
 

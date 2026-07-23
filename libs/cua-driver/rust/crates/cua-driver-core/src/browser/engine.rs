@@ -26,6 +26,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Weak};
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -51,7 +52,10 @@ use super::store::{
     format_ref, BrowserStore, FrameIdentity, FrameKind, FrameRef, RefEntry, SemanticContinuation,
     SnapshotRecord, TabRecord, TargetRecord,
 };
-use super::types::{BindingQuality, NativeWindowInfo, OwnedEndpoint, Rect};
+use super::types::{
+    BindingQuality, BrowserClassification, BrowserEngineFamily, NativeWindowInfo, OwnedEndpoint,
+    Rect,
+};
 
 /// Bounds tolerance (device pixels) for native ↔ CDP window correlation.
 /// Absorbs window-shadow and DIP-rounding differences.
@@ -60,6 +64,9 @@ pub const BOUNDS_TOLERANCE_PX: f64 = 8.0;
 /// Cap on refs minted per snapshot — keeps snapshots bounded on
 /// pathological pages. The truncation is reported in the tool output.
 pub const MAX_REFS_PER_SNAPSHOT: usize = 300;
+/// Hard cap for decoded tab screenshots returned through MCP. This bounds a
+/// compromised or malformed endpoint before its response reaches consumers.
+const MAX_BROWSER_SCREENSHOT_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct BrowserEngine {
     pub(crate) platform: Arc<dyn BrowserPlatform>,
@@ -67,6 +74,7 @@ pub struct BrowserEngine {
     pub(crate) pool: CdpPool,
     pub(crate) managed_browsers: ManagedBrowsers,
     pub(crate) existing_profile_grants: ExistingProfileGrants,
+    pub(crate) approval_broker: crate::consent::ApprovalBroker,
     mutation_gates: MutationGates,
     reconnect_gates: ReconnectGates,
 }
@@ -75,11 +83,61 @@ fn refuse(code: BrowserRefusalCode, msg: impl Into<String>) -> BrowserRefusal {
     BrowserRefusal::new(code, msg)
 }
 
+fn authorize_live_browser_origin(
+    manifest: Option<&crate::session_manifest::SessionManifest>,
+    live_url: &str,
+) -> Result<(), BrowserRefusal> {
+    let manifest = manifest.ok_or_else(|| {
+        refuse(
+            BrowserRefusalCode::BrowserOriginOutsideScope,
+            "the bounded session policy is unavailable",
+        )
+    })?;
+    manifest
+        .authorize_browser_url(live_url)
+        .map_err(|error| refuse(BrowserRefusalCode::BrowserOriginOutsideScope, error))
+}
+
 fn route_err(context: &str, err: impl std::fmt::Display) -> BrowserRefusal {
     refuse(
         BrowserRefusalCode::BrowserRouteUnavailable,
         format!("{context}: {err}"),
     )
+}
+
+pub(super) fn unsupported_engine_refusal(
+    classification: &BrowserClassification,
+    operation: &'static str,
+) -> BrowserRefusal {
+    let (message, protocol, limitation) = match classification.engine {
+        BrowserEngineFamily::Gecko => (
+            "Firefox browser tools require a WebDriver BiDi or Remote Agent route; attaching to an ordinary running profile is not supported",
+            "webdriver_bidi",
+            "remote_agent_requires_launch_time_enablement",
+        ),
+        BrowserEngineFamily::Webkit => (
+            "Safari browser tools require a WebKit-native automation route; Safari does not expose an attachable CDP endpoint for an ordinary running profile",
+            "webkit_automation",
+            "no_attachable_runtime_endpoint",
+        ),
+        BrowserEngineFamily::Chromium => (
+            "this Chromium-family browser does not expose a supported CDP route",
+            "cdp",
+            "cdp_unavailable",
+        ),
+        BrowserEngineFamily::Unknown => (
+            "this browser engine has no supported typed browser route",
+            "unknown",
+            "engine_route_unavailable",
+        ),
+    };
+    BrowserRefusal::new(BrowserRefusalCode::BrowserRouteUnavailable, message).with_detail(json!({
+        "operation": operation,
+        "engine_family": classification.engine,
+        "product": classification.product_kind,
+        "required_protocol": protocol,
+        "limitation": limitation,
+    }))
 }
 
 /// Everything revalidation proves before a mutation proceeds. The
@@ -228,6 +286,72 @@ pub(crate) struct SemanticSnapshotOutcome {
     pub oopif: OopifStatus,
 }
 
+pub(crate) struct BrowserTabScreenshot {
+    pub data_base64: String,
+    pub width: u32,
+    pub height: u32,
+    pub viewport_css_width: f64,
+    pub viewport_css_height: f64,
+    pub pixel_to_css_scale_x: f64,
+    pub pixel_to_css_scale_y: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BrowserScreenshotViewport {
+    page_x: f64,
+    page_y: f64,
+    width: f64,
+    height: f64,
+}
+
+fn browser_screenshot_viewport(
+    metrics: &Value,
+) -> Result<BrowserScreenshotViewport, BrowserRefusal> {
+    let viewport = metrics
+        .get("cssVisualViewport")
+        .or_else(|| metrics.get("visualViewport"))
+        .ok_or_else(|| {
+            route_err(
+                "Page.getLayoutMetrics returned malformed data",
+                "missing visual viewport metrics",
+            )
+        })?;
+    let number = |field: &str| {
+        viewport
+            .get(field)
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| {
+                route_err(
+                    "Page.getLayoutMetrics returned malformed data",
+                    format!("missing or non-finite visual viewport field {field}"),
+                )
+            })
+    };
+    let page_x = number("pageX")?;
+    let page_y = number("pageY")?;
+    let width = number("clientWidth")?;
+    let height = number("clientHeight")?;
+    if page_x < 0.0 || page_y < 0.0 {
+        return Err(route_err(
+            "Page.getLayoutMetrics returned malformed data",
+            "visual viewport page offsets must be non-negative",
+        ));
+    }
+    if width <= 0.0 || height <= 0.0 {
+        return Err(route_err(
+            "Page.getLayoutMetrics returned malformed data",
+            "visual viewport dimensions must be positive",
+        ));
+    }
+    Ok(BrowserScreenshotViewport {
+        page_x,
+        page_y,
+        width,
+        height,
+    })
+}
+
 /// Whether OOPIF content could be composed into the snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OopifStatus {
@@ -349,12 +473,23 @@ impl BrowserEngine {
     /// capability store. Platform crates call this once and register
     /// the five tools via `register_browser_tools`.
     pub fn new(platform: Arc<dyn BrowserPlatform>) -> Arc<Self> {
+        Self::new_with_protected_consent_provider(platform, None)
+    }
+
+    /// Create an engine with a provider installed by a trusted embedding host
+    /// or platform adapter. Ordinary MCP/CLI callers cannot register or replace
+    /// this provider after daemon startup.
+    pub fn new_with_protected_consent_provider(
+        platform: Arc<dyn BrowserPlatform>,
+        provider: Option<Arc<dyn crate::consent::ProtectedConsentProvider>>,
+    ) -> Arc<Self> {
         let engine = Arc::new(Self {
             platform,
             store: BrowserStore::new(),
             pool: CdpPool::new(),
             managed_browsers: Default::default(),
             existing_profile_grants: ExistingProfileGrants::new(),
+            approval_broker: crate::consent::ApprovalBroker::new(provider),
             mutation_gates: MutationGates::new(),
             reconnect_gates: ReconnectGates::new(),
         });
@@ -363,14 +498,21 @@ impl BrowserEngine {
             if let Some(engine) = weak.upgrade() {
                 engine.store.remove_session(session_id);
                 engine.cleanup_prepared_session(session_id);
-                for (endpoint, generation) in
-                    engine.existing_profile_grants.remove_session(session_id)
-                {
-                    engine.pool.release_claim_marker(&endpoint);
+                for grant in engine.existing_profile_grants.remove_session(session_id) {
+                    engine.pool.release_claim_marker(&grant.endpoint_ws_url);
+                    if let Some(protected) = grant.protected_consent.as_ref() {
+                        protected.indicator.revoke();
+                    }
                     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                         let engine = engine.clone();
                         runtime.spawn(async move {
-                            engine.pool.release_existing(&endpoint, generation).await;
+                            engine
+                                .pool
+                                .release_existing(&grant.endpoint_ws_url, grant.generation)
+                                .await;
+                            if let Some(protected) = grant.protected_consent.as_ref() {
+                                engine.approval_broker.revoke(protected).await;
+                            }
                         });
                     }
                 }
@@ -398,6 +540,9 @@ impl BrowserEngine {
                 self.pool
                     .release_existing(&grant.endpoint_ws_url, grant.generation)
                     .await;
+                if let Some(protected) = grant.protected_consent.as_ref() {
+                    self.approval_broker.revoke(protected).await;
+                }
                 Err(refuse(
                     BrowserRefusalCode::BrowserConsentRequired,
                     "the existing-profile grant expired; approve this attachment again",
@@ -420,6 +565,9 @@ impl BrowserEngine {
             self.pool
                 .release_existing(&grant.endpoint_ws_url, grant.generation)
                 .await;
+            if let Some(protected) = grant.protected_consent.as_ref() {
+                self.approval_broker.revoke(protected).await;
+            }
         }
     }
 
@@ -866,13 +1014,7 @@ impl BrowserEngine {
             ));
         }
         if !class.supports_cdp {
-            return Err(refuse(
-                BrowserRefusalCode::BrowserRouteUnavailable,
-                format!(
-                    "{} does not expose a CDP route in browser-tool v1",
-                    class.product.as_deref().unwrap_or("this browser")
-                ),
-            ));
+            return Err(unsupported_engine_refusal(&class, "bind_native_window"));
         }
 
         let native = self.native_window_checked(pid, window_id).await?;
@@ -1170,6 +1312,36 @@ impl BrowserEngine {
         }
 
         let cdp_session = self.attach(&conn, &tab.cdp_target_id).await?;
+        if crate::authorization::configured_permission_mode()
+            .is_ok_and(|mode| mode == crate::authorization::PermissionMode::Bounded)
+        {
+            let frame_tree = conn
+                .call(Some(&cdp_session), "Page.getFrameTree", json!({}))
+                .await
+                .map_err(|error| {
+                    route_err(
+                        "could not prove the live browser origin before bounded-mode input",
+                        error,
+                    )
+                })?;
+            let live_url = frame_tree
+                .pointer("/frameTree/frame/url")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    refuse(
+                        BrowserRefusalCode::BrowserOriginOutsideScope,
+                        "the live top-level browser origin could not be proven",
+                    )
+                })?;
+            let manifest =
+                crate::session_manifest::configured_session_manifest().map_err(|error| {
+                    refuse(
+                        BrowserRefusalCode::BrowserOriginOutsideScope,
+                        format!("the bounded session policy is unavailable: {error}"),
+                    )
+                })?;
+            authorize_live_browser_origin(manifest, live_url)?;
+        }
         Ok(ValidatedTab {
             conn,
             record,
@@ -1375,6 +1547,103 @@ impl BrowserEngine {
     }
 
     // ── Read-side: page snapshot (ref minting) ──────────────────────────
+
+    /// Capture the exact page target's current viewport through its attached
+    /// CDP session. This route never calls `Target.activateTarget`,
+    /// `Page.bringToFront`, or a native foreground API, so an already-open
+    /// inactive tab stays inactive.
+    pub(crate) async fn capture_tab_screenshot(
+        &self,
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+    ) -> Result<BrowserTabScreenshot, BrowserRefusal> {
+        let record = self.store.get_target(session, target_id)?;
+        let tab = record.tabs.get(tab_id).cloned().ok_or_else(|| {
+            refuse(
+                BrowserRefusalCode::BrowserTabNotFound,
+                format!("tab {tab_id} is not known for target {target_id}"),
+            )
+        })?;
+        let conn = self.connection_for_record(session, &record).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id).await?;
+        let metrics = conn
+            .call(Some(&cdp_session), "Page.getLayoutMetrics", json!({}))
+            .await
+            .map_err(|error| route_err("Page.getLayoutMetrics failed", error))?;
+        let viewport = browser_screenshot_viewport(&metrics)?;
+        let response = conn
+            .call(
+                Some(&cdp_session),
+                "Page.captureScreenshot",
+                json!({
+                    "format": "png",
+                    "fromSurface": true,
+                    "captureBeyondViewport": false,
+                    "clip": {
+                        "x": viewport.page_x,
+                        "y": viewport.page_y,
+                        "width": viewport.width,
+                        "height": viewport.height,
+                        "scale": 1.0,
+                    },
+                }),
+            )
+            .await
+            .map_err(|error| route_err("Page.captureScreenshot failed", error))?;
+        let data_base64 = response
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                route_err(
+                    "Page.captureScreenshot returned malformed data",
+                    "missing base64 PNG payload",
+                )
+            })?
+            .to_owned();
+        if data_base64.len() > MAX_BROWSER_SCREENSHOT_BYTES.saturating_mul(2) {
+            return Err(route_err(
+                "Page.captureScreenshot returned oversized data",
+                "encoded payload exceeds the browser screenshot limit",
+            ));
+        }
+        let png = BASE64.decode(&data_base64).map_err(|error| {
+            route_err(
+                "Page.captureScreenshot returned malformed data",
+                format!("base64 decode failed: {error}"),
+            )
+        })?;
+        if png.len() > MAX_BROWSER_SCREENSHOT_BYTES {
+            return Err(route_err(
+                "Page.captureScreenshot returned oversized data",
+                format!(
+                    "decoded PNG is {} bytes; limit is {MAX_BROWSER_SCREENSHOT_BYTES}",
+                    png.len()
+                ),
+            ));
+        }
+        let (width, height) = crate::image_utils::png_dimensions(&png).map_err(|error| {
+            route_err(
+                "Page.captureScreenshot returned malformed data",
+                format!("invalid PNG: {error}"),
+            )
+        })?;
+        if width == 0 || height == 0 {
+            return Err(route_err(
+                "Page.captureScreenshot returned malformed data",
+                "PNG dimensions must be non-zero",
+            ));
+        }
+        Ok(BrowserTabScreenshot {
+            data_base64,
+            width,
+            height,
+            viewport_css_width: viewport.width,
+            viewport_css_height: viewport.height,
+            pixel_to_css_scale_x: viewport.width / f64::from(width),
+            pixel_to_css_scale_y: viewport.height / f64::from(height),
+        })
+    }
 
     /// Snapshot one tab's composed DOM (main frame + shadow DOM +
     /// same-process iframes + capability-tested OOPIFs) and mint
@@ -1788,6 +2057,9 @@ impl BrowserEngine {
         Ok(document)
     }
 
+    // These values form one semantic snapshot envelope; keeping them explicit
+    // makes the stored reference index and reported metadata auditable together.
+    #[allow(clippy::too_many_arguments)]
     fn semantic_outcome(
         &self,
         snapshot_id: u64,
@@ -2387,5 +2659,35 @@ mod tests {
             "a root without a loader id fails the parse"
         );
         assert!(parse_frame_tree(&json!({})).is_none());
+    }
+
+    #[cfg(feature = "yaml")]
+    #[test]
+    fn live_browser_origin_decision_refuses_redirect_outside_manifest_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("session-policy.yaml");
+        std::fs::write(
+            &path,
+            r#"
+version: 1
+mode: bounded
+expires_after: 1h
+idle_timeout: 10m
+resources:
+  browser:
+    origins: [https://app.example.com]
+allow:
+  tools: [browser_navigate, browser_click]
+"#,
+        )
+        .unwrap();
+        let manifest = crate::session_manifest::load_manifest(&path).unwrap();
+
+        authorize_live_browser_origin(Some(&manifest), "https://app.example.com/work").unwrap();
+        let refusal =
+            authorize_live_browser_origin(Some(&manifest), "https://attacker.example/redirected")
+                .unwrap_err();
+        assert_eq!(refusal.code, BrowserRefusalCode::BrowserOriginOutsideScope);
+        assert!(authorize_live_browser_origin(None, "https://app.example.com").is_err());
     }
 }

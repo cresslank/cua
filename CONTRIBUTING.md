@@ -23,6 +23,12 @@ For feature requests, describe the user problem and the expected behavior
 before prescribing an implementation. Mention affected platforms and existing
 workarounds when known.
 
+Use the [RFC process](rfcs/README.md) before implementation when a proposal
+changes a public SDK, CLI, MCP, protocol, compatibility, permission, or
+cross-component architectural contract. Start with the **Request for comments**
+GitHub issue form. Longer proposals and diagrams remain in this repository under
+`rfcs/` and link back to the discussion issue.
+
 ## Submit Code
 
 1. Read [`Development.md`](Development.md) and the guide next to the component.
@@ -33,11 +39,17 @@ workarounds when known.
 6. Open a focused pull request that explains behavior, validation, and known gaps.
 
 Use a Conventional Commit title because the squash-merge title becomes the
-release entry. `fix(driver): preserve input while reconnecting` produces a
+release entry. `fix(cua-driver): preserve input while reconnecting` produces a
 patch release, `feat(lume): add a VM readiness probe` produces a minor release,
-and `feat(driver)!: remove the legacy event endpoint` marks a breaking change.
-Use `docs`, `test`, `ci`, or `chore` when the pull request has no user-facing
-release entry.
+and `feat(cua-driver)!: remove the legacy event endpoint` marks a breaking
+change. `perf` and `revert` also produce releases.
+
+Use `docs`, `test`, `ci`, `chore`, `build`, `refactor`, or `style` only when the
+pull request has no user-facing release entry. A pull request that adds tests
+while changing production behavior must be titled for the production change,
+not the tests. If release-tracked Cua Driver or Lume files changed but the work
+is intentionally non-releasing, add the `no-release` label. The
+`CI: Release metadata` check enforces this contract before squash merge.
 
 ## Preserve Contributor Authorship
 
@@ -50,9 +62,16 @@ If a maintainer adapts material parts of a contribution in a new commit,
 include a `Co-authored-by` trailer with the contributor's GitHub no-reply email
 and link the source pull request in the landing pull request. Use a line such as
 `Salvaged from #123` so release automation can recover the source author.
-Preserve human coauthor trailers during rebases and squash merges. Honor public
-credit opt-out requests and keep security-report attribution private until the
-report can be disclosed.
+Prefer a commit email linked to the contributor's GitHub account, especially a
+GitHub no-reply address. If preserved authorship uses an email GitHub cannot
+resolve, add the verified email-to-login entry to
+`.github/release-attribution-config.json` in the same pull request. The
+contributor-attribution check provides the exact `identityOverrides` JSON when
+one explicitly referenced source pull request proves a unique mapping; it never
+guesses from a name or email. Attribution preservation and resolvability must
+land together. Preserve human coauthor trailers during rebases and squash
+merges. Honor public credit opt-out requests and keep security-report
+attribution private until the report can be disclosed.
 
 Root pre-commit hooks are optional local helpers. Install them with:
 

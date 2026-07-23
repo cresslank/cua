@@ -22,6 +22,7 @@
 //! that blocking zbus connection and serializes those calls.
 
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -32,6 +33,9 @@ use crate::x11::WindowInfo;
 const DEST: &str = "org.cua.WinRects";
 const PATH: &str = "/org/cua/WinRects";
 const IFACE: &str = "org.cua.WinRects";
+const DBUS_DEST: &str = "org.freedesktop.DBus";
+const DBUS_PATH: &str = "/org/freedesktop/DBus";
+const DBUS_IFACE: &str = "org.freedesktop.DBus";
 const INTROSPECT_DEST: &str = "org.gnome.Shell.Introspect";
 const INTROSPECT_PATH: &str = "/org/gnome/Shell/Introspect";
 const INTROSPECT_IFACE: &str = "org.gnome.Shell.Introspect";
@@ -88,6 +92,9 @@ fn dispatch_overlay_request(
     targets: &HashMap<String, u64>,
     request: OverlayDispatchRequest,
 ) {
+    let Some(destination) = shell_owner(false) else {
+        return;
+    };
     match request {
         OverlayDispatchRequest::Pin { .. } => {}
         OverlayDispatchRequest::Move { owner, x, y } => {
@@ -98,7 +105,7 @@ fn dispatch_overlay_request(
                 return;
             };
             let _ = connection.call_method(
-                Some(DEST),
+                Some(destination.as_str()),
                 PATH,
                 Some(IFACE),
                 "MoveCursorFor",
@@ -113,7 +120,7 @@ fn dispatch_overlay_request(
                 return;
             };
             let _ = connection.call_method(
-                Some(DEST),
+                Some(destination.as_str()),
                 PATH,
                 Some(IFACE),
                 "ClickPulseFor",
@@ -122,7 +129,7 @@ fn dispatch_overlay_request(
         }
         OverlayDispatchRequest::Hide { owner } => {
             let _ = connection.call_method(
-                Some(DEST),
+                Some(destination.as_str()),
                 PATH,
                 Some(IFACE),
                 "HideCursorFor",
@@ -131,7 +138,7 @@ fn dispatch_overlay_request(
         }
         OverlayDispatchRequest::Remove { owner } => {
             let _ = connection.call_method(
-                Some(DEST),
+                Some(destination.as_str()),
                 PATH,
                 Some(IFACE),
                 "RemoveCursor",
@@ -382,50 +389,51 @@ impl Drop for ForegroundTransaction {
 }
 
 pub fn available() -> bool {
-    capabilities().is_some_and(|capabilities| {
-        capabilities.protocol_version == REQUIRED_PROTOCOL
-            && !capabilities.epoch.is_empty()
-            && capabilities
-                .capabilities
-                .iter()
-                .any(|capability| capability == "exact-target-v2")
-            && capabilities
-                .capabilities
-                .iter()
-                .any(|capability| capability == "transient-parent-v1")
-            && capabilities
-                .capabilities
-                .iter()
-                .any(|capability| capability == "foreground-revalidate-v1")
-            && capabilities
-                .capabilities
-                .iter()
-                .any(|capability| capability == "foreground-reconcile-v1")
-            && capabilities
-                .capabilities
-                .iter()
-                .any(|capability| capability == "unoccluded-target-v1")
-            && capabilities
-                .capabilities
-                .iter()
-                .any(|capability| capability == "trusted-cursor-overlay-v1")
-            && capabilities
-                .capabilities
-                .iter()
-                .any(|capability| capability == "exact-target-activation-v1")
-            && capabilities
-                .capabilities
-                .iter()
-                .any(|capability| capability == "shell-grab-classification-v1")
-            && capabilities
-                .capabilities
-                .iter()
-                .any(|capability| capability == "atomic-target-capture-v1")
-            && capabilities
-                .capabilities
-                .iter()
-                .any(|capability| capability == "connection-owned-cursors-v1")
-    })
+    shell_owner(true).is_some()
+        && capabilities().is_some_and(|capabilities| {
+            capabilities.protocol_version == REQUIRED_PROTOCOL
+                && !capabilities.epoch.is_empty()
+                && capabilities
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "exact-target-v2")
+                && capabilities
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "transient-parent-v1")
+                && capabilities
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "foreground-revalidate-v1")
+                && capabilities
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "foreground-reconcile-v1")
+                && capabilities
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "unoccluded-target-v1")
+                && capabilities
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "trusted-cursor-overlay-v1")
+                && capabilities
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "exact-target-activation-v1")
+                && capabilities
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "shell-grab-classification-v1")
+                && capabilities
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "atomic-target-capture-v1")
+                && capabilities
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == "connection-owned-cursors-v1")
+        })
 }
 
 fn exact_identity_capabilities() -> Option<Vec<String>> {
@@ -488,7 +496,103 @@ fn gdbus_call(method: &str, args: &[String]) -> Option<String> {
 }
 
 fn gdbus_call_with_timeout(method: &str, args: &[String], timeout: Duration) -> Option<String> {
-    gdbus_call_target(DEST, PATH, &format!("{IFACE}.{method}"), args, timeout)
+    let owner = shell_owner(false)?;
+    gdbus_call_target(&owner, PATH, &format!("{IFACE}.{method}"), args, timeout)
+}
+
+/// Resolve the helper's immutable unique bus name and prove that it is hosted
+/// by this user's system-installed GNOME Shell process. Protocol-sensitive
+/// callers can additionally require the extension's current API. Addressing
+/// the unique name closes the race where another process replaces the public
+/// name after ownership is checked.
+fn shell_owner(require_protocol: bool) -> Option<String> {
+    let owner_raw = gdbus_call_target(
+        DBUS_DEST,
+        DBUS_PATH,
+        &format!("{DBUS_IFACE}.GetNameOwner"),
+        &[DEST.to_owned()],
+        Duration::from_millis(800),
+    )?;
+    let owner = parse_quoted_string(&owner_raw)?;
+    if !owner.starts_with(':') {
+        return None;
+    }
+
+    let pid_raw = gdbus_call_target(
+        DBUS_DEST,
+        DBUS_PATH,
+        &format!("{DBUS_IFACE}.GetConnectionUnixProcessID"),
+        &[owner.clone()],
+        Duration::from_millis(800),
+    )?;
+    let uid_raw = gdbus_call_target(
+        DBUS_DEST,
+        DBUS_PATH,
+        &format!("{DBUS_IFACE}.GetConnectionUnixUser"),
+        &[owner.clone()],
+        Duration::from_millis(800),
+    )?;
+    let pid = parse_first_u32(&pid_raw)?;
+    let uid = parse_first_u32(&uid_raw)?;
+    if uid != current_uid() || !is_trusted_gnome_shell(pid) {
+        return None;
+    }
+
+    if require_protocol {
+        let version_raw = gdbus_call_target(
+            &owner,
+            PATH,
+            &format!("{IFACE}.GetVersion"),
+            &[],
+            Duration::from_millis(800),
+        )?;
+        if u64::from(parse_first_u32(&version_raw)?) != REQUIRED_PROTOCOL {
+            return None;
+        }
+    }
+    Some(owner)
+}
+
+fn parse_quoted_string(raw: &str) -> Option<String> {
+    let start = raw.find('\'')? + 1;
+    let end = raw[start..].find('\'')? + start;
+    (end > start).then(|| raw[start..end].to_owned())
+}
+
+fn parse_first_u32(raw: &str) -> Option<u32> {
+    // `gdbus call` renders typed scalars as `(uint32 6079,)`. Searching the
+    // whole string would incorrectly return the `32` in the type annotation.
+    let payload = raw.split_once("uint32").map_or(raw, |(_, payload)| payload);
+    payload
+        .split(|character: char| !character.is_ascii_digit())
+        .find(|part| !part.is_empty())?
+        .parse()
+        .ok()
+}
+
+fn current_uid() -> u32 {
+    std::fs::metadata("/proc/self")
+        .map(|meta| meta.uid())
+        .unwrap_or(u32::MAX)
+}
+
+fn is_trusted_gnome_shell(pid: u32) -> bool {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok();
+    if comm.as_deref().map(str::trim) != Some("gnome-shell") {
+        return false;
+    }
+    let executable = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
+    let metadata = executable
+        .as_ref()
+        .and_then(|path| std::fs::metadata(path).ok());
+    executable
+        .as_ref()
+        .and_then(|path| path.file_name())
+        .and_then(|name| name.to_str())
+        == Some("gnome-shell")
+        && metadata
+            .as_ref()
+            .is_some_and(|meta| meta.uid() == 0 && meta.permissions().mode() & 0o022 == 0)
 }
 
 fn gdbus_call_target(
@@ -721,6 +825,53 @@ pub fn list_windows(filter_pid: Option<u32>) -> Option<Vec<WindowInfo>> {
             })
             .collect(),
     )
+}
+
+/// Return one compositor-attested GNOME window only when the exact public id
+/// still belongs to the approved process.
+pub fn trusted_window_for_id(pid: u32, window_id: u64) -> Option<WindowInfo> {
+    list_windows(Some(pid))?
+        .into_iter()
+        .find(|window| window.xid == window_id)
+}
+
+/// Enumerate incarnation-qualified window ids for one approved process.
+pub fn trusted_window_ids_for_pid(pid: u32) -> Option<Vec<u64>> {
+    Some(
+        list_windows(Some(pid))?
+            .into_iter()
+            .map(|window| window.xid)
+            .collect(),
+    )
+}
+
+/// Execute one bounded operation against an exact GNOME target, then restore
+/// and verify the prior compositor context even when the operation fails.
+pub fn with_focused_window<T>(
+    pid: u32,
+    window_id: u64,
+    body: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    trusted_window_for_id(pid, window_id)
+        .ok_or_else(|| anyhow::anyhow!("no exact GNOME Shell window owns the approved target"))?;
+    let transaction = begin_foreground(window_id)?;
+    let action = transaction.validate().and_then(|()| body());
+    let restoration = transaction.finish();
+    match (action, restoration) {
+        (Ok(value), Ok(_)) => Ok(value),
+        (Err(action_error), Ok(_)) => Err(action_error),
+        (Ok(_), Err(restoration_error)) => Err(restoration_error),
+        (Err(action_error), Err(restoration_error)) => Err(anyhow::anyhow!(
+            "{action_error}; foreground reconciliation also failed: {restoration_error}"
+        )),
+    }
+}
+
+/// The local-hardened helper never exports compositor-wide pixels. Upstream's
+/// video backend treats `None` as an instruction to use the platform recorder;
+/// preserving that fallback avoids weakening exact-target capture policy.
+pub fn trusted_screenshot_display() -> Option<Vec<u8>> {
+    None
 }
 
 pub fn begin_foreground(window_id: u64) -> anyhow::Result<ForegroundTransaction> {
@@ -1071,6 +1222,19 @@ pub fn remove_cursor(owner: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_dbus_owner_and_numeric_identity() {
+        assert_eq!(
+            parse_quoted_string("(':1.204',)"),
+            Some(":1.204".to_owned())
+        );
+        assert_eq!(parse_first_u32("(uint32 6079,)"), Some(6079));
+        assert_eq!(parse_first_u32("(uint32 4,)"), Some(4));
+        assert_eq!(parse_first_u32("(6079,)"), Some(6079));
+        assert_eq!(parse_quoted_string("(nothing,)"), None);
+        assert_eq!(parse_first_u32("(nothing,)"), None);
+    }
 
     #[test]
     fn exact_identity_records_advertise_all_delivery_invariants() {

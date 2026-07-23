@@ -557,7 +557,7 @@ verify_release_checksum() {
 # the baked line hasn't been updated yet (dev / pre-release checkouts).
 #
 # ~~~ BAKED_VERSION: auto-updated in the release PR — do not edit ~~~
-CUA_DRIVER_RS_BAKED_VERSION="0.9.0" # x-release-please-version
+CUA_DRIVER_RS_BAKED_VERSION="0.12.2" # x-release-please-version
 # ~~~ END_BAKED_VERSION ~~~
 
 if [[ -n "${CUA_DRIVER_RS_VERSION:-}" ]]; then
@@ -625,8 +625,9 @@ tar -xzf "$TMP_DIR/$TARBALL" -C "$TMP_DIR"
 #       ├── CuaDriver.app/     (minimal bundle; copy of the same binary
 #       │                         lives at Contents/MacOS/cua-driver)
 #       └── LICENSE
-#   Linux bare-binary tarball expands to:
-#     cua-driver               (single file at the archive root)
+#   Linux bare-runtime tarball expands to:
+#     cua-driver and libcua_driver_sdk.so at the archive root. The installer
+#     consumes the CLI; SDK packaging consumes the colocated library.
 case "$LABEL" in
     darwin-*)
         STAGE="cua-driver-rs-${VERSION}-darwin-universal"

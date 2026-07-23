@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use cua_driver_core::policy::{configured_policy, PolicyDecision};
+use cua_driver_core::policy::{authorize_tool_call, validate_configured_policy};
 use cua_driver_core::protocol::{initialize_result, Request, Response};
 use cua_driver_core::server::{
     observe_proxy_session_started, observe_proxy_tool_completed, tool_observation_timer,
@@ -43,7 +43,7 @@ use crate::serve::{is_daemon_listening, send_request, DaemonRequest, ToolObserva
 /// advertises zero tools and then errors on every call. Matches
 /// Swift `makeProxy`'s `fetchProxyToolList` pre-check.
 pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
-    configured_policy().map_err(anyhow::Error::msg)?;
+    validate_configured_policy()?;
     if !is_daemon_listening(&socket_path) {
         anyhow::bail!(
             "cua-driver-rs daemon not reachable on {socket_path}. Start it \
@@ -140,6 +140,7 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
                                 &call.args,
                                 known_tool,
                                 cua_driver_core::session::SessionTransport::McpStdio,
+                                cua_driver_core::session::SessionClientKind::Mcp,
                             )
                         })
                     })
@@ -238,6 +239,7 @@ async fn run_control_connection(
         args: None,
         session_id: Some(session_id.clone()),
         observation_origin: None,
+        client_kind: None,
     };
     let line = match serde_json::to_string(&begin) {
         Ok(s) => s + "\n",
@@ -376,6 +378,7 @@ fn fetch_tools_list_from_daemon(
         args: None,
         session_id: Some(session_id.to_owned()),
         observation_origin: None,
+        client_kind: None,
     };
     let resp = send_request(socket_path, &req)?;
     if !resp.ok {
@@ -434,16 +437,30 @@ fn fetch_tools_list_from_daemon(
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_else(|| {
-                    // Fallback: derive from the centralised map by
-                    // name. Keeps the proxy compatible with daemon
+                    // Fallback: derive from the centralised name + schema
+                    // resolver. Keeps the proxy compatible with daemon
                     // builds that pre-date the capabilities field.
                     name.as_str()
-                        .map(cua_driver_core::tool::default_capabilities_for)
+                        .map(|name| {
+                            cua_driver_core::tool::advertised_capabilities_for(name, &input_schema)
+                        })
                         .unwrap_or_default()
                         .into_iter()
                         .map(serde_json::Value::String)
                         .collect()
                 });
+            let risk = t.get("risk").cloned().unwrap_or_else(|| {
+                name.as_str()
+                    .map(cua_driver_core::authorization::risk_metadata_json)
+                    .unwrap_or_else(|| {
+                        serde_json::json!({
+                            "class": "unclassified",
+                            "enforcement": "metadata_only",
+                            "operation_sensitive": false,
+                            "version": cua_driver_core::authorization::RISK_METADATA_VERSION,
+                        })
+                    })
+            });
             serde_json::json!({
                 "name": name,
                 "description": description,
@@ -455,6 +472,7 @@ fn fetch_tools_list_from_daemon(
                     "openWorldHint": open_world,
                 },
                 "capabilities": capabilities,
+                "risk": risk,
             })
         })
         .collect();
@@ -469,10 +487,9 @@ fn fetch_tools_list_from_daemon(
         .unwrap_or_else(|| {
             serde_json::Value::String(cua_driver_core::tool::CAPABILITY_VERSION.to_owned())
         });
-    let schema_version = result
-        .get("schema_version")
-        .cloned()
-        .unwrap_or_else(|| serde_json::Value::String("1".to_owned()));
+    let schema_version = result.get("schema_version").cloned().unwrap_or_else(|| {
+        serde_json::Value::String(cua_driver_core::tool::TOOLS_LIST_SCHEMA_VERSION.to_owned())
+    });
 
     let daemon_observes_tool_calls = daemon_owns_tool_observation(&result);
 
@@ -495,13 +512,12 @@ fn daemon_owns_tool_observation(result: &serde_json::Value) -> bool {
 
 /// JSON-RPC method dispatcher for the proxy. Mirrors
 /// `cua_driver_core::server::handle_request`:
-///   - `initialize`     → static `initialize_result()` (same envelope
-///                        as the core protocol server; the daemon's
-///                        identity is hidden from the MCP client).
-///   - `tools/list`     → return the cached daemon tool list.
-///   - `tools/call`     → forward to the daemon and reshape the
-///                        response into MCP's `CallTool.Result`.
-///   - other            → method-not-found.
+/// - `initialize` → static `initialize_result()` (same envelope as the core
+///   protocol server; the daemon's identity is hidden from the MCP client).
+/// - `tools/list` → return the cached daemon tool list.
+/// - `tools/call` → forward to the daemon and reshape the response into MCP's
+///   `CallTool.Result`.
+/// - other → method-not-found.
 async fn handle_proxy_request(
     req: Request,
     id: serde_json::Value,
@@ -518,32 +534,8 @@ async fn handle_proxy_request(
         "tools/call" => match req.tool_call() {
             Err(e) => Response::error(id, -32602, format!("Invalid params: {e}")),
             Ok(call) => {
-                match configured_policy() {
-                    Ok(Some(policy)) => match policy.evaluate(&call.name, &call.args) {
-                        PolicyDecision::Allow => {}
-                        PolicyDecision::Deny(reason) => {
-                            return Response::error(
-                                id,
-                                -32603,
-                                format!("Permission denied: {reason}"),
-                            );
-                        }
-                        PolicyDecision::Error(message) => {
-                            return Response::error(
-                                id,
-                                -32603,
-                                format!("Policy evaluation error: {message}"),
-                            );
-                        }
-                    },
-                    Ok(None) => {}
-                    Err(message) => {
-                        return Response::error(
-                            id,
-                            -32603,
-                            format!("Policy loading error: {message}"),
-                        );
-                    }
+                if let Err(error) = authorize_tool_call(&call.name, &call.args) {
+                    return Response::error(id, -32603, error.to_string());
                 }
                 forward_tool_call(
                     id,
@@ -591,6 +583,7 @@ async fn forward_tool_call(
         args: Some(args),
         session_id: Some(session_id.to_owned()),
         observation_origin: daemon_observes_tool_calls.then_some(ToolObservationOrigin::McpProxy),
+        client_kind: None,
     };
 
     // The daemon client is sync, so jump to a blocking thread to keep

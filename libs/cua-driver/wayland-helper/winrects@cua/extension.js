@@ -27,6 +27,7 @@ const FOREGROUND_TIMEOUT_MS = 30_000;
 const CURSOR_IDLE_TIMEOUT_US = 5 * 60 * 1_000_000;
 
 const IFACE = `<node><interface name="org.cua.WinRects">
+<method name="GetVersion"><arg type="u" direction="out" name="version"/></method>
 <method name="GetCapabilities"><arg type="s" direction="out" name="json"/></method>
 <method name="GetRects"><arg type="s" direction="out" name="json"/></method>
 <method name="CaptureTarget"><arg type="s" direction="in" name="target"/><arg type="s" direction="out" name="capture_json"/></method>
@@ -295,6 +296,8 @@ export default class WinRectsExtension extends Extension {
         }
         return '';
     }
+
+    GetVersion() { return PROTOCOL_VERSION; }
 
     GetCapabilities() {
         return JSON.stringify({

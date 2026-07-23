@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! cua-driver-rs — cross-platform background computer-use automation daemon.
 //!
 //! Runs a daemon-backed MCP JSON-RPC 2.0 proxy over stdio. The platform
@@ -24,6 +26,7 @@ mod doctor;
 mod mcp_http;
 mod proxy;
 mod responsibility;
+mod sdk_adapter;
 mod serve;
 mod skills;
 mod telemetry;
@@ -39,6 +42,59 @@ fn init_logging() {
         .with_env_filter(EnvFilter::from_env("CUA_LOG").add_directive(tracing::Level::WARN.into()))
         .init();
     telemetry::register_stdio_observer();
+}
+
+fn configure_startup_permission_mode(
+    permission_mode: Option<&str>,
+    dangerously_bypass_approvals: bool,
+    allow_legacy_existing_profile_approval: bool,
+    session_policy: Option<&str>,
+    approve_session_policy: bool,
+) -> anyhow::Result<()> {
+    if let Some(mode) = permission_mode {
+        std::env::set_var(cua_driver_core::authorization::PERMISSION_MODE_ENV, mode);
+    } else if dangerously_bypass_approvals
+        && std::env::var_os(cua_driver_core::authorization::PERMISSION_MODE_ENV).is_none()
+    {
+        // The alarming CLI flag is both the unrestricted-mode selector and
+        // the user's explicit launch-time risk acknowledgement. Embedded and
+        // environment-driven launchers retain the two-part mode + acceptance
+        // contract because they do not pass through this CLI normalization.
+        std::env::set_var(
+            cua_driver_core::authorization::PERMISSION_MODE_ENV,
+            "unrestricted",
+        );
+    }
+    if dangerously_bypass_approvals {
+        std::env::set_var(cua_driver_core::authorization::DANGEROUS_BYPASS_ENV, "1");
+    }
+    if allow_legacy_existing_profile_approval {
+        std::env::set_var(
+            cua_driver_core::authorization::LEGACY_EXISTING_PROFILE_APPROVAL_ENV,
+            "1",
+        );
+    }
+    if let Some(path) = session_policy {
+        std::env::set_var(
+            cua_driver_core::session_manifest::SESSION_POLICY_FILE_ENV,
+            path,
+        );
+    }
+    if approve_session_policy {
+        std::env::set_var(
+            cua_driver_core::session_manifest::SESSION_POLICY_APPROVED_ENV,
+            "1",
+        );
+    }
+    cua_driver_core::authorization::validate_startup_authorization()?;
+    if cua_driver_core::authorization::configured_permission_mode()
+        .is_ok_and(|mode| mode == cua_driver_core::authorization::PermissionMode::Unrestricted)
+    {
+        eprintln!(
+            "DANGER: Cua Driver is running in unrestricted mode. Runtime approval prompts are disabled; prompt injection or unintended input may act with every capability allowed by the built-in, managed, and user policy ceilings. Use only in a disposable or fully trusted environment."
+        );
+    }
+    Ok(())
 }
 
 /// Execute finite commands in a child so the parent can observe every exit,
@@ -188,24 +244,40 @@ fn maybe_init_pip() {
     }
 }
 
-// ── Registry helpers (macOS) ─────────────────────────────────────────────
+// ── Public SDK runtime host ──────────────────────────────────────────────
 
-/// Build the macOS tool registry and inject the platform-agnostic
-/// `check_for_update` tool. Wrapper lives in the binary crate so the
-/// `cua-driver-core` graph (shared with every `platform-*` crate) stays
-/// free of the `ureq` + rustls + ring deps that the check tool needs.
-#[cfg(target_os = "macos")]
-fn build_macos_registry() -> cua_driver_core::tool::ToolRegistry {
-    let mut r = platform_macos::register_tools();
-    check_update_tool::register_into(&mut r);
-    r
+/// Construct the canonical SDK-owned runtime for the CLI or daemon host.
+/// The private socket and MCP layers consume this object downstream.
+fn build_driver(
+    cursor: cursor_overlay::CursorConfig,
+    compatibility_mode: bool,
+) -> Arc<cua_driver_sdk::CuaDriver> {
+    cua_driver_sdk::CuaDriver::create_for_host(cua_driver_sdk::DriverHostOptions {
+        cursor,
+        claude_code_compatibility: compatibility_mode,
+        prepare_desktop_environment: true,
+        register_host_tools: Some(check_update_tool::register_into),
+    })
 }
 
-#[cfg(target_os = "macos")]
-fn build_macos_registry_with_compat(compat: bool) -> cua_driver_core::tool::ToolRegistry {
-    let mut r = platform_macos::register_tools_with_compat(compat);
-    check_update_tool::register_into(&mut r);
-    r
+fn build_driver_without_cursor() -> Arc<cua_driver_sdk::CuaDriver> {
+    build_driver(
+        cursor_overlay::CursorConfig {
+            enabled: false,
+            ..cursor_overlay::CursorConfig::default()
+        },
+        false,
+    )
+}
+
+fn sdk_tool_inventory(driver: Arc<cua_driver_sdk::CuaDriver>) -> serde_json::Value {
+    match sdk_adapter::SdkAdapter::load_blocking(driver) {
+        Ok(sdk) => sdk.tools_list(),
+        Err(error) => {
+            eprintln!("Could not load Cua Driver SDK tool inventory: {error}");
+            std::process::exit(1);
+        }
+    }
 }
 
 // ── macOS entry-point ─────────────────────────────────────────────────────
@@ -217,6 +289,9 @@ fn main() {
         return;
     }
     if telemetry::run_lifecycle_worker_if_requested() {
+        return;
+    }
+    if telemetry::run_update_event_worker_if_requested() {
         return;
     }
     maybe_wrap_finite_command();
@@ -231,27 +306,22 @@ fn main() {
     match command {
         cli::Command::Telemetry(command) => {
             run_telemetry_command(command);
-            return;
         }
         cli::Command::ListTools => {
-            let reg = Arc::new(build_macos_registry());
-            cli::run_list_tools(&reg);
-            return;
+            let tools = sdk_tool_inventory(build_driver_without_cursor());
+            cli::run_list_tools(&tools);
         }
         cli::Command::Describe(name) => {
-            let reg = Arc::new(build_macos_registry());
-            cli::run_describe(&reg, &name);
-            return;
+            let tools = sdk_tool_inventory(build_driver_without_cursor());
+            cli::run_describe(&tools, &name);
         }
         cli::Command::McpConfig { client } => {
             cli::run_mcp_config(client.as_deref());
-            return;
         }
         cli::Command::Manifest { pretty } => {
             // Surface 8: machine-readable CLI manifest. Read-only — no
             // registry build needed, no daemon contact.
             cli::run_manifest(pretty);
-            return;
         }
         cli::Command::Call {
             tool,
@@ -260,13 +330,27 @@ fn main() {
             socket,
         } => {
             cli::run_call(&tool, json_args, screenshot_out_file, socket);
-            return;
         }
         cli::Command::Serve {
             socket,
+            permission_mode,
+            dangerously_bypass_approvals,
+            allow_legacy_existing_profile_approval,
+            session_policy,
+            approve_session_policy,
             no_permissions_gate,
             claude_code_compat,
         } => {
+            if let Err(error) = configure_startup_permission_mode(
+                permission_mode.as_deref(),
+                dangerously_bypass_approvals,
+                allow_legacy_existing_profile_approval,
+                session_policy.as_deref(),
+                approve_session_policy,
+            ) {
+                eprintln!("cua-driver: authorization startup error: {error}");
+                std::process::exit(64);
+            }
             responsibility::reexec_disclaimed_if_needed();
             let gate_opts =
                 platform_macos::permissions::GateOpts::from_env_and_flag(no_permissions_gate);
@@ -290,29 +374,6 @@ fn main() {
             // before any blocking work so the banner can land on stderr
             // early in the serve lifecycle.
             version_check::maybe_announce_update();
-            cua_driver_core::recording::set_screenshot_fn(|window_id, pid| {
-                if let Some(wid) = window_id {
-                    platform_macos::capture::screenshot_window_bytes(wid as u32).ok()
-                } else if let Some(p) = pid {
-                    platform_macos::windows::resolve_main_window_id(p as i32)
-                        .ok()
-                        .and_then(|wid| platform_macos::capture::screenshot_window_bytes(wid).ok())
-                } else {
-                    platform_macos::capture::screenshot_display_bytes().ok()
-                }
-            });
-            cua_driver_core::recording::set_click_marker_fn(|png_bytes, cx, cy| {
-                platform_macos::capture::crosshair_png_bytes(png_bytes, cx, cy).ok()
-            });
-            cua_driver_core::recording::set_ax_snapshot_fn(|window_id, pid| {
-                platform_macos::recording_hooks::app_state_json_for(window_id, pid)
-            });
-            cua_driver_core::recording::set_element_bounds_fn(|wid, pid, idx| {
-                platform_macos::recording_hooks::element_window_local_xy(wid, pid, idx)
-            });
-            cua_driver_core::video::set_video_backend_factory(Box::new(
-                platform_macos::video_sckit::SckitVideoBackendFactory,
-            ));
             let pip_cfg = match pip_preview::default_config_path() {
                 Some(p) => pip_preview::PipConfig::from_args_and_file(&p),
                 None => pip_preview::PipConfig::from_args(),
@@ -325,17 +386,13 @@ fn main() {
             // owns every cursor command and window. Init the channel before spawning
             // the serve thread so `run_on_main_thread()` always finds it ready.
             let cursor_cfg = cursor_overlay::CursorConfig::from_args();
-            if cursor_cfg.enabled {
-                platform_macos::cursor::overlay::init(cursor_cfg.clone());
-            }
 
             // Honour the compat flag forwarded by the MCP proxy
             // (launch_daemon_and_wait passes `serve
             // --claude-code-computer-use-compat`). The Serve arm is the daemon
             // the proxy talks to, so without this the proxy path always served
             // the full screenshot tool regardless of the client's request.
-            let reg = Arc::new(build_macos_registry_with_compat(claude_code_compat));
-            reg.init_self_weak();
+            let driver = build_driver(cursor_cfg.clone(), claude_code_compat);
             let sp = socket.unwrap_or_else(serve::default_socket_path);
             let pid_path = serve::default_pid_file_path();
 
@@ -363,7 +420,7 @@ fn main() {
             let serve_handle = std::thread::Builder::new()
                 .name("cua-serve".into())
                 .spawn(move || {
-                    serve::run_serve_cmd(reg, &sp, Some(&pid_path));
+                    serve::run_serve_cmd(driver, &sp, Some(&pid_path));
                     std::process::exit(0);
                 })
                 .expect("spawn serve thread");
@@ -441,18 +498,23 @@ fn main() {
             } else {
                 let _ = serve_handle.join();
             }
-            return;
         }
         cli::Command::Stop { socket } => {
             let sp = socket.unwrap_or_else(serve::default_socket_path);
             serve::run_stop_cmd(&sp);
-            return;
+        }
+        cli::Command::Revoke {
+            socket,
+            session,
+            all,
+        } => {
+            let sp = socket.unwrap_or_else(serve::default_socket_path);
+            serve::run_revoke_cmd(&sp, session.as_deref(), all);
         }
         cli::Command::Status { socket } => {
             let sp = socket.unwrap_or_else(serve::default_socket_path);
             let pid_path = serve::default_pid_file_path();
             serve::run_status_cmd(&sp, &pid_path);
-            return;
         }
         cli::Command::Recording {
             subcommand,
@@ -460,20 +522,16 @@ fn main() {
             socket,
         } => {
             cli::run_recording_cmd(&subcommand, &args, socket.as_deref());
-            return;
         }
         cli::Command::DumpDocs { pretty, doc_type } => {
-            let reg = Arc::new(build_macos_registry());
-            cli::run_dump_docs_with_type(&reg, pretty, &doc_type);
-            return;
+            let tools = sdk_tool_inventory(build_driver_without_cursor());
+            cli::run_dump_docs_with_type(&tools, pretty, &doc_type);
         }
         cli::Command::Update { apply, json } => {
             cli::run_update_cmd(apply, json);
-            return;
         }
         cli::Command::CheckUpdate { json, no_cache } => {
             cli::run_check_update_cmd(json, no_cache);
-            return;
         }
         cli::Command::Doctor { json } => {
             // Long-running interactive entry point — kick off the
@@ -484,23 +542,18 @@ fn main() {
                 version_check::maybe_announce_update();
             }
             cli::run_doctor_cmd(json);
-            return;
         }
         cli::Command::Diagnose => {
             cli::run_diagnose_cmd();
-            return;
         }
         cli::Command::Permissions { subcommand, json } => {
             cli::run_permissions_cmd(&subcommand, json);
-            return;
         }
         cli::Command::Autostart { subcommand } => {
             autostart::run_autostart_cmd(&subcommand);
-            return;
         }
         cli::Command::Skills { subcommand, flags } => {
             skills::run(&subcommand, &flags);
-            return;
         }
         cli::Command::BrowserApprove {
             pid,
@@ -518,7 +571,6 @@ fn main() {
                 profile_mode.as_deref(),
                 profile_name.as_deref(),
             );
-            return;
         }
         cli::Command::Config {
             subcommand,
@@ -532,7 +584,6 @@ fn main() {
                 value.as_deref(),
                 socket.as_deref(),
             );
-            return;
         }
         cli::Command::Mcp {
             socket,
@@ -557,7 +608,6 @@ fn main() {
                 std::process::exit(1);
             }
             telemetry::flush_pending(std::time::Duration::from_millis(750));
-            return;
         }
     }
 }
@@ -571,6 +621,9 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if telemetry::run_lifecycle_worker_if_requested() {
+        return Ok(());
+    }
+    if telemetry::run_update_event_worker_if_requested() {
         return Ok(());
     }
     maybe_wrap_finite_command();
@@ -589,13 +642,13 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         cli::Command::ListTools => {
-            let reg = Arc::new(build_registry_no_cursor());
-            cli::run_list_tools(&reg);
+            let tools = sdk_tool_inventory(build_driver_without_cursor());
+            cli::run_list_tools(&tools);
             return Ok(());
         }
         cli::Command::Describe(name) => {
-            let reg = Arc::new(build_registry_no_cursor());
-            cli::run_describe(&reg, &name);
+            let tools = sdk_tool_inventory(build_driver_without_cursor());
+            cli::run_describe(&tools, &name);
             return Ok(());
         }
         cli::Command::McpConfig { client } => {
@@ -619,9 +672,21 @@ fn main() -> anyhow::Result<()> {
         }
         cli::Command::Serve {
             socket,
+            permission_mode,
+            dangerously_bypass_approvals,
+            allow_legacy_existing_profile_approval,
+            session_policy,
+            approve_session_policy,
             no_permissions_gate,
             claude_code_compat,
         } => {
+            configure_startup_permission_mode(
+                permission_mode.as_deref(),
+                dangerously_bypass_approvals,
+                allow_legacy_existing_profile_approval,
+                session_policy.as_deref(),
+                approve_session_policy,
+            )?;
             responsibility::reexec_disclaimed_if_needed();
             telemetry::capture_start(
                 telemetry::event::SERVE_START_LEGACY,
@@ -637,14 +702,13 @@ fn main() -> anyhow::Result<()> {
             let _ = no_permissions_gate;
             // Serve mode needs the cursor overlay just like MCP mode.
             let cursor_cfg = cursor_overlay::CursorConfig::from_args();
-            let reg = Arc::new(build_registry(cursor_cfg, claude_code_compat));
-            reg.init_self_weak();
+            let driver = build_driver(cursor_cfg, claude_code_compat);
             maybe_init_pip();
             let sp = socket.unwrap_or_else(serve::default_socket_path);
             let pid_path = serve::default_pid_file_path();
             // run_serve_cmd builds its own runtime; must run on a fresh thread.
             std::thread::spawn(move || {
-                serve::run_serve_cmd(reg, &sp, Some(&pid_path));
+                serve::run_serve_cmd(driver, &sp, Some(&pid_path));
             })
             .join()
             .ok();
@@ -653,6 +717,15 @@ fn main() -> anyhow::Result<()> {
         cli::Command::Stop { socket } => {
             let sp = socket.unwrap_or_else(serve::default_socket_path);
             serve::run_stop_cmd(&sp);
+            return Ok(());
+        }
+        cli::Command::Revoke {
+            socket,
+            session,
+            all,
+        } => {
+            let sp = socket.unwrap_or_else(serve::default_socket_path);
+            serve::run_revoke_cmd(&sp, session.as_deref(), all);
             return Ok(());
         }
         cli::Command::Status { socket } => {
@@ -670,8 +743,8 @@ fn main() -> anyhow::Result<()> {
             return Ok(());
         }
         cli::Command::DumpDocs { pretty, doc_type } => {
-            let reg = Arc::new(build_registry_no_cursor());
-            cli::run_dump_docs_with_type(&reg, pretty, &doc_type);
+            let tools = sdk_tool_inventory(build_driver_without_cursor());
+            cli::run_dump_docs_with_type(&tools, pretty, &doc_type);
             return Ok(());
         }
         cli::Command::Update { apply, json } => {
@@ -764,207 +837,6 @@ fn main() -> anyhow::Result<()> {
             }
             telemetry::flush_pending(std::time::Duration::from_millis(750));
             return Ok(());
-        }
-    }
-}
-
-// ── Registry builder (non-macOS) ──────────────────────────────────────────
-
-#[cfg(not(target_os = "macos"))]
-fn build_registry(
-    cursor_cfg: cursor_overlay::CursorConfig,
-    compat: bool,
-) -> cua_driver_core::tool::ToolRegistry {
-    #[cfg(target_os = "windows")]
-    {
-        cua_driver_core::recording::set_classified_screenshot_fn(|window_id, pid| {
-            platform_windows::recording_hooks::screenshot_for_recording(window_id, pid)
-        });
-        cua_driver_core::recording::set_click_marker_fn(|png_bytes, cx, cy| {
-            platform_windows::capture::crosshair_png_bytes(png_bytes, cx, cy).ok()
-        });
-        cua_driver_core::recording::set_ax_snapshot_fn(|window_id, pid| {
-            platform_windows::recording_hooks::app_state_json_for(window_id, pid)
-        });
-        cua_driver_core::recording::set_element_bounds_fn(|wid, pid, idx| {
-            platform_windows::recording_hooks::element_window_local_xy(wid, pid, idx)
-        });
-        cua_driver_core::video::set_video_backend_factory(Box::new(
-            cua_driver_core::video_ffmpeg::FfmpegVideoBackendFactory,
-        ));
-        {
-            let mut r = platform_windows::register_tools_with_cursor(cursor_cfg, compat);
-            check_update_tool::register_into(&mut r);
-            r
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        cua_driver_core::recording::set_screenshot_fn(|window_id, pid| {
-            platform_linux::recording_hooks::screenshot_for_recording(window_id, pid)
-        });
-        cua_driver_core::recording::set_click_marker_fn(|png_bytes, cx, cy| {
-            platform_linux::capture::crosshair_png_bytes(png_bytes, cx, cy).ok()
-        });
-        cua_driver_core::recording::set_ax_snapshot_fn(|window_id, pid| {
-            platform_linux::recording_hooks::app_state_json_for(window_id, pid)
-        });
-        cua_driver_core::recording::set_element_bounds_fn(|wid, pid, idx| {
-            platform_linux::recording_hooks::element_window_local_xy(wid, pid, idx)
-        });
-        if platform_linux::wayland::is_wayland() {
-            cua_driver_core::video::set_video_backend_factory(Box::new(
-                platform_linux::video_wayland::WfRecorderVideoBackendFactory,
-            ));
-        } else {
-            cua_driver_core::video::set_video_backend_factory(Box::new(
-                cua_driver_core::video_ffmpeg::FfmpegVideoBackendFactory,
-            ));
-        }
-        // SSH-driven Wayland+Xwayland sessions inherit DISPLAY but not
-        // XAUTHORITY; adopt the running X server's auth cookie so X11 tools
-        // don't all fail "Authorization required" (#1926). No-op when
-        // XAUTHORITY is already set or there's no DISPLAY.
-        platform_linux::xauth::ensure_xauthority_discovered();
-        // AT-SPI lives on the session bus; when the daemon is started outside
-        // the desktop session (container, headless, runuser, systemd system
-        // unit) DBUS_SESSION_BUS_ADDRESS is unset and the AT-SPI tree comes back
-        // empty. Recover it from /run/user/<uid>/bus or a running session
-        // process before the a11y advertise (which itself needs the bus). No-op
-        // when already set.
-        platform_linux::session_bus::ensure_session_bus_discovered();
-        // Advertise generic accessibility so GTK/Qt expose their AT-SPI trees.
-        // Chromium's global screen-reader signal requires an explicit opt-in.
-        // Best-effort and idempotent; only on the serve path, not for
-        // short-lived CLI calls.
-        platform_linux::a11y::ensure_accessibility_enabled();
-        if let Err(error) = platform_linux::atspi::ensure_listener_active() {
-            tracing::warn!("could not activate the persistent AT-SPI listener: {error}");
-        }
-        {
-            let mut r = platform_linux::register_tools_with_cursor(cursor_cfg, compat);
-            check_update_tool::register_into(&mut r);
-            r
-        }
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    {
-        let _ = cursor_cfg;
-        let _ = compat;
-        let mut r = cua_driver_core::tool::ToolRegistry::new();
-        r.register(Box::new(crate::stub::UnsupportedPlatformTool));
-        r
-    }
-}
-
-/// Build a registry without initialising the cursor overlay.
-/// Used by CLI subcommands (list-tools / describe / call) that don't need the overlay.
-#[cfg(not(target_os = "macos"))]
-fn build_registry_no_cursor() -> cua_driver_core::tool::ToolRegistry {
-    let compat = false;
-    #[cfg(target_os = "windows")]
-    {
-        cua_driver_core::recording::set_classified_screenshot_fn(|window_id, pid| {
-            platform_windows::recording_hooks::screenshot_for_recording(window_id, pid)
-        });
-        cua_driver_core::recording::set_click_marker_fn(|png_bytes, cx, cy| {
-            platform_windows::capture::crosshair_png_bytes(png_bytes, cx, cy).ok()
-        });
-        cua_driver_core::recording::set_ax_snapshot_fn(|window_id, pid| {
-            platform_windows::recording_hooks::app_state_json_for(window_id, pid)
-        });
-        cua_driver_core::recording::set_element_bounds_fn(|wid, pid, idx| {
-            platform_windows::recording_hooks::element_window_local_xy(wid, pid, idx)
-        });
-        cua_driver_core::video::set_video_backend_factory(Box::new(
-            cua_driver_core::video_ffmpeg::FfmpegVideoBackendFactory,
-        ));
-        {
-            let mut r = platform_windows::register_tools_with_cursor(
-                cursor_overlay::CursorConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                compat,
-            );
-            check_update_tool::register_into(&mut r);
-            r
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        platform_linux::xauth::ensure_xauthority_discovered();
-        platform_linux::session_bus::ensure_session_bus_discovered();
-        platform_linux::a11y::ensure_accessibility_enabled();
-        if let Err(error) = platform_linux::atspi::ensure_listener_active() {
-            tracing::warn!("could not activate the persistent AT-SPI listener: {error}");
-        }
-        cua_driver_core::recording::set_screenshot_fn(|window_id, pid| {
-            platform_linux::recording_hooks::screenshot_for_recording(window_id, pid)
-        });
-        cua_driver_core::recording::set_click_marker_fn(|png_bytes, cx, cy| {
-            platform_linux::capture::crosshair_png_bytes(png_bytes, cx, cy).ok()
-        });
-        cua_driver_core::recording::set_ax_snapshot_fn(|window_id, pid| {
-            platform_linux::recording_hooks::app_state_json_for(window_id, pid)
-        });
-        cua_driver_core::recording::set_element_bounds_fn(|wid, pid, idx| {
-            platform_linux::recording_hooks::element_window_local_xy(wid, pid, idx)
-        });
-        if platform_linux::wayland::is_wayland() {
-            cua_driver_core::video::set_video_backend_factory(Box::new(
-                platform_linux::video_wayland::WfRecorderVideoBackendFactory,
-            ));
-        } else {
-            cua_driver_core::video::set_video_backend_factory(Box::new(
-                cua_driver_core::video_ffmpeg::FfmpegVideoBackendFactory,
-            ));
-        }
-        {
-            let mut r = platform_linux::register_tools_with_cursor(
-                cursor_overlay::CursorConfig {
-                    enabled: false,
-                    ..Default::default()
-                },
-                compat,
-            );
-            check_update_tool::register_into(&mut r);
-            r
-        }
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-    {
-        let _ = compat;
-        let mut r = cua_driver_core::tool::ToolRegistry::new();
-        r.register(Box::new(crate::stub::UnsupportedPlatformTool));
-        r
-    }
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
-mod stub {
-    use async_trait::async_trait;
-    use cua_driver_core::tool::{Tool, ToolDef, ToolResult};
-    use serde_json::Value;
-
-    pub struct UnsupportedPlatformTool;
-
-    #[async_trait]
-    impl Tool for UnsupportedPlatformTool {
-        fn def(&self) -> &ToolDef {
-            static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
-            DEF.get_or_init(|| ToolDef {
-                name: "unsupported_platform".into(),
-                description: "This platform is not supported.".into(),
-                input_schema: serde_json::json!({"type":"object","properties":{}}),
-                read_only: true,
-                destructive: false,
-                idempotent: true,
-                open_world: false,
-            })
-        }
-        async fn invoke(&self, _args: Value) -> ToolResult {
-            ToolResult::error("Unsupported platform")
         }
     }
 }

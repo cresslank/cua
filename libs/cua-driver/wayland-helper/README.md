@@ -9,6 +9,9 @@ normal Wayland client cannot do these things globally.
 
 It exposes `org.cua.WinRects` on the session bus:
 
+- `GetVersion() -> uint` — a protocol identifier. The driver only accepts it
+  after resolving the helper's immutable D-Bus owner and proving that owner is
+  the current user's system-installed `gnome-shell` process.
 - `GetCapabilities() -> json` — protocol version, helper epoch, and exact-target
   capabilities. Driver/helper version skew fails closed.
 - `GetRects() -> json` — every window's epoch-qualified target id, workspace,
