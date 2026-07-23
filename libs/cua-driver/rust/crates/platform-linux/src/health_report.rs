@@ -559,8 +559,6 @@ fn probe_portal_screenshot() -> anyhow::Result<bool> {
 fn probe_portal_remote_desktop() -> anyhow::Result<bool> {
     #[cfg(feature = "portal-input")]
     {
-        use ashpd::desktop::remote_desktop::RemoteDesktop;
-
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -569,20 +567,27 @@ fn probe_portal_remote_desktop() -> anyhow::Result<bool> {
             })?;
 
         rt.block_on(async {
-            match RemoteDesktop::new().await {
-                Ok(_) => Ok(true),
-                Err(e) => {
-                    let msg = format!("{e}");
-                    if msg.contains("ServiceUnknown")
-                        || msg.contains("NameHasNoOwner")
-                        || msg.contains("NotFound")
-                    {
-                        Ok(false)
-                    } else {
-                        Err(anyhow::anyhow!("portal RemoteDesktop probe failed: {e}"))
-                    }
-                }
-            }
+            let probe = async {
+                let connection = zbus::Connection::session()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("session bus unreachable: {e}"))?;
+                let proxy = zbus::Proxy::new(
+                    &connection,
+                    "org.freedesktop.portal.Desktop",
+                    "/org/freedesktop/portal/desktop",
+                    "org.freedesktop.portal.RemoteDesktop",
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("portal RemoteDesktop proxy failed: {e}"))?;
+                proxy.get_property::<u32>("version").await.map_err(|e| {
+                    anyhow::anyhow!("portal RemoteDesktop version probe failed: {e}")
+                })?;
+                Ok(true)
+            };
+
+            tokio::time::timeout(std::time::Duration::from_secs(3), probe)
+                .await
+                .map_err(|_| anyhow::anyhow!("portal RemoteDesktop probe timed out after 3s"))?
         })
     }
     #[cfg(not(feature = "portal-input"))]
