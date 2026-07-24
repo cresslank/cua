@@ -931,7 +931,7 @@ dependencies = [
 
 [[package]]
 name = "cua-driver"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -966,7 +966,7 @@ dependencies = [
 
 [[package]]
 name = "cua-driver-bindgen"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "cbindgen",
  "uniffi",
@@ -974,7 +974,7 @@ dependencies = [
 
 [[package]]
 name = "cua-driver-contract"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "schemars",
  "serde",
@@ -984,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "cua-driver-core"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1011,7 +1011,7 @@ dependencies = [
 
 [[package]]
 name = "cua-driver-sdk"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "core-foundation",
  "cua-driver-contract",
@@ -1032,7 +1032,7 @@ dependencies = [
 
 [[package]]
 name = "cua-driver-testkit"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "core-foundation",
  "libc",
@@ -1046,7 +1046,7 @@ dependencies = [
 
 [[package]]
 name = "cua-driver-uia"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "anyhow",
  "cua-driver-core",
@@ -1061,7 +1061,7 @@ dependencies = [
 
 [[package]]
 name = "cursor-overlay"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "anyhow",
  "image",
@@ -2589,7 +2589,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pip-preview"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -2649,7 +2649,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "platform-linux"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -2692,7 +2692,7 @@ dependencies = [
 
 [[package]]
 name = "platform-macos"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2726,7 +2726,7 @@ dependencies = [
 
 [[package]]
 name = "platform-windows"
-version = "0.12.2"
+version = "0.12.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2858,12 +2858,11 @@ checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
 
 [[package]]
 name = "quick-xml"
-version = "0.39.4"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
- "serde",
 ]
 
 [[package]]
@@ -4574,9 +4573,9 @@ dependencies = [
 
 [[package]]
 name = "wayland-scanner"
-version = "0.31.10"
+version = "0.31.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9c324a910fd86ebdc364a3e61ec1f11737d3b1d6c273c0239ee8ff4bc0d24b4a"
+checksum = "338e30461b3a2b67d70eb30a6d89f8e0c93a833e07d2ae89085cd070c4a00ac0"
 dependencies = [
  "proc-macro2",
  "quick-xml",
@@ -5257,9 +5256,9 @@ dependencies = [
 
 [[package]]
 name = "zbus_names"
-version = "4.3.2"
+version = "4.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7074f3e50b894eac91750142016d30d0a89be8e67dbfd9704fb875825760e52d"
+checksum = "d8bf88b4a3ff53e883001e0e0115b297a9d53c31b9c1edd2bfdd853e3428624e"
 dependencies = [
  "serde",
  "winnow 1.0.3",
@@ -5268,12 +5267,12 @@ dependencies = [
 
 [[package]]
 name = "zbus_xml"
-version = "5.1.1"
+version = "5.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8067892e940ed1727dea64690378601603b31d62dfde019a5335fbb7c0e0ed9"
+checksum = "d1586c021a01ca0a9216dcd874e546382e156a5cbab5fab6cb5f10087e22682a"
 dependencies = [
- "quick-xml",
  "serde",
+ "winnow 1.0.3",
  "zbus_names",
  "zvariant",
 ]
@@ -5381,9 +5380,9 @@ dependencies = [
 
 [[package]]
 name = "zvariant"
-version = "5.12.0"
+version = "5.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a192a0bde63360d77a7523c833d4b4ce6070a927e2c53246e4c540b1a3e27be0"
+checksum = "bee2a0bcd2a907786a456fff45aaaaf54c9ba5f50b71ae9ec1a4edd200c94911"
 dependencies = [
  "endi",
  "enumflags2",
@@ -5395,9 +5394,9 @@ dependencies = [
 
 [[package]]
 name = "zvariant_derive"
-version = "5.12.0"
+version = "5.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90bc6cde9c01c511074be97f7ccb6c19d0da89e3f8662e812e999dcfd4638737"
+checksum = "38a708216a18780796770bfe3f4739c7c83a3e8f789b755534bbbc06e4e23e12"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -5408,9 +5407,9 @@ dependencies = [
 
 [[package]]
 name = "zvariant_utils"
-version = "3.4.0"
+version = "3.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1e8535915cfa75547e559d8c68e8139909a4aeee076831e4ef7fc59d8172c4d6"
+checksum = "90cb9383f9b45290407a1258b202d3f8f01db719eb60b4e4055c6375af4fc7c7"
 dependencies = [
  "proc-macro2",
  "quote",
