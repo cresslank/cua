@@ -3451,8 +3451,10 @@ impl Tool for TypeTextTool {
                 the system input queue), so the fallback path silently dropped chars. \
                 If you call `type_text(pid, text)` on a XAML host without `element_index`, \
                 the tool returns an actionable error pointing you at `get_window_state` \
-                first. Legacy Win32 apps still use the PostMessage path, preserving the \
-                no-focus-steal property.\n\n\
+                first. Native ConsoleHost on Windows ARM64 is hard-refused because it can \
+                accept synthesized Unicode events without delivering them; use a process \
+                or PTY setup channel instead. Legacy Win32 apps still use the PostMessage \
+                path, preserving the no-focus-steal property.\n\n\
                 `delay_ms` (0–200, default 30) spaces successive characters on the \
                 PostMessage path so autocomplete and IME can keep up. Ignored on the \
                 UIA path (SetValue is atomic).".into(),
@@ -3629,6 +3631,23 @@ impl Tool for TypeTextTool {
         };
         let text_len = text.chars().count();
 
+        // Native ConsoleHost can accept every synthesized Unicode event while
+        // dropping the text at the prompt (observed on Windows 11 ARM64).
+        // Classify terminal delivery before the foreground SendInput branch so
+        // an explicit foreground retry cannot bypass the hard refusal.
+        match crate::terminal::type_text_policy(hwnd, delivery.is_foreground()) {
+            crate::terminal::TypeTextPolicy::Unsupported => {
+                return crate::terminal::native_consolehost_type_text_error(hwnd);
+            }
+            crate::terminal::TypeTextPolicy::ForegroundRequired => {
+                return crate::input::delivery::background_unavailable_error(
+                    hwnd,
+                    EventKind::TextInput,
+                );
+            }
+            crate::terminal::TypeTextPolicy::Supported => {}
+        }
+
         // Refuse known background drops before the final WM_CHAR path. WPF is
         // conditional: indexed text still has a working UIA ValuePattern route,
         // while unindexed text would be posted to the top-level and disappear.
@@ -3742,20 +3761,6 @@ impl Tool for TypeTextTool {
                     },
                 );
             }
-        }
-
-        // 0. Terminal short-circuit: Windows Terminal, mintty, ConsoleWindowClass,
-        //    GVim / NeoVim — all consume keys through console / VT pipelines that
-        //    PostMessage(WM_CHAR) doesn't reach, and the `set_value` UIA path
-        //    silently no-ops on most of these. The only background way in was a
-        //    cloaked focus grab (SendInput Unicode) — which the macOS-aligned
-        //    contract forbids in background. Surface background_unavailable; the
-        //    agent escalates to delivery_mode:"foreground".
-        if crate::terminal::is_terminal_hwnd(hwnd) {
-            return crate::input::delivery::background_unavailable_error(
-                hwnd,
-                EventKind::TextInput,
-            );
         }
 
         // CUA-543 routing: PostMessage WM_CHAR doesn't reach modern
@@ -4748,7 +4753,7 @@ impl Tool for HotkeyTool {
         // on PostMessage and the no-foreground contract holds.
         // Foreground is an explicit request for system-queue delivery. This is
         // still required after a PX focus click: PostMessage does not update
-        // global modifier state, so Chromium never observes Ctrl+Shift+7 as a
+        // global modifier state, so Chromium never observes Ctrl+Shift+H as a
         // chord even though the renderer control is focused.
         let use_send_input = delivery == DeliveryMode::Foreground;
         let result = tokio::task::spawn_blocking(move || {
@@ -8699,7 +8704,7 @@ pub fn build_registry(compat: bool) -> ToolRegistry {
         std::sync::Arc::new(super::page::WindowsPageBackend::new()),
     )));
     let browser_engine = cua_driver_core::browser::BrowserEngine::new(std::sync::Arc::new(
-        crate::browser_platform::WindowsBrowserPlatform,
+        crate::browser_platform::WindowsBrowserPlatform::new(state.cursor_registry.clone()),
     ));
     cua_driver_core::browser::register_browser_tools(&browser_engine, &mut r);
     r.register_recording_tools();

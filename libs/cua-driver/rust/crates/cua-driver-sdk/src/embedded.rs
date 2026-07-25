@@ -431,6 +431,10 @@ impl EmbeddedCuaDriverHost {
         for variable in safe_environment(&self.options.environment) {
             command.env(variable.name, variable.value);
         }
+        command.env(
+            "CUA_DRIVER_EMBEDDED_HOST_PID",
+            std::process::id().to_string(),
+        );
 
         let mut child = command
             .spawn()
@@ -805,7 +809,7 @@ fn configuration_error<T>(reason: impl Into<String>) -> Result<T, EmbeddedDriver
     })
 }
 
-fn allowed_environment_name(name: &str) -> bool {
+pub(crate) fn allowed_environment_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     upper.starts_with("LC_")
         || matches!(
@@ -836,20 +840,96 @@ fn allowed_environment_name(name: &str) -> bool {
         )
 }
 
-fn safe_environment(overrides: &[EmbeddedEnvironmentVariable]) -> Vec<EmbeddedEnvironmentVariable> {
+pub(crate) fn inherited_managed_environment_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "CUA_DRIVER_PERMISSION_MODE"
+            | "CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS"
+            | "CUA_DRIVER_DISABLE_UNRESTRICTED"
+            | "CUA_DRIVER_ALLOW_LEGACY_EXISTING_PROFILE_APPROVAL"
+            | "CUA_DRIVER_SESSION_POLICY_FILE"
+            | "CUA_DRIVER_SESSION_POLICY_APPROVED"
+            | "CUA_DRIVER_POLICY_FILE"
+            | "CUA_DRIVER_MANAGED_POLICY_FILE"
+    )
+}
+
+/// Runtime-routing and state-root variables that a trusted host process may
+/// pass through to an isolated worker, but an SDK caller may not override in
+/// `environment`.
+///
+/// Private workers clear their environment before startup. Without this
+/// inherited-only set, Linux workers silently fall out of an explicitly
+/// selected Wayland/compositor route, lose isolated XDG roots, and can
+/// re-enable telemetry even when the host disabled it.
+pub(crate) fn inherited_runtime_environment_name(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "AT_SPI_BUS"
+            | "CUA_DRIVER_BROWSER_PROFILE_ROOT"
+            | "CUA_DRIVER_CDP_PORT"
+            | "CUA_DRIVER_RS_A11Y_ADVERTISE_MODE"
+            | "CUA_DRIVER_RS_DISABLE_A11Y_ADVERTISE"
+            | "CUA_DRIVER_RS_DRAW_SYSTEM_CURSOR"
+            | "CUA_DRIVER_RS_ENABLE_WAYLAND"
+            | "CUA_DRIVER_RS_HOME"
+            | "CUA_DRIVER_RS_TELEMETRY_ENABLED"
+            | "CUA_INJECT_SOCKET"
+            | "CUA_TELEMETRY_ENABLED"
+            | "CUA_WAYLAND_NEST"
+            | "CUA_WAYLAND_NEST_COMPOSITOR"
+            | "CUA_WAYLAND_RECORDING_OUTPUT"
+            | "SWAYSOCK"
+            | "WSL_DISTRO_NAME"
+            | "WSL_INTEROP"
+            | "XDG_CACHE_HOME"
+            | "XDG_CONFIG_HOME"
+            | "XDG_CURRENT_DESKTOP"
+            | "XDG_DATA_DIRS"
+            | "XDG_DATA_HOME"
+            | "XDG_SESSION_DESKTOP"
+            | "XDG_STATE_HOME"
+    )
+}
+
+pub(crate) fn safe_environment(
+    overrides: &[EmbeddedEnvironmentVariable],
+) -> Vec<EmbeddedEnvironmentVariable> {
+    merge_safe_environment(std::env::vars(), overrides)
+}
+
+fn merge_safe_environment(
+    inherited: impl IntoIterator<Item = (String, String)>,
+    overrides: &[EmbeddedEnvironmentVariable],
+) -> Vec<EmbeddedEnvironmentVariable> {
     let mut values = BTreeMap::new();
-    for (name, value) in std::env::vars() {
-        if allowed_environment_name(&name) {
-            values.insert(name, value);
+    for (name, value) in inherited {
+        if allowed_environment_name(&name)
+            || inherited_managed_environment_name(&name)
+            || inherited_runtime_environment_name(&name)
+        {
+            let canonical_name = if inherited_managed_environment_name(&name)
+                || inherited_runtime_environment_name(&name)
+            {
+                name.to_ascii_uppercase()
+            } else {
+                name
+            };
+            values.insert(
+                canonical_name.to_ascii_uppercase(),
+                EmbeddedEnvironmentVariable {
+                    name: canonical_name,
+                    value,
+                },
+            );
         }
     }
     for variable in overrides {
-        values.insert(variable.name.clone(), variable.value.clone());
+        if allowed_environment_name(&variable.name) {
+            values.insert(variable.name.to_ascii_uppercase(), variable.clone());
+        }
     }
-    values
-        .into_iter()
-        .map(|(name, value)| EmbeddedEnvironmentVariable { name, value })
-        .collect()
+    values.into_values().collect()
 }
 
 fn validate_metadata(
@@ -1115,6 +1195,90 @@ mod tests {
         assert!(!allowed_environment_name("CUA_DRIVER_PERMISSION_MODE"));
         assert!(!allowed_environment_name("LD_PRELOAD"));
         assert!(!allowed_environment_name("NODE_OPTIONS"));
+    }
+
+    #[test]
+    fn managed_environment_is_inherited_case_insensitively_but_never_overridden() {
+        assert!(inherited_managed_environment_name(
+            "cua_driver_disable_unrestricted"
+        ));
+        let values = merge_safe_environment(
+            [
+                ("Path".into(), "inherited-path".into()),
+                (
+                    "cua_driver_disable_unrestricted".into(),
+                    "inherited-lock".into(),
+                ),
+            ],
+            &[
+                EmbeddedEnvironmentVariable {
+                    name: "PATH".into(),
+                    value: "host-path".into(),
+                },
+                EmbeddedEnvironmentVariable {
+                    name: "CUA_DRIVER_DISABLE_UNRESTRICTED".into(),
+                    value: "forged-lock".into(),
+                },
+            ],
+        );
+        assert!(values
+            .iter()
+            .any(|variable| variable.name == "PATH" && variable.value == "host-path"));
+        assert!(values.iter().any(|variable| {
+            variable.name == "CUA_DRIVER_DISABLE_UNRESTRICTED" && variable.value == "inherited-lock"
+        }));
+        assert!(!values
+            .iter()
+            .any(|variable| variable.value == "forged-lock"));
+    }
+
+    #[test]
+    fn runtime_isolation_environment_is_inherited_but_never_overridden() {
+        for name in [
+            "CUA_DRIVER_RS_ENABLE_WAYLAND",
+            "CUA_DRIVER_RS_TELEMETRY_ENABLED",
+            "CUA_INJECT_SOCKET",
+            "XDG_CONFIG_HOME",
+        ] {
+            assert!(inherited_runtime_environment_name(name));
+            assert!(
+                !allowed_environment_name(name),
+                "caller-provided worker environment must not override {name}"
+            );
+        }
+
+        let values = merge_safe_environment(
+            [
+                ("cua_driver_rs_enable_wayland".into(), "1".into()),
+                ("CUA_DRIVER_RS_TELEMETRY_ENABLED".into(), "false".into()),
+                ("CUA_INJECT_SOCKET".into(), "/run/user/1000/cua.sock".into()),
+                ("XDG_CONFIG_HOME".into(), "/isolated/config".into()),
+            ],
+            &[
+                EmbeddedEnvironmentVariable {
+                    name: "CUA_INJECT_SOCKET".into(),
+                    value: "/tmp/forged.sock".into(),
+                },
+                EmbeddedEnvironmentVariable {
+                    name: "XDG_CONFIG_HOME".into(),
+                    value: "/tmp/forged-config".into(),
+                },
+            ],
+        );
+
+        for (name, value) in [
+            ("CUA_DRIVER_RS_ENABLE_WAYLAND", "1"),
+            ("CUA_DRIVER_RS_TELEMETRY_ENABLED", "false"),
+            ("CUA_INJECT_SOCKET", "/run/user/1000/cua.sock"),
+            ("XDG_CONFIG_HOME", "/isolated/config"),
+        ] {
+            assert!(values
+                .iter()
+                .any(|variable| variable.name == name && variable.value == value));
+        }
+        assert!(!values
+            .iter()
+            .any(|variable| variable.value.starts_with("/tmp/forged")));
     }
 
     #[test]

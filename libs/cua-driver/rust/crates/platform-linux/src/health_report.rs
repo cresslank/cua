@@ -559,6 +559,8 @@ fn probe_portal_screenshot() -> anyhow::Result<bool> {
 fn probe_portal_remote_desktop() -> anyhow::Result<bool> {
     #[cfg(feature = "portal-input")]
     {
+        use ashpd::desktop::remote_desktop::RemoteDesktop;
+
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -567,27 +569,29 @@ fn probe_portal_remote_desktop() -> anyhow::Result<bool> {
             })?;
 
         rt.block_on(async {
-            let probe = async {
-                let connection = zbus::Connection::session()
+            let probe = tokio::time::timeout(crate::wayland::portal::PROBE_TIMEOUT, async {
+                let connection = crate::wayland::portal::fresh_session_connection().await?;
+                RemoteDesktop::with_connection(connection)
                     .await
-                    .map_err(|e| anyhow::anyhow!("session bus unreachable: {e}"))?;
-                let proxy = zbus::Proxy::new(
-                    &connection,
-                    "org.freedesktop.portal.Desktop",
-                    "/org/freedesktop/portal/desktop",
-                    "org.freedesktop.portal.RemoteDesktop",
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("portal RemoteDesktop proxy failed: {e}"))?;
-                proxy.get_property::<u32>("version").await.map_err(|e| {
-                    anyhow::anyhow!("portal RemoteDesktop version probe failed: {e}")
-                })?;
-                Ok(true)
-            };
+                    .map_err(anyhow::Error::from)
+            })
+            .await;
 
-            tokio::time::timeout(std::time::Duration::from_secs(3), probe)
-                .await
-                .map_err(|_| anyhow::anyhow!("portal RemoteDesktop probe timed out after 3s"))?
+            match probe {
+                Err(_) => Err(anyhow::anyhow!("portal RemoteDesktop probe timed out")),
+                Ok(Ok(_)) => Ok(true),
+                Ok(Err(e)) => {
+                    let msg = format!("{e}");
+                    if msg.contains("ServiceUnknown")
+                        || msg.contains("NameHasNoOwner")
+                        || msg.contains("NotFound")
+                    {
+                        Ok(false)
+                    } else {
+                        Err(anyhow::anyhow!("portal RemoteDesktop probe failed: {e}"))
+                    }
+                }
+            }
         })
     }
     #[cfg(not(feature = "portal-input"))]
