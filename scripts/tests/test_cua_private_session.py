@@ -21,6 +21,7 @@ def _load() -> ModuleType:
 
 def test_private_environment_drops_human_desktop_endpoints(tmp_path, monkeypatch):
     module = _load()
+    monkeypatch.setenv("HOME", "/home/human")
     monkeypatch.setenv("DISPLAY", ":99")
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-human")
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/human")
@@ -32,8 +33,11 @@ def test_private_environment_drops_human_desktop_endpoints(tmp_path, monkeypatch
     assert "DISPLAY" not in env
     assert "WAYLAND_DISPLAY" not in env
     assert "DBUS_SESSION_BUS_ADDRESS" not in env
+    assert env["HOME"] == str(tmp_path / "state/home")
+    assert env["XDG_STATE_HOME"].endswith("instances/lane-a/state")
     assert env["CUA_INJECT_SOCKET"].endswith("/cua-inject-v2.sock")
     assert env["CUA_BROWSER_PROFILE_DIR"].endswith("instances/lane-a/browser-profile")
+    assert env["CUA_DRIVER_BROWSER_PROFILE_ROOT"] == env["CUA_BROWSER_PROFILE_DIR"]
 
 
 def test_dry_run_has_no_compositor_side_effect(tmp_path, capsys):

@@ -55,9 +55,11 @@ def _base_environment(args: argparse.Namespace, runtime: Path) -> dict[str, str]
     state = args.state_dir.expanduser().resolve()
     instance = state / "instances" / args.name
     home = state / "home"
+    browser_profile = instance / "browser-profile"
     env = os.environ.copy()
     env.update(
         {
+            "HOME": str(home),
             "XDG_RUNTIME_DIR": str(runtime),
             "XDG_SESSION_TYPE": "wayland",
             "XDG_CURRENT_DESKTOP": "cua-private",
@@ -65,13 +67,15 @@ def _base_environment(args: argparse.Namespace, runtime: Path) -> dict[str, str]
             "XDG_CONFIG_HOME": str(home / ".config"),
             "XDG_DATA_HOME": str(home / ".local" / "share"),
             "XDG_CACHE_HOME": str(instance / "cache"),
+            "XDG_STATE_HOME": str(instance / "state"),
             "CUA_DRIVER_RS_ENABLE_WAYLAND": "1",
+            "CUA_DRIVER_BROWSER_PROFILE_ROOT": str(browser_profile),
             "CUA_INJECT_SOCKET": str(runtime / "cua-inject-v2.sock"),
             "CUA_OUTW": str(args.width),
             "CUA_OUTH": str(args.height),
             "CUA_PRIVATE_INSTANCE": args.name,
             "CUA_PRIVATE_STATE_DIR": str(instance),
-            "CUA_BROWSER_PROFILE_DIR": str(instance / "browser-profile"),
+            "CUA_BROWSER_PROFILE_DIR": str(browser_profile),
             "WLR_BACKENDS": "headless",
             "WLR_RENDERER": "pixman",
             "WLR_RENDERER_ALLOW_SOFTWARE": "1",
@@ -215,6 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     for directory in (
         instance,
         instance / "cache",
+        instance / "state",
         instance / "browser-profile",
         state / "home" / ".config",
         state / "home" / ".local" / "share",

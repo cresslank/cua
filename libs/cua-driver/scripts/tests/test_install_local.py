@@ -42,7 +42,7 @@ def test_installer_stages_binary_from_custom_cargo_target(
     _write_executable(
         fake_bin / "cargo",
         """set -eu
-test "${1:-}" = build
+test "$*" = "build --locked --release -p cua-driver --features portal-input"
 test "$CARGO_TARGET_DIR" = "$EXPECTED_CARGO_TARGET_DIR"
 mkdir -p "$CARGO_TARGET_DIR/release"
 printf 'fresh custom target\n' > "$CARGO_TARGET_DIR/release/cua-driver"

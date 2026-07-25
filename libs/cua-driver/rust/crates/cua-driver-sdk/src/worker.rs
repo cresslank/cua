@@ -566,6 +566,10 @@ mod tests {
     #[test]
     fn runtime_isolation_is_inherited_but_cannot_be_overridden() {
         for name in [
+            "AT_SPI_BUS_ADDRESS",
+            "CUA_BROWSER_PROFILE_DIR",
+            "CUA_DRIVER_BROWSER_PROFILE_ROOT",
+            "CUA_DRIVER_RS_DISABLE_A11Y_ADVERTISE",
             "CUA_DRIVER_RS_ENABLE_WAYLAND",
             "CUA_DRIVER_RS_TELEMETRY_ENABLED",
             "CUA_INJECT_SOCKET",

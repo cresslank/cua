@@ -866,6 +866,8 @@ pub(crate) fn inherited_runtime_environment_name(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
         "AT_SPI_BUS"
+            | "AT_SPI_BUS_ADDRESS"
+            | "CUA_BROWSER_PROFILE_DIR"
             | "CUA_DRIVER_BROWSER_PROFILE_ROOT"
             | "CUA_DRIVER_CDP_PORT"
             | "CUA_DRIVER_RS_A11Y_ADVERTISE_MODE"
@@ -875,6 +877,8 @@ pub(crate) fn inherited_runtime_environment_name(name: &str) -> bool {
             | "CUA_DRIVER_RS_HOME"
             | "CUA_DRIVER_RS_TELEMETRY_ENABLED"
             | "CUA_INJECT_SOCKET"
+            | "CUA_PRIVATE_INSTANCE"
+            | "CUA_PRIVATE_STATE_DIR"
             | "CUA_TELEMETRY_ENABLED"
             | "CUA_WAYLAND_NEST"
             | "CUA_WAYLAND_NEST_COMPOSITOR"
@@ -1235,6 +1239,10 @@ mod tests {
     #[test]
     fn runtime_isolation_environment_is_inherited_but_never_overridden() {
         for name in [
+            "AT_SPI_BUS_ADDRESS",
+            "CUA_BROWSER_PROFILE_DIR",
+            "CUA_DRIVER_BROWSER_PROFILE_ROOT",
+            "CUA_DRIVER_RS_DISABLE_A11Y_ADVERTISE",
             "CUA_DRIVER_RS_ENABLE_WAYLAND",
             "CUA_DRIVER_RS_TELEMETRY_ENABLED",
             "CUA_INJECT_SOCKET",
@@ -1249,7 +1257,16 @@ mod tests {
 
         let values = merge_safe_environment(
             [
-                ("cua_driver_rs_enable_wayland".into(), "1".into()),
+                (
+                    "AT_SPI_BUS_ADDRESS".into(),
+                    "unix:path=/run/user/1000/private-atspi".into(),
+                ),
+                (
+                    "CUA_DRIVER_BROWSER_PROFILE_ROOT".into(),
+                    "/isolated/browser-profile".into(),
+                ),
+                ("CUA_DRIVER_RS_DISABLE_A11Y_ADVERTISE".into(), "1".into()),
+                ("cua_driver_rs_enable_wayland".into(), "0".into()),
                 ("CUA_DRIVER_RS_TELEMETRY_ENABLED".into(), "false".into()),
                 ("CUA_INJECT_SOCKET".into(), "/run/user/1000/cua.sock".into()),
                 ("XDG_CONFIG_HOME".into(), "/isolated/config".into()),
@@ -1267,7 +1284,16 @@ mod tests {
         );
 
         for (name, value) in [
-            ("CUA_DRIVER_RS_ENABLE_WAYLAND", "1"),
+            (
+                "AT_SPI_BUS_ADDRESS",
+                "unix:path=/run/user/1000/private-atspi",
+            ),
+            (
+                "CUA_DRIVER_BROWSER_PROFILE_ROOT",
+                "/isolated/browser-profile",
+            ),
+            ("CUA_DRIVER_RS_DISABLE_A11Y_ADVERTISE", "1"),
+            ("CUA_DRIVER_RS_ENABLE_WAYLAND", "0"),
             ("CUA_DRIVER_RS_TELEMETRY_ENABLED", "false"),
             ("CUA_INJECT_SOCKET", "/run/user/1000/cua.sock"),
             ("XDG_CONFIG_HOME", "/isolated/config"),
