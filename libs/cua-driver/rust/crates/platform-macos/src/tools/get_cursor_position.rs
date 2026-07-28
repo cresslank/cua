@@ -44,7 +44,7 @@ impl Tool for GetCursorPositionTool {
             event_source::{CGEventSource, CGEventSourceStateID},
         };
 
-        let result = tokio::task::spawn_blocking(|| {
+        let result = cua_driver_core::blocking::spawn(|| {
             let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
                 .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
             let event = CGEvent::new(source).map_err(|_| anyhow::anyhow!("CGEvent::new failed"))?;

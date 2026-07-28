@@ -101,7 +101,7 @@ async fn check_ax_capability() -> CheckEntry {
     // `org.a11y.Bus` being reachable on the session bus. Falls back to X11
     // reachability for X / XWayland sessions.
     if is_wayland_session() {
-        let bus_ok = tokio::task::spawn_blocking(probe_a11y_bus)
+        let bus_ok = cua_driver_core::blocking::spawn(probe_a11y_bus)
             .await
             .unwrap_or(false);
         if bus_ok {
@@ -122,7 +122,7 @@ async fn check_ax_capability() -> CheckEntry {
     // Mirror the existing `check_permissions` Linux probe: X11
     // connectivity is the AX prerequisite (AT-SPI is over D-Bus, but
     // input/readback need an X server). Cheap and side-effect-free.
-    let x11_ok = tokio::task::spawn_blocking(probe_x11_connect)
+    let x11_ok = cua_driver_core::blocking::spawn(probe_x11_connect)
         .await
         .unwrap_or(false);
     if x11_ok {
@@ -130,7 +130,7 @@ async fn check_ax_capability() -> CheckEntry {
         // org.a11y.Bus on the session bus. Probe it so we don't claim AX works
         // when the tree would come back empty — the DBUS_SESSION_BUS_ADDRESS-
         // unset / a11y-bridge-off case the daemon now auto-recovers at startup.
-        let a11y_ok = tokio::task::spawn_blocking(probe_a11y_bus)
+        let a11y_ok = cua_driver_core::blocking::spawn(probe_a11y_bus)
             .await
             .unwrap_or(false);
         if a11y_ok {
@@ -189,7 +189,7 @@ async fn check_screen_capture_capability() -> CheckEntry {
     // misleading "screen capture will fail" just because wlroots isn't
     // present.
     if is_wayland_session() {
-        let snap = tokio::task::spawn_blocking(probe_wayland_managers)
+        let snap = cua_driver_core::blocking::spawn(probe_wayland_managers)
             .await
             .ok()
             .and_then(|r| r.ok());
@@ -214,7 +214,7 @@ async fn check_screen_capture_capability() -> CheckEntry {
         // No wlr screencopy AND no ext-image-copy-capture. Probe the
         // portal as the last native tier. The probe is read-only — it
         // checks for a name owner on the bus, does NOT take a screenshot.
-        let portal_ok = tokio::task::spawn_blocking(probe_portal_screenshot)
+        let portal_ok = cua_driver_core::blocking::spawn(probe_portal_screenshot)
             .await
             .ok()
             .and_then(|r| r.ok())
@@ -242,7 +242,7 @@ async fn check_screen_capture_capability() -> CheckEntry {
     // we use for ax_capability, but the consumer-facing message and
     // hint differ so future drift between the two doesn't break either
     // contract.
-    let x11_ok = tokio::task::spawn_blocking(probe_x11_connect)
+    let x11_ok = cua_driver_core::blocking::spawn(probe_x11_connect)
         .await
         .unwrap_or(false);
     if x11_ok {
@@ -285,7 +285,7 @@ async fn check_wayland_backend() -> CheckEntry {
             ),
         );
     }
-    let snap = match tokio::task::spawn_blocking(probe_wayland_managers).await {
+    let snap = match cua_driver_core::blocking::spawn(probe_wayland_managers).await {
         Ok(Ok(snap)) => snap,
         Ok(Err(e)) => {
             return CheckEntry::fail(
@@ -303,7 +303,7 @@ async fn check_wayland_backend() -> CheckEntry {
         }
     };
     let remote_desktop_portal_reachable = if portal_input_enabled() {
-        tokio::task::spawn_blocking(probe_portal_remote_desktop)
+        cua_driver_core::blocking::spawn(probe_portal_remote_desktop)
             .await
             .ok()
             .and_then(|r| r.ok())

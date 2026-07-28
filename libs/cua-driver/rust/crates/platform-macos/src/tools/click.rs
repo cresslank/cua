@@ -190,7 +190,7 @@ impl Tool for ClickTool {
             // screenshot width / logical screen width. This is robust even when
             // CGDisplayPixelsWide under-reports the backing scale (it returns the
             // scaled-mode point width on some Retina configs → a bogus 1.0).
-            let desktop_ratio = tokio::task::spawn_blocking(|| {
+            let desktop_ratio = cua_driver_core::blocking::spawn(|| {
                 let logical_w =
                     super::get_screen_size::main_screen_size().map(|(w, _, _)| w as f64);
                 let shot_w = crate::capture::screenshot_display_bytes()
@@ -225,7 +225,7 @@ impl Tool for ClickTool {
                 .update_position(&cursor_key, sx, sy);
 
             let btn = button.clone();
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<()> {
                 // Desktop scope is explicitly foreground and vision-driven: post
                 // at the global HID tap so WindowServer delivers to the window
                 // actually visible at this point. PID-posting here would silently
@@ -345,7 +345,7 @@ impl Tool for ClickTool {
             // Animate cursor to element center BEFORE firing AX action,
             // mirroring Swift's `performElementClick` → `animateAndWait(to:)`.
             let center_ptr = element_ptr;
-            let center = tokio::task::spawn_blocking(move || unsafe {
+            let center = cua_driver_core::blocking::spawn(move || unsafe {
                 crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
             })
             .await
@@ -377,7 +377,7 @@ impl Tool for ClickTool {
                     .update_position(&cursor_key, cx, cy);
 
                 let mods_owned = modifiers.clone();
-                let result = tokio::task::spawn_blocking(move || {
+                let result = cua_driver_core::blocking::spawn(move || {
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                     crate::input::mouse::middle_click_at_xy(pid, cx, cy, &m)
                 })
@@ -435,7 +435,7 @@ impl Tool for ClickTool {
                 prior_front,
                 "click.AXPress",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    cua_driver_core::blocking::spawn(move || {
                         if foreground {
                             let mut outcome = None;
                             let fronted = crate::input::skylight::with_foreground_assist(
@@ -531,7 +531,7 @@ impl Tool for ClickTool {
                             &self.state.config.read().unwrap(),
                         );
                         let dbg_path_c = dbg_path.clone();
-                        let dbg_result = tokio::task::spawn_blocking(move || {
+                        let dbg_result = cua_driver_core::blocking::spawn(move || {
                             let png = crate::capture::screenshot_window_bytes(wid)?;
                             let png = crate::capture::resize_png_if_needed(&png, max_dim)?;
                             crate::capture::write_crosshair_png(&png, cx, cy, &dbg_path_c)
@@ -586,7 +586,7 @@ impl Tool for ClickTool {
             // win_local_x/y: window-local logical-pixel coords (= cx/scale, cy/scale)
             // needed for CGEventSetWindowLocation in the Chromium recipe.
             let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(wid) = window_id {
-                let result = tokio::task::spawn_blocking(move || {
+                let result = cua_driver_core::blocking::spawn(move || {
                     let bounds = crate::windows::window_bounds_by_id(wid);
                     let scale: f64 = if let Some(ref b) = bounds {
                         // Detect Retina scale from the window screenshot.
@@ -639,7 +639,7 @@ impl Tool for ClickTool {
                 && modifiers.is_empty()
             {
                 let focus_only = action == "focus";
-                let ax_result = tokio::task::spawn_blocking(move || unsafe {
+                let ax_result = cua_driver_core::blocking::spawn(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                         return Ok::<bool, anyhow::Error>(false);
                     };
@@ -731,7 +731,7 @@ impl Tool for ClickTool {
                 prior_front,
                 "click.pixel",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    cua_driver_core::blocking::spawn(move || {
                         let do_click = move || -> anyhow::Result<()> {
                             let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                             match button_kind.as_str() {

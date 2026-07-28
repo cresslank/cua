@@ -114,7 +114,7 @@ impl Tool for DoubleClickTool {
             // Thread the resolved session cursor key into the blocking AX path
             // so its ClickPulse lands on THIS session's cursor, not "default".
             let ck = cursor_key.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::blocking::spawn(move || {
                 ax_double_click(pid, wid, element_ptr, idx, &ck)
             })
             .await;
@@ -149,7 +149,7 @@ impl Tool for DoubleClickTool {
         // Window-local → screen coordinate translation + win-local logical coords
         // for CGEventSetWindowLocation (matches click.rs enhancement).
         let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(wid) = window_id {
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::blocking::spawn(move || {
                 let bounds = crate::windows::window_bounds_by_id(wid);
                 let scale: f64 = if let Some(ref b) = bounds {
                     if let Ok(png) = crate::capture::screenshot_window_bytes(wid) {
@@ -204,7 +204,7 @@ impl Tool for DoubleClickTool {
         );
 
         let fg = delivery_mode.is_foreground() && window_id.is_some();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<()> {
             let do_click = move || -> anyhow::Result<()> {
                 if let Some(wid) = window_id {
                     crate::input::mouse::click_at_xy_with_window_local(

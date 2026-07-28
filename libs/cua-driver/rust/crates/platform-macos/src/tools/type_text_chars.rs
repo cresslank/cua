@@ -102,7 +102,7 @@ impl Tool for TypeTextCharsTool {
                     self.state.element_cache.get_element_retained(pid, wid, idx)
                 {
                     let element_ptr = element_guard.as_ptr();
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let _ = cua_driver_core::blocking::spawn(move || {
                         crate::input::ax_actions::focus_element(element_ptr)
                     })
                     .await;
@@ -113,7 +113,7 @@ impl Tool for TypeTextCharsTool {
         }
 
         let text_len = text.chars().count();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = cua_driver_core::blocking::spawn(move || {
             crate::input::keyboard::type_text_with_delay(pid, &text, delay_ms)
         })
         .await;

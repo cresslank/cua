@@ -78,7 +78,7 @@ impl Tool for ZoomTool {
         }
 
         let state = self.state.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = cua_driver_core::blocking::spawn(move || {
             let png_bytes = crate::capture::screenshot_window_bytes(window_id)?;
             cursor_overlay::capture_utils::crop_png_to_jpeg(&png_bytes, x1, y1, x2, y2, 500)
         })

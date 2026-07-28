@@ -341,12 +341,23 @@ async fn active_port_endpoint(
         ownership: EndpointOwnershipProof {
             method: EndpointOwnershipMethod::DevtoolsActivePortsFile,
             owner_pid: pid,
+            listener_pid: None,
             detail: Some(
                 "exact default-profile DevToolsActivePort path plus lsof loopback listener owner"
                     .to_owned(),
             ),
         },
     }))
+}
+
+fn ensure_profile_discoverable(pid: i64) -> Result<(), BrowserRefusal> {
+    let pid = i32::try_from(pid).map_err(|_| {
+        refusal(
+            BrowserRefusalCode::BrowserWrongTargetRefused,
+            "browser pid is outside the macOS process-id range",
+        )
+    })?;
+    super::setup_ui::ensure_profile_discoverable(pid)
 }
 
 async fn browser_websocket_url(port: u16) -> Option<String> {
@@ -470,16 +481,17 @@ impl BrowserPlatform for MacOsBrowserPlatform {
     }
 
     async fn classify_browser(&self, pid: i64) -> Result<BrowserClassification, BrowserRefusal> {
-        let (app, fallback_name, fallback_bundle_id) = tokio::task::spawn_blocking(move || {
-            let app = crate::apps::list_running_apps()
-                .into_iter()
-                .find(|app| i64::from(app.pid) == pid);
-            let fallback_name = crate::apps::get_app_name_for_pid(pid as i32);
-            let fallback_bundle_id = crate::apps::bundle_id_for_pid(pid as i32);
-            (app, fallback_name, fallback_bundle_id)
-        })
-        .await
-        .unwrap_or((None, None, None));
+        let (app, fallback_name, fallback_bundle_id) =
+            cua_driver_core::blocking::spawn(move || {
+                let app = crate::apps::list_running_apps()
+                    .into_iter()
+                    .find(|app| i64::from(app.pid) == pid);
+                let fallback_name = crate::apps::get_app_name_for_pid(pid as i32);
+                let fallback_bundle_id = crate::apps::bundle_id_for_pid(pid as i32);
+                (app, fallback_name, fallback_bundle_id)
+            })
+            .await
+            .unwrap_or((None, None, None));
         let name = app
             .as_ref()
             .map(|app| app.name.as_str())
@@ -523,7 +535,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 format!("window_id {window_id} is outside the macOS window-id range"),
             )
         })?;
-        let window = tokio::task::spawn_blocking(move || {
+        let window = cua_driver_core::blocking::spawn(move || {
             crate::windows::all_windows()
                 .into_iter()
                 .find(|window| window.window_id == window_id_u32)
@@ -567,7 +579,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         pid: i64,
         window_id: u64,
     ) -> Result<Option<bool>, BrowserRefusal> {
-        let windows = tokio::task::spawn_blocking(move || {
+        let windows = cua_driver_core::blocking::spawn(move || {
             exact_browser_surface_ids(crate::windows::all_windows(), pid)
         })
         .await
@@ -584,6 +596,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         &self,
         pid: i64,
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
+        ensure_profile_discoverable(pid)?;
         for port in loopback_ports_for_pid(pid).await? {
             if let Some(ws_url) = browser_websocket_url(port).await {
                 return Ok(Some(OwnedEndpoint {
@@ -592,6 +605,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                     ownership: EndpointOwnershipProof {
                         method: EndpointOwnershipMethod::ListeningSocketPid,
                         owner_pid: pid,
+                        listener_pid: None,
                         detail: Some("lsof loopback listener owner".to_owned()),
                     },
                 }));
@@ -604,6 +618,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         &self,
         pid: i64,
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
+        ensure_profile_discoverable(pid)?;
         let classification = self.classify_browser(pid).await?;
         if let Some(endpoint) = active_port_endpoint(pid, classification.product_kind).await? {
             return Ok(Some(endpoint));
@@ -623,6 +638,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 ownership: EndpointOwnershipProof {
                     method: EndpointOwnershipMethod::ListeningSocketPid,
                     owner_pid: pid,
+                    listener_pid: None,
                     detail: Some("lsof loopback listener owner plus /json/version".to_owned()),
                 },
             }));
@@ -645,6 +661,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         pid: i64,
         expected_ws_url: &str,
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
+        ensure_profile_discoverable(pid)?;
         let Some(port) = loopback_websocket_port(expected_ws_url) else {
             return Err(refusal(
                 BrowserRefusalCode::BrowserEndpointOwnerMismatch,
@@ -670,6 +687,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             ownership: EndpointOwnershipProof {
                 method: EndpointOwnershipMethod::ListeningSocketPid,
                 owner_pid: pid,
+                listener_pid: None,
                 detail: Some("lsof owner of exact approved endpoint".to_owned()),
             },
         }))
@@ -705,7 +723,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             Some(pid),
             "browser_prepare.remote_debugging",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                cua_driver_core::blocking::spawn(move || {
                     super::setup_ui::enable(pid, window_id, descriptor)
                 })
                 .await
@@ -723,6 +741,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         .await?;
         let opened_setup_page = handle.opened_setup_page;
         let enabled_remote_debugging = handle.enabled_remote_debugging;
+        let used_bounded_pixel_fallback = handle.used_bounded_pixel_fallback;
         let focused_setup_address_field = handle.focused_setup_address_field;
         let foregrounded_window = handle.foregrounded_window;
         let injected_global_input = handle.injected_global_input;
@@ -774,6 +793,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                         ownership: EndpointOwnershipProof {
                             method: EndpointOwnershipMethod::ListeningSocketPid,
                             owner_pid: request.pid,
+                            listener_pid: None,
                             detail: Some((*detail).to_owned()),
                         },
                     })
@@ -805,7 +825,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             Ok(endpoint) => endpoint,
             Err(error) => {
                 let error =
-                    tokio::task::spawn_blocking(move || handle.abort(pid, window_id, error))
+                    cua_driver_core::blocking::spawn(move || handle.abort(pid, window_id, error))
                         .await
                         .map_err(|join_error| {
                             refusal(
@@ -822,6 +842,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             opened_setup_page,
             closed_setup_page: false,
             enabled_remote_debugging,
+            used_bounded_pixel_fallback,
             focused_setup_address_field,
             foregrounded_window,
             injected_global_input,
@@ -845,7 +866,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 "the approved browser window is outside the macOS window-id range",
             )
         })?;
-        tokio::task::spawn_blocking(move || super::setup_ui::commit_pending(pid, window_id))
+        cua_driver_core::blocking::spawn(move || super::setup_ui::commit_pending(pid, window_id))
             .await
             .map_err(|error| {
                 refusal(
@@ -866,14 +887,16 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         let Ok(window_id) = u32::try_from(request.window_id) else {
             return error;
         };
-        tokio::task::spawn_blocking(move || super::setup_ui::abort_pending(pid, window_id, error))
-            .await
-            .unwrap_or_else(|join_error| {
-                refusal(
-                    BrowserRefusalCode::BrowserRouteUnavailable,
-                    format!("could not roll back exact browser setup: {join_error}"),
-                )
-            })
+        cua_driver_core::blocking::spawn(move || {
+            super::setup_ui::abort_pending(pid, window_id, error)
+        })
+        .await
+        .unwrap_or_else(|join_error| {
+            refusal(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                format!("could not roll back exact browser setup: {join_error}"),
+            )
+        })
     }
 
     async fn handle_existing_profile_consent(

@@ -27,7 +27,7 @@ impl MacOsPageBackend {
 
     /// Resolve `bundle_id` for `pid` via the running-apps list.
     async fn bundle_id_for(pid: i32) -> String {
-        tokio::task::spawn_blocking(move || {
+        cua_driver_core::blocking::spawn(move || {
             crate::apps::list_running_apps()
                 .into_iter()
                 .find(|a| a.pid == pid)
@@ -45,7 +45,7 @@ impl PageBackend for MacOsPageBackend {
         let bundle_id = Self::bundle_id_for(pid).await;
 
         let use_ax_fallback = !BrowserJs::supports(&bundle_id)
-            && tokio::task::spawn_blocking(move || is_wk_web_view_app(pid))
+            && cua_driver_core::blocking::spawn(move || is_wk_web_view_app(pid))
                 .await
                 .unwrap_or(false);
 
@@ -70,7 +70,7 @@ impl PageBackend for MacOsPageBackend {
         let bundle_id = Self::bundle_id_for(pid).await;
 
         let use_ax_fallback = !BrowserJs::supports(&bundle_id)
-            && tokio::task::spawn_blocking(move || is_wk_web_view_app(pid))
+            && cua_driver_core::blocking::spawn(move || is_wk_web_view_app(pid))
                 .await
                 .unwrap_or(false);
 
@@ -269,11 +269,12 @@ async fn execute_js(js: &str, bundle_id: &str, pid: i32, window_id: u64) -> anyh
             .map_err(|_| anyhow::anyhow!("macOS window_id {window_id} is out of u32 range"))?;
         return BrowserJs::execute(js, bundle_id, window_id).await;
     }
-    let is_electron = tokio::task::spawn_blocking(move || ElectronJs::is_electron(pid)).await?;
+    let is_electron =
+        cua_driver_core::blocking::spawn(move || ElectronJs::is_electron(pid)).await?;
     if is_electron {
         return ElectronJs::execute(js, pid).await;
     }
-    let is_wk = tokio::task::spawn_blocking(move || is_wk_web_view_app(pid)).await?;
+    let is_wk = cua_driver_core::blocking::spawn(move || is_wk_web_view_app(pid)).await?;
     if is_wk {
         anyhow::bail!(
             "execute_javascript is not available for WKWebView/Tauri apps. \
@@ -287,10 +288,11 @@ async fn execute_js(js: &str, bundle_id: &str, pid: i32, window_id: u64) -> anyh
 async fn ax_text_fallback(pid: i32, window_id: u64) -> anyhow::Result<String> {
     let window_id = u32::try_from(window_id)
         .map_err(|_| anyhow::anyhow!("macOS window_id {window_id} is out of u32 range"))?;
-    let result =
-        tokio::task::spawn_blocking(move || crate::ax::tree::walk_tree(pid, Some(window_id), None))
-            .await
-            .map_err(|e| anyhow::anyhow!("AX walk task failed: {e}"))?;
+    let result = cua_driver_core::blocking::spawn(move || {
+        crate::ax::tree::walk_tree(pid, Some(window_id), None)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("AX walk task failed: {e}"))?;
     Ok(AXPageReader::extract_text(&result.tree_markdown))
 }
 
@@ -303,10 +305,11 @@ async fn ax_query_fallback(
     let window_id = u32::try_from(window_id)
         .map_err(|_| anyhow::anyhow!("macOS window_id {window_id} is out of u32 range"))?;
     let sel = selector.to_owned();
-    let result =
-        tokio::task::spawn_blocking(move || crate::ax::tree::walk_tree(pid, Some(window_id), None))
-            .await
-            .map_err(|e| anyhow::anyhow!("AX walk task failed: {e}"))?;
+    let result = cua_driver_core::blocking::spawn(move || {
+        crate::ax::tree::walk_tree(pid, Some(window_id), None)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("AX walk task failed: {e}"))?;
     Ok(AXPageReader::query(&sel, &result.tree_markdown))
 }
 

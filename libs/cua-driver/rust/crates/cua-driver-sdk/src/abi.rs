@@ -9,7 +9,8 @@ use crate::runtime::{DriverRuntime, RuntimeCreateError, RuntimeOptions, RuntimeS
 use crate::{DriverError, DriverMetadata};
 use cua_driver_core::{
     authorization::{
-        PermissionMode, DANGEROUS_BYPASS_ENV, DISABLE_UNRESTRICTED_ENV, PERMISSION_MODE_ENV,
+        PermissionMode, DANGEROUS_BYPASS_ENV, DISABLE_UNRESTRICTED_ENV,
+        LEGACY_EXISTING_PROFILE_APPROVAL_ENV, PERMISSION_MODE_ENV,
     },
     session_authorization::{DelegatedSessionRequest, SessionModeCeiling},
     session_manifest::{load_manifest, SESSION_POLICY_APPROVED_ENV, SESSION_POLICY_FILE_ENV},
@@ -94,6 +95,7 @@ impl CuaDriverBuffer {
 /// Opaque driver runtime handle.
 pub struct CuaDriverHandle {
     runtime: Arc<DriverRuntime>,
+    host_bundle_id: Option<String>,
 }
 
 /// Opaque session handle whose actions are already bound to one immutable
@@ -184,6 +186,12 @@ struct AbiRuntimeAuthorizationOptions {
 fn validate_explicit_authorization_sources(
     authorization: &AbiRuntimeAuthorizationOptions,
 ) -> Result<(), AbiFailure> {
+    cua_driver_core::policy::validate_configured_policy().map_err(|error| {
+        AbiFailure::new(
+            CuaDriverStatus::InvalidArgument,
+            format!("configured policy is invalid: {error}"),
+        )
+    })?;
     if std::env::var_os(PERMISSION_MODE_ENV).is_some()
         || std::env::var_os(DANGEROUS_BYPASS_ENV).is_some()
     {
@@ -216,6 +224,13 @@ fn validate_explicit_authorization_sources(
         return Err(AbiFailure::new(
             CuaDriverStatus::InvalidArgument,
             "explicit runtime ceiling conflicts with managed configuration disabling unrestricted mode",
+        ));
+    }
+
+    if environment_flag(LEGACY_EXISTING_PROFILE_APPROVAL_ENV) {
+        return Err(AbiFailure::new(
+            CuaDriverStatus::InvalidArgument,
+            "explicit runtime authorization conflicts with the legacy existing-profile approval escape hatch",
         ));
     }
 
@@ -385,7 +400,7 @@ unsafe fn required_session_handle<'a>(
     })
 }
 
-fn metadata_json() -> Result<String, AbiFailure> {
+fn metadata_json(host_bundle_id: Option<&str>) -> Result<String, AbiFailure> {
     serde_json::to_string(&DriverMetadata {
         driver_version: env!("CARGO_PKG_VERSION").into(),
         contract_version: cua_driver_contract::CONTRACT_VERSION.into(),
@@ -394,7 +409,7 @@ fn metadata_json() -> Result<String, AbiFailure> {
         mcp_protocol_version: cua_driver_contract::MCP_PROTOCOL_VERSION.into(),
         pid: std::process::id(),
         embedded: true,
-        host_bundle_id: None,
+        host_bundle_id: host_bundle_id.map(str::to_owned),
     })
     .map_err(|error| AbiFailure::new(CuaDriverStatus::Internal, error.to_string()))
 }
@@ -547,8 +562,12 @@ pub unsafe extern "C" fn cua_driver_create_v1(
             })?
         };
         let runtime_options = runtime_options_from_abi(options)?;
+        let host_bundle_id = runtime_options.host_bundle_id.clone();
         let runtime = DriverRuntime::create(runtime_options).map_err(runtime_create_failure)?;
-        *out_handle = Box::into_raw(Box::new(CuaDriverHandle { runtime }));
+        *out_handle = Box::into_raw(Box::new(CuaDriverHandle {
+            runtime,
+            host_bundle_id,
+        }));
         Ok(())
     })
 }
@@ -605,7 +624,7 @@ pub unsafe extern "C" fn cua_driver_metadata_json_v1(
         let out_json = out_json.as_mut().ok_or_else(|| {
             AbiFailure::new(CuaDriverStatus::NullPointer, "out_json must not be null")
         })?;
-        *out_json = CuaDriverBuffer::from_string(metadata_json()?);
+        *out_json = CuaDriverBuffer::from_string(metadata_json(driver.host_bundle_id.as_deref())?);
         Ok(())
     })
 }
@@ -1107,6 +1126,7 @@ impl Drop for OperationGuard {
 /// statically linked into the same distribution.
 pub(crate) struct NativeAbiDriver {
     handle: Mutex<*mut ffi::Handle>,
+    runtime_scope_key: String,
 }
 
 pub(crate) struct NativeAbiSession {
@@ -1132,22 +1152,56 @@ impl NativeAbiDriver {
         let status =
             unsafe { ffi::create(options.as_ptr(), options.len(), &mut handle, &mut error) };
         status_result(status, &mut error, "create embedded runtime")?;
+        let runtime_scope_key = unsafe {
+            handle
+                .cast::<CuaDriverHandle>()
+                .as_ref()
+                .expect("successful ABI creation returns a non-null handle")
+                .runtime
+                .runtime_scope_key()
+        };
         Ok(Self {
             handle: Mutex::new(handle),
+            runtime_scope_key,
         })
     }
 
+    pub(crate) fn create_configured_with_protected_provider(
+        options: Value,
+        provider: Arc<dyn cua_driver_core::consent::ProtectedConsentProvider>,
+    ) -> Result<Self, DriverError> {
+        let options: AbiDriverOptions =
+            serde_json::from_value(options).map_err(|error| DriverError::Configuration {
+                reason: format!("invalid configured host options: {error}"),
+            })?;
+        let mut runtime_options =
+            runtime_options_from_abi(options).map_err(|error| DriverError::Configuration {
+                reason: error.message,
+            })?;
+        runtime_options.protected_consent_provider = Some(provider);
+        Self::create_for_host(runtime_options)
+    }
+
     pub(crate) fn create_for_host(options: RuntimeOptions) -> Result<Self, DriverError> {
+        let host_bundle_id = options.host_bundle_id.clone();
         let runtime = DriverRuntime::create(options).map_err(map_runtime_create_error)?;
-        let handle = Box::into_raw(Box::new(CuaDriverHandle { runtime })).cast::<ffi::Handle>();
+        let runtime_scope_key = runtime.runtime_scope_key();
+        let handle = Box::into_raw(Box::new(CuaDriverHandle {
+            runtime,
+            host_bundle_id,
+        }))
+        .cast::<ffi::Handle>();
         Ok(Self {
             handle: Mutex::new(handle),
+            runtime_scope_key,
         })
     }
 
     pub(crate) fn create_configured_for_host(
         options: Value,
         cursor: cursor_overlay::CursorConfig,
+        host_owns_permission_ux: bool,
+        host_bundle_id: Option<String>,
         prepare_desktop_environment: bool,
         register_host_tools: Option<fn(&mut cua_driver_core::tool::ToolRegistry)>,
     ) -> Result<Self, DriverError> {
@@ -1160,6 +1214,8 @@ impl NativeAbiDriver {
                 reason: error.message,
             })?;
         runtime_options.cursor = cursor;
+        runtime_options.host_owns_permission_ux = host_owns_permission_ux;
+        runtime_options.host_bundle_id = host_bundle_id;
         runtime_options.prepare_desktop_environment = prepare_desktop_environment;
         runtime_options.register_host_tools = register_host_tools;
         Self::create_for_host(runtime_options)
@@ -1167,6 +1223,10 @@ impl NativeAbiDriver {
 
     fn raw_handle(&self) -> *mut ffi::Handle {
         *self.handle.lock().unwrap()
+    }
+
+    pub(crate) fn runtime_scope_key(&self) -> &str {
+        &self.runtime_scope_key
     }
 
     pub(crate) fn is_available(&self) -> bool {
@@ -1275,6 +1335,34 @@ impl NativeAbiDriver {
         }
         serde_json::from_str(&completed.result).map_err(|error| DriverError::Protocol {
             reason: format!("{name} returned invalid native JSON: {error}"),
+        })
+    }
+
+    pub(crate) async fn invoke_from_trusted_adapter(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, DriverError> {
+        let runtime = {
+            let handle = *self.handle.lock().unwrap();
+            if handle.is_null() {
+                return Err(DriverError::Shutdown);
+            }
+            unsafe {
+                handle
+                    .cast::<CuaDriverHandle>()
+                    .as_ref()
+                    .expect("live ABI handle is non-null")
+                    .runtime
+                    .clone()
+            }
+        };
+        let result = runtime
+            .invoke_from_trusted_adapter(name, arguments)
+            .await
+            .ok_or(DriverError::Shutdown)?;
+        serde_json::to_value(result).map_err(|error| DriverError::Protocol {
+            reason: format!("serialize {name} trusted-adapter result: {error}"),
         })
     }
 
@@ -1441,6 +1529,9 @@ fn runtime_create_failure(error: RuntimeCreateError) -> AbiFailure {
         RuntimeCreateError::Authorization(reason) => {
             AbiFailure::new(CuaDriverStatus::InvalidArgument, reason)
         }
+        RuntimeCreateError::Unavailable(reason) => {
+            AbiFailure::new(CuaDriverStatus::RuntimeUnavailable, reason)
+        }
     }
 }
 
@@ -1448,6 +1539,7 @@ fn map_runtime_create_error(error: RuntimeCreateError) -> DriverError {
     match error {
         RuntimeCreateError::AlreadyExists => DriverError::RuntimeAlreadyExists,
         RuntimeCreateError::Authorization(reason) => DriverError::Configuration { reason },
+        RuntimeCreateError::Unavailable(reason) => DriverError::Protocol { reason },
     }
 }
 
@@ -1455,6 +1547,23 @@ fn map_runtime_create_error(error: RuntimeCreateError) -> DriverError {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn metadata_preserves_the_runtime_host_identity() {
+        let metadata: DriverMetadata =
+            serde_json::from_str(&metadata_json(Some("com.example.host")).unwrap()).unwrap();
+        assert_eq!(metadata.host_bundle_id.as_deref(), Some("com.example.host"));
+    }
+
+    fn desktop_free_test_handle() -> *mut CuaDriverHandle {
+        let mut options = runtime_options_from_abi(AbiDriverOptions::default()).unwrap();
+        options.prepare_desktop_environment = false;
+        let runtime = DriverRuntime::create(options).unwrap();
+        Box::into_raw(Box::new(CuaDriverHandle {
+            runtime,
+            host_bundle_id: None,
+        }))
+    }
 
     #[test]
     fn abi_layout_and_status_values_are_stable() {
@@ -1526,15 +1635,28 @@ mod tests {
         }
         assert!(buffer.data.is_null());
 
-        let mut handle = ptr::null_mut();
-        let mut error = CuaDriverBuffer::empty();
-        let status = unsafe { cua_driver_create_v1(ptr::null(), 0, &mut handle, &mut error) };
-        assert_eq!(status, CuaDriverStatus::Ok);
+        let mut handle = desktop_free_test_handle();
         unsafe {
             cua_driver_destroy_v1(&mut handle);
             cua_driver_destroy_v1(&mut handle);
         }
         assert!(handle.is_null());
+    }
+
+    #[test]
+    fn abi_can_own_two_runtime_handles_concurrently() {
+        let _runtime_test = crate::runtime::TEST_RUNTIME_LOCK.lock().unwrap();
+        let mut first = desktop_free_test_handle();
+        let mut second = desktop_free_test_handle();
+        assert!(!first.is_null());
+        assert!(!second.is_null());
+        assert_ne!(first, second);
+        unsafe {
+            cua_driver_destroy_v1(&mut first);
+            cua_driver_destroy_v1(&mut second);
+        }
+        assert!(first.is_null());
+        assert!(second.is_null());
     }
 
     #[tokio::test]

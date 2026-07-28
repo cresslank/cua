@@ -80,7 +80,7 @@ impl Tool for GetDesktopStateTool {
         // Capture the FULL display at native size — no resize. Run the
         // blocking screencapture subprocess off the async runtime.
         let out_file = screenshot_out_file.clone();
-        let res = tokio::task::spawn_blocking(
+        let res = cua_driver_core::blocking::spawn(
             move || -> anyhow::Result<(Option<String>, Option<String>, u32, u32)> {
                 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
                 let png = crate::capture::screenshot_display_bytes()?;

@@ -241,7 +241,7 @@ impl Snapshot {
     pub async fn detect_async(self) -> Changes {
         // Move the Snapshot (and its embedded lease) onto the blocking
         // thread; the lease's Drop runs there when detect_with returns.
-        tokio::task::spawn_blocking(move || self.detect())
+        cua_driver_core::blocking::spawn(move || self.detect())
             .await
             .unwrap_or_else(|_| Changes::no_change())
     }

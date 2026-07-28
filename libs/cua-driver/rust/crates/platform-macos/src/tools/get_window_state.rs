@@ -163,7 +163,7 @@ impl Tool for GetWindowStateTool {
             // deadline so callers receive a structured driver error. The AX
             // walker also applies a native per-element messaging timeout because
             // dropping a spawn_blocking JoinHandle cannot cancel a blocked AX call.
-            let walk_future = tokio::task::spawn_blocking(move || {
+            let walk_future = cua_driver_core::blocking::spawn(move || {
                 crate::ax::tree::walk_tree_bounded(
                     pid,
                     Some(window_id),
@@ -202,7 +202,7 @@ impl Tool for GetWindowStateTool {
         // Returns (b64_or_path, final_w, final_h, Option<original_w>, is_file_path)
         let screenshot = if should_capture {
             let out_file = screenshot_out_file.clone();
-            let res = tokio::task::spawn_blocking(move || -> anyhow::Result<(Option<String>, Option<String>, u32, u32, Option<u32>)> {
+            let res = cua_driver_core::blocking::spawn(move || -> anyhow::Result<(Option<String>, Option<String>, u32, u32, Option<u32>)> {
                 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
                 let raw = crate::capture::screenshot_window_bytes(window_id)?;
                 let (orig_w, _orig_h) = crate::capture::png_dimensions(&raw)?;

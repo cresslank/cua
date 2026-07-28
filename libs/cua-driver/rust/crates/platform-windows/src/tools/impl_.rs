@@ -448,7 +448,7 @@ impl Tool for ListAppsTool {
         //    that launch_path. Remaining installed entries are emitted with
         //    running=false, pid=0. Remaining running pids (no installed-app
         //    match) are emitted as running=true with launch_path=null.
-        let apps = tokio::task::spawn_blocking(|| -> Vec<serde_json::Value> {
+        let apps = cua_driver_core::blocking::spawn(|| -> Vec<serde_json::Value> {
             use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
             use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 
@@ -658,7 +658,7 @@ impl Tool for ListWindowsTool {
         use cua_driver_core::tool_args::ArgsExt;
         let filter_pid = args.opt_u64("pid").map(|v| v as u32);
         let on_screen_only = args.bool_or("on_screen_only", false);
-        let (mut windows, pid_to_name) = tokio::task::spawn_blocking(move || {
+        let (mut windows, pid_to_name) = cua_driver_core::blocking::spawn(move || {
             let wins = crate::win32::list_windows(filter_pid);
             let procs = crate::win32::list_processes();
             let map: std::collections::HashMap<u32, String> =
@@ -870,12 +870,12 @@ impl Tool for GetWindowStateTool {
             };
         // Validate window belongs to pid — Swift's hard error.
         let windows_for_pid =
-            tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid)))
+            cua_driver_core::blocking::spawn(move || crate::win32::list_windows(Some(pid)))
                 .await
                 .unwrap_or_default();
         if !windows_for_pid.iter().any(|w| w.hwnd == hwnd) {
             // Check if the window exists under a different pid.
-            let all = tokio::task::spawn_blocking(|| crate::win32::list_windows(None))
+            let all = cua_driver_core::blocking::spawn(|| crate::win32::list_windows(None))
                 .await
                 .unwrap_or_default();
             if let Some(w) = all.iter().find(|w| w.hwnd == hwnd) {
@@ -932,7 +932,7 @@ impl Tool for GetWindowStateTool {
         let state = self.state.clone();
         let q = query.clone();
         let out_file = screenshot_out_file.clone();
-        let blocking = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let blocking = cua_driver_core::blocking::spawn(move || -> anyhow::Result<_> {
             let tree_result = if do_tree {
                 Some(crate::uia::walk_tree_bounded(
                     hwnd,
@@ -1427,7 +1427,7 @@ async fn restore_foreground_polling_best_effort(prior_foreground_addr: usize, sp
         // antivirus filters tolerate better than QUERY_INFORMATION.
         // OpenProcess result is also `!Send` (HANDLE), so do the open +
         // wait + close in one blocking task.
-        let _ = tokio::task::spawn_blocking(move || unsafe {
+        let _ = cua_driver_core::blocking::spawn(move || unsafe {
             if let Ok(handle) = OpenProcess(
                 PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
                 false,
@@ -1769,7 +1769,7 @@ impl Tool for LaunchAppTool {
             // Run the (cached) AppsFolder lookup on a blocking thread to
             // avoid stalling the async runtime on the cold-enumeration
             // path (~200 ms first call, ~µs after).
-            tokio::task::spawn_blocking(move || crate::launch_uwp::resolve_aumid_by_name(&n))
+            cua_driver_core::blocking::spawn(move || crate::launch_uwp::resolve_aumid_by_name(&n))
                 .await
                 .unwrap_or(None)
         } else {
@@ -1845,7 +1845,7 @@ impl Tool for LaunchAppTool {
         let pid = if let Some(aumid) = aumid_for_uwp.clone() {
             let aumid_clone = aumid.clone();
             let args_clone = extra_joined.clone();
-            let activation = tokio::task::spawn_blocking(move || {
+            let activation = cua_driver_core::blocking::spawn(move || {
                 crate::launch_uwp::launch_uwp(&aumid_clone, &args_clone)
             })
             .await;
@@ -1882,7 +1882,7 @@ impl Tool for LaunchAppTool {
             // UI so that case fails fast with an error code; the timeout is the
             // backstop for any *other* blocking broker dialog (SmartScreen, an
             // elevation/consent surface) so a bad target can't hang the daemon.
-            let launch = tokio::task::spawn_blocking(move || -> anyhow::Result<u32> {
+            let launch = cua_driver_core::blocking::spawn(move || -> anyhow::Result<u32> {
                 use windows::core::{PCWSTR, PWSTR};
                 use windows::Win32::Foundation::CloseHandle;
                 use windows::Win32::System::Threading::{
@@ -2042,7 +2042,7 @@ impl Tool for LaunchAppTool {
         if aumid_for_uwp.is_some() && !urls.is_empty() {
             let urls_clone = urls.clone();
             let n_show_for_urls = n_show;
-            let _ = tokio::task::spawn_blocking(move || {
+            let _ = cua_driver_core::blocking::spawn(move || {
                 use windows::core::PCWSTR;
                 use windows::Win32::UI::Shell::{ShellExecuteExW, SHELLEXECUTEINFOW};
                 fn to_wide(s: &str) -> Vec<u16> {
@@ -2095,10 +2095,11 @@ impl Tool for LaunchAppTool {
         // frame can lag the activation by a few hundred ms.
         if aumid_for_uwp.is_some() {
             for _ in 0..10 {
-                let host =
-                    tokio::task::spawn_blocking(move || crate::win32::resolve_uwp_host_window(pid))
-                        .await
-                        .unwrap_or(None);
+                let host = cua_driver_core::blocking::spawn(move || {
+                    crate::win32::resolve_uwp_host_window(pid)
+                })
+                .await
+                .unwrap_or(None);
                 if let Some(w) = host {
                     windows_json = vec![json!({
                         "window_id": w.hwnd, "title": w.title,
@@ -2121,9 +2122,10 @@ impl Tool for LaunchAppTool {
             if !windows_json.is_empty() {
                 break;
             }
-            let wins = tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid)))
-                .await
-                .unwrap_or_default();
+            let wins =
+                cua_driver_core::blocking::spawn(move || crate::win32::list_windows(Some(pid)))
+                    .await
+                    .unwrap_or_default();
             if !wins.is_empty() {
                 windows_json = wins.iter().map(|w| json!({
                     "window_id": w.hwnd, "title": w.title,
@@ -2159,7 +2161,7 @@ impl Tool for LaunchAppTool {
             let max_candidate_attempts: usize = if is_slow_launcher { 30 } else { 3 };
 
             let basename_clone = basename_for_match.clone();
-            let candidates_initial = tokio::task::spawn_blocking(move || {
+            let candidates_initial = cua_driver_core::blocking::spawn(move || {
                 crate::win32::related_processes(pid, &basename_clone)
             })
             .await
@@ -2179,7 +2181,7 @@ impl Tool for LaunchAppTool {
                 while let Some(candidate_pid) = candidate_queue.pop() {
                     for _ in 0..max_candidate_attempts {
                         total_attempts += 1;
-                        let wins = tokio::task::spawn_blocking(move || {
+                        let wins = cua_driver_core::blocking::spawn(move || {
                             crate::win32::list_windows(Some(candidate_pid))
                         })
                         .await
@@ -2208,7 +2210,7 @@ impl Tool for LaunchAppTool {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 total_attempts += 3; // count the 500ms wait as 3 attempts
                 let basename_rescan = basename_for_match.clone();
-                let fresh = tokio::task::spawn_blocking(move || {
+                let fresh = cua_driver_core::blocking::spawn(move || {
                     crate::win32::related_processes(pid, &basename_rescan)
                 })
                 .await
@@ -2264,7 +2266,7 @@ impl Tool for LaunchAppTool {
             // poll window.
             let parent_pid = pid;
             let immediate_hwnds_for_poll = immediate_hwnds.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            let _ = cua_driver_core::blocking::spawn(move || {
                 use windows::Win32::Foundation::HWND;
                 use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWMINNOACTIVE};
                 for h in immediate_hwnds {
@@ -2313,7 +2315,7 @@ impl Tool for LaunchAppTool {
                     // Build the family pid set fresh each tick — both
                     // descendant graph and name-relatives can grow as
                     // launcher-stub chains spawn deeper children.
-                    let family_new_pids: Vec<u32> = tokio::task::spawn_blocking(move || {
+                    let family_new_pids: Vec<u32> = cua_driver_core::blocking::spawn(move || {
                         let related: std::collections::HashSet<u32> =
                             crate::win32::related_processes(parent_pid, &basename_clone)
                                 .into_iter()
@@ -2331,7 +2333,7 @@ impl Tool for LaunchAppTool {
                     .unwrap_or_default();
                     let mut tick_hits: usize = 0;
                     for cpid in family_new_pids {
-                        let wins = tokio::task::spawn_blocking(move || {
+                        let wins = cua_driver_core::blocking::spawn(move || {
                             crate::win32::list_windows(Some(cpid))
                         })
                         .await
@@ -2342,7 +2344,7 @@ impl Tool for LaunchAppTool {
                                 hit_count_total += 1;
                             }
                             let hwnd_iso = w.hwnd as usize;
-                            let restored = tokio::task::spawn_blocking(move || unsafe {
+                            let restored = cua_driver_core::blocking::spawn(move || unsafe {
                                 let hwnd = HWND(hwnd_iso as *mut _);
                                 if IsIconic(hwnd).as_bool() {
                                     false
@@ -2570,7 +2572,7 @@ impl Tool for ClickTool {
             // Click the HWND that owned the pixel before the driver overlay
             // moved there. The active SendInput path performs the foreground
             // swap and UIPI checks needed for Chromium and retained-mode apps.
-            let send_result = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+            let send_result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<u64> {
                 let mod_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::send_click_synthesized_active_mods(
                     hwnd_u, sx, sy, count, &button, &mod_refs,
@@ -2678,7 +2680,7 @@ impl Tool for ClickTool {
             Some(h) => h,
             None => {
                 let windows =
-                    tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid)))
+                    cua_driver_core::blocking::spawn(move || crate::win32::list_windows(Some(pid)))
                         .await
                         .unwrap_or_default();
                 match windows.first() {
@@ -2770,7 +2772,7 @@ impl Tool for ClickTool {
                 let prev_fg_addr = unsafe {
                     windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
                 };
-                let send_result = tokio::task::spawn_blocking(move || {
+                let send_result = cua_driver_core::blocking::spawn(move || {
                     crate::input::send_click_synthesized(hwnd, tx, ty, count, &btn_fg)
                 })
                 .await;
@@ -2823,7 +2825,7 @@ impl Tool for ClickTool {
             // transient or scroll-adjusted.
             if action_req.as_deref() == Some("expand") {
                 let state = self.state.clone();
-                let expand = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let expand = cua_driver_core::blocking::spawn(move || -> anyhow::Result<()> {
                     use windows::core::Interface;
                     use windows::Win32::UI::Accessibility::{
                         IUIAutomationElement, IUIAutomationExpandCollapsePattern,
@@ -2892,7 +2894,7 @@ impl Tool for ClickTool {
                 let prev_fg_addr = unsafe {
                     windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
                 };
-                let send_result = tokio::task::spawn_blocking(move || {
+                let send_result = cua_driver_core::blocking::spawn(move || {
                     crate::input::send_click_synthesized(hwnd, cx, cy, count, &btn_fg)
                 })
                 .await;
@@ -2929,7 +2931,7 @@ impl Tool for ClickTool {
                 && count == 1
                 && crate::input::is_chromium_target_window(hwnd)
             {
-                let posted = tokio::task::spawn_blocking(move || {
+                let posted = cua_driver_core::blocking::spawn(move || {
                     crate::input::post_click_screen(hwnd, cx, cy, count, &btn)
                 })
                 .await;
@@ -2959,7 +2961,7 @@ impl Tool for ClickTool {
             //     concept — PostMessage produces the actual WM_LBUTTONDBLCLK)
             let state_clone = self.state.clone();
             let use_uia_invoke = (btn == "left" || btn == "middle") && count == 1;
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<String> {
                 // Direct Chromium UIA Invoke can return S_OK without firing a
                 // DOM event while occluded. Try the honest coordinate actuator
                 // first: it lands while visible and reports occlusion without
@@ -3196,7 +3198,7 @@ impl Tool for ClickTool {
                     windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
                 };
                 let mods_owned = modifiers.clone();
-                let send_result = tokio::task::spawn_blocking(move || {
+                let send_result = cua_driver_core::blocking::spawn(move || {
                     let mod_refs: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                     crate::input::send_click_synthesized_active_mods(
                         hwnd, sx as i32, sy as i32, count, &btn, &mod_refs,
@@ -3242,7 +3244,7 @@ impl Tool for ClickTool {
                 && count == 1
                 && crate::input::is_chromium_target_window(hwnd)
             {
-                let posted = tokio::task::spawn_blocking(move || {
+                let posted = cua_driver_core::blocking::spawn(move || {
                     crate::input::post_click_screen(hwnd, sx_i, sy_i, count, &btn)
                 })
                 .await;
@@ -3267,7 +3269,7 @@ impl Tool for ClickTool {
             if delivery == DeliveryMode::Background && crate::input::is_chromium_target_window(hwnd)
             {
                 let btn2 = btn.clone();
-                let inj = tokio::task::spawn_blocking(move || {
+                let inj = cua_driver_core::blocking::spawn(move || {
                     crate::input::inject_click_screen(hwnd, sx as i32, sy as i32, count, &btn2)
                 })
                 .await;
@@ -3286,7 +3288,7 @@ impl Tool for ClickTool {
             }
             let use_uia = (btn == "left" || btn == "middle") && count == 1;
             if use_uia {
-                let invoked = tokio::task::spawn_blocking(move || {
+                let invoked = cua_driver_core::blocking::spawn(move || {
                     crate::uia::windows_enum::try_invoke_in_window_at_point(
                         hwnd as isize,
                         sx as i32,
@@ -3311,7 +3313,7 @@ impl Tool for ClickTool {
                 && crate::input::delivery::would_be_silently_dropped(hwnd, EventKind::MouseClick)
             {
                 let btn2 = btn.clone();
-                let inj = tokio::task::spawn_blocking(move || {
+                let inj = cua_driver_core::blocking::spawn(move || {
                     crate::input::inject_click_screen(hwnd, sx as i32, sy as i32, count, &btn2)
                 })
                 .await;
@@ -3341,7 +3343,7 @@ impl Tool for ClickTool {
 
             // bitmap pixels -> screen (DWM-frame origin + inset). Use
             // post_click_screen so we don't double-ClientToScreen.
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::blocking::spawn(move || {
                 crate::input::post_click_screen(hwnd, sx_i, sy_i, count, &btn)
             })
             .await;
@@ -3497,7 +3499,7 @@ impl Tool for TypeTextTool {
                 Err(error) => return ToolResult::error(error.to_string()),
             };
             let text_len = text.chars().count();
-            return match tokio::task::spawn_blocking(move || {
+            return match cua_driver_core::blocking::spawn(move || {
                 crate::input::send_text_synthesized(hwnd, &text)
             })
             .await
@@ -3616,7 +3618,7 @@ impl Tool for TypeTextTool {
             Some(h) => h,
             None => {
                 let windows =
-                    tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid)))
+                    cua_driver_core::blocking::spawn(move || crate::win32::list_windows(Some(pid)))
                         .await
                         .unwrap_or_default();
                 match windows.first() {
@@ -3699,7 +3701,7 @@ impl Tool for TypeTextTool {
                     Ok(point) => point,
                     Err(message) => return ToolResult::error(message),
                 };
-                let focus_result = tokio::task::spawn_blocking(move || {
+                let focus_result = cua_driver_core::blocking::spawn(move || {
                     crate::input::send_click_synthesized(hwnd, cx, cy, 1, "left")
                 })
                 .await;
@@ -3716,7 +3718,7 @@ impl Tool for TypeTextTool {
                 }
             }
             let text_fg = text.clone();
-            let r = tokio::task::spawn_blocking(move || {
+            let r = cua_driver_core::blocking::spawn(move || {
                 crate::input::send_text_synthesized(hwnd, &text_fg)
             })
             .await;
@@ -3781,7 +3783,7 @@ impl Tool for TypeTextTool {
             let idx = idx as usize;
             let state = self.state.clone();
             let text_for_uia = text.clone();
-            let set_ok = tokio::task::spawn_blocking(move || -> bool {
+            let set_ok = cua_driver_core::blocking::spawn(move || -> bool {
                 // Retain the element under the cache lock so a concurrent
                 // get_window_state snapshot-replace on the same (pid, hwnd)
                 // can't Release it to zero while this SetValue is in flight.
@@ -3833,7 +3835,7 @@ impl Tool for TypeTextTool {
                 // return alone.
                 let state_rb = self.state.clone();
                 let text_rb = text.clone();
-                let verify = tokio::task::spawn_blocking(move || {
+                let verify = cua_driver_core::blocking::spawn(move || {
                     match read_cached_element_value(&state_rb, pid, hwnd, idx) {
                         Some(v) if v.contains(text_rb.as_str()) => "confirmed",
                         Some(_) => "unchanged",
@@ -3945,7 +3947,7 @@ impl Tool for TypeTextTool {
         let verify_pid = pid;
         let verify_idx = elem_idx.map(|i| i as usize);
         let state_rb = self.state.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = cua_driver_core::blocking::spawn(move || {
             // Prefer a focus-independent read of the *specific* cached element
             // when we have its index; only fall back to the (flaky, focus-
             // dependent) system focused element when typing into "whatever is
@@ -4167,7 +4169,7 @@ impl Tool for PressKeyTool {
                 Err(error) => return ToolResult::error(error.to_string()),
             };
             let key_display = key.clone();
-            return match tokio::task::spawn_blocking(move || {
+            return match cua_driver_core::blocking::spawn(move || {
                 let modifiers: Vec<&str> = mods.iter().map(String::as_str).collect();
                 crate::input::send_key_synthesized(hwnd, &key, &modifiers)
             })
@@ -4271,7 +4273,7 @@ impl Tool for PressKeyTool {
             Some(h) => h,
             None => {
                 let windows =
-                    tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid)))
+                    cua_driver_core::blocking::spawn(move || crate::win32::list_windows(Some(pid)))
                         .await
                         .unwrap_or_default();
                 match windows.first() {
@@ -4363,7 +4365,7 @@ impl Tool for PressKeyTool {
             }
         } else if let Some(idx) = elem_idx {
             let state = self.state.clone();
-            let focused = tokio::task::spawn_blocking(move || {
+            let focused = cua_driver_core::blocking::spawn(move || {
                 crate::uia::fg_bypass::run_with_uwp_bypass(hwnd as isize, || {
                     state.element_cache.focus_element(pid, hwnd, idx as usize)
                 })
@@ -4387,7 +4389,7 @@ impl Tool for PressKeyTool {
         // Skipped when px-focus already fronted/clicked the target — the key then
         // goes via the plain background post path below.
         if !px_focus && delivery == DeliveryMode::Foreground {
-            let send_result = tokio::task::spawn_blocking(move || {
+            let send_result = cua_driver_core::blocking::spawn(move || {
                 let m: Vec<&str> = mods.iter().map(String::as_str).collect();
                 crate::input::send_key_synthesized(hwnd, &key, &m)
             })
@@ -4400,7 +4402,7 @@ impl Tool for PressKeyTool {
                 Err(e)     => ToolResult::error(format!("Task error: {e}")),
             };
         }
-        let result = tokio::task::spawn_blocking(move || {
+        let result = cua_driver_core::blocking::spawn(move || {
             let m: Vec<&str> = mods.iter().map(String::as_str).collect();
             crate::input::post_key(hwnd, &key, &m)
         })
@@ -4531,7 +4533,7 @@ impl Tool for HotkeyTool {
                 Err(error) => return ToolResult::error(error.to_string()),
             };
             let key_display = full_keys.join("+");
-            return match tokio::task::spawn_blocking(move || {
+            return match cua_driver_core::blocking::spawn(move || {
                 let modifiers: Vec<&str> = mods.iter().map(String::as_str).collect();
                 crate::input::send_key_synthesized(hwnd, &key, &modifiers)
             })
@@ -4597,10 +4599,11 @@ impl Tool for HotkeyTool {
             Some(h) => h,
             None => {
                 let pid2 = pid;
-                let windows =
-                    tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid2)))
-                        .await
-                        .unwrap_or_default();
+                let windows = cua_driver_core::blocking::spawn(move || {
+                    crate::win32::list_windows(Some(pid2))
+                })
+                .await
+                .unwrap_or_default();
                 match windows.first() {
                     Some(w) => w.hwnd,
                     None => {
@@ -4659,7 +4662,7 @@ impl Tool for HotkeyTool {
             // bound the call so a hung provider returns an error instead of
             // blocking the daemon indefinitely. 4 s matches the budget the
             // rest of this file uses for similar UIA scans.
-            let blocking = tokio::task::spawn_blocking(move || {
+            let blocking = cua_driver_core::blocking::spawn(move || {
                 crate::uia::windows_enum::try_invoke_accelerator_in_window(
                     hwnd as isize,
                     &accelerator_combo,
@@ -4756,7 +4759,7 @@ impl Tool for HotkeyTool {
         // global modifier state, so Chromium never observes Ctrl+Shift+H as a
         // chord even though the renderer control is focused.
         let use_send_input = delivery == DeliveryMode::Foreground;
-        let result = tokio::task::spawn_blocking(move || {
+        let result = cua_driver_core::blocking::spawn(move || {
             let m: Vec<&str> = mods.iter().map(String::as_str).collect();
             if use_send_input {
                 crate::input::send_key_synthesized(hwnd, &key, &m)
@@ -4901,7 +4904,7 @@ impl Tool for SetValueTool {
         }
 
         let state = self.state.clone();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<String> {
             // Retain the element under the cache lock so a concurrent
             // get_window_state snapshot-replace on the same (pid, hwnd) can't
             // Release it to zero while this Value/RangeValue SetValue is in
@@ -5061,7 +5064,7 @@ impl Tool for ScrollTool {
             };
             let ticks = sign * amount as i32;
             let dir_disp = direction.as_str();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::blocking::spawn(move || {
                 crate::input::send_wheel_synthesized(sx, sy, ticks, horizontal)
             })
             .await;
@@ -5127,7 +5130,7 @@ impl Tool for ScrollTool {
             Some(h) => h,
             None => {
                 let windows =
-                    tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid)))
+                    cua_driver_core::blocking::spawn(move || crate::win32::list_windows(Some(pid)))
                         .await
                         .unwrap_or_default();
                 match windows.first() {
@@ -5168,7 +5171,7 @@ impl Tool for ScrollTool {
             };
             let state = self.state.clone();
             let direction_for_uia = direction.clone();
-            let uia_result = tokio::task::spawn_blocking(move || {
+            let uia_result = cua_driver_core::blocking::spawn(move || {
                 let retained = state
                     .element_cache
                     .get_element_retained(pid, hwnd, idx as usize)
@@ -5278,7 +5281,7 @@ impl Tool for ScrollTool {
             let center = if let (Some(x), Some(y)) = (px, py) {
                 Some(bitmap_to_screen(hwnd, x as i32, y as i32))
             } else {
-                tokio::task::spawn_blocking(move || {
+                cua_driver_core::blocking::spawn(move || {
                     crate::win32::list_windows(Some(pid))
                         .into_iter()
                         .find(|w| w.hwnd == hwnd)
@@ -5300,7 +5303,7 @@ impl Tool for ScrollTool {
             };
             let dir_disp = direction.clone();
             let tick_disp = ticks.abs();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::blocking::spawn(move || {
                 crate::input::send_wheel_synthesized(cx, cy, ticks, horizontal)
             })
             .await;
@@ -5314,7 +5317,7 @@ impl Tool for ScrollTool {
             };
         }
 
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<()> {
             use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
             use windows::Win32::UI::WindowsAndMessaging::{
                 PostMessageW, SB_LINEDOWN, SB_LINELEFT, SB_LINERIGHT, SB_LINEUP, SB_PAGEDOWN,
@@ -5398,7 +5401,7 @@ async fn chromium_click_short_circuit(
     gesture: &str,
 ) -> Option<ToolResult> {
     let is_chromium =
-        tokio::task::spawn_blocking(move || crate::input::is_chromium_target_window(hwnd))
+        cua_driver_core::blocking::spawn(move || crate::input::is_chromium_target_window(hwnd))
             .await
             .unwrap_or(false);
     if !is_chromium {
@@ -5410,7 +5413,7 @@ async fn chromium_click_short_circuit(
     let prev_fg_addr =
         unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize };
     let button_owned = button.to_string();
-    let send_result = tokio::task::spawn_blocking(move || {
+    let send_result = cua_driver_core::blocking::spawn(move || {
         crate::input::send_click_synthesized(hwnd, sx, sy, count, &button_owned)
     })
     .await;
@@ -5512,17 +5515,18 @@ async fn winui3_background_gesture(
     count: usize,
     button: &str,
 ) -> Option<ToolResult> {
-    let is_w =
-        tokio::task::spawn_blocking(move || crate::input::delivery::is_winui3_target_window(hwnd))
-            .await
-            .unwrap_or(false);
+    let is_w = cua_driver_core::blocking::spawn(move || {
+        crate::input::delivery::is_winui3_target_window(hwnd)
+    })
+    .await
+    .unwrap_or(false);
     if !is_w {
         return None;
     }
     if count >= 2 && button == "left" {
         if let Some(idx) = idx {
             let st = state.clone();
-            let uia = tokio::task::spawn_blocking(move || {
+            let uia = cua_driver_core::blocking::spawn(move || {
                 winui3_uia_multi_invoke(&st, pid, hwnd, idx, count)
             })
             .await
@@ -5650,7 +5654,7 @@ impl Tool for DoubleClickTool {
             Some(h) => h,
             None => {
                 let windows =
-                    tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid)))
+                    cua_driver_core::blocking::spawn(move || crate::win32::list_windows(Some(pid)))
                         .await
                         .unwrap_or_default();
                 match windows.first() {
@@ -5717,7 +5721,7 @@ impl Tool for DoubleClickTool {
             if delivery == DeliveryMode::Background
                 && crate::input::delivery::would_be_silently_dropped(hwnd, EventKind::MouseClick)
             {
-                let inj = tokio::task::spawn_blocking(move || {
+                let inj = cua_driver_core::blocking::spawn(move || {
                     crate::input::inject_click_screen(hwnd, cx, cy, 2, "left")
                 })
                 .await;
@@ -5738,7 +5742,7 @@ impl Tool for DoubleClickTool {
                 let prev_fg_addr = unsafe {
                     windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
                 };
-                let send_result = tokio::task::spawn_blocking(move || {
+                let send_result = cua_driver_core::blocking::spawn(move || {
                     crate::input::send_click_synthesized(hwnd, cx, cy, 2, "left")
                 })
                 .await;
@@ -5757,7 +5761,7 @@ impl Tool for DoubleClickTool {
             {
                 return r;
             }
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<String> {
                 crate::input::post_click_screen(hwnd, cx, cy, 2, "left")?;
                 // Swift text format 1:1: `"✅ Posted double-click to [N] role \"title\" at screen-point (X, Y)."`.
                 // UIA role/title placeholder pending element-cache enrichment.
@@ -5819,7 +5823,7 @@ impl Tool for DoubleClickTool {
             if delivery == DeliveryMode::Background
                 && crate::input::delivery::would_be_silently_dropped(hwnd, EventKind::MouseClick)
             {
-                let inj = tokio::task::spawn_blocking(move || {
+                let inj = cua_driver_core::blocking::spawn(move || {
                     crate::input::inject_click_screen(hwnd, sx_i, sy_i, 2, "left")
                 })
                 .await;
@@ -5840,7 +5844,7 @@ impl Tool for DoubleClickTool {
                 let prev_fg_addr = unsafe {
                     windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
                 };
-                let send_result = tokio::task::spawn_blocking(move || {
+                let send_result = cua_driver_core::blocking::spawn(move || {
                     crate::input::send_click_synthesized(hwnd, sx_i, sy_i, 2, "left")
                 })
                 .await;
@@ -5860,7 +5864,7 @@ impl Tool for DoubleClickTool {
             {
                 return r;
             }
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::blocking::spawn(move || {
                 crate::input::post_click_screen(hwnd, sx_i, sy_i, 2, "left")
             })
             .await;
@@ -5988,7 +5992,7 @@ impl Tool for RightClickTool {
             Some(h) => h,
             None => {
                 let windows =
-                    tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid)))
+                    cua_driver_core::blocking::spawn(move || crate::win32::list_windows(Some(pid)))
                         .await
                         .unwrap_or_default();
                 match windows.first() {
@@ -6050,7 +6054,7 @@ impl Tool for RightClickTool {
             if delivery == DeliveryMode::Background
                 && crate::input::delivery::would_be_silently_dropped(hwnd, EventKind::MouseClick)
             {
-                let inj = tokio::task::spawn_blocking(move || {
+                let inj = cua_driver_core::blocking::spawn(move || {
                     crate::input::inject_click_screen(hwnd, cx, cy, 1, "right")
                 })
                 .await;
@@ -6070,7 +6074,7 @@ impl Tool for RightClickTool {
                 let prev_fg_addr = unsafe {
                     windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
                 };
-                let send_result = tokio::task::spawn_blocking(move || {
+                let send_result = cua_driver_core::blocking::spawn(move || {
                     crate::input::send_click_synthesized(hwnd, cx, cy, 1, "right")
                 })
                 .await;
@@ -6089,7 +6093,7 @@ impl Tool for RightClickTool {
             {
                 return r;
             }
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+            let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<String> {
                 crate::input::post_click_screen(hwnd, cx, cy, 1, "right")?;
                 // Match Swift's element-path text 1:1
                 // (`"✅ Shown menu for [N] role \"title\"."`).  UIA role/title
@@ -6149,7 +6153,7 @@ impl Tool for RightClickTool {
             if delivery == DeliveryMode::Background
                 && crate::input::delivery::would_be_silently_dropped(hwnd, EventKind::MouseClick)
             {
-                let inj = tokio::task::spawn_blocking(move || {
+                let inj = cua_driver_core::blocking::spawn(move || {
                     crate::input::inject_click_screen(hwnd, sx_i, sy_i, 1, "right")
                 })
                 .await;
@@ -6169,7 +6173,7 @@ impl Tool for RightClickTool {
                 let prev_fg_addr = unsafe {
                     windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
                 };
-                let send_result = tokio::task::spawn_blocking(move || {
+                let send_result = cua_driver_core::blocking::spawn(move || {
                     crate::input::send_click_synthesized(hwnd, sx_i, sy_i, 1, "right")
                 })
                 .await;
@@ -6189,7 +6193,7 @@ impl Tool for RightClickTool {
             {
                 return r;
             }
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::blocking::spawn(move || {
                 crate::input::post_click_screen(hwnd, sx_i, sy_i, 1, "right")
             })
             .await;
@@ -6266,7 +6270,7 @@ impl Tool for DragTool {
                 Ok(hwnd) => hwnd,
                 Err(error) => return ToolResult::error(error.to_string()),
             };
-            return match tokio::task::spawn_blocking(move || {
+            return match cua_driver_core::blocking::spawn(move || {
                 crate::input::mouse::send_drag_synthesized(
                     hwnd,
                     from_x,
@@ -6353,7 +6357,7 @@ impl Tool for DragTool {
             Some(h) => h,
             None => {
                 let windows =
-                    tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid)))
+                    cua_driver_core::blocking::spawn(move || crate::win32::list_windows(Some(pid)))
                         .await
                         .unwrap_or_default();
                 match windows.first() {
@@ -6409,7 +6413,7 @@ impl Tool for DragTool {
                     y: sy_from as f64,
                 },
             );
-            let inj = tokio::task::spawn_blocking(move || {
+            let inj = cua_driver_core::blocking::spawn(move || {
                 crate::input::inject::inject_drag_screen(
                     target,
                     sx_from,
@@ -6456,7 +6460,7 @@ impl Tool for DragTool {
             let prev_fg_addr = unsafe {
                 windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
             };
-            let send_result = tokio::task::spawn_blocking(move || {
+            let send_result = cua_driver_core::blocking::spawn(move || {
                 crate::input::mouse::send_drag_synthesized(
                     hwnd,
                     sx_from,
@@ -6509,7 +6513,7 @@ impl Tool for DragTool {
         );
 
         let button_c = button.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = cua_driver_core::blocking::spawn(move || {
             // Screen-coord, deepest-child variant: routes the gesture to the
             // child control under the start point (e.g. a WinForms Panel),
             // not the top-level frame that would ignore it.
@@ -6662,7 +6666,7 @@ impl Tool for GetDesktopStateTool {
         // Capture the FULL display at native size — no resize. Run the
         // blocking GDI capture off the async runtime.
         let out_file = screenshot_out_file.clone();
-        let res = tokio::task::spawn_blocking(
+        let res = cua_driver_core::blocking::spawn(
             move || -> anyhow::Result<(Option<String>, Option<String>, u32, u32)> {
                 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
                 let png = crate::capture::screenshot_display_bytes()?;
@@ -6835,449 +6839,242 @@ impl Tool for MoveCursorTool {
 
 // ── set_agent_cursor_enabled ──────────────────────────────────────────────────
 
-pub struct SetAgentCursorEnabledTool {
+pub struct SetAgentCursorEnabledV2Tool {
     state: Arc<ToolState>,
 }
 
-static SCE_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+static CURSOR_ENABLED_V2_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 #[async_trait]
-impl Tool for SetAgentCursorEnabledTool {
+impl Tool for SetAgentCursorEnabledV2Tool {
     fn def(&self) -> &ToolDef {
-        SCE_DEF.get_or_init(|| ToolDef {
-            name: "set_agent_cursor_enabled".into(),
-            // Description ported from Swift `SetAgentCursorEnabledTool.swift`.
-            description: "Toggle the visual agent-cursor overlay. When enabled, future \
-                pointer actions animate a floating arrow to the target's on-screen position \
-                before firing the click — purely visual, the click dispatch itself is \
-                unchanged. Disabling removes the overlay immediately.\n\n\
-                Default: enabled. Stays on for the life of the MCP session / daemon; \
-                disable with `{\"enabled\": false}` for headless / CI runs where the \
-                visual isn't wanted.\n\n\
-                Rust-only: `cursor_id` selects an instance from the multi-cursor registry; \
-                default is `'default'` (Swift has a single AgentCursor.shared).".into(),
-            input_schema: json!({"type":"object","required":["enabled"],"properties":{
-                "enabled":{"type":"boolean","description":"True to show the overlay cursor; false to hide."},
-                "cursor_id":{"type":"string","description":"Rust-only: multi-cursor instance id. Default 'default'."}
-            },"additionalProperties":false}),
-            read_only: false, destructive: false, idempotent: true, open_world: false,
-        })
+        CURSOR_ENABLED_V2_DEF.get_or_init(|| canonical_cursor_def("set_agent_cursor_enabled"))
     }
+
     async fn invoke(&self, args: Value) -> ToolResult {
-        // Swift error wording 1:1.
-        let enabled = match args.get("enabled").and_then(|v| v.as_bool()) {
-            Some(v) => v,
+        let enabled = match args.get("enabled").and_then(Value::as_bool) {
+            Some(value) => value,
             None => return ToolResult::error("Missing required boolean field `enabled`."),
         };
-        let cursor_key = resolve_cursor_key(&args);
-        if !cursor_key.is_empty() {
-            self.state.cursor_registry.set_enabled(&cursor_key, enabled);
+        let session = resolve_cursor_key(&args);
+        if session.is_empty() {
+            return ToolResult::error("`session` is required for agent cursor controls.");
         }
+        self.state.cursor_registry.set_enabled(&session, enabled);
         crate::overlay::send_command(
-            cursor_key.clone(),
+            session.clone(),
             cursor_overlay::OverlayCommand::SetEnabled(enabled),
         );
-        // Match Swift text format 1:1: `"✅ Agent cursor enabled."`
-        // (or `"✅ Agent cursor disabled."`).
-        ToolResult::text(if enabled {
-            "✅ Agent cursor enabled.".to_owned()
-        } else {
-            "✅ Agent cursor disabled.".to_owned()
-        })
+        ToolResult::text(format!(
+            "Agent cursor for session '{session}' {}.",
+            if enabled { "enabled" } else { "disabled" }
+        ))
+        .with_structured(json!({"session":session,"enabled":enabled}))
     }
 }
 
-// ── set_agent_cursor_motion ───────────────────────────────────────────────────
+pub struct SetAgentCursorMotionV2Tool;
 
-pub struct SetAgentCursorMotionTool {
-    state: Arc<ToolState>,
+static CURSOR_MOTION_V2_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+
+fn cursor_number(value: Option<&Value>) -> Option<f64> {
+    value.and_then(|value| {
+        value
+            .as_f64()
+            .or_else(|| value.as_i64().map(|integer| integer as f64))
+    })
 }
-
-static CURSOR_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 #[async_trait]
-impl Tool for SetAgentCursorMotionTool {
+impl Tool for SetAgentCursorMotionV2Tool {
     fn def(&self) -> &ToolDef {
-        CURSOR_DEF.get_or_init(|| ToolDef {
-            name: "set_agent_cursor_motion".into(),
-            description: format!("Configure the visual appearance and motion curve of an agent cursor instance.\n\n\
-                Appearance:\n\
-                - cursor_id: instance name (default='default')\n\
-                - cursor_icon: built-in ({}) or a path to a PNG/JPEG/SVG/ICO file; '' reverts to the default cursor\n\
-                - cursor_color: hex color e.g. '#00FFFF' or CSS name\n\
-                - cursor_label: short text shown near the cursor\n\
-                - cursor_size: dot radius in points (default=16)\n\
-                - cursor_opacity: 0.0–1.0 (default=0.85)\n\n\
-                Motion curve (Bezier):\n\
-                - arc_size: perpendicular deflection as fraction of path length [0,1]. Default 0.25\n\
-                - spring: settle damping [0.3,1.0]; 1.0=no overshoot. Default 0.72\n\
-                - glide_duration_ms: fixed flight duration per move [50,5000]; omit for speed-based (the default)\n\
-                - dwell_after_click_ms: pause after click ripple [0,5000]. Default 80\n\
-                - idle_hide_ms: auto-hide delay [0,60000]; 0=never. Default 20000",
-                cursor_overlay::BuiltinShape::names_help()),
-            input_schema: json!({
-                "type":"object","properties":{
-                    "cursor_id":{"type":"string"},
-                    "cursor_icon":{"type":"string"},
-                    "cursor_color":{"type":"string"},
-                    "cursor_label":{"type":"string"},
-                    "cursor_size":{"type":"number"},
-                    "cursor_opacity":{"type":"number"},
-                    "start_handle":{"type":"number","description":"Start-handle fraction [0,1]. Default 0.3."},
-                    "end_handle":{"type":"number","description":"End-handle fraction [0,1]. Default 0.3."},
-                    "arc_size":{"type":"number","description":"Arc deflection as fraction of path length [0,1]. Default 0.25."},
-                    "arc_flow":{"type":"number","description":"Asymmetry bias [-1,1]. Default 0.0."},
-                    "spring":{"type":"number","description":"Settle damping [0.3,1.0]. Default 0.72."},
-                    "glide_duration_ms":{"type":"number","minimum":50,"maximum":5000,"description":"Fixed flight duration per move in ms; omit for speed-based timing (the default)."},
-                    "dwell_after_click_ms":{"type":"number","minimum":0,"maximum":5000,"description":"Pause after click ripple in ms. Default 80."},
-                    "idle_hide_ms":{"type":"number","minimum":0,"maximum":60000,"description":"Auto-hide delay in ms. 0=never. Default 20000."},
-                    "turn_radius":{"type":"number","minimum":1,"maximum":1000,"description":"Minimum turning radius of the glide path in points; smaller = tighter curves. Default 80."}
-                },"additionalProperties":false
-            }),
-            read_only: false, destructive: false, idempotent: true, open_world: false,
-        })
+        CURSOR_MOTION_V2_DEF.get_or_init(|| canonical_cursor_def("set_agent_cursor_motion"))
     }
+
     async fn invoke(&self, args: Value) -> ToolResult {
-        // JSON numbers without decimals parse as ints; coerce to f64 so
-        // callers can write `{"glide_duration_ms": 1500}` without it being
-        // silently ignored (matches Swift's `number()` helper).
-        fn num(v: Option<&Value>) -> Option<f64> {
-            v.and_then(|x| x.as_f64().or_else(|| x.as_i64().map(|i| i as f64)))
+        let session = resolve_cursor_key(&args);
+        if session.is_empty() {
+            return ToolResult::error("`session` is required for agent cursor controls.");
         }
-        // Cursor key: caller-declared `session` > legacy `cursor_id` > NO_CURSOR.
-        let cursor_id = resolve_cursor_key(&args);
-        // 0. Resolve `cursor_icon` (built-in name or image path — same vocabulary
-        // as the CLI flags) to a shape override and dispatch it below, so the
-        // overlay actually changes instead of only recording the string.
-        let mut shape_cmd: Option<cursor_overlay::OverlayCommand> = None;
-        if let Some(icon) = args.get("cursor_icon").and_then(|v| v.as_str()) {
-            let icon_owned = icon.to_owned();
-            match tokio::task::spawn_blocking(move || {
-                cursor_overlay::resolve_cursor_icon(&icon_owned)
-            })
-            .await
-            {
-                Ok(Ok(resolution)) => {
-                    shape_cmd = Some(cursor_overlay::OverlayCommand::from_cursor_icon(resolution))
-                }
-                Ok(Err(e)) => return ToolResult::error(format!("Invalid cursor_icon: {e}")),
-                Err(e) => return ToolResult::error(format!("Task error: {e}")),
-            }
-        }
-        // 1. Per-instance appearance fields (Rust-only).
-        self.state.cursor_registry.update_config(&cursor_id, |cfg| {
-            if let Some(v) = args.get("cursor_icon").and_then(|v| v.as_str()) {
-                cfg.cursor_icon = Some(v.to_owned());
-            }
-            if let Some(v) = args.get("cursor_color").and_then(|v| v.as_str()) {
-                cfg.cursor_color = Some(v.to_owned());
-            }
-            if let Some(v) = args.get("cursor_label").and_then(|v| v.as_str()) {
-                cfg.cursor_label = Some(v.to_owned());
-            }
-            if let Some(v) = num(args.get("cursor_size")) {
-                cfg.cursor_size = Some(v);
-            }
-            if let Some(v) = num(args.get("cursor_opacity")) {
-                cfg.cursor_opacity = Some(v.clamp(0.0, 1.0));
-            }
-        });
-        if let Some(cmd) = shape_cmd {
-            crate::overlay::send_command(cursor_id.clone(), cmd);
-        }
-        // 2. Apply motion knobs to the live render state — was silently
-        // dropped before; this is the Swift parity behavior.
-        let current = crate::overlay::current_motion(&cursor_id);
-        let updated = current.with_overrides(
-            num(args.get("start_handle")),
-            num(args.get("end_handle")),
-            num(args.get("arc_size")),
-            num(args.get("arc_flow")),
-            num(args.get("spring")),
-            num(args.get("glide_duration_ms")),
-            num(args.get("dwell_after_click_ms")),
-            num(args.get("idle_hide_ms")),
-            None, // press_duration_ms — not in Swift tool surface
-            num(args.get("turn_radius")),
+        let current = crate::overlay::current_motion(&session);
+        let motion = current.with_overrides(
+            cursor_number(args.get("start_handle")),
+            cursor_number(args.get("end_handle")),
+            cursor_number(args.get("arc_size")),
+            cursor_number(args.get("arc_flow")),
+            cursor_number(args.get("spring")),
+            cursor_number(args.get("glide_duration_ms")),
+            cursor_number(args.get("dwell_after_click_ms")),
+            cursor_number(args.get("idle_hide_ms")),
+            None,
+            cursor_number(args.get("turn_radius")),
         );
         crate::overlay::send_command(
-            cursor_id.clone(),
-            cursor_overlay::OverlayCommand::SetMotion(updated.clone()),
+            session.clone(),
+            cursor_overlay::OverlayCommand::SetMotion(motion.clone()),
         );
-        // Match Swift text format 1:1.
-        let summary = format!(
-            "cursor motion: startHandle={sh} endHandle={eh} arcSize={asz} arcFlow={af} \
-             spring={sp} glideDurationMs={gd} dwellAfterClickMs={dw} idleHideMs={ih} turnRadius={tr}",
-            sh = updated.start_handle, eh = updated.end_handle,
-            asz = updated.arc_size,   af = updated.arc_flow,
-            sp = updated.spring,
-            gd = updated.glide_duration_ms as i64,
-            dw = updated.dwell_after_click_ms as i64,
-            ih = updated.idle_hide_ms as i64,
-            tr = updated.turn_radius as i64,
-        );
-        ToolResult::text(format!("✅ {summary}")).with_structured(json!({
-            "cursor_id":            cursor_id,
-            "start_handle":         updated.start_handle,
-            "end_handle":           updated.end_handle,
-            "arc_size":             updated.arc_size,
-            "arc_flow":             updated.arc_flow,
-            "spring":               updated.spring,
-            "glide_duration_ms":    updated.glide_duration_ms,
-            "dwell_after_click_ms": updated.dwell_after_click_ms,
-            "idle_hide_ms":         updated.idle_hide_ms,
-            "turn_radius":          updated.turn_radius,
-        }))
+        ToolResult::text(format!(
+            "Agent cursor motion updated for session '{session}'."
+        ))
+        .with_structured(json!({"session":session,"motion":{
+            "start_handle":motion.start_handle,
+            "end_handle":motion.end_handle,
+            "arc_size":motion.arc_size,
+            "arc_flow":motion.arc_flow,
+            "spring":motion.spring,
+            "glide_duration_ms":motion.glide_duration_ms,
+            "dwell_after_click_ms":motion.dwell_after_click_ms,
+            "idle_hide_ms":motion.idle_hide_ms,
+            "turn_radius":motion.turn_radius
+        }}))
     }
 }
 
-// ── get_agent_cursor_state ────────────────────────────────────────────────────
-
-pub struct GetAgentCursorStateTool {
+pub struct SetAgentCursorThemeTool {
     state: Arc<ToolState>,
 }
 
-static GCSTATE_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+static CURSOR_THEME_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+
+fn cursor_reduced_motion(value: Option<&str>) -> cursor_overlay::ReducedMotion {
+    match value {
+        Some("on") => cursor_overlay::ReducedMotion::On,
+        Some("off") => cursor_overlay::ReducedMotion::Off,
+        _ => cursor_overlay::ReducedMotion::Auto,
+    }
+}
 
 #[async_trait]
-impl Tool for GetAgentCursorStateTool {
+impl Tool for SetAgentCursorThemeTool {
     fn def(&self) -> &ToolDef {
-        GCSTATE_DEF.get_or_init(|| ToolDef {
-            name: "get_agent_cursor_state".into(),
-            // Description ported from Swift `GetAgentCursorStateTool.swift`.
-            description: "Report the current agent-cursor configuration: enabled flag, \
-                motion knobs (startHandle, endHandle, arcSize, arcFlow, spring), glide \
-                duration, post-click dwell, and idle-hide delay. Durations come back in \
-                milliseconds to match the setter's units. Pure read-only — no side effects."
-                .into(),
-            input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
-            read_only: true,
-            destructive: false,
-            idempotent: true,
-            open_world: false,
-        })
+        CURSOR_THEME_DEF.get_or_init(|| canonical_cursor_def("set_agent_cursor_theme"))
     }
+
     async fn invoke(&self, args: Value) -> ToolResult {
-        // Report THIS session's cursor (caller-declared `session` > `cursor_id`
-        // > "default"), mirroring macOS get_agent_cursor_state scoping.
-        let cursor_key = resolve_cursor_key(&args);
-        let enabled = crate::overlay::is_enabled(&cursor_key);
-        let motion = crate::overlay::current_motion(&cursor_key);
-        // Swift text format 1:1: single-line camelCase key=value pairs.
-        let summary = format!(
-            "cursor: enabled={enabled} startHandle={sh} endHandle={eh} arcSize={asz} \
-             arcFlow={af} spring={sp} glideDurationMs={gd} dwellAfterClickMs={dw} idleHideMs={ih} turnRadius={tr}",
-            sh = motion.start_handle, eh = motion.end_handle,
-            asz = motion.arc_size,   af = motion.arc_flow,
-            sp = motion.spring,
-            gd = motion.glide_duration_ms as i64,
-            dw = motion.dwell_after_click_ms as i64,
-            ih = motion.idle_hide_ms as i64,
-            tr = motion.turn_radius as i64,
+        let Some(theme_id) = args.get("theme_id").and_then(Value::as_str) else {
+            return ToolResult::error("Missing required string field `theme_id`.");
+        };
+        let session = resolve_cursor_key(&args);
+        if session.is_empty() {
+            return ToolResult::error("`session` is required for agent cursor controls.");
+        }
+        let resolved_theme = match cursor_overlay::resolve_theme_selection(theme_id) {
+            Ok(theme) => theme,
+            Err(error) => {
+                return ToolResult::error(format!(
+                    "Cursor theme '{theme_id}' cannot be selected: {error}"
+                ));
+            }
+        };
+        let (version, profile) = resolved_theme
+            .as_deref()
+            .map(|theme| (theme.version.as_str(), theme.profile.as_str()))
+            .unwrap_or((
+                cursor_overlay::DEFAULT_THEME_VERSION,
+                cursor_overlay::THEME_PROFILE,
+            ));
+        let reduced_motion =
+            cursor_reduced_motion(args.get("reduced_motion").and_then(Value::as_str));
+        self.state
+            .cursor_registry
+            .update_config(&session, |config| {
+                config.theme_id = theme_id.to_owned();
+                config.reduced_motion = reduced_motion;
+            });
+        crate::overlay::send_command(
+            session.clone(),
+            cursor_overlay::OverlayCommand::SetTheme {
+                theme_id: theme_id.to_owned(),
+                reduced_motion,
+            },
         );
-        // Rust-only structured payload: the same fields + the multi-cursor
-        // instance map. Cursor instances are a Rust-only extension.
-        let cursors =
-            serde_json::to_value(self.state.cursor_registry.all_states()).unwrap_or_default();
-        ToolResult::text(format!("✅ {summary}")).with_structured(json!({
-            "enabled":              enabled,
-            "start_handle":         motion.start_handle,
-            "end_handle":           motion.end_handle,
-            "arc_size":             motion.arc_size,
-            "arc_flow":             motion.arc_flow,
-            "spring":               motion.spring,
-            "glide_duration_ms":    motion.glide_duration_ms,
-            "dwell_after_click_ms": motion.dwell_after_click_ms,
-            "idle_hide_ms":         motion.idle_hide_ms,
-            "turn_radius":          motion.turn_radius,
-            "cursors":              cursors,
-        }))
+        ToolResult::text(format!(
+            "Agent cursor theme for session '{session}' set to '{theme_id}'."
+        ))
+        .with_structured(json!({"session":session,"theme":{
+            "id":theme_id,
+            "version":version,
+            "profile":profile,
+            "reduced_motion":reduced_motion,
+            "fallback":null
+        }}))
     }
 }
 
-// ── set_agent_cursor_style ────────────────────────────────────────────────────
+pub struct GetAgentCursorStateV2Tool;
 
-pub struct SetAgentCursorStyleTool {
-    state: Arc<ToolState>,
-}
-
-static STYLE_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+static CURSOR_STATE_V2_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 #[async_trait]
-impl Tool for SetAgentCursorStyleTool {
+impl Tool for GetAgentCursorStateV2Tool {
     fn def(&self) -> &ToolDef {
-        STYLE_DEF.get_or_init(|| ToolDef {
-            name: "set_agent_cursor_style".into(),
-            description:
-                "Update the visual style of the agent cursor overlay.\n\n\
-                 - gradient_colors: array of CSS hex strings (e.g. [\"#FF0000\",\"#0000FF\"]) \
-                   used as the arrow fill gradient from tip to tail. Empty array reverts to \
-                   the default palette colours.\n\
-                 - bloom_color: hex string for the radial halo/bloom behind the cursor \
-                   (e.g. \"#00FFFF\"). Empty string reverts to the default.\n\
-                 - image_path: path to a PNG, JPEG, SVG, or ICO file to use as the cursor \
-                   icon instead of the default silhouette. Empty string reverts to the \
-                   default cursor.\n\
-                 All parameters are optional; omit any you do not want to change."
-                .into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "cursor_id": {
-                        "type": "string",
-                        "description": "Cursor instance. Default: 'default'."
-                    },
-                    "gradient_colors": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "CSS hex gradient stops tip→tail. [] = revert to default."
-                    },
-                    "bloom_color": {
-                        "type": "string",
-                        "description": "Hex bloom/halo colour (e.g. '#00FFFF'). '' = revert to default."
-                    },
-                    "image_path": {
-                        "type": "string",
-                        "description": "Path to PNG/JPEG/SVG/ICO cursor image. '' = revert to the default cursor."
-                    }
+        CURSOR_STATE_V2_DEF.get_or_init(|| canonical_cursor_def("get_agent_cursor_state"))
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        let session = resolve_cursor_key(&args);
+        if session.is_empty() {
+            return ToolResult::error("`session` is required for agent cursor controls.");
+        }
+        let enabled = crate::overlay::is_enabled(&session);
+        let motion = crate::overlay::current_motion(&session);
+        let (theme_id, version, profile, fallback, visual) =
+            crate::overlay::current_theme_state(&session).unwrap_or_else(|| {
+                (
+                    cursor_overlay::DEFAULT_THEME_ID.into(),
+                    cursor_overlay::DEFAULT_THEME_VERSION.into(),
+                    cursor_overlay::THEME_PROFILE.into(),
+                    None,
+                    cursor_overlay::CursorVisualState::default(),
+                )
+            });
+        let modifiers: Vec<&str> = [
+            visual.delivery.map(|value| value.as_str()),
+            visual.target.map(|value| value.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        ToolResult::text(format!("Agent cursor state for session '{session}'.")).with_structured(
+            json!({
+                "session":session,
+                "enabled":enabled,
+                "position":null,
+                "theme":{
+                    "id":theme_id,
+                    "version":version,
+                    "profile":profile,
+                    "reduced_motion":visual.reduced_motion,
+                    "fallback":fallback
                 },
-                "additionalProperties": false
+                "visual_state":{
+                    "requested_action":visual.requested_action,
+                    "resolved_action":visual.resolved_action,
+                    "modifiers":modifiers,
+                    "phase":visual.phase(),
+                    "frame":visual.frame(),
+                    "preempted_count":visual.preempted_count
+                },
+                "motion":{
+                    "start_handle":motion.start_handle,
+                    "end_handle":motion.end_handle,
+                    "arc_size":motion.arc_size,
+                    "arc_flow":motion.arc_flow,
+                    "spring":motion.spring,
+                    "glide_duration_ms":motion.glide_duration_ms,
+                    "dwell_after_click_ms":motion.dwell_after_click_ms,
+                    "idle_hide_ms":motion.idle_hide_ms,
+                    "turn_radius":motion.turn_radius
+                }
             }),
-            read_only: false, destructive: false, idempotent: true, open_world: false,
-        })
-    }
-
-    async fn invoke(&self, args: Value) -> ToolResult {
-        // Cursor key: caller-declared `session` > legacy `cursor_id` > NO_CURSOR.
-        let cursor_id = resolve_cursor_key(&args);
-
-        // image_path
-        let image_path = args.get("image_path").and_then(|v| v.as_str());
-        let shape_cmd: Option<cursor_overlay::OverlayCommand> = if let Some(path) = image_path {
-            if path.is_empty() {
-                Some(cursor_overlay::OverlayCommand::SetShape(None))
-            } else {
-                let path_owned = path.to_owned();
-                match tokio::task::spawn_blocking(move || {
-                    cursor_overlay::CursorShape::load(&path_owned)
-                })
-                .await
-                {
-                    Ok(Ok(shape)) => {
-                        let path_owned2 = path.to_owned();
-                        self.state.cursor_registry.update_config(&cursor_id, |c| {
-                            c.cursor_icon = Some(path_owned2);
-                        });
-                        Some(cursor_overlay::OverlayCommand::SetShape(Some(shape)))
-                    }
-                    Ok(Err(e)) => {
-                        return ToolResult::error(format!("Failed to load image_path: {e}"))
-                    }
-                    Err(e) => return ToolResult::error(format!("Task error: {e}")),
-                }
-            }
-        } else {
-            None
-        };
-
-        // gradient_colors
-        let gradient_colors: Vec<[u8; 4]> =
-            if let Some(arr) = args.get("gradient_colors").and_then(|v| v.as_array()) {
-                let mut out = vec![];
-                for v in arr {
-                    if let Some(hex) = v.as_str() {
-                        match parse_hex_color(hex) {
-                            Some(c) => out.push(c),
-                            None => return ToolResult::error(format!("Invalid hex color: {hex}")),
-                        }
-                    }
-                }
-                out
-            } else {
-                vec![]
-            };
-
-        // bloom_color
-        let bloom_color: Option<Option<[u8; 4]>> =
-            if let Some(hex) = args.get("bloom_color").and_then(|v| v.as_str()) {
-                if hex.is_empty() {
-                    Some(None)
-                } else {
-                    match parse_hex_color(hex) {
-                        Some(c) => Some(Some(c)),
-                        None => return ToolResult::error(format!("Invalid bloom_color: {hex}")),
-                    }
-                }
-            } else {
-                None
-            };
-
-        // Dispatch to overlay
-        if let Some(cmd) = shape_cmd {
-            crate::overlay::send_command(cursor_id.clone(), cmd);
-        }
-        let gradient_provided = args.get("gradient_colors").is_some();
-        let bloom_provided = args.get("bloom_color").is_some();
-        if gradient_provided || bloom_provided {
-            crate::overlay::send_command(
-                cursor_id.clone(),
-                cursor_overlay::OverlayCommand::SetGradient {
-                    gradient_colors,
-                    bloom_color: bloom_color.flatten(),
-                },
-            );
-        }
-
-        // Swift `SetAgentCursorStyleTool` text format: only include fields
-        // whose post-write value is `Some` (i.e. not reverted to default).
-        // Falls back to "✅ cursor style: reverted to default" when every
-        // field is empty.
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(arr) = args.get("gradient_colors").and_then(|v| v.as_array()) {
-            let hexes: Vec<String> = arr
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect();
-            if !hexes.is_empty() {
-                parts.push(format!("gradient_colors=[{}]", hexes.join(",")));
-            }
-        }
-        if let Some(s) = args.get("bloom_color").and_then(|v| v.as_str()) {
-            if !s.is_empty() {
-                parts.push(format!("bloom_color={s}"));
-            }
-        }
-        if let Some(s) = image_path {
-            if !s.is_empty() {
-                parts.push(format!("image_path={s}"));
-            }
-        }
-        let summary = if parts.is_empty() {
-            "reverted to default".to_owned()
-        } else {
-            parts.join(" ")
-        };
-        ToolResult::text(format!("✅ cursor style: {summary}"))
+        )
     }
 }
 
-fn parse_hex_color(hex: &str) -> Option<[u8; 4]> {
-    let s = hex.trim_start_matches('#');
-    match s.len() {
-        6 => {
-            let r = u8::from_str_radix(&s[0..2], 16).ok()?;
-            let g = u8::from_str_radix(&s[2..4], 16).ok()?;
-            let b = u8::from_str_radix(&s[4..6], 16).ok()?;
-            Some([r, g, b, 255])
-        }
-        3 => {
-            let r = u8::from_str_radix(&s[0..1].repeat(2), 16).ok()?;
-            let g = u8::from_str_radix(&s[1..2].repeat(2), 16).ok()?;
-            let b = u8::from_str_radix(&s[2..3].repeat(2), 16).ok()?;
-            Some([r, g, b, 255])
-        }
-        _ => None,
-    }
+fn canonical_cursor_def(name: &str) -> ToolDef {
+    let contract = cua_driver_contract::tool_contract(name)
+        .unwrap_or_else(|| panic!("missing canonical cursor contract for {name}"));
+    ToolDef::from_contract(&contract)
 }
 
 // ── check_permissions ─────────────────────────────────────────────────────────
@@ -7709,7 +7506,7 @@ impl Tool for GetAccessibilityTreeTool {
         })
     }
     async fn invoke(&self, _args: Value) -> ToolResult {
-        let (procs, windows) = tokio::task::spawn_blocking(|| {
+        let (procs, windows) = cua_driver_core::blocking::spawn(|| {
             (
                 crate::win32::list_processes(),
                 crate::win32::list_windows(None),
@@ -7839,7 +7636,7 @@ impl Tool for ZoomTool {
         let (nx1, ny1, nx2, ny2) = (x1 * ratio, y1 * ratio, x2 * ratio, y2 * ratio);
 
         let state = self.state.clone();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = cua_driver_core::blocking::spawn(move || {
             let png = crate::capture::screenshot_window_bytes(hwnd)?;
             cursor_overlay::capture_utils::crop_png_to_jpeg(&png, nx1, ny1, nx2, ny2, 500)
         })
@@ -7931,7 +7728,7 @@ impl Tool for TypeTextCharsTool {
             Some(h) => h,
             None => {
                 let windows =
-                    tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid)))
+                    cua_driver_core::blocking::spawn(move || crate::win32::list_windows(Some(pid)))
                         .await
                         .unwrap_or_default();
                 match windows.first() {
@@ -7945,7 +7742,7 @@ impl Tool for TypeTextCharsTool {
             }
         };
         let text_len = text.chars().count();
-        let result = tokio::task::spawn_blocking(move || {
+        let result = cua_driver_core::blocking::spawn(move || {
             crate::input::post_type_text_with_delay(hwnd, &text, delay_ms)
         })
         .await;
@@ -8027,7 +7824,7 @@ impl Tool for BringToFrontTool {
             Some(h) => h,
             None => {
                 let windows =
-                    tokio::task::spawn_blocking(move || crate::win32::list_windows(Some(pid)))
+                    cua_driver_core::blocking::spawn(move || crate::win32::list_windows(Some(pid)))
                         .await
                         .unwrap_or_default();
                 match windows.first() {
@@ -8046,7 +7843,7 @@ impl Tool for BringToFrontTool {
         // and is validated by `flash-repro/16-edge-launch-fg.ps1` for the
         // Edge launch focus-steal recovery case.
         let outcome =
-            tokio::task::spawn_blocking(move || -> Result<(u64, u64, bool, bool), String> {
+            cua_driver_core::blocking::spawn(move || -> Result<(u64, u64, bool, bool), String> {
                 use windows::Win32::Foundation::HWND;
                 use windows::Win32::Graphics::Dwm::DwmFlush;
                 use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
@@ -8207,7 +8004,46 @@ impl Tool for KillAppTool {
         })
     }
 
+    async fn protected_resource_scope(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, String> {
+        if adapter_id != "process_control" {
+            return Ok(None);
+        }
+        use cua_driver_core::browser::platform::BrowserPlatform;
+        let pid = args
+            .get("pid")
+            .and_then(Value::as_i64)
+            .filter(|pid| *pid > 0)
+            .ok_or_else(|| "kill_app requires a positive integer pid".to_owned())?;
+        let fingerprint = crate::browser_platform::WindowsBrowserPlatform::default()
+            .process_fingerprint(pid)
+            .await
+            .map_err(|error| error.message)?;
+        Ok(Some(json!({
+            "kind": "process_instance",
+            "fingerprint": fingerprint,
+        })))
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
+        if let Some(expected) = args.get("_protected_process_fingerprint") {
+            let current = match self
+                .protected_resource_scope("process_control", &args)
+                .await
+            {
+                Ok(Some(scope)) => scope["fingerprint"].clone(),
+                Ok(None) => Value::Null,
+                Err(message) => return kill_app_stale_process_refusal(message),
+            };
+            if current != *expected {
+                return kill_app_stale_process_refusal(
+                    "the process identity changed at the termination boundary".to_owned(),
+                );
+            }
+        }
         let pid_v: u32 = match args.get("pid").and_then(|v| v.as_u64()) {
             Some(p) if p > 0 && p <= u32::MAX as u64 => p as u32,
             Some(_) => {
@@ -8223,7 +8059,7 @@ impl Tool for KillAppTool {
         // Run the syscalls on a blocking thread — TerminateProcess + the
         // WaitForSingleObject confirmation are both blocking, and we don't
         // want to stall the tokio reactor.
-        let outcome = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        let outcome = cua_driver_core::blocking::spawn(move || -> Result<(), String> {
             use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
             use windows::Win32::System::Threading::{
                 OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
@@ -8277,6 +8113,16 @@ impl Tool for KillAppTool {
     }
 }
 
+fn kill_app_stale_process_refusal(message: String) -> ToolResult {
+    ToolResult::error(message.clone()).with_structured(json!({
+        "status": "refused",
+        "refusal": {
+            "code": "protected_resource_scope_stale",
+            "message": message,
+        }
+    }))
+}
+
 // ── debug_window_info ─────────────────────────────────────────────────────────
 //
 // Diagnostic tool: dump everything the daemon (Session 2 when launched via
@@ -8325,7 +8171,7 @@ impl Tool for DebugWindowInfoTool {
             }
         };
 
-        let outcome = tokio::task::spawn_blocking(move || -> serde_json::Value {
+        let outcome = cua_driver_core::blocking::spawn(move || -> serde_json::Value {
             use std::collections::HashSet;
             use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, BOOL, TRUE};
             use windows::Win32::System::Com::{
@@ -8537,10 +8383,17 @@ impl Tool for DebugWindowInfoTool {
 // ── registry builder ──────────────────────────────────────────────────────────
 
 pub fn build_registry(compat: bool) -> ToolRegistry {
+    build_registry_with_provider(compat, None)
+}
+
+pub fn build_registry_with_provider(
+    compat: bool,
+    provider: Option<std::sync::Arc<dyn cua_driver_core::consent::ProtectedConsentProvider>>,
+) -> ToolRegistry {
     let state = ToolState::new();
-    {
+    let cursor_outcome_reader = {
         let cursor_registry = state.cursor_registry.clone();
-        let _ = cua_driver_core::session::set_cursor_outcome_reader(std::sync::Arc::new(
+        cua_driver_core::session::register_scoped_cursor_outcome_reader(std::sync::Arc::new(
             move |session_id| {
                 let state = cursor_registry.get(session_id);
                 let motion_customized = state.is_some()
@@ -8556,9 +8409,7 @@ pub fn build_registry(compat: bool) -> ToolRegistry {
                     Some(state) => cua_driver_core::session::bounded_cursor_outcome(
                         true,
                         state.config.enabled,
-                        state.config.cursor_icon.as_deref(),
-                        state.config.cursor_color.as_deref(),
-                        state.config.cursor_label.as_deref(),
+                        Some(state.config.theme_id.as_str()),
                         motion_customized,
                         active_cursor_count,
                     ),
@@ -8566,15 +8417,13 @@ pub fn build_registry(compat: bool) -> ToolRegistry {
                         false,
                         false,
                         None,
-                        None,
-                        None,
                         false,
                         active_cursor_count,
                     ),
                 }
             },
-        ));
-    }
+        ))
+    };
     // Share the element cache with the recording-hook layer so it can
     // resolve element_index → window-local screenshot coords for click.png.
     crate::recording_hooks::set_element_cache(state.element_cache.clone());
@@ -8583,22 +8432,34 @@ pub fn build_registry(compat: bool) -> ToolRegistry {
     // CLI `session end` verb, or the daemon idle-TTL sweep). The session id IS
     // the cursor key (caller-declared `session`), so this prunes the metadata
     // registry AND stops the overlay painting that session's cursor. Both paths
-    // guard "default" so the anonymous / one-shot cursor survives. Registering
-    // once per process (build_registry runs once in the daemon) is guarded so a
-    // repeated build in tests can't accumulate duplicate hooks. Mirrors the
-    // macOS `register_all` session_end hook (platform-macos/src/tools/mod.rs).
-    {
-        static HOOK_ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        if HOOK_ONCE.set(()).is_ok() {
-            let cursor_registry = state.cursor_registry.clone();
-            cua_driver_core::session::register_session_end_hook(move |session_id| {
-                cursor_registry.remove(session_id);
-                crate::overlay::remove_cursor(session_id.to_owned());
-            });
-        }
-    }
+    // guard "default" so the anonymous / one-shot cursor survives. The scoped
+    // registration lets each direct runtime clean up its own cursor state and
+    // deregisters when that runtime's registry is dropped. Mirrors the macOS
+    // `register_all` session_end hook (platform-macos/src/tools/mod.rs).
+    let cursor_registry = state.cursor_registry.clone();
+    let session_end_hook =
+        cua_driver_core::session::register_scoped_session_end_hook(move |session_id| {
+            cursor_registry.remove(session_id);
+            crate::overlay::remove_cursor(session_id.to_owned());
+        });
 
-    let mut r = ToolRegistry::new();
+    let mut r = ToolRegistry::new_with_protected_consent_provider(provider);
+    r.retain_cursor_outcome_reader(cursor_outcome_reader);
+    r.retain_session_end_hook(session_end_hook);
+    if let Some(runtime_scope) = cua_driver_core::tool::current_dispatch_runtime_scope() {
+        let prefix = format!("__cua_runtime_{runtime_scope}:");
+        let cursor_registry = state.cursor_registry.clone();
+        r.retain_runtime_cleanup(move || {
+            for cursor in cursor_registry
+                .all_states()
+                .into_iter()
+                .filter(|cursor| cursor.config.cursor_id.starts_with(&prefix))
+            {
+                cursor_registry.remove(&cursor.config.cursor_id);
+                crate::overlay::remove_cursor(cursor.config.cursor_id);
+            }
+        });
+    }
     r.register(Box::new(ListAppsTool));
     r.register(Box::new(ListWindowsTool));
     r.register(Box::new(GetWindowStateTool {
@@ -8659,16 +8520,12 @@ pub fn build_registry(compat: bool) -> ToolRegistry {
     r.register(Box::new(MoveCursorTool {
         state: state.clone(),
     }));
-    r.register(Box::new(SetAgentCursorEnabledTool {
+    r.register(Box::new(SetAgentCursorEnabledV2Tool {
         state: state.clone(),
     }));
-    r.register(Box::new(SetAgentCursorMotionTool {
-        state: state.clone(),
-    }));
-    r.register(Box::new(GetAgentCursorStateTool {
-        state: state.clone(),
-    }));
-    r.register(Box::new(SetAgentCursorStyleTool {
+    r.register(Box::new(SetAgentCursorMotionV2Tool));
+    r.register(Box::new(GetAgentCursorStateV2Tool));
+    r.register(Box::new(SetAgentCursorThemeTool {
         state: state.clone(),
     }));
     r.register(Box::new(CheckPermissionsTool));
@@ -8703,9 +8560,13 @@ pub fn build_registry(compat: bool) -> ToolRegistry {
     r.register(Box::new(cua_driver_core::page::PageTool::new(
         std::sync::Arc::new(super::page::WindowsPageBackend::new()),
     )));
-    let browser_engine = cua_driver_core::browser::BrowserEngine::new(std::sync::Arc::new(
-        crate::browser_platform::WindowsBrowserPlatform::new(state.cursor_registry.clone()),
-    ));
+    let browser_engine = cua_driver_core::browser::BrowserEngine::new_with_runtime_services(
+        std::sync::Arc::new(crate::browser_platform::WindowsBrowserPlatform::new(
+            state.cursor_registry.clone(),
+        )),
+        r.approval_broker(),
+        r.protected_resource_ownership(),
+    );
     cua_driver_core::browser::register_browser_tools(&browser_engine, &mut r);
     r.register_recording_tools();
     r.register_session_tools();

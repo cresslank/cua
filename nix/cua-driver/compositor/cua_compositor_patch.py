@@ -228,8 +228,13 @@ static void cua_assign_target(struct tinywl_toplevel *t) {
 	if (t->cua_id) return;
 	cua_init_epoch();
 	t->cua_id = g_cua_next_id++;
-	snprintf(t->cua_target, sizeof t->cua_target, "surface:%016llx:%016llx",
-		(unsigned long long)g_cua_epoch, (unsigned long long)t->cua_id);
+	/* Bind the opaque surface incarnation to credentials read by the
+	 * compositor from the owning Wayland client. Foreign-toplevel itself has
+	 * no PID event, so consumers must authenticate the PID without correlating
+	 * attacker-controlled titles/app ids through accessibility. */
+	snprintf(t->cua_target, sizeof t->cua_target, "surface:%016llx:%016llx:%d",
+		(unsigned long long)g_cua_epoch, (unsigned long long)t->cua_id,
+		(int)cua_toplevel_pid(t));
 }
 /* Resolve only the exact v2 token. PID, app-id, title, and newest-window
  * fallbacks are deliberately unsupported because one browser process may own

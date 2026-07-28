@@ -47,8 +47,9 @@ release, socket close, and a compositor timeout all restore the scene.
 
 ## Browser profile ownership
 
-The supervisor exports `CUA_BROWSER_PROFILE_DIR`. One browser process owns that
-profile; several agents must attach to the same process through a browser broker.
+The supervisor exports `CUA_DRIVER_BROWSER_PROFILE_ROOT`. One browser process
+owns that profile; several agents must attach to the same process through a
+browser broker.
 Do not launch multiple browser processes against the directory or bypass browser
 profile locks.
 

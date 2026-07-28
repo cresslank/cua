@@ -78,6 +78,18 @@ pub fn ensure_session_bus_discovered() {
     });
 }
 
+/// Resolve the desktop session bus without mutating the process environment.
+///
+/// Public SDK constructors can run after arbitrary embedding-process threads
+/// exist, so they must pass this address explicitly rather than calling
+/// [`ensure_session_bus_discovered`].
+pub fn session_bus_address() -> Option<String> {
+    std::env::var("DBUS_SESSION_BUS_ADDRESS")
+        .ok()
+        .filter(|address| !address.is_empty())
+        .or_else(discover_session_bus_address)
+}
+
 /// Prefer the standard systemd user-bus socket; fall back to reading the
 /// address from a running desktop-session process's environment.
 fn discover_session_bus_address() -> Option<String> {

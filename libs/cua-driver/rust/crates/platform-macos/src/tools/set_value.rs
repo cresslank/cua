@@ -171,7 +171,7 @@ impl Tool for SetValueTool {
             prior_front,
             "set_value.AXValue",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                cua_driver_core::blocking::spawn(move || {
                     set_value_blocking(element_ptr, element_index, pid, &value)
                 })
                 .await

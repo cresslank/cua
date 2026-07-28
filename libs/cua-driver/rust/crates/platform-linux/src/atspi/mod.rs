@@ -4,7 +4,7 @@
 //! `atspi` crate (zbus) — no Python, `pyatspi`, or GObject-introspection
 //! typelibs are required at runtime. The async zbus calls run on a shared
 //! background Tokio runtime; the public functions stay synchronous because
-//! callers invoke them inside `tokio::task::spawn_blocking`.
+//! callers invoke them inside `cua_driver_core::blocking::spawn`.
 //!
 //! When the AT-SPI bus is unavailable (or the app exposes no a11y tree) we
 //! fall back to a minimal X11 property tree (window title + role) via x11rb.
@@ -135,6 +135,26 @@ pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
     native::perform_action(pid, idx)
 }
 
+pub fn perform_verified_action_by_key(
+    target_proof: &crate::wayland::ExactTargetProof,
+    element_key: u64,
+    expected_role: &str,
+    expected_name: &str,
+    expected_checked: Option<bool>,
+    expected_actions: &[String],
+    expected_action: &str,
+) -> Result<(String, bool)> {
+    native::perform_verified_action_by_key(
+        target_proof,
+        element_key,
+        expected_role,
+        expected_name,
+        expected_checked,
+        expected_actions,
+        expected_action,
+    )
+}
+
 /// Give an indexed AT-SPI element keyboard focus without activating its window.
 pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
     native::focus_element(pid, idx)
@@ -216,6 +236,26 @@ pub fn focused_is_editable(pid: u32) -> Result<Option<bool>> {
 
 pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> {
     native::get_element_bounds(pid, idx)
+}
+
+pub fn get_verified_element_bounds_by_key(
+    pid: u32,
+    window_id: u64,
+    element_key: u64,
+    expected_role: &str,
+    expected_name: &str,
+    expected_checked: Option<bool>,
+    expected_actions: &[String],
+) -> Result<(i32, i32, u32, u32)> {
+    native::get_verified_element_bounds_by_key(
+        pid,
+        window_id,
+        element_key,
+        expected_role,
+        expected_name,
+        expected_checked,
+        expected_actions,
+    )
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────

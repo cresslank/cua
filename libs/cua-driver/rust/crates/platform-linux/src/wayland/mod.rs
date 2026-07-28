@@ -332,6 +332,30 @@ fn private_target_window_id(target: &str) -> u64 {
     hash.max(1)
 }
 
+/// Extract the PID embedded by the private compositor from the owning
+/// Wayland client's credentials. Older/malformed surface tokens deliberately
+/// return `None`: title/app-id correlation is not an ownership proof.
+fn private_target_client_pid(target: &str) -> Option<u32> {
+    let mut fields = target.split(':');
+    let (Some("surface"), Some(epoch), Some(surface), Some(pid), None) = (
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+        fields.next(),
+    ) else {
+        return None;
+    };
+    if epoch.len() != 16
+        || surface.len() != 16
+        || !epoch.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || !surface.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    pid.parse::<u32>().ok().filter(|pid| *pid > 0)
+}
+
 fn identity_for(id: u64) -> Option<ToplevelIdentity> {
     identity_registry()
         .lock()
@@ -700,7 +724,11 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
         remember_identity(stable_id, tl);
         out.push(WindowInfo {
             xid: stable_id,
-            pid: sway.map(|window| window.pid),
+            pid: if exact_private_target {
+                private_target_client_pid(&tl.app_id)
+            } else {
+                sway.map(|window| window.pid)
+            },
             app_name: if exact_private_target {
                 String::new()
             } else {
@@ -715,8 +743,11 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
             height: sway.map(|window| window.height).unwrap_or(0),
             native_window_id: Some(u64::from(*id)),
             target_id: exact_private_target.then(|| tl.app_id.clone()),
-            helper_epoch: exact_private_target
-                .then(|| tl.app_id.split(':').nth(1).unwrap_or_default().to_owned()),
+            // Private compositor targets are exact surface tokens, not GNOME
+            // helper identities. Conflating the token's generation segment
+            // with a helper epoch makes the proof constructor require the
+            // GNOME exact-target-v2 capability and rejects every private target.
+            helper_epoch: None,
             transient_for_window_id: None,
             transient_for_target_id: None,
             is_attached_dialog: None,
@@ -1325,6 +1356,7 @@ pub struct ForegroundInputGuard {
     // process-wide raw-input lease to the next waiting action.
     _transaction: Option<shell_helper::ForegroundTransaction>,
     _lease: Option<HostRawInputLease>,
+    _inject_target: Option<InjectFocusedTargetGuard>,
 }
 
 /// Immutable proof of the caller-established Wayland toplevel identity.
@@ -1336,8 +1368,8 @@ pub struct ForegroundInputGuard {
 /// boundary, then carry it unchanged through readiness, activation, and input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExactTargetProof {
-    pub window_id: u64,
-    pub pid: u32,
+    window_id: u64,
+    pid: u32,
     helper_epoch: Option<String>,
     target_id: Option<String>,
 }
@@ -1349,6 +1381,35 @@ impl ExactTargetProof {
                 "exact_target_mismatch: window {} is not authoritatively owned by pid {expected_pid}",
                 window.xid
             );
+        }
+
+        let private_surface_exact = window
+            .target_id
+            .as_deref()
+            .is_some_and(|target| target.starts_with("surface:"));
+        if private_surface_exact {
+            let target_id = window.target_id.as_deref().expect("private target checked");
+            let credential_pid = private_target_client_pid(target_id).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "exact_target_unavailable: private surface omitted compositor-authenticated client credentials"
+                )
+            })?;
+            if credential_pid != expected_pid {
+                anyhow::bail!(
+                    "exact_target_mismatch: private surface credentials name pid {credential_pid}, not approved pid {expected_pid}"
+                );
+            }
+            if window.helper_epoch.is_some() || window.identity_capabilities.is_some() {
+                anyhow::bail!(
+                    "exact_target_unavailable: private surface identity was mixed with GNOME helper metadata"
+                );
+            }
+            return Ok(Self {
+                window_id: window.xid,
+                pid: expected_pid,
+                helper_epoch: None,
+                target_id: window.target_id.clone(),
+            });
         }
 
         let helper_exact = window.helper_epoch.is_some()
@@ -1398,6 +1459,14 @@ impl ExactTargetProof {
             && window.helper_epoch == self.helper_epoch
             && window.target_id == self.target_id
     }
+
+    pub fn window_id(&self) -> u64 {
+        self.window_id
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
 }
 
 /// Establish an exact target from the PID and window ID supplied by the tool
@@ -1423,7 +1492,7 @@ pub fn establish_exact_target(pid: u32, window_id: u64) -> anyhow::Result<ExactT
     ExactTargetProof::from_window(window, pid)
 }
 
-fn validate_exact_target(target: &ExactTargetProof) -> anyhow::Result<()> {
+pub fn validate_exact_target(target: &ExactTargetProof) -> anyhow::Result<()> {
     let matches = list_windows_dispatch(Some(target.pid))
         .into_iter()
         .any(|window| target.matches_window(&window));
@@ -1437,8 +1506,24 @@ fn validate_exact_target(target: &ExactTargetProof) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Validate the immutable target against one authoritative window-list snapshot
+/// and require it to be the process's only native toplevel. Browser setup uses
+/// this stronger form when correlating a process-wide AT-SPI application tree:
+/// the singleton requirement makes the selected accessibility root correspond
+/// to this exact compositor identity rather than merely to the same PID.
+pub(crate) fn validate_single_exact_target(target: &ExactTargetProof) -> anyhow::Result<()> {
+    let windows = list_windows_dispatch(Some(target.pid));
+    if windows.len() != 1 || !target.matches_window(&windows[0]) {
+        anyhow::bail!(
+            "exact_target_unavailable: browser setup requires one immutable native window for pid {}",
+            target.pid
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
-struct HostRawInputLease {
+pub(super) struct HostRawInputLease {
     _process: std::sync::MutexGuard<'static, ()>,
     _session_file: std::fs::File,
 }
@@ -1448,6 +1533,9 @@ impl ForegroundInputGuard {
     pub fn validate(&self) -> anyhow::Result<()> {
         if let Some(transaction) = self._transaction.as_ref() {
             transaction.validate()?;
+        }
+        if self._inject_target.is_some() {
+            inject_focused_target()?;
         }
         Ok(())
     }
@@ -1474,6 +1562,23 @@ fn with_foreground_input(
     target: &ExactTargetProof,
     inject: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<Option<shell_helper::ForegroundTerminalOutcome>> {
+    if !is_inject_mode() && !shell_helper::available() {
+        // Sway focus is desktop-global input routing just like a GNOME helper
+        // transaction. Serialize the complete focus/inject/restore sequence
+        // across both this process and the host session.
+        let lease = acquire_host_raw_input_lease()?;
+        validate_exact_target(target)?;
+        let window = sway_ipc::window_for_id(target.window_id)
+            .filter(|window| window.pid == target.pid)
+            .ok_or_else(|| anyhow::anyhow!(
+                "foreground_unavailable: no exact action-time focus adapter is available for pid {} window {}; refusing global input",
+                target.pid,
+                target.window_id
+            ))?;
+        let result = sway_ipc::with_focused_container(target.pid, window.id, inject).map(|()| None);
+        drop(lease);
+        return result;
+    }
     let guard = activate_window_for_input_target(target)?;
     let action = guard.validate().and_then(|()| inject());
     let restoration = guard.finish();
@@ -1487,7 +1592,7 @@ fn with_foreground_input(
     }
 }
 
-fn acquire_host_raw_input_lease() -> anyhow::Result<HostRawInputLease> {
+pub(super) fn acquire_host_raw_input_lease() -> anyhow::Result<HostRawInputLease> {
     acquire_host_raw_input_lease_with_timeout(std::time::Duration::from_secs(2))
 }
 
@@ -1568,21 +1673,22 @@ fn acquire_host_raw_input_lease_with_timeout(
     }
 }
 
-/// Activate a Wayland target with an explicit process identity when available.
-/// The bundled compositor does not depend on connection-local Wayland object
-/// ids: its control protocol resolves the one mapped toplevel owned by `pid`.
+/// Activate a Wayland target from an immutable exact-target proof.
+/// The bundled compositor receives its compositor-owned surface token rather
+/// than a PID, because one browser process can own several controlled surfaces.
 pub fn activate_window_for_input_target(
     target: &ExactTargetProof,
 ) -> anyhow::Result<ForegroundInputGuard> {
     validate_exact_target(target)?;
     let window_id = target.window_id;
     if is_inject_mode() {
-        let target = inject_target_for_window(window_id)?;
-        inject_send(&[format!("f {target}")])?;
+        let surface = inject_target_for_window(window_id)?;
+        inject_send(&[format!("f {surface}")])?;
         std::thread::sleep(std::time::Duration::from_millis(60));
         return Ok(ForegroundInputGuard {
             _transaction: None,
             _lease: None,
+            _inject_target: Some(InjectFocusedTargetGuard::new(target.pid, window_id)),
         });
     }
 
@@ -1602,6 +1708,7 @@ pub fn activate_window_for_input_target(
         return Ok(ForegroundInputGuard {
             _transaction: Some(transaction),
             _lease: Some(lease),
+            _inject_target: None,
         });
     }
 
@@ -1626,6 +1733,7 @@ pub fn activate_window_for_input_target(
         return Ok(ForegroundInputGuard {
             _transaction: None,
             _lease: Some(lease),
+            _inject_target: None,
         });
     }
 
@@ -1691,6 +1799,49 @@ fn event_time_ms() -> u32 {
         .clamp(1, u32::MAX as u128) as u32
 }
 
+fn nested_local_point(
+    target: &ExactTargetProof,
+    point: Option<(i32, i32)>,
+    operation: &str,
+) -> anyhow::Result<(f64, f64)> {
+    let window = list_windows_dispatch(Some(target.pid))
+        .into_iter()
+        .find(|window| target.matches_window(window))
+        .ok_or_else(|| anyhow::anyhow!("stale_target: nested {operation} target changed"))?;
+    if window.width == 0 || window.height == 0 {
+        anyhow::bail!("exact_target_unavailable: nested {operation} target has no geometry");
+    }
+    let (output_x, output_y) = match point {
+        Some(point) => point,
+        None => (
+            window
+                .x
+                .checked_add(i32::try_from(window.width / 2)?)
+                .ok_or_else(|| anyhow::anyhow!("nested {operation} center x overflowed"))?,
+            window
+                .y
+                .checked_add(i32::try_from(window.height / 2)?)
+                .ok_or_else(|| anyhow::anyhow!("nested {operation} center y overflowed"))?,
+        ),
+    };
+    let local_x = output_x
+        .checked_sub(window.x)
+        .ok_or_else(|| anyhow::anyhow!("nested {operation} x coordinate overflowed"))?;
+    let local_y = output_y
+        .checked_sub(window.y)
+        .ok_or_else(|| anyhow::anyhow!("nested {operation} y coordinate overflowed"))?;
+    if local_x < 0
+        || local_y < 0
+        || local_x >= i32::try_from(window.width)?
+        || local_y >= i32::try_from(window.height)?
+    {
+        anyhow::bail!(
+            "exact_target_mismatch: {operation} point lies outside the immutable nested surface"
+        );
+    }
+    Ok((f64::from(local_x), f64::from(local_y)))
+}
+
 /// Click a native Wayland toplevel identified by its `window_id` (the
 /// foreign-toplevel protocol id from `list_windows`) at output-relative
 /// `(x, y)`, with `button` (1/2/3 = left/middle/right) emitted `count` times.
@@ -1727,18 +1878,23 @@ pub fn click_with_outcome(
 ) -> anyhow::Result<Option<shell_helper::ForegroundTerminalOutcome>> {
     validate_exact_target(&target)?;
     let count = bounded_click_count(count)?;
+    if is_inject_mode() {
+        // Nested compositor injection is surface-token addressed and expects
+        // window-local coordinates. Never route this fallback through the
+        // title/app-id virtual-pointer activator.
+        let (local_x, local_y) = nested_local_point(&target, Some((x, y)), "click")?;
+        inject_click(target.window_id, local_x, local_y, count, button)?;
+        return Ok(None);
+    }
     if is_gnome_wayland_session() {
         require_gnome_pointer_transport_ready()?;
         return with_foreground_input(&target, || libei_click(x, y, count, button));
     }
-    let window_id = target.window_id;
     with_libei_fallback(
-        || click_vptr(Some(window_id), x, y, count, button),
+        || with_foreground_input(&target, || click_vptr(None, x, y, count, button)).map(|_| ()),
         || {
             libei_wait_pointer_ready()?;
-            let foreground = activate_window_for_input_target(&target)?;
-            foreground.validate()?;
-            libei_click(x, y, count, button)
+            with_foreground_input(&target, || libei_click(x, y, count, button)).map(|_| ())
         },
     )
     .map(|()| None)
@@ -1923,6 +2079,11 @@ pub fn scroll_at_with_outcome(
     amount: u32,
 ) -> anyhow::Result<Option<shell_helper::ForegroundTerminalOutcome>> {
     validate_exact_target(&target)?;
+    if is_inject_mode() {
+        let (local_x, local_y) = nested_local_point(&target, point, "scroll")?;
+        inject_scroll(target.window_id, local_x, local_y, direction, amount)?;
+        return Ok(None);
+    }
     if is_gnome_wayland_session() {
         require_gnome_scroll_transport_ready()?;
         return with_foreground_input(&target, || {
@@ -1932,18 +2093,21 @@ pub fn scroll_at_with_outcome(
             libei_scroll(direction, amount)
         });
     }
-    let window_id = target.window_id;
     let direction = direction.to_string();
     with_libei_fallback(
-        || scroll_vptr(Some(window_id), point, &direction, amount),
+        || {
+            with_foreground_input(&target, || scroll_vptr(None, point, &direction, amount))
+                .map(|_| ())
+        },
         || {
             libei_wait_scroll_ready()?;
-            let foreground = activate_window_for_input_target(&target)?;
-            foreground.validate()?;
-            if let Some((x, y)) = point {
-                libei_move_absolute(x, y)?;
-            }
-            libei_scroll(&direction, amount)
+            with_foreground_input(&target, || {
+                if let Some((x, y)) = point {
+                    libei_move_absolute(x, y)?;
+                }
+                libei_scroll(&direction, amount)
+            })
+            .map(|_| ())
         },
     )
     .map(|()| None)
@@ -1952,6 +2116,9 @@ pub fn scroll_at_with_outcome(
 /// Scroll at a desktop-absolute point without activating a named toplevel.
 pub fn scroll_desktop(x: i32, y: i32, direction: &str, amount: u32) -> anyhow::Result<()> {
     reject_unsafe_gnome_desktop_input("scroll")?;
+    if is_inject_mode() {
+        return inject_scroll_desktop(x, y, direction, amount);
+    }
     let direction = direction.to_string();
     with_libei_fallback(
         || scroll_vptr(None, Some((x, y)), &direction, amount),
@@ -2058,6 +2225,13 @@ pub fn move_cursor_absolute_with_outcome(
     if let Some(target) = target.as_ref() {
         validate_exact_target(target)?;
     }
+    if is_inject_mode() {
+        if let Some(target) = target.as_ref() {
+            let (local_x, local_y) = nested_local_point(target, Some((x, y)), "pointer move")?;
+            inject_move(target.window_id, local_x, local_y)?;
+            return Ok(None);
+        }
+    }
     if is_gnome_wayland_session() {
         libei_wait_pointer_ready()?;
         let target = target
@@ -2065,15 +2239,24 @@ pub fn move_cursor_absolute_with_outcome(
             .ok_or_else(|| anyhow::anyhow!("GNOME pointer move requires an exact target"))?;
         return with_foreground_input(target, || libei_move_absolute(x, y));
     }
-    let window_id = target.as_ref().map(|target| target.window_id);
-    with_libei_fallback(
-        || move_cursor_absolute_vptr(window_id, x, y),
-        || {
-            libei_wait_pointer_ready()?;
-            libei_move_absolute(x, y)
-        },
-    )
-    .map(|()| None)
+    match target.as_ref() {
+        Some(target) => with_libei_fallback(
+            || with_foreground_input(target, || move_cursor_absolute_vptr(None, x, y)).map(|_| ()),
+            || {
+                libei_wait_pointer_ready()?;
+                with_foreground_input(target, || libei_move_absolute(x, y)).map(|_| ())
+            },
+        )
+        .map(|()| None),
+        None => with_libei_fallback(
+            || move_cursor_absolute_vptr(None, x, y),
+            || {
+                libei_wait_pointer_ready()?;
+                libei_move_absolute(x, y)
+            },
+        )
+        .map(|()| None),
+    }
 }
 
 /// wlroots virtual-pointer implementation of [`move_cursor_absolute`].
@@ -2119,20 +2302,37 @@ pub fn drag_with_outcome(
     button: u8,
 ) -> anyhow::Result<Option<shell_helper::ForegroundTerminalOutcome>> {
     validate_exact_target(&target)?;
+    if is_inject_mode() {
+        let from = nested_local_point(&target, Some((from_x, from_y)), "drag start")?;
+        let to = nested_local_point(&target, Some((to_x, to_y)), "drag end")?;
+        inject_drag(
+            target.window_id,
+            from,
+            to,
+            usize::try_from(steps.max(1))?,
+            evdev_pointer_button(button),
+        )?;
+        return Ok(None);
+    }
     if is_gnome_wayland_session() {
         require_gnome_pointer_transport_ready()?;
         return with_foreground_input(&target, || {
             libei_drag(from_x, from_y, to_x, to_y, steps, button)
         });
     }
-    let window_id = target.window_id;
     with_libei_fallback(
-        || drag_vptr(Some(window_id), from_x, from_y, to_x, to_y, steps, button),
+        || {
+            with_foreground_input(&target, || {
+                drag_vptr(None, from_x, from_y, to_x, to_y, steps, button)
+            })
+            .map(|_| ())
+        },
         || {
             libei_wait_pointer_ready()?;
-            let foreground = activate_window_for_input_target(&target)?;
-            foreground.validate()?;
-            libei_drag(from_x, from_y, to_x, to_y, steps, button)
+            with_foreground_input(&target, || {
+                libei_drag(from_x, from_y, to_x, to_y, steps, button)
+            })
+            .map(|_| ())
         },
     )
     .map(|()| None)
@@ -2237,32 +2437,29 @@ pub fn type_text_with_outcome(
         require_gnome_keyboard_transport_ready()?;
         return with_foreground_input(&target, || libei_type_text(text));
     }
-    let foreground = activate_window_for_input_target(&target)?;
-    foreground.validate()?;
-    // Lead with a no-op Shift_L tap: on a freshly-focused window under a headless
-    // seat (notably sway), the compositor needs the first virtual-keyboard event
-    // to wire up keyboard routing, and that first key is dropped. Sacrificing a
-    // modifier tap (no character) absorbs the drop so the real text lands intact;
-    // it's harmless where routing is already live (labwc).
-    let result = std::process::Command::new("wtype")
-        .args(["-k", "Shift_L", "--"])
-        .arg(text)
-        .output();
-    match result {
-        Ok(out) if out.status.success() => Ok(None),
-        // `wtype` relies on `zwp_virtual_keyboard_v1`, which KWin/Plasma and
-        // Mutter/GNOME don't implement (and the binary may be missing wtype
-        // entirely). On a portal-input build, route typing through libei's
-        // `ei_text` interface instead. See #1982.
-        other => with_wtype_libei_fallback(
-            || {
-                libei_wait_keyboard_ready()?;
-                libei_type_text(text)
-            },
-            other.map(|o| String::from_utf8_lossy(&o.stderr).into_owned()),
-        )
-        .map(|()| None),
-    }
+    with_foreground_input(&target, || {
+        if is_inject_mode() {
+            let target = inject_focused_target()?;
+            return inject_type_text(target.window_id, text);
+        }
+        // Lead with a no-op Shift_L tap: on a freshly-focused window under a
+        // headless seat (notably sway), the compositor needs the first virtual-
+        // keyboard event to wire up routing and drops that first event.
+        let result = std::process::Command::new("wtype")
+            .args(["-k", "Shift_L", "--"])
+            .arg(text)
+            .output();
+        match result {
+            Ok(out) if out.status.success() => Ok(()),
+            other => with_wtype_libei_fallback(
+                || {
+                    libei_wait_keyboard_ready()?;
+                    libei_type_text(text)
+                },
+                other.map(|out| String::from_utf8_lossy(&out.stderr).into_owned()),
+            ),
+        }
+    })
 }
 
 /// Type into a surface whose exact Sway container is already held focused by
@@ -2272,6 +2469,10 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
     reject_unsafe_gnome_desktop_input("text input")?;
     if text.is_empty() {
         return Ok(());
+    }
+    if is_inject_mode() {
+        let target = inject_focused_target()?;
+        return inject_type_text(target.window_id, text);
     }
     let result = std::process::Command::new("wtype")
         .args(["-k", "Shift_L", "--"])
@@ -2295,6 +2496,12 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
 /// process after the text has landed.
 pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
     reject_unsafe_gnome_desktop_input("text and key input")?;
+    if is_inject_mode() {
+        validate_injectable_key(key)?;
+        let target = inject_focused_target()?;
+        inject_type_text(target.window_id, text)?;
+        return inject_press_key(target.window_id, key);
+    }
     let keysym = key_to_keysym(key);
     let result = std::process::Command::new("wtype")
         .args(["-k", "Shift_L", "-s", "30"])
@@ -2328,31 +2535,36 @@ pub fn press_key_with_outcome(
         require_gnome_keyboard_transport_ready()?;
         return with_foreground_input(&target, || libei_press_key(key));
     }
-    let foreground = activate_window_for_input_target(&target)?;
-    foreground.validate()?;
-    let keysym = key_to_keysym(key);
-    // Keep the sacrificial modifier and requested key in one virtual-keyboard
-    // lifetime. Starting a second wtype process creates a fresh protocol object,
-    // causing headless seats to drop the requested key as their first event.
-    let result = std::process::Command::new("wtype")
-        .args(["-k", "Shift_L", "-k", &keysym])
-        .output();
-    match result {
-        Ok(out) if out.status.success() => Ok(None),
-        other => with_wtype_libei_fallback(
-            || {
-                libei_wait_keyboard_ready()?;
-                libei_press_key(key)
-            },
-            other.map(|o| String::from_utf8_lossy(&o.stderr).into_owned()),
-        )
-        .map(|()| None),
-    }
+    with_foreground_input(&target, || {
+        if is_inject_mode() {
+            let target = inject_focused_target()?;
+            return inject_press_key(target.window_id, key);
+        }
+        let keysym = key_to_keysym(key);
+        // Keep the primer and requested key in one virtual-keyboard lifetime.
+        let result = std::process::Command::new("wtype")
+            .args(["-k", "Shift_L", "-k", &keysym])
+            .output();
+        match result {
+            Ok(out) if out.status.success() => Ok(()),
+            other => with_wtype_libei_fallback(
+                || {
+                    libei_wait_keyboard_ready()?;
+                    libei_press_key(key)
+                },
+                other.map(|out| String::from_utf8_lossy(&out.stderr).into_owned()),
+            ),
+        }
+    })
 }
 
 /// Press one key while an outer exact-container focus guard is active.
 pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
     reject_unsafe_gnome_desktop_input("key input")?;
+    if is_inject_mode() {
+        let target = inject_focused_target()?;
+        return inject_press_key(target.window_id, key);
+    }
     let keysym = key_to_keysym(key);
     let result = std::process::Command::new("wtype")
         .args(["-k", "Shift_L", "-k", &keysym])
@@ -2388,44 +2600,51 @@ pub fn hotkey_with_outcome(
         require_gnome_keyboard_transport_ready()?;
         return with_foreground_input(&target, || libei_hotkey(&mods, &final_key));
     }
-    let foreground = activate_window_for_input_target(&target)?;
-    foreground.validate()?;
-    if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
-        return Ok(None);
-    }
-    let keysym = key_to_keysym(&final_key);
-    let args = wtype_hotkey_args(&mods, &keysym);
-    let result = std::process::Command::new("wtype").args(&args).output();
-    match result {
-        Ok(out) if out.status.success() => Ok(None),
-        other => {
-            let stderr = other.map(|o| String::from_utf8_lossy(&o.stderr).into_owned());
-            #[cfg(feature = "portal-input")]
-            {
-                return with_wtype_libei_fallback(
-                    || {
-                        libei::wait_keyboard_ready()?;
-                        libei_hotkey(&mods, &final_key)
-                    },
-                    stderr,
-                )
-                .map(|()| None);
-            }
-            #[cfg(not(feature = "portal-input"))]
-            {
-                anyhow::bail!(
-                    "wtype {} failed: {}",
-                    args.join(" "),
-                    stderr.unwrap_or_else(|_| "wtype unavailable".into())
-                );
+    with_foreground_input(&target, || {
+        if is_inject_mode() {
+            let target = inject_focused_target()?;
+            return inject_hotkey(target.window_id, keys);
+        }
+        if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
+            return Ok(());
+        }
+        let keysym = key_to_keysym(&final_key);
+        let args = wtype_hotkey_args(&mods, &keysym);
+        let result = std::process::Command::new("wtype").args(&args).output();
+        match result {
+            Ok(out) if out.status.success() => Ok(()),
+            other => {
+                let stderr = other.map(|out| String::from_utf8_lossy(&out.stderr).into_owned());
+                #[cfg(feature = "portal-input")]
+                {
+                    return with_wtype_libei_fallback(
+                        || {
+                            libei::wait_keyboard_ready()?;
+                            libei_hotkey(&mods, &final_key)
+                        },
+                        stderr,
+                    );
+                }
+                #[cfg(not(feature = "portal-input"))]
+                {
+                    anyhow::bail!(
+                        "wtype {} failed: {}",
+                        args.join(" "),
+                        stderr.unwrap_or_else(|_| "wtype unavailable".into())
+                    );
+                }
             }
         }
-    }
+    })
 }
 
 /// Send a chord while an outer exact-container focus guard is active.
 pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
     reject_unsafe_gnome_desktop_input("hotkey input")?;
+    if is_inject_mode() {
+        let target = inject_focused_target()?;
+        return inject_hotkey(target.window_id, keys);
+    }
     let (mods, final_key) = partition_modifiers(keys)?;
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
         return Ok(());
@@ -2904,6 +3123,91 @@ pub fn is_inject_mode() -> bool {
     inject_socket_path().is_some()
 }
 
+std::thread_local! {
+    static INJECT_FOCUSED_TARGETS: std::cell::RefCell<Vec<(u64, u32, u64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+static NEXT_INJECT_FOCUSED_GUARD_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+struct InjectFocusedTargetGuard {
+    guard_id: u64,
+}
+
+impl InjectFocusedTargetGuard {
+    fn new(pid: u32, window_id: u64) -> Self {
+        let guard_id =
+            NEXT_INJECT_FOCUSED_GUARD_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        INJECT_FOCUSED_TARGETS.with(|targets| {
+            targets.borrow_mut().push((guard_id, pid, window_id));
+        });
+        Self { guard_id }
+    }
+}
+
+impl Drop for InjectFocusedTargetGuard {
+    fn drop(&mut self) {
+        INJECT_FOCUSED_TARGETS.with(|targets| {
+            let mut targets = targets.borrow_mut();
+            if let Some(index) = targets
+                .iter()
+                .position(|(guard_id, _, _)| *guard_id == self.guard_id)
+            {
+                targets.remove(index);
+            }
+        });
+    }
+}
+
+fn inject_focused_target() -> anyhow::Result<ExactTargetProof> {
+    let (pid, window_id) = current_inject_focused_target().ok_or_else(|| {
+        anyhow::anyhow!(
+            "foreground_unavailable: cua-compositor has no scoped foreground target; \
+                 establish an exact target before focused keyboard input"
+        )
+    })?;
+    establish_exact_target(pid, window_id)
+}
+
+fn current_inject_focused_target() -> Option<(u32, u64)> {
+    INJECT_FOCUSED_TARGETS.with(|targets| {
+        targets
+            .borrow()
+            .last()
+            .map(|(_, pid, window_id)| (*pid, *window_id))
+    })
+}
+
+fn inject_scroll_desktop(x: i32, y: i32, direction: &str, amount: u32) -> anyhow::Result<()> {
+    let windows = list_windows_dispatch(None);
+    let target = windows
+        .iter()
+        .filter(|window| {
+            window.is_on_screen
+                && x >= window.x
+                && y >= window.y
+                && x < window.x.saturating_add(window.width as i32)
+                && y < window.y.saturating_add(window.height as i32)
+                && inject_target_for_window(window.xid).is_ok()
+        })
+        .max_by_key(|window| window.z_index.unwrap_or_default())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "foreground_unavailable: no exact cua-compositor surface contains desktop point ({x},{y})"
+            )
+        })?;
+    let pid = target.pid.ok_or_else(|| {
+        anyhow::anyhow!(
+            "foreground_unavailable: desktop point ({x},{y}) resolved to a window without a pid"
+        )
+    })?;
+    let local_x = f64::from(x.saturating_sub(target.x));
+    let local_y = f64::from(y.saturating_sub(target.y));
+    let exact_target = establish_exact_target(pid, target.xid)?;
+    inject_scroll(exact_target.window_id, local_x, local_y, direction, amount)
+}
+
 /// Reject any character the nested compositor cannot type before it reaches the
 /// wire. The compositor's chartab (`cua_init_keymap`) only covers printable
 /// ASCII (`0x20..=0x7E`) plus newline and tab; anything else — Unicode, other
@@ -3198,26 +3502,16 @@ fn parse_inject_geometry(line: &str) -> anyhow::Result<((i32, i32), (i32, i32))>
 
 /// Return the offset that rebases native Wayland accessibility coordinates into
 /// the nested compositor's root-surface/output coordinate space.
-pub fn inject_accessibility_offset(pid: u32) -> Option<(i32, i32)> {
-    if !is_inject_mode() || pid == 0 {
+pub fn inject_accessibility_offset(window_id: u64) -> Option<(i32, i32)> {
+    if !is_inject_mode() || window_id == 0 {
         return None;
     }
-    let replies = inject_exchange(&[format!("g {pid}")]).ok()?;
+    let target = inject_target_for_window(window_id).ok()?;
+    let replies = inject_exchange(&[format!("g {target}")]).ok()?;
     replies
         .first()
         .and_then(|line| parse_inject_geometry(line).ok())
         .map(|geometry| geometry.0)
-}
-
-fn inject_window_origin(pid: u32) -> Option<(i32, i32)> {
-    if !is_inject_mode() || pid == 0 {
-        return None;
-    }
-    let replies = inject_exchange(&[format!("g {pid}")]).ok()?;
-    replies
-        .first()
-        .and_then(|line| parse_inject_geometry(line).ok())
-        .map(|geometry| geometry.1)
 }
 
 fn inject_window_origin_for_window(window_id: u64) -> Option<(i32, i32)> {
@@ -3305,6 +3599,12 @@ pub fn inject_hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
     let (modifiers, key) = validate_injectable_hotkey(keys)?;
     let app = inject_target_for_window(window_id)?;
     inject_send(&[format!("h {app} {modifiers} {key}")])
+}
+
+/// Focus-free pointer movement within one exact nested-compositor surface.
+pub fn inject_move(window_id: u64, x: f64, y: f64) -> anyhow::Result<()> {
+    let app = inject_target_for_window(window_id)?;
+    inject_send(&[format!("m {app} 0 {x:.1} {y:.1}")])
 }
 
 /// Focus-free wheel/axis input at one target-local point.
@@ -3498,11 +3798,9 @@ fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     }
     if is_inject_mode() {
         for window in &mut windows {
-            if let Some(pid) = window.pid {
-                if let Some((window_x, window_y)) = inject_window_origin(pid) {
-                    window.x = window_x;
-                    window.y = window_y;
-                }
+            if let Some((window_x, window_y)) = inject_window_origin_for_window(window.xid) {
+                window.x = window_x;
+                window.y = window_y;
             }
         }
     }
@@ -3626,7 +3924,15 @@ fn enrich_native_windows(
 ) -> Vec<WindowInfo> {
     let mut claimed = std::collections::HashSet::new();
     for window in &mut native {
-        if window.pid.is_some() {
+        // A private surface token is an exact compositor identity. Its PID
+        // must come from credentials embedded by that compositor; never fill
+        // a missing/malformed one from equal AT-SPI titles or app ids.
+        if window.pid.is_some()
+            || window
+                .target_id
+                .as_deref()
+                .is_some_and(|target| target.starts_with("surface:"))
+        {
             continue;
         }
         let native_title = undecorated_native_title(window);
@@ -3676,11 +3982,9 @@ fn enrich_native_windows(
             window.height = candidate.height;
         }
         if adopt_atspi_ids {
-            if let Some(pid) = candidate.pid {
-                if let Some((window_x, window_y)) = inject_window_origin(pid) {
-                    window.x = window_x;
-                    window.y = window_y;
-                }
+            if let Some((window_x, window_y)) = inject_window_origin_for_window(window.xid) {
+                window.x = window_x;
+                window.y = window_y;
             }
         }
         window.is_on_screen = candidate.is_on_screen;
@@ -3867,6 +4171,24 @@ mod tests {
     }
 
     #[test]
+    fn exact_target_proof_accepts_private_surface_without_gnome_identity() {
+        let mut original = window(11, Some(101), "Target");
+        original.target_id = Some("surface:1111111111111111:0000000000000001:101".to_owned());
+        let proof = ExactTargetProof::from_window(&original, 101).expect("private exact proof");
+        assert_eq!(proof.window_id(), 11);
+        assert_eq!(proof.pid(), 101);
+        assert!(proof.matches_window(&original));
+
+        let mut replaced = original.clone();
+        replaced.target_id = Some("surface:1111111111111111:0000000000000002:101".to_owned());
+        assert!(!proof.matches_window(&replaced));
+
+        let mut mixed = original;
+        mixed.helper_epoch = Some("generation".to_owned());
+        assert!(ExactTargetProof::from_window(&mixed, 101).is_err());
+    }
+
+    #[test]
     fn gnome_desktop_detection_handles_composite_session_names() {
         assert!(desktop_name_is_gnome("GNOME"));
         assert!(desktop_name_is_gnome("ubuntu:GNOME"));
@@ -3885,6 +4207,35 @@ mod tests {
         drop(first);
         acquire_host_raw_input_lease_with_timeout(std::time::Duration::ZERO)
             .expect("lease must recover after owner drop");
+    }
+
+    #[test]
+    fn inject_focused_target_is_nested_and_guard_scoped() {
+        assert_eq!(current_inject_focused_target(), None);
+        let outer = InjectFocusedTargetGuard::new(101, 201);
+        assert_eq!(current_inject_focused_target(), Some((101, 201)));
+        {
+            let _inner = InjectFocusedTargetGuard::new(102, 202);
+            assert_eq!(current_inject_focused_target(), Some((102, 202)));
+        }
+        assert_eq!(current_inject_focused_target(), Some((101, 201)));
+        drop(outer);
+        assert_eq!(current_inject_focused_target(), None);
+    }
+
+    #[test]
+    fn inject_focused_target_out_of_order_drop_removes_the_exact_guard() {
+        assert_eq!(current_inject_focused_target(), None);
+        let first_a = InjectFocusedTargetGuard::new(101, 201);
+        let b = InjectFocusedTargetGuard::new(102, 202);
+        let second_a = InjectFocusedTargetGuard::new(101, 201);
+        assert_eq!(current_inject_focused_target(), Some((101, 201)));
+        drop(first_a);
+        assert_eq!(current_inject_focused_target(), Some((101, 201)));
+        drop(second_a);
+        assert_eq!(current_inject_focused_target(), Some((102, 202)));
+        drop(b);
+        assert_eq!(current_inject_focused_target(), None);
     }
 
     #[test]
@@ -3935,6 +4286,44 @@ mod tests {
         assert_eq!(enriched[0].pid, Some(123));
         assert_eq!((enriched[0].x, enriched[0].y), (20, 30));
         assert_eq!((enriched[0].width, enriched[0].height), (800, 600));
+    }
+
+    #[test]
+    fn private_surface_pid_is_credential_bound_and_never_title_correlated() {
+        let mut first = window(41, None, "Duplicate title");
+        first.target_id = Some("surface:1111111111111111:0000000000000001:101".to_owned());
+        first.pid = first
+            .target_id
+            .as_deref()
+            .and_then(private_target_client_pid);
+        let mut second = window(42, None, "Duplicate title");
+        second.target_id = Some("surface:1111111111111111:0000000000000002:202".to_owned());
+        second.pid = second
+            .target_id
+            .as_deref()
+            .and_then(private_target_client_pid);
+        let atspi = vec![window(101 << 16, Some(101), "Duplicate title")];
+
+        let enriched = enrich_native_windows(vec![first, second], atspi, false);
+        assert_eq!(enriched[0].pid, Some(101));
+        assert_eq!(enriched[1].pid, Some(202));
+
+        let mut legacy = window(43, None, "Duplicate title");
+        legacy.target_id = Some("surface:1111111111111111:0000000000000003".to_owned());
+        let enriched = enrich_native_windows(
+            vec![legacy],
+            vec![window(303 << 16, Some(303), "Duplicate title")],
+            false,
+        );
+        assert_eq!(enriched[0].pid, None);
+        assert!(ExactTargetProof::from_window(&enriched[0], 303).is_err());
+    }
+
+    #[test]
+    fn private_surface_credential_pid_must_match_approved_pid() {
+        let mut target = window(44, Some(202), "Target");
+        target.target_id = Some("surface:1111111111111111:0000000000000004:202".to_owned());
+        assert!(ExactTargetProof::from_window(&target, 101).is_err());
     }
 
     #[test]

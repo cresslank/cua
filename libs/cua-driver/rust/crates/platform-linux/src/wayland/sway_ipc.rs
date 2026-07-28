@@ -182,34 +182,154 @@ fn focus_container(id: u64) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-/// Briefly focus one compositor-attested container, run `body`, then restore
-/// the previously focused container. The caller must already have verified the
-/// target container's PID and id through [`window_for_id`].
-pub fn with_focused_container<T>(
+fn focus_container_exact(id: u64, pid: u32) -> bool {
+    let selector = format!("[con_id={id} pid={pid}]");
+    Command::new("swaymsg")
+        .args([selector.as_str(), "focus"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Exact Sway focus transaction for a stateful press/move/release sequence.
+/// Its caller must hold the host raw-input lease for this value's lifetime.
+pub struct StatefulFocus {
     id: u64,
+    pid: u32,
+    prior: Option<(u64, u32)>,
+    finished: bool,
+}
+
+impl StatefulFocus {
+    pub fn begin(pid: u32, id: u64) -> anyhow::Result<Self> {
+        let windows =
+            list_windows().ok_or_else(|| anyhow::anyhow!("Sway IPC tree is unavailable"))?;
+        if !windows
+            .iter()
+            .any(|window| window.id == id && window.pid == pid)
+        {
+            anyhow::bail!("stale_target: Sway container {id} is no longer owned by pid {pid}");
+        }
+        let prior = windows
+            .iter()
+            .find(|window| window.focused)
+            .map(|window| (window.id, window.pid));
+        if !focus_container_exact(id, pid) {
+            anyhow::bail!("Sway refused to focus exact container {id}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let focus = Self {
+            id,
+            pid,
+            prior,
+            finished: false,
+        };
+        focus.validate()?;
+        Ok(focus)
+    }
+
+    /// Re-read identity and focus immediately before every event, rejecting id
+    /// reuse and focus theft rather than injecting into the active surface.
+    pub fn validate(&self) -> anyhow::Result<Window> {
+        window_for_id(self.id)
+            .filter(|window| window.pid == self.pid && window.focused)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                "stale_target: exact Sway container {} for pid {} is not focused at action time",
+                self.id,
+                self.pid
+            )
+            })
+    }
+
+    pub fn finish(mut self) -> anyhow::Result<()> {
+        let result = self.restore();
+        self.finished = true;
+        result
+    }
+
+    fn restore(&mut self) -> anyhow::Result<()> {
+        let Some((prior, prior_pid)) = self.prior.filter(|(prior, _)| *prior != self.id) else {
+            return Ok(());
+        };
+        if !window_for_id(prior).is_some_and(|window| window.pid == prior_pid) {
+            anyhow::bail!("Sway prior container {prior} changed identity before restoration");
+        }
+        if !focus_container_exact(prior, prior_pid) {
+            anyhow::bail!("Sway could not restore prior container {prior}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        if !window_for_id(prior).is_some_and(|window| window.focused) {
+            anyhow::bail!("Sway did not confirm restored container {prior}");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for StatefulFocus {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.restore();
+        }
+    }
+}
+
+fn with_focused_container_using<T>(
+    expected_pid: u32,
+    id: u64,
+    mut read_windows: impl FnMut() -> anyhow::Result<Vec<Window>>,
+    mut focus: impl FnMut(u64) -> bool,
+    mut settle: impl FnMut(),
     body: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let prior = list_windows()
-        .ok_or_else(|| anyhow::anyhow!("Sway IPC tree is unavailable"))?
+    let prior = read_windows()?
         .into_iter()
         .find(|window| window.focused)
-        .map(|window| window.id);
-    if !focus_container(id) {
+        .map(|window| (window.id, window.pid));
+    if !focus(id) {
         anyhow::bail!("Sway refused to focus exact container {id}");
     }
-    std::thread::sleep(std::time::Duration::from_millis(80));
-    if !window_for_id(id).is_some_and(|window| window.focused) {
-        anyhow::bail!("Sway did not confirm focus on exact container {id}");
-    }
-    let result = body();
+    settle();
+
+    // Once focus succeeds, every later path restores the prior identity. Re-read
+    // both id and PID before the action body to reject container-id replacement.
+    let result = match read_windows() {
+        Ok(windows) => match windows.into_iter().find(|window| window.id == id) {
+            Some(window) if window.pid != expected_pid => Err(anyhow::anyhow!(
+                "stale_target: Sway container {id} changed from expected pid {expected_pid} to pid {} while acquiring focus",
+                window.pid
+            )),
+            Some(window) if !window.focused => Err(anyhow::anyhow!(
+                "Sway did not confirm focus on exact container {id} for pid {expected_pid}"
+            )),
+            Some(_) => body(),
+            None => Err(anyhow::anyhow!(
+                "stale_target: Sway container {id} for pid {expected_pid} disappeared while acquiring focus"
+            )),
+        },
+        Err(error) => Err(error.context(format!(
+            "Sway could not confirm exact container {id} for pid {expected_pid} after focusing it"
+        ))),
+    };
     let restore = prior
-        .filter(|prior| *prior != id)
-        .map(|prior| {
-            if !focus_container(prior) {
+        .filter(|(prior, _)| *prior != id)
+        .map(|(prior, prior_pid)| {
+            if !read_windows()?
+                .into_iter()
+                .any(|window| window.id == prior && window.pid == prior_pid)
+            {
+                anyhow::bail!("Sway prior container {prior} changed identity before restoration");
+            }
+            if !focus(prior) {
                 anyhow::bail!("Sway could not restore prior container {prior}");
             }
-            std::thread::sleep(std::time::Duration::from_millis(80));
-            if !window_for_id(prior).is_some_and(|window| window.focused) {
+            settle();
+            if !read_windows()?
+                .into_iter()
+                .any(|window| window.id == prior && window.pid == prior_pid && window.focused)
+            {
                 anyhow::bail!("Sway did not confirm restored container {prior}");
             }
             Ok(())
@@ -223,6 +343,24 @@ pub fn with_focused_container<T>(
             "the prior Sway focus also could not be restored: {restore}"
         ))),
     }
+}
+
+/// Briefly focus one compositor-attested container, run `body`, then restore
+/// the previously focused identity. PID and id are revalidated together after
+/// focus and immediately before `body` can run.
+pub fn with_focused_container<T>(
+    expected_pid: u32,
+    id: u64,
+    body: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    with_focused_container_using(
+        expected_pid,
+        id,
+        || list_windows().ok_or_else(|| anyhow::anyhow!("Sway IPC tree is unavailable")),
+        focus_container,
+        || std::thread::sleep(std::time::Duration::from_millis(80)),
+        body,
+    )
 }
 
 pub fn window_origin_for_pid(pid: u32) -> Option<(i32, i32)> {
@@ -244,6 +382,124 @@ pub fn window_origin_for_title(title: &str) -> Option<(i32, i32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn window(id: u64, pid: u32, focused: bool) -> Window {
+        Window {
+            id,
+            pid,
+            title: String::new(),
+            app_id: String::new(),
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+            content_x: 0,
+            content_y: 0,
+            focused,
+            visible: true,
+            fullscreen: false,
+        }
+    }
+
+    #[test]
+    fn pid_replacement_after_focus_is_refused_and_prior_focus_is_restored() {
+        let reads = std::cell::RefCell::new(std::collections::VecDeque::from([
+            Ok(vec![window(1, 10, true), window(2, 20, false)]),
+            Ok(vec![window(1, 10, false), window(2, 99, true)]),
+            Ok(vec![window(1, 10, false), window(2, 99, true)]),
+            Ok(vec![window(1, 10, true), window(2, 99, false)]),
+        ]));
+        let focused = std::cell::RefCell::new(Vec::new());
+        let body_ran = std::cell::Cell::new(false);
+
+        let error = with_focused_container_using(
+            20,
+            2,
+            || reads.borrow_mut().pop_front().expect("expected tree read"),
+            |id| {
+                focused.borrow_mut().push(id);
+                true
+            },
+            || {},
+            || {
+                body_ran.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("replacement pid must be refused");
+
+        assert!(error
+            .to_string()
+            .contains("changed from expected pid 20 to pid 99"));
+        assert!(!body_ran.get());
+        assert_eq!(*focused.borrow(), [2, 1]);
+    }
+
+    #[test]
+    fn failed_focus_confirmation_still_restores_prior_focus() {
+        let reads = std::cell::RefCell::new(std::collections::VecDeque::from([
+            Ok(vec![window(1, 10, true), window(2, 20, false)]),
+            Ok(vec![window(1, 10, false), window(2, 20, false)]),
+            Ok(vec![window(1, 10, false), window(2, 20, false)]),
+            Ok(vec![window(1, 10, true), window(2, 20, false)]),
+        ]));
+        let focused = std::cell::RefCell::new(Vec::new());
+        let body_ran = std::cell::Cell::new(false);
+
+        let error = with_focused_container_using(
+            20,
+            2,
+            || reads.borrow_mut().pop_front().expect("expected tree read"),
+            |id| {
+                focused.borrow_mut().push(id);
+                true
+            },
+            || {},
+            || {
+                body_ran.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("unconfirmed focus must be refused");
+
+        assert!(error.to_string().contains("did not confirm focus"));
+        assert!(!body_ran.get());
+        assert_eq!(*focused.borrow(), [2, 1]);
+    }
+
+    #[test]
+    fn failed_post_focus_tree_read_still_restores_prior_focus() {
+        let reads = std::cell::RefCell::new(std::collections::VecDeque::from([
+            Ok(vec![window(1, 10, true), window(2, 20, false)]),
+            Err(anyhow::anyhow!("transient get_tree failure")),
+            Ok(vec![window(1, 10, false), window(2, 20, true)]),
+            Ok(vec![window(1, 10, true), window(2, 20, false)]),
+        ]));
+        let focused = std::cell::RefCell::new(Vec::new());
+        let body_ran = std::cell::Cell::new(false);
+
+        let error = with_focused_container_using(
+            20,
+            2,
+            || reads.borrow_mut().pop_front().expect("expected tree read"),
+            |id| {
+                focused.borrow_mut().push(id);
+                true
+            },
+            || {},
+            || {
+                body_ran.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("failed focus tree read must be refused");
+
+        assert!(error
+            .to_string()
+            .contains("could not confirm exact container"));
+        assert!(!body_ran.get());
+        assert_eq!(*focused.borrow(), [2, 1]);
+    }
 
     #[test]
     fn parses_nested_and_floating_windows() {

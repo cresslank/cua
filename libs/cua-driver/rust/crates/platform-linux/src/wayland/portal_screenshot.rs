@@ -8,7 +8,7 @@
 //! calls in the same session are silent.
 //!
 //! ashpd is async (zbus under the hood); the rest of `wayland::screenshot_*`
-//! is sync because it's called from `tokio::task::spawn_blocking`. We build
+//! is sync because it's called from `cua_driver_core::blocking::spawn`. We build
 //! a dedicated single-threaded tokio runtime per call so the async ashpd
 //! work has somewhere to live without colliding with the caller's runtime.
 

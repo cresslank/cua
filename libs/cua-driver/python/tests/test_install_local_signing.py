@@ -128,16 +128,17 @@ def test_unix_local_installer_uses_separate_paths_and_autostart() -> None:
     assert "stop_cua_driver_daemons" not in script
 
 
-def test_unix_local_installer_always_embeds_source_provenance() -> None:
-    """Local builds derive Git provenance but preserve VM snapshot overrides."""
+def test_unix_local_installer_requires_exact_clean_source_provenance() -> None:
+    """Linux source promotion derives and enforces one exact clean Git OID."""
     script = (
         Path(__file__).resolve().parents[2] / "scripts" / "_install-local-rust.sh"
     ).read_text()
 
     assert 'if [ -z "${CUA_DRIVER_SOURCE_SHA:-}" ]; then' in script
     assert "rev-parse --verify 'HEAD^{commit}'" in script
-    assert "status --porcelain --untracked-files=normal" in script
-    assert 'CUA_DRIVER_SOURCE_SHA="${CUA_DRIVER_SOURCE_SHA}-dirty"' in script
+    assert "status --porcelain=v1 --untracked-files=normal" in script
+    assert "refusing promotion from a dirty source tree" in script
+    assert '-dirty"' not in script
     assert "export CUA_DRIVER_SOURCE_SHA" in script
 
 

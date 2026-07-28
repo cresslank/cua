@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::{Child, ChildStdin, Command};
@@ -865,9 +865,7 @@ pub(crate) fn inherited_managed_environment_name(name: &str) -> bool {
 pub(crate) fn inherited_runtime_environment_name(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
-        "AT_SPI_BUS"
-            | "AT_SPI_BUS_ADDRESS"
-            | "CUA_BROWSER_PROFILE_DIR"
+        "CUA_BROWSER_PROFILE_DIR"
             | "CUA_DRIVER_BROWSER_PROFILE_ROOT"
             | "CUA_DRIVER_CDP_PORT"
             | "CUA_DRIVER_RS_A11Y_ADVERTISE_MODE"
@@ -875,6 +873,8 @@ pub(crate) fn inherited_runtime_environment_name(name: &str) -> bool {
             | "CUA_DRIVER_RS_DRAW_SYSTEM_CURSOR"
             | "CUA_DRIVER_RS_ENABLE_WAYLAND"
             | "CUA_DRIVER_RS_HOME"
+            | "CUA_DRIVER_RS_RECORDING_IDLE_TTL_SECS"
+            | "CUA_DRIVER_RS_SESSION_IDLE_TTL_SECS"
             | "CUA_DRIVER_RS_TELEMETRY_ENABLED"
             | "CUA_INJECT_SOCKET"
             | "CUA_PRIVATE_INSTANCE"
@@ -900,6 +900,164 @@ pub(crate) fn safe_environment(
     overrides: &[EmbeddedEnvironmentVariable],
 ) -> Vec<EmbeddedEnvironmentVariable> {
     merge_safe_environment(std::env::vars(), overrides)
+}
+
+const PRIVATE_ATSPI_ROUTE: &str = "CUA_DRIVER_PRIVATE_AT_SPI_BUS_ADDRESS";
+
+pub(crate) const PRIVATE_WORKER_MAX_ENVIRONMENT_ENTRIES: usize = 4_096;
+pub(crate) const PRIVATE_WORKER_MAX_ENVIRONMENT_BYTES: usize = 1024 * 1024;
+pub(crate) const PRIVATE_WORKER_MAX_ENVIRONMENT_VALUE_BYTES: usize = 64 * 1024;
+pub(crate) const PRIVATE_WORKER_MAX_ENVIRONMENT_NAME_BYTES: usize = 255;
+
+#[derive(Debug)]
+pub(crate) enum PrivateWorkerEnvironmentError {
+    DeadlineExpired,
+    Invalid(String),
+}
+
+/// Construct the private worker's process environment from a route prepared by
+/// the trusted host. Unlike the embedded-service environment, SDK-supplied
+/// overrides may not replace display, bus, home, or compositor routing.
+pub(crate) fn private_worker_environment(
+    overrides: &[EmbeddedEnvironmentVariable],
+    trusted_accessibility_bus: Option<&str>,
+    startup_deadline: Instant,
+) -> Result<Vec<EmbeddedEnvironmentVariable>, PrivateWorkerEnvironmentError> {
+    merge_private_worker_environment(
+        std::env::vars_os(),
+        overrides,
+        trusted_accessibility_bus,
+        Some(startup_deadline),
+    )
+}
+
+fn private_worker_override_name(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.starts_with("LC_") || matches!(upper.as_str(), "LANG" | "CUA_LOG")
+}
+
+fn merge_private_worker_environment(
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    overrides: &[EmbeddedEnvironmentVariable],
+    trusted_accessibility_bus: Option<&str>,
+    startup_deadline: Option<Instant>,
+) -> Result<Vec<EmbeddedEnvironmentVariable>, PrivateWorkerEnvironmentError> {
+    let mut values = BTreeMap::new();
+    let mut aggregate_bytes = 0_usize;
+    for (name, value) in inherited {
+        if startup_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(PrivateWorkerEnvironmentError::DeadlineExpired);
+        }
+        let name = name.into_string().map_err(|_| {
+            PrivateWorkerEnvironmentError::Invalid(
+                "private worker inherited a non-UTF-8 environment name".into(),
+            )
+        })?;
+        let value = value.into_string().map_err(|_| {
+            PrivateWorkerEnvironmentError::Invalid(format!(
+                "private worker inherited a non-UTF-8 value for {name}"
+            ))
+        })?;
+        let upper = name.to_ascii_uppercase();
+        if matches!(upper.as_str(), PRIVATE_ATSPI_ROUTE | "AT_SPI_BUS_ADDRESS") {
+            continue;
+        }
+        if allowed_environment_name(&name)
+            || inherited_managed_environment_name(&name)
+            || inherited_runtime_environment_name(&name)
+        {
+            let canonical_name = if inherited_managed_environment_name(&name)
+                || inherited_runtime_environment_name(&name)
+            {
+                upper.clone()
+            } else {
+                name
+            };
+            insert_bounded_private_worker_variable(
+                &mut values,
+                &mut aggregate_bytes,
+                upper,
+                EmbeddedEnvironmentVariable {
+                    name: canonical_name,
+                    value,
+                },
+            )?;
+        }
+    }
+    if startup_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+        return Err(PrivateWorkerEnvironmentError::DeadlineExpired);
+    }
+    if let Some(address) = trusted_accessibility_bus {
+        insert_bounded_private_worker_variable(
+            &mut values,
+            &mut aggregate_bytes,
+            "AT_SPI_BUS_ADDRESS".into(),
+            EmbeddedEnvironmentVariable {
+                name: "AT_SPI_BUS_ADDRESS".into(),
+                value: address.to_owned(),
+            },
+        )?;
+    }
+    for variable in overrides {
+        if startup_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(PrivateWorkerEnvironmentError::DeadlineExpired);
+        }
+        if private_worker_override_name(&variable.name) {
+            insert_bounded_private_worker_variable(
+                &mut values,
+                &mut aggregate_bytes,
+                variable.name.to_ascii_uppercase(),
+                variable.clone(),
+            )?;
+        }
+    }
+    let mut merged = Vec::with_capacity(values.len());
+    for variable in values.into_values() {
+        if startup_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(PrivateWorkerEnvironmentError::DeadlineExpired);
+        }
+        merged.push(variable);
+    }
+    Ok(merged)
+}
+
+fn insert_bounded_private_worker_variable(
+    values: &mut BTreeMap<String, EmbeddedEnvironmentVariable>,
+    aggregate_bytes: &mut usize,
+    key: String,
+    variable: EmbeddedEnvironmentVariable,
+) -> Result<(), PrivateWorkerEnvironmentError> {
+    if variable.name.len() > PRIVATE_WORKER_MAX_ENVIRONMENT_NAME_BYTES {
+        return Err(PrivateWorkerEnvironmentError::Invalid(format!(
+            "private worker environment name exceeds {PRIVATE_WORKER_MAX_ENVIRONMENT_NAME_BYTES} bytes"
+        )));
+    }
+    if variable.value.len() > PRIVATE_WORKER_MAX_ENVIRONMENT_VALUE_BYTES {
+        return Err(PrivateWorkerEnvironmentError::Invalid(format!(
+            "private worker environment value for {} exceeds {PRIVATE_WORKER_MAX_ENVIRONMENT_VALUE_BYTES} bytes",
+            variable.name
+        )));
+    }
+    if !values.contains_key(&key) && values.len() >= PRIVATE_WORKER_MAX_ENVIRONMENT_ENTRIES {
+        return Err(PrivateWorkerEnvironmentError::Invalid(format!(
+            "private worker environment exceeds {PRIVATE_WORKER_MAX_ENVIRONMENT_ENTRIES} entries"
+        )));
+    }
+    let replaced_bytes = values
+        .get(&key)
+        .map_or(0, |existing| existing.name.len() + existing.value.len());
+    let variable_bytes = variable.name.len() + variable.value.len();
+    let updated_bytes = aggregate_bytes
+        .saturating_sub(replaced_bytes)
+        .saturating_add(variable_bytes);
+    if updated_bytes > PRIVATE_WORKER_MAX_ENVIRONMENT_BYTES {
+        return Err(PrivateWorkerEnvironmentError::Invalid(format!(
+            "private worker environment exceeds {PRIVATE_WORKER_MAX_ENVIRONMENT_BYTES} aggregate bytes"
+        )));
+    }
+    values.insert(key, variable);
+    *aggregate_bytes = updated_bytes;
+    Ok(())
 }
 
 fn merge_safe_environment(
@@ -1160,7 +1318,11 @@ mod tests {
 
     fn options(mode: EmbeddedPermissionMode) -> EmbeddedDriverHostOptions {
         EmbeddedDriverHostOptions {
-            binary_path: "/example/cua-driver".into(),
+            binary_path: std::env::current_dir()
+                .expect("test working directory")
+                .join("cua-driver")
+                .to_string_lossy()
+                .into_owned(),
             host_bundle_id: "com.example.host".into(),
             socket_path: None,
             startup_timeout_ms: None,
@@ -1239,11 +1401,12 @@ mod tests {
     #[test]
     fn runtime_isolation_environment_is_inherited_but_never_overridden() {
         for name in [
-            "AT_SPI_BUS_ADDRESS",
             "CUA_BROWSER_PROFILE_DIR",
             "CUA_DRIVER_BROWSER_PROFILE_ROOT",
             "CUA_DRIVER_RS_DISABLE_A11Y_ADVERTISE",
             "CUA_DRIVER_RS_ENABLE_WAYLAND",
+            "CUA_DRIVER_RS_RECORDING_IDLE_TTL_SECS",
+            "CUA_DRIVER_RS_SESSION_IDLE_TTL_SECS",
             "CUA_DRIVER_RS_TELEMETRY_ENABLED",
             "CUA_INJECT_SOCKET",
             "XDG_CONFIG_HOME",
@@ -1254,12 +1417,14 @@ mod tests {
                 "caller-provided worker environment must not override {name}"
             );
         }
+        assert!(!inherited_runtime_environment_name("AT_SPI_BUS_ADDRESS"));
 
         let values = merge_safe_environment(
             [
+                ("AT_SPI_BUS_ADDRESS".into(), "must-not-leak".into()),
                 (
-                    "AT_SPI_BUS_ADDRESS".into(),
-                    "unix:path=/run/user/1000/private-atspi".into(),
+                    "CUA_BROWSER_PROFILE_DIR".into(),
+                    "/compat/browser-profile".into(),
                 ),
                 (
                     "CUA_DRIVER_BROWSER_PROFILE_ROOT".into(),
@@ -1267,6 +1432,8 @@ mod tests {
                 ),
                 ("CUA_DRIVER_RS_DISABLE_A11Y_ADVERTISE".into(), "1".into()),
                 ("cua_driver_rs_enable_wayland".into(), "0".into()),
+                ("CUA_DRIVER_RS_RECORDING_IDLE_TTL_SECS".into(), "45".into()),
+                ("CUA_DRIVER_RS_SESSION_IDLE_TTL_SECS".into(), "90".into()),
                 ("CUA_DRIVER_RS_TELEMETRY_ENABLED".into(), "false".into()),
                 ("CUA_INJECT_SOCKET".into(), "/run/user/1000/cua.sock".into()),
                 ("XDG_CONFIG_HOME".into(), "/isolated/config".into()),
@@ -1277,6 +1444,10 @@ mod tests {
                     value: "/tmp/forged.sock".into(),
                 },
                 EmbeddedEnvironmentVariable {
+                    name: "CUA_DRIVER_RS_SESSION_IDLE_TTL_SECS".into(),
+                    value: "9999".into(),
+                },
+                EmbeddedEnvironmentVariable {
                     name: "XDG_CONFIG_HOME".into(),
                     value: "/tmp/forged-config".into(),
                 },
@@ -1284,16 +1455,15 @@ mod tests {
         );
 
         for (name, value) in [
-            (
-                "AT_SPI_BUS_ADDRESS",
-                "unix:path=/run/user/1000/private-atspi",
-            ),
+            ("CUA_BROWSER_PROFILE_DIR", "/compat/browser-profile"),
             (
                 "CUA_DRIVER_BROWSER_PROFILE_ROOT",
                 "/isolated/browser-profile",
             ),
             ("CUA_DRIVER_RS_DISABLE_A11Y_ADVERTISE", "1"),
             ("CUA_DRIVER_RS_ENABLE_WAYLAND", "0"),
+            ("CUA_DRIVER_RS_RECORDING_IDLE_TTL_SECS", "45"),
+            ("CUA_DRIVER_RS_SESSION_IDLE_TTL_SECS", "90"),
             ("CUA_DRIVER_RS_TELEMETRY_ENABLED", "false"),
             ("CUA_INJECT_SOCKET", "/run/user/1000/cua.sock"),
             ("XDG_CONFIG_HOME", "/isolated/config"),
@@ -1305,6 +1475,150 @@ mod tests {
         assert!(!values
             .iter()
             .any(|variable| variable.value.starts_with("/tmp/forged")));
+        assert!(!values
+            .iter()
+            .any(|variable| variable.name == "AT_SPI_BUS_ADDRESS"));
+    }
+
+    #[test]
+    fn interactive_linux_session_environment_is_inherited_without_atspi_leak() {
+        let values = merge_safe_environment(
+            [
+                ("WAYLAND_DISPLAY".into(), "wayland-7".into()),
+                ("XDG_RUNTIME_DIR".into(), "/run/user/1000".into()),
+                ("XDG_SESSION_TYPE".into(), "wayland".into()),
+                (
+                    "DBUS_SESSION_BUS_ADDRESS".into(),
+                    "unix:path=/run/user/1000/bus".into(),
+                ),
+                ("AT_SPI_BUS_ADDRESS".into(), "must-not-leak".into()),
+            ],
+            &[],
+        );
+
+        for (name, value) in [
+            ("WAYLAND_DISPLAY", "wayland-7"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("XDG_SESSION_TYPE", "wayland"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+        ] {
+            assert!(values
+                .iter()
+                .any(|variable| variable.name == name && variable.value == value));
+        }
+        assert!(!values
+            .iter()
+            .any(|variable| variable.name == "AT_SPI_BUS_ADDRESS"));
+    }
+
+    #[test]
+    fn private_worker_routing_uses_only_the_host_prepared_atspi_route() {
+        let values = merge_private_worker_environment(
+            [
+                ("HOME".into(), "/trusted/home".into()),
+                ("WAYLAND_DISPLAY".into(), "wayland-trusted".into()),
+                (
+                    "AT_SPI_BUS_ADDRESS".into(),
+                    "unix:path=/ambient-atspi".into(),
+                ),
+                (
+                    PRIVATE_ATSPI_ROUTE.into(),
+                    "unix:path=/private-atspi".into(),
+                ),
+                ("CUA_DRIVER_RS_RECORDING_IDLE_TTL_SECS".into(), "45".into()),
+            ],
+            &[
+                EmbeddedEnvironmentVariable {
+                    name: "HOME".into(),
+                    value: "/forged/home".into(),
+                },
+                EmbeddedEnvironmentVariable {
+                    name: "WAYLAND_DISPLAY".into(),
+                    value: "wayland-forged".into(),
+                },
+                EmbeddedEnvironmentVariable {
+                    name: "CUA_DRIVER_RS_RECORDING_IDLE_TTL_SECS".into(),
+                    value: "9999".into(),
+                },
+                EmbeddedEnvironmentVariable {
+                    name: "LANG".into(),
+                    value: "C.UTF-8".into(),
+                },
+            ],
+            Some("unix:path=/private-atspi"),
+            None,
+        )
+        .unwrap();
+
+        for (name, value) in [
+            ("HOME", "/trusted/home"),
+            ("WAYLAND_DISPLAY", "wayland-trusted"),
+            ("AT_SPI_BUS_ADDRESS", "unix:path=/private-atspi"),
+            ("CUA_DRIVER_RS_RECORDING_IDLE_TTL_SECS", "45"),
+            ("LANG", "C.UTF-8"),
+        ] {
+            assert!(values
+                .iter()
+                .any(|variable| variable.name == name && variable.value == value));
+        }
+        assert!(!values.iter().any(|variable| {
+            variable.value.contains("forged") || variable.value == "unix:path=/ambient-atspi"
+        }));
+        assert!(!values
+            .iter()
+            .any(|variable| variable.name == PRIVATE_ATSPI_ROUTE));
+    }
+
+    #[test]
+    fn private_worker_environment_merge_honors_an_expired_startup_deadline() {
+        assert!(matches!(
+            merge_private_worker_environment(
+                [("LANG".into(), "C.UTF-8".into())],
+                &[],
+                None,
+                Some(Instant::now()),
+            ),
+            Err(PrivateWorkerEnvironmentError::DeadlineExpired)
+        ));
+    }
+
+    #[test]
+    fn private_worker_environment_merge_caps_the_final_inherited_environment() {
+        let inherited = (0..=PRIVATE_WORKER_MAX_ENVIRONMENT_ENTRIES)
+            .map(|index| (format!("LC_AUDIT_{index}").into(), "x".into()))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            merge_private_worker_environment(inherited, &[], None, None),
+            Err(PrivateWorkerEnvironmentError::Invalid(reason))
+                if reason.contains("entries")
+        ));
+
+        assert!(matches!(
+            merge_private_worker_environment(
+                [("LANG".into(), "x".repeat(PRIVATE_WORKER_MAX_ENVIRONMENT_VALUE_BYTES + 1).into())],
+                &[],
+                None,
+                None,
+            ),
+            Err(PrivateWorkerEnvironmentError::Invalid(reason))
+                if reason.contains("value")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_worker_environment_merge_rejects_non_utf8_without_panicking() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let inherited = [(
+            std::ffi::OsString::from("LANG"),
+            std::ffi::OsString::from_vec(vec![0xff]),
+        )];
+        assert!(matches!(
+            merge_private_worker_environment(inherited, &[], None, None),
+            Err(PrivateWorkerEnvironmentError::Invalid(reason))
+                if reason.contains("non-UTF-8")
+        ));
     }
 
     #[test]

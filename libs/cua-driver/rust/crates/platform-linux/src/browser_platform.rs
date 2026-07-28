@@ -302,11 +302,20 @@ fn active_port_endpoint(pid: i64) -> Result<Option<OwnedEndpoint>, BrowserRefusa
         ownership: EndpointOwnershipProof {
             method: EndpointOwnershipMethod::DevtoolsActivePortsFile,
             owner_pid: pid,
+            listener_pid: None,
             detail: Some(
                 "exact /proc argv profile port file plus loopback socket inode owner".to_owned(),
             ),
         },
     }))
+}
+
+fn ensure_profile_discoverable(pid: i64) -> Result<(), BrowserRefusal> {
+    let profile_path = user_data_dir_for_pid(pid)?;
+    if let Some(profile_path) = profile_path {
+        crate::browser_setup_ui::ensure_profile_discoverable(&profile_path)?;
+    }
+    Ok(())
 }
 
 fn process_identity(pid: i64) -> Result<(u64, Option<String>), BrowserRefusal> {
@@ -398,7 +407,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                 format!("pid {pid} is outside the Linux process-id range"),
             )
         })?;
-        let (process, executable) = tokio::task::spawn_blocking(move || {
+        let (process, executable) = cua_driver_core::blocking::spawn(move || {
             let process = crate::proc_fs::list_processes()
                 .into_iter()
                 .find(|process| process.pid == pid_u32);
@@ -499,7 +508,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                     },
                 });
             }
-            let window = tokio::task::spawn_blocking(move || {
+            let window = cua_driver_core::blocking::spawn(move || {
                 crate::wayland::list_windows_dispatch(Some(pid_u32))
                     .into_iter()
                     .find(|window| window.xid == window_id)
@@ -535,7 +544,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
             });
         }
 
-        let window = tokio::task::spawn_blocking(move || {
+        let window = cua_driver_core::blocking::spawn(move || {
             crate::x11::list_windows(Some(pid_u32))
                 .into_iter()
                 .find(|window| window.xid == window_id)
@@ -595,7 +604,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                     // generic AT-SPI-only Wayland session, that is sufficient
                     // to attest singleton native-window cardinality for an
                     // embedded Chromium endpoint.
-                    let owned = tokio::task::spawn_blocking(move || {
+                    let owned = cua_driver_core::blocking::spawn(move || {
                         crate::wayland::list_windows_dispatch(Some(pid_u32))
                             .into_iter()
                             .filter(|window| window.pid == Some(pid_u32))
@@ -620,7 +629,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                 .collect::<Vec<_>>();
             return Ok(Some(owned.len() == 1 && owned[0] == window_id));
         }
-        let owned = tokio::task::spawn_blocking(move || {
+        let owned = cua_driver_core::blocking::spawn(move || {
             crate::x11::list_windows(Some(pid_u32))
                 .into_iter()
                 .map(|window| u64::from(window.xid))
@@ -640,10 +649,12 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         &self,
         pid: i64,
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
+        ensure_profile_discoverable(pid)?;
         if let Some(endpoint) = active_port_endpoint(pid)? {
+            ensure_profile_discoverable(pid)?;
             return Ok(Some(endpoint));
         }
-        let ports = tokio::task::spawn_blocking(move || loopback_ports_for_pid(pid))
+        let ports = cua_driver_core::blocking::spawn(move || loopback_ports_for_pid(pid))
             .await
             .map_err(|error| {
                 refusal(
@@ -653,17 +664,20 @@ impl BrowserPlatform for LinuxBrowserPlatform {
             })??;
         for port in ports {
             if let Some(ws_url) = browser_websocket_url(port).await {
+                ensure_profile_discoverable(pid)?;
                 return Ok(Some(OwnedEndpoint {
                     ws_url,
                     http_port: Some(port),
                     ownership: EndpointOwnershipProof {
                         method: EndpointOwnershipMethod::ListeningSocketPid,
                         owner_pid: pid,
+                        listener_pid: None,
                         detail: Some("/proc socket inode owner".to_owned()),
                     },
                 }));
             }
         }
+        ensure_profile_discoverable(pid)?;
         Ok(None)
     }
 
@@ -671,10 +685,12 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         &self,
         pid: i64,
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
+        ensure_profile_discoverable(pid)?;
         if let Some(endpoint) = active_port_endpoint(pid)? {
+            ensure_profile_discoverable(pid)?;
             return Ok(Some(endpoint));
         }
-        let ports = tokio::task::spawn_blocking(move || loopback_ports_for_pid(pid))
+        let ports = cua_driver_core::blocking::spawn(move || loopback_ports_for_pid(pid))
             .await
             .map_err(|error| {
                 refusal(
@@ -688,6 +704,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                 discovered.push((port, ws_url));
             }
         }
+        ensure_profile_discoverable(pid)?;
         match discovered.as_slice() {
             [] => Ok(None),
             [(port, ws_url)] => Ok(Some(OwnedEndpoint {
@@ -696,6 +713,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                 ownership: EndpointOwnershipProof {
                     method: EndpointOwnershipMethod::ListeningSocketPid,
                     owner_pid: pid,
+                    listener_pid: None,
                     detail: Some("/proc owner plus /json/version".to_owned()),
                 },
             })),
@@ -711,13 +729,14 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         pid: i64,
         expected_ws_url: &str,
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
+        ensure_profile_discoverable(pid)?;
         let Some(port) = loopback_websocket_port(expected_ws_url) else {
             return Err(refusal(
                 BrowserRefusalCode::BrowserEndpointOwnerMismatch,
                 "the approved existing-profile endpoint is not loopback-only",
             ));
         };
-        let ports = tokio::task::spawn_blocking(move || loopback_ports_for_pid(pid))
+        let ports = cua_driver_core::blocking::spawn(move || loopback_ports_for_pid(pid))
             .await
             .map_err(|error| {
                 refusal(
@@ -726,14 +745,17 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                 )
             })??;
         if !ports.contains(&port) {
+            ensure_profile_discoverable(pid)?;
             return Ok(None);
         }
+        ensure_profile_discoverable(pid)?;
         Ok(Some(OwnedEndpoint {
             ws_url: expected_ws_url.to_owned(),
             http_port: Some(port),
             ownership: EndpointOwnershipProof {
                 method: EndpointOwnershipMethod::ListeningSocketPid,
                 owner_pid: pid,
+                listener_pid: None,
                 detail: Some("/proc owner of exact approved endpoint".to_owned()),
             },
         }))
@@ -769,8 +791,14 @@ impl BrowserPlatform for LinuxBrowserPlatform {
             ));
         }
         let window_id = request.window_id;
+        let profile_path = user_data_dir_for_pid(request.pid)?.ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserBindingStale,
+                "could not identify the approved browser instance/profile resource",
+            )
+        })?;
         let listeners_before =
-            tokio::task::spawn_blocking(move || loopback_ports_for_pid(request.pid))
+            cua_driver_core::blocking::spawn(move || loopback_ports_for_pid(request.pid))
                 .await
                 .map_err(|error| {
                     refusal(
@@ -778,8 +806,8 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                         format!("listener inspection task failed: {error}"),
                     )
                 })??;
-        let handle = tokio::task::spawn_blocking(move || {
-            crate::browser_setup_ui::enable(pid_u32, window_id, descriptor)
+        let handle = cua_driver_core::blocking::spawn(move || {
+            crate::browser_setup_ui::enable(pid_u32, window_id, descriptor, &profile_path)
         })
         .await
         .map_err(|error| {
@@ -796,6 +824,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         let focused_setup_address_field = handle.focused_setup_address_field;
         let foregrounded_window = handle.foregrounded_window;
         let injected_global_input = handle.injected_global_input;
+        let used_bounded_pixel_fallback = handle.used_bounded_pixel_fallback;
 
         let deadline = std::time::Instant::now() + Duration::from_secs(6);
         let endpoint_result = loop {
@@ -804,20 +833,19 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                 Ok(None) => {}
                 Err(error) => break Err(error),
             }
-            let ports = match tokio::task::spawn_blocking(move || {
-                loopback_ports_for_pid(request.pid)
-            })
-            .await
-            {
-                Ok(Ok(ports)) => ports,
-                Ok(Err(error)) => break Err(error),
-                Err(error) => {
-                    break Err(refusal(
-                        BrowserRefusalCode::BrowserRouteUnavailable,
-                        format!("listener inspection task failed: {error}"),
-                    ))
-                }
-            };
+            let ports =
+                match cua_driver_core::blocking::spawn(move || loopback_ports_for_pid(request.pid))
+                    .await
+                {
+                    Ok(Ok(ports)) => ports,
+                    Ok(Err(error)) => break Err(error),
+                    Err(error) => {
+                        break Err(refusal(
+                            BrowserRefusalCode::BrowserRouteUnavailable,
+                            format!("listener inspection task failed: {error}"),
+                        ))
+                    }
+                };
             let mut endpoints = Vec::new();
             for port in &ports {
                 if let Some(ws_url) = browser_websocket_url(*port).await {
@@ -858,6 +886,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                         ownership: EndpointOwnershipProof {
                             method: EndpointOwnershipMethod::ListeningSocketPid,
                             owner_pid: request.pid,
+                            listener_pid: None,
                             detail: Some((*detail).to_owned()),
                         },
                     })
@@ -888,7 +917,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         let endpoint = match endpoint_result {
             Ok(endpoint) => endpoint,
             Err(error) => {
-                let error = tokio::task::spawn_blocking(move || handle.abort(error))
+                let error = cua_driver_core::blocking::spawn(move || handle.abort(error))
                     .await
                     .map_err(|join_error| {
                         refusal(
@@ -905,6 +934,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
             opened_setup_page,
             closed_setup_page: false,
             enabled_remote_debugging,
+            used_bounded_pixel_fallback,
             focused_setup_address_field,
             foregrounded_window,
             injected_global_input,
@@ -922,7 +952,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                 "the approved browser pid is outside the Linux process-id range",
             )
         })?;
-        tokio::task::spawn_blocking(move || {
+        cua_driver_core::blocking::spawn(move || {
             crate::browser_setup_ui::commit_pending(pid, request.window_id)
         })
         .await
@@ -942,7 +972,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         let Ok(pid) = u32::try_from(request.pid) else {
             return error;
         };
-        tokio::task::spawn_blocking(move || {
+        cua_driver_core::blocking::spawn(move || {
             crate::browser_setup_ui::abort_pending(pid, request.window_id, error)
         })
         .await
@@ -962,14 +992,15 @@ impl BrowserPlatform for LinuxBrowserPlatform {
     }
 
     async fn process_fingerprint(&self, pid: i64) -> Result<ProcessFingerprint, BrowserRefusal> {
-        let (start_time, executable) = tokio::task::spawn_blocking(move || process_identity(pid))
-            .await
-            .map_err(|error| {
-                refusal(
-                    BrowserRefusalCode::BrowserRouteUnavailable,
-                    format!("process fingerprint task failed: {error}"),
-                )
-            })??;
+        let (start_time, executable) =
+            cua_driver_core::blocking::spawn(move || process_identity(pid))
+                .await
+                .map_err(|error| {
+                    refusal(
+                        BrowserRefusalCode::BrowserRouteUnavailable,
+                        format!("process fingerprint task failed: {error}"),
+                    )
+                })??;
         Ok(ProcessFingerprint {
             pid,
             start_time: Some(start_time),

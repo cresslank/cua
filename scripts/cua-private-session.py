@@ -69,13 +69,13 @@ def _base_environment(args: argparse.Namespace, runtime: Path) -> dict[str, str]
             "XDG_CACHE_HOME": str(instance / "cache"),
             "XDG_STATE_HOME": str(instance / "state"),
             "CUA_DRIVER_RS_ENABLE_WAYLAND": "1",
+            "CUA_BROWSER_PROFILE_DIR": str(browser_profile),
             "CUA_DRIVER_BROWSER_PROFILE_ROOT": str(browser_profile),
             "CUA_INJECT_SOCKET": str(runtime / "cua-inject-v2.sock"),
             "CUA_OUTW": str(args.width),
             "CUA_OUTH": str(args.height),
             "CUA_PRIVATE_INSTANCE": args.name,
             "CUA_PRIVATE_STATE_DIR": str(instance),
-            "CUA_BROWSER_PROFILE_DIR": str(browser_profile),
             "WLR_BACKENDS": "headless",
             "WLR_RENDERER": "pixman",
             "WLR_RENDERER_ALLOW_SOFTWARE": "1",
@@ -140,6 +140,10 @@ def _configure_atspi(env: dict[str, str]) -> None:
     if not address.startswith("unix:"):
         raise RuntimeError("private AT-SPI bus returned an invalid address")
     env["AT_SPI_BUS_ADDRESS"] = address
+    # The SDK-owned private worker deliberately strips ambient AT-SPI state.
+    # This marker is the narrow, supervisor-owned route it maps back to the
+    # worker's AT_SPI_BUS_ADDRESS at process initialization.
+    env["CUA_DRIVER_PRIVATE_AT_SPI_BUS_ADDRESS"] = address
     subprocess.run(
         [
             "gdbus",

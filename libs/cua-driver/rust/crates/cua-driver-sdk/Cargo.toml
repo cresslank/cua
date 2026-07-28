@@ -27,11 +27,20 @@ cursor-overlay = { path = "../cursor-overlay" }
 [target.'cfg(target_os = "macos")'.dependencies]
 platform-macos = { path = "../platform-macos" }
 core-foundation = "0.10"
+libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 platform-windows = { path = "../platform-windows" }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Pipes",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 platform-linux = { path = "../platform-linux" }
 
 [features]

@@ -152,7 +152,7 @@ pub async fn handle(
     let mut saw_prompt = false;
     let mut accepted_prompt = false;
     loop {
-        let trees = tokio::task::spawn_blocking(move || {
+        let trees = cua_driver_core::blocking::spawn(move || {
             consent_surface_ids(crate::windows::all_windows(), pid, window_id)
                 .into_iter()
                 .map(|candidate_window_id| {

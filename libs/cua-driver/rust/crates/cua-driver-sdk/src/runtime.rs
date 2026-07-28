@@ -24,56 +24,40 @@ use std::sync::{
 
 const RECORDING_IDLE_TTL_SECS_DEFAULT: u64 = 300;
 const SESSION_IDLE_TTL_SECS_DEFAULT: u64 = 300;
-static DIRECT_RUNTIME_ACTIVE: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 pub(crate) static TEST_RUNTIME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum RuntimeCreateError {
+    #[allow(dead_code)]
     #[error(
         "runtime_already_exists: one direct Cua Driver runtime is already active in this process"
     )]
     AlreadyExists,
     #[error("invalid runtime authorization configuration: {0}")]
     Authorization(String),
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    #[error("runtime_unavailable: {0}")]
+    Unavailable(String),
 }
 
-struct RuntimeOwnershipGuard {
-    released: AtomicBool,
-}
-
-impl RuntimeOwnershipGuard {
-    fn acquire() -> Result<Self, RuntimeCreateError> {
-        DIRECT_RUNTIME_ACTIVE
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .map_err(|_| RuntimeCreateError::AlreadyExists)?;
-        Ok(Self {
-            released: AtomicBool::new(false),
-        })
-    }
-
-    fn release(&self) {
-        if !self.released.swap(true, Ordering::AcqRel) {
-            DIRECT_RUNTIME_ACTIVE.store(false, Ordering::Release);
-        }
-    }
-}
-
-impl Drop for RuntimeOwnershipGuard {
-    fn drop(&mut self) {
-        self.release();
-    }
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct RuntimeOptions {
     pub cursor: CursorConfig,
+    /// Whether the importing/embedding host owns macOS permission UX. Such a
+    /// runtime may inspect TCC state but must never raise Cua-owned prompts.
+    pub host_owns_permission_ux: bool,
+    pub host_bundle_id: Option<String>,
     pub compatibility_mode: bool,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub prepare_desktop_environment: bool,
     pub register_host_tools: Option<fn(&mut ToolRegistry)>,
     pub authorization_ceiling: Option<SessionModeCeiling>,
     pub compatibility_authorization: Option<(PermissionMode, Option<Arc<SessionManifest>>)>,
+    /// Constructor-only protected host. This object is never reachable from
+    /// public tool arguments or transport metadata.
+    pub protected_consent_provider:
+        Option<Arc<dyn cua_driver_core::consent::ProtectedConsentProvider>>,
 }
 
 impl RuntimeOptions {
@@ -83,11 +67,14 @@ impl RuntimeOptions {
                 enabled: false,
                 ..CursorConfig::default()
             },
+            host_owns_permission_ux: true,
+            host_bundle_id: None,
             compatibility_mode,
             prepare_desktop_environment: true,
             register_host_tools: None,
             authorization_ceiling: None,
             compatibility_authorization: None,
+            protected_consent_provider: None,
         }
     }
 
@@ -115,7 +102,6 @@ pub(crate) struct RuntimeSession {
     connection: AuthenticatedActionConnection,
     context: Arc<EffectiveAuthorizationContext>,
     public_session: String,
-    transport_session: String,
 }
 
 impl RuntimeSession {
@@ -139,14 +125,6 @@ impl RuntimeSession {
         arguments.insert(
             "session".to_owned(),
             Value::String(self.public_session.clone()),
-        );
-        arguments.insert(
-            "_session_id".to_owned(),
-            Value::String(self.public_session.clone()),
-        );
-        arguments.insert(
-            "_transport_session_id".to_owned(),
-            Value::String(self.transport_session.clone()),
         );
         let result = self
             .runtime
@@ -172,7 +150,6 @@ pub(crate) struct DriverRuntime {
     registry: Arc<ToolRegistry>,
     authorization_registry: Arc<SessionAuthorizationRegistry>,
     compatibility_context: Arc<EffectiveAuthorizationContext>,
-    ownership: RuntimeOwnershipGuard,
     shutdown: AtomicBool,
     last_activity: AtomicU64,
     /// Calls hold a read guard; shutdown takes the write guard after closing
@@ -183,6 +160,12 @@ pub(crate) struct DriverRuntime {
 
 impl DriverRuntime {
     pub(crate) fn create(options: RuntimeOptions) -> Result<Arc<Self>, RuntimeCreateError> {
+        #[cfg(target_os = "windows")]
+        if let Err(reason) = platform_windows::diagnostics::interactive_desktop_check() {
+            return Err(RuntimeCreateError::Unavailable(format!(
+                "Cua Driver requires an interactive Windows user session: {reason}"
+            )));
+        }
         let authorization_registry = Arc::new(match options.authorization_ceiling.clone() {
             Some(ceiling) => SessionAuthorizationRegistry::with_ceiling(ceiling),
             None => SessionAuthorizationRegistry::process()
@@ -196,15 +179,15 @@ impl DriverRuntime {
                 .legacy_context()
                 .map_err(RuntimeCreateError::Authorization)?,
         };
-        let ownership = RuntimeOwnershipGuard::acquire()?;
-        let registry = Arc::new(build_registry(&options));
+        let registry = Arc::new(cua_driver_core::tool::with_runtime_scope(
+            compatibility_context.runtime_scope_key(),
+            || build_registry(&options),
+        )?);
         registry.init_self_weak();
-        register_recording_session_end_hook(&registry);
         let runtime = Arc::new(Self {
             registry,
             authorization_registry,
             compatibility_context,
-            ownership,
             shutdown: AtomicBool::new(false),
             last_activity: AtomicU64::new(now_unix_secs()),
             lifecycle: tokio::sync::RwLock::new(()),
@@ -217,14 +200,24 @@ impl DriverRuntime {
         !self.shutdown.load(Ordering::Acquire)
     }
 
+    pub(crate) fn runtime_scope_key(&self) -> String {
+        self.compatibility_context.runtime_scope_key()
+    }
+
     pub(crate) async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         let _drained = self.lifecycle.write().await;
         self.authorization_registry.revoke_all();
-        cua_driver_core::session::revoke_all_sessions();
+        let runtime_prefix = format!(
+            "__cua_runtime_{}:",
+            self.compatibility_context.runtime_scope_key()
+        );
+        cua_driver_core::session::revoke_sessions_with_prefix(&runtime_prefix);
+        cua_driver_core::session::forget_ended_sessions_with_prefix(&runtime_prefix);
+        cua_driver_core::element_token::global()
+            .clear_runtime_scope(&self.compatibility_context.runtime_scope_key());
         let recording = self.registry.recording.clone();
         let _ = tokio::task::spawn_blocking(move || recording.stop_owner(None)).await;
-        self.ownership.release();
     }
 
     pub(crate) fn tools_list(&self) -> Option<Value> {
@@ -236,11 +229,43 @@ impl DriverRuntime {
             .await
     }
 
+    pub(crate) async fn invoke_from_trusted_adapter(
+        &self,
+        name: &str,
+        mut args: Value,
+    ) -> Option<CoreToolResult> {
+        let evidence =
+            cua_driver_core::tool::TrustedInvocationEvidence::extract_from_adapter_args(&mut args);
+        self.invoke_with_context_and_evidence(
+            name,
+            args,
+            self.compatibility_context.clone(),
+            evidence,
+        )
+        .await
+    }
+
     async fn invoke_with_context(
         &self,
         name: &str,
         args: Value,
         context: Arc<EffectiveAuthorizationContext>,
+    ) -> Option<CoreToolResult> {
+        self.invoke_with_context_and_evidence(
+            name,
+            args,
+            context,
+            cua_driver_core::tool::TrustedInvocationEvidence::default(),
+        )
+        .await
+    }
+
+    async fn invoke_with_context_and_evidence(
+        &self,
+        name: &str,
+        args: Value,
+        context: Arc<EffectiveAuthorizationContext>,
+        evidence: cua_driver_core::tool::TrustedInvocationEvidence,
     ) -> Option<CoreToolResult> {
         if !self.is_running() {
             return None;
@@ -254,10 +279,13 @@ impl DriverRuntime {
             .then(|| {
                 args.get("session")
                     .and_then(Value::as_str)
-                    .map(str::to_owned)
+                    .map(|session| context.runtime_session_key(session))
             })
             .flatten();
-        let result = self.registry.invoke_with_context(name, args, context).await;
+        let result = self
+            .registry
+            .invoke_with_context_and_evidence(name, args, context, evidence)
+            .await;
         if let Some(session) = ending_session {
             // `end_session` is a lifecycle boundary: do not report completion
             // until any recording owned by the session has finalized.
@@ -291,7 +319,6 @@ impl DriverRuntime {
             connection,
             context,
             public_session,
-            transport_session,
         }))
     }
 }
@@ -300,16 +327,18 @@ impl Drop for DriverRuntime {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
         self.authorization_registry.revoke_all();
-        // Explicit `shutdown()` drains work, finalizes recordings, and clears
-        // compatibility sessions. Drop can happen later than shutdown in
-        // garbage-collected bindings, after a replacement runtime has already
-        // acquired process ownership. It must therefore stay runtime-scoped
-        // and non-blocking rather than touching process-global session state.
+        let runtime_scope = self.compatibility_context.runtime_scope_key();
+        let runtime_prefix = format!("__cua_runtime_{runtime_scope}:");
+        cua_driver_core::session::revoke_sessions_with_prefix(&runtime_prefix);
+        cua_driver_core::session::forget_ended_sessions_with_prefix(&runtime_prefix);
+        cua_driver_core::element_token::global().clear_runtime_scope(&runtime_scope);
+        // Explicit `shutdown()` drains work and finalizes recordings. Drop is
+        // runtime-scoped and non-blocking so a retained binding cannot affect
+        // another generation.
         let recording = self.registry.recording.clone();
         std::thread::spawn(move || {
             let _ = recording.stop_owner(None);
         });
-        self.ownership.release();
     }
 }
 
@@ -356,11 +385,17 @@ fn spawn_lifecycle_maintenance(runtime: &Arc<DriverRuntime>) {
         if !runtime.is_running() {
             break;
         }
-        let ended = cua_driver_core::session::evict_idle(session_ttl);
+        let ended = cua_driver_core::session::evict_idle_with_prefix(
+            session_ttl,
+            &format!(
+                "__cua_runtime_{}:",
+                runtime.compatibility_context.runtime_scope_key()
+            ),
+        );
         if !ended.is_empty() {
             tracing::info!(
                 count = ended.len(),
-                "idle-TTL reclaimed sessions: {ended:?}"
+                "idle-TTL reclaimed runtime-owned sessions"
             );
         }
         let idle = now_unix_secs().saturating_sub(runtime.last_activity.load(Ordering::Relaxed));
@@ -371,33 +406,39 @@ fn spawn_lifecycle_maintenance(runtime: &Arc<DriverRuntime>) {
     });
 }
 
-fn register_recording_session_end_hook(registry: &Arc<ToolRegistry>) {
-    let recording = Arc::downgrade(&registry.recording);
-    cua_driver_core::session::register_session_end_hook(move |session| {
-        let Some(recording) = recording.upgrade() else {
-            return;
-        };
-        let session = session.to_owned();
-        std::thread::spawn(move || {
-            let _ = recording.stop_owner(Some(&session));
-        });
-    });
+/// Build the canonical SDK tool inventory without acquiring runtime ownership.
+///
+/// This metadata-only path cannot dispatch actions and therefore remains
+/// available when the host has no interactive desktop (for example Windows
+/// Session 0). Finite CLI inspection commands use it to preserve their
+/// desktop-free compatibility contract without weakening runtime admission.
+pub(crate) fn tool_inventory(mut options: RuntimeOptions) -> Value {
+    // Inventory construction is metadata-only even if the host's eventual
+    // action runtime requests eager desktop preparation.
+    options.prepare_desktop_environment = false;
+    build_registry(&options)
+        .expect("desktop-free tool inventory construction cannot fail")
+        .tools_list()
 }
 
-fn build_registry(options: &RuntimeOptions) -> ToolRegistry {
+fn build_registry(options: &RuntimeOptions) -> Result<ToolRegistry, RuntimeCreateError> {
     #[cfg(target_os = "macos")]
     let mut registry = {
         configure_macos_runtime();
-        platform_macos::register_tools_with_cursor(
+        platform_macos::register_tools_with_cursor_and_provider(
+            options.protected_consent_provider.clone(),
             options.cursor.clone(),
             options.compatibility_mode,
+            options.host_owns_permission_ux,
+            options.host_bundle_id.clone(),
         )
     };
 
     #[cfg(target_os = "windows")]
     let mut registry = {
         configure_windows_runtime();
-        platform_windows::register_tools_with_cursor(
+        platform_windows::register_tools_with_cursor_and_provider(
+            options.protected_consent_provider.clone(),
             options.cursor.clone(),
             options.compatibility_mode,
         )
@@ -405,8 +446,9 @@ fn build_registry(options: &RuntimeOptions) -> ToolRegistry {
 
     #[cfg(target_os = "linux")]
     let mut registry = {
-        configure_linux_runtime(options.prepare_desktop_environment);
-        platform_linux::register_tools_with_cursor(
+        configure_linux_runtime(options.prepare_desktop_environment)?;
+        platform_linux::register_tools_with_cursor_and_provider(
+            options.protected_consent_provider.clone(),
             options.cursor.clone(),
             options.compatibility_mode,
         )
@@ -421,7 +463,19 @@ fn build_registry(options: &RuntimeOptions) -> ToolRegistry {
     if let Some(register_host_tools) = options.register_host_tools {
         register_host_tools(&mut registry);
     }
-    registry
+    let recording = Arc::downgrade(&registry.recording);
+    let recording_session_end =
+        cua_driver_core::session::register_scoped_session_end_hook(move |session| {
+            let Some(recording) = recording.upgrade() else {
+                return;
+            };
+            let session = session.to_owned();
+            std::thread::spawn(move || {
+                let _ = recording.stop_owner(Some(&session));
+            });
+        });
+    registry.retain_session_end_hook(recording_session_end);
+    Ok(registry)
 }
 
 #[cfg(target_os = "macos")]
@@ -473,14 +527,214 @@ fn configure_windows_runtime() {
 }
 
 #[cfg(target_os = "linux")]
-fn configure_linux_runtime(prepare_desktop_environment: bool) {
+fn acquire_linux_desktop_preparation_lock() -> Result<std::fs::File, String> {
+    let effective_uid = unsafe { libc::geteuid() };
+    let path = linux_desktop_preparation_lock_path(effective_uid);
+    acquire_linux_desktop_preparation_lock_at(&path, effective_uid)
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_linux_desktop_preparation_lock_until(
+    deadline: std::time::Instant,
+) -> Result<std::fs::File, String> {
+    let effective_uid = unsafe { libc::geteuid() };
+    let path = linux_desktop_preparation_lock_path(effective_uid);
+    acquire_linux_desktop_preparation_lock_at_until(&path, effective_uid, deadline)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_desktop_preparation_lock_path(effective_uid: u32) -> std::path::PathBuf {
+    // Derive one host-wide location from the effective UID, never from ambient
+    // XDG_RUNTIME_DIR or TMPDIR. Services, private workers, and manually
+    // launched runtimes must serialize on the same inode even when their
+    // environment discovery inputs differ.
+    let runtime_dir = std::path::Path::new("/run/user").join(effective_uid.to_string());
+    if runtime_dir.is_dir() {
+        runtime_dir.join("cua-driver-desktop-preparation.lock")
+    } else {
+        std::path::Path::new("/tmp").join(format!(
+            "cua-driver-desktop-preparation-{effective_uid}.lock"
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_linux_desktop_preparation_lock_at(
+    path: &std::path::Path,
+    effective_uid: u32,
+) -> Result<std::fs::File, String> {
+    acquire_linux_desktop_preparation_lock_at_until(
+        path,
+        effective_uid,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn acquire_linux_desktop_preparation_lock_at_until(
+    path: &std::path::Path,
+    effective_uid: u32,
+    deadline: std::time::Instant,
+) -> Result<std::fs::File, String> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|error| format!("open {}: {error}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect {}: {error}", path.display()))?;
+    // Reject a substituted non-regular, linked, group/world-accessible, or
+    // foreign lock before trusting host-wide serialization.
+    if !metadata.file_type().is_file()
+        || metadata.uid() != effective_uid
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(format!(
+            "refusing unsafe desktop preparation lock {}",
+            path.display()
+        ));
+    }
+
+    loop {
+        // SAFETY: `file` owns this descriptor for the entire flock call.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(file);
+        }
+        let error = std::io::Error::last_os_error();
+        let would_block = error
+            .raw_os_error()
+            .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN);
+        if !would_block || std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "desktop preparation lock {} unavailable: {error}",
+                path.display()
+            ));
+        }
+        std::thread::sleep(
+            std::time::Duration::from_millis(20)
+                .min(deadline.saturating_duration_since(std::time::Instant::now())),
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn trusted_private_worker_accessibility_bus_from_current_process(
+) -> Result<Option<String>, RuntimeCreateError> {
+    const PRIVATE_ATSPI_ROUTE: &str = "CUA_DRIVER_PRIVATE_AT_SPI_BUS_ADDRESS";
+
+    match std::env::var(PRIVATE_ATSPI_ROUTE) {
+        Ok(address) => {
+            platform_linux::a11y::initialize_private_accessibility_bus(&address).map_err(
+                |error| {
+                    RuntimeCreateError::Unavailable(format!(
+                        "could not validate the supervisor-owned private AT-SPI route: {error:#}"
+                    ))
+                },
+            )?;
+            Ok(Some(address))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(RuntimeCreateError::Unavailable(
+            "supervisor-owned private AT-SPI route is not valid UTF-8".into(),
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_private_worker_accessibility_route(
+    deadline: std::time::Instant,
+) -> Result<String, RuntimeCreateError> {
+    if std::time::Instant::now() >= deadline {
+        return Err(RuntimeCreateError::Unavailable(
+            "private-worker desktop preparation deadline expired".into(),
+        ));
+    }
+    if trusted_private_worker_accessibility_bus_from_current_process()?.is_none() {
+        let preparation_lock = acquire_linux_desktop_preparation_lock_until(deadline)
+            .map_err(RuntimeCreateError::Unavailable)?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(RuntimeCreateError::Unavailable(
+                "private-worker desktop preparation exceeded its startup deadline".into(),
+            ));
+        }
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("cua-session-bus-discovery".into())
+            .spawn(move || {
+                let _ = sender.send(platform_linux::session_bus::session_bus_address());
+            })
+            .map_err(|error| {
+                RuntimeCreateError::Unavailable(format!(
+                    "could not start side-effect-free session-bus discovery: {error}"
+                ))
+            })?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(RuntimeCreateError::Unavailable(
+                "session-bus discovery exceeded the private-worker startup deadline".into(),
+            ));
+        }
+        let session_bus_address = receiver
+            .recv_timeout(remaining)
+            .map_err(|_| {
+                RuntimeCreateError::Unavailable(
+                    "session-bus discovery exceeded the private-worker startup deadline".into(),
+                )
+            })?
+            .ok_or_else(|| {
+                RuntimeCreateError::Unavailable(
+                    "could not discover the desktop session bus without mutating the host environment"
+                        .into(),
+                )
+            })?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(RuntimeCreateError::Unavailable(
+                "private-worker accessibility preparation exceeded its startup deadline".into(),
+            ));
+        }
+        platform_linux::a11y::ensure_accessibility_enabled_with_session_bus(
+            preparation_lock,
+            Some(session_bus_address),
+            remaining,
+        )
+        .map_err(RuntimeCreateError::Unavailable)?;
+    }
+
+    platform_linux::a11y::trusted_accessibility_bus_address().map_err(|error| {
+        RuntimeCreateError::Unavailable(format!(
+            "could not resolve the prepared private-worker AT-SPI route: {error:#}"
+        ))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn configure_linux_runtime(prepare_desktop_environment: bool) -> Result<(), RuntimeCreateError> {
     if prepare_desktop_environment {
+        let preparation_lock =
+            acquire_linux_desktop_preparation_lock().map_err(RuntimeCreateError::Unavailable)?;
         platform_linux::xauth::ensure_xauthority_discovered();
         platform_linux::session_bus::ensure_session_bus_discovered();
-        platform_linux::a11y::ensure_accessibility_enabled();
-        if let Err(error) = platform_linux::atspi::ensure_listener_active() {
-            tracing::warn!("could not activate the persistent AT-SPI listener: {error}");
-        }
+        platform_linux::a11y::ensure_accessibility_enabled(preparation_lock)
+            .map_err(RuntimeCreateError::Unavailable)?;
+        // The listener connection is process-local and does not mutate shared
+        // desktop state. Do not serialize its bounded D-Bus startup across
+        // independent daemons/private workers.
+        platform_linux::atspi::ensure_listener_active().map_err(|error| {
+            RuntimeCreateError::Unavailable(format!(
+                "could not activate the persistent AT-SPI listener: {error}"
+            ))
+        })?;
     }
     cua_driver_core::recording::set_screenshot_fn(|window_id, pid| {
         platform_linux::recording_hooks::screenshot_for_recording(window_id, pid)
@@ -502,5 +756,242 @@ fn configure_linux_runtime(prepare_desktop_environment: bool) {
         cua_driver_core::video::set_video_backend_factory(Box::new(
             cua_driver_core::video_ffmpeg::FfmpegVideoBackendFactory,
         ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use cua_driver_core::consent::{
+        ConsentAction, ConsentRequest, IndicatorLease, ProtectedConsentProvider, ProviderDecision,
+    };
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    struct TestProtectedHost;
+
+    #[async_trait]
+    impl ProtectedConsentProvider for TestProtectedHost {
+        fn provider_id(&self) -> &'static str {
+            "test.runtime-protected-host"
+        }
+
+        async fn request_consent(
+            &self,
+            request: &ConsentRequest,
+        ) -> Result<ProviderDecision, String> {
+            Ok(ProviderDecision {
+                action: ConsentAction::Accept,
+                request_digest: request.request_digest.clone(),
+            })
+        }
+
+        async fn activate_indicator(
+            &self,
+            request: &ConsentRequest,
+        ) -> Result<IndicatorLease, String> {
+            Ok(IndicatorLease::new(
+                format!("test-indicator-{}", request.generation),
+                Arc::new(AtomicBool::new(false)),
+            ))
+        }
+
+        async fn deactivate_indicator(&self, _indicator_id: &str) {}
+    }
+
+    fn standard_options() -> RuntimeOptions {
+        let ceiling = SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Standard],
+            false,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let mut options =
+            RuntimeOptions::embedded_with_ceiling(false, ceiling, PermissionMode::Standard, None);
+        options.prepare_desktop_environment = false;
+        options.protected_consent_provider = Some(Arc::new(TestProtectedHost));
+        options
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_preparation_lock_is_secure_and_serializes_callers() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("desktop-preparation.lock");
+        let uid = unsafe { libc::geteuid() };
+        let first = acquire_linux_desktop_preparation_lock_at(&path, uid).unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(first);
+        });
+        let started = std::time::Instant::now();
+        let second = acquire_linux_desktop_preparation_lock_at(&path, uid).unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        assert_eq!(second.metadata().unwrap().mode() & 0o777, 0o600);
+        release.join().unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_preparation_lock_honors_the_private_worker_startup_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("desktop-preparation.lock");
+        let uid = unsafe { libc::geteuid() };
+        let first = acquire_linux_desktop_preparation_lock_at(&path, uid).unwrap();
+        let timeout = Duration::from_millis(75);
+        let started = std::time::Instant::now();
+        let error = acquire_linux_desktop_preparation_lock_at_until(&path, uid, started + timeout)
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(error.contains("unavailable"));
+        assert!(elapsed >= timeout / 2);
+        assert!(elapsed < Duration::from_secs(1));
+        drop(first);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_preparation_lock_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        std::fs::write(&target, b"").unwrap();
+        let path = directory.path().join("desktop-preparation.lock");
+        symlink(&target, &path).unwrap();
+        let error = acquire_linux_desktop_preparation_lock_at(&path, unsafe { libc::geteuid() })
+            .unwrap_err();
+        assert!(error.contains("open"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_preparation_lock_location_is_canonical_for_the_uid() {
+        let uid = unsafe { libc::geteuid() };
+        let first = linux_desktop_preparation_lock_path(uid);
+        let second = linux_desktop_preparation_lock_path(uid);
+        assert_eq!(first, second);
+        if first.starts_with("/run/user") {
+            assert_eq!(
+                first.file_name().and_then(|name| name.to_str()),
+                Some("cua-driver-desktop-preparation.lock")
+            );
+        } else {
+            assert!(first.ends_with(format!("cua-driver-desktop-preparation-{uid}.lock")));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_preparation_lock_rejects_hardlinks() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        std::fs::write(&target, b"").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let path = directory.path().join("desktop-preparation.lock");
+        std::fs::hard_link(&target, &path).unwrap();
+        let error = acquire_linux_desktop_preparation_lock_at(&path, unsafe { libc::geteuid() })
+            .unwrap_err();
+        assert!(error.contains("unsafe"));
+    }
+
+    #[tokio::test]
+    async fn authorized_dispatch_refreshes_only_the_runtime_private_activity_key() {
+        let _runtime_test = TEST_RUNTIME_LOCK.lock().unwrap();
+        let runtime = DriverRuntime::create(standard_options()).unwrap();
+        let public = "runtime-activity-refresh";
+        let internal = runtime.compatibility_context.runtime_session_key(public);
+        let prefix = format!(
+            "__cua_runtime_{}:",
+            runtime.compatibility_context.runtime_scope_key()
+        );
+
+        runtime
+            .invoke(
+                "start_session",
+                serde_json::json!({"session": public, "capture_scope": "auto"}),
+            )
+            .await
+            .unwrap();
+        assert!(cua_driver_core::session::has_session_activity(&internal));
+        assert!(!cua_driver_core::session::has_session_activity(public));
+
+        std::thread::sleep(Duration::from_millis(20));
+        let idle_before_refresh =
+            cua_driver_core::session::session_idle_duration(&internal).unwrap();
+        runtime
+            .invoke("health_report", serde_json::json!({"session": public}))
+            .await
+            .unwrap();
+        let idle_after_refresh =
+            cua_driver_core::session::session_idle_duration(&internal).unwrap();
+        assert!(
+            idle_after_refresh < idle_before_refresh,
+            "authorized traffic must reset the private idle clock: before={idle_before_refresh:?} after={idle_after_refresh:?} ended={}",
+            cua_driver_core::session::is_session_ended(&internal)
+        );
+        let evicted =
+            cua_driver_core::session::evict_idle_with_prefix(idle_before_refresh, &prefix);
+        assert!(
+            !evicted.contains(&internal),
+            "continuous authorized traffic must refresh the private idle clock"
+        );
+
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn idle_eviction_finalizes_the_owning_runtime_recording() {
+        let _runtime_test = TEST_RUNTIME_LOCK.lock().unwrap();
+        let runtime = DriverRuntime::create(standard_options()).unwrap();
+        let public = "runtime-recording-idle";
+        let internal = runtime.compatibility_context.runtime_session_key(public);
+        let prefix = format!(
+            "__cua_runtime_{}:",
+            runtime.compatibility_context.runtime_scope_key()
+        );
+        runtime
+            .invoke(
+                "start_session",
+                serde_json::json!({"session": public, "capture_scope": "auto"}),
+            )
+            .await
+            .unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let started = runtime
+            .invoke(
+                "start_recording",
+                serde_json::json!({
+                    "session": public,
+                    "output_dir": output.path(),
+                    "record_video": false,
+                }),
+            )
+            .await
+            .unwrap();
+        assert_ne!(started.is_error, Some(true));
+        assert!(runtime.registry.recording.current_state().enabled);
+
+        let evicted = cua_driver_core::session::evict_idle_with_prefix(Duration::ZERO, &prefix);
+        assert!(evicted.contains(&internal));
+        for _ in 0..100 {
+            if !runtime.registry.recording.current_state().enabled {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !runtime.registry.recording.current_state().enabled,
+            "session-end hook must finalize recording after idle eviction"
+        );
+
+        runtime.shutdown().await;
     }
 }

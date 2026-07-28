@@ -62,9 +62,10 @@ impl Tool for MoveCursorTool {
             };
             let (x, y) = (input.x, input.y);
             let (x, y) = super::desktop_screenshot_point(x, y).await;
-            let result =
-                tokio::task::spawn_blocking(move || crate::input::mouse::move_cursor_desktop(x, y))
-                    .await;
+            let result = cua_driver_core::blocking::spawn(move || {
+                crate::input::mouse::move_cursor_desktop(x, y)
+            })
+            .await;
             return match result {
                 Ok(Ok(())) => ToolResult::text(format!(
                     "Moved the real desktop pointer to ({x:.1}, {y:.1})."
@@ -80,6 +81,9 @@ impl Tool for MoveCursorTool {
                 }
                 Err(error) => ToolResult::error(format!("desktop pointer task failed: {error}")),
             };
+        }
+        if !self.state.cursor_overlay_available {
+            return super::cursor_overlay_unavailable();
         }
         let x = match args.require_f64("x") {
             Ok(v) => v,

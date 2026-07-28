@@ -46,7 +46,7 @@ impl BrowserJs {
         // matched against the browser's AppleScript window model.
         let target = {
             let wid = window_id;
-            tokio::task::spawn_blocking(move || native_window_target(wid)).await?
+            cua_driver_core::blocking::spawn(move || native_window_target(wid)).await?
         }?;
 
         let escaped_js = escape_js_for_applescript(javascript);

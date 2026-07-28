@@ -145,7 +145,7 @@ impl Tool for TypeTextTool {
                 cua_driver_core::text_sanitize::strip_trailing_agent_protocol_tags(&input.text)
                     .into_owned();
             let delay_ms = args.u64_or("delay_ms", 30).min(200);
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::blocking::spawn(move || {
                 crate::input::keyboard::type_text_global(&text, delay_ms)
             })
             .await;
@@ -286,7 +286,7 @@ impl Tool for TypeTextTool {
             prior_front,
             "type_text.AXSelectedText",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                cua_driver_core::blocking::spawn(move || {
                     type_text_blocking(
                         pid,
                         &text_clone,

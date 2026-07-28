@@ -158,7 +158,8 @@ impl Tool for RightClickTool {
             let element_ptr = element_guard.as_ptr();
 
             let result =
-                tokio::task::spawn_blocking(move || ax_show_menu(element_ptr, idx, pid, wid)).await;
+                cua_driver_core::blocking::spawn(move || ax_show_menu(element_ptr, idx, pid, wid))
+                    .await;
 
             return match result {
                 Ok(Ok(msg)) => ToolResult::text(msg),
@@ -178,7 +179,7 @@ impl Tool for RightClickTool {
         // Window-local → screen coordinate translation + win-local logical coords
         // for CGEventSetWindowLocation (matches click.rs enhancement).
         let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(wid) = window_id {
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::blocking::spawn(move || {
                 let bounds = crate::windows::window_bounds_by_id(wid);
                 let scale: f64 = if let Some(ref b) = bounds {
                     if let Ok(png) = crate::capture::screenshot_window_bytes(wid) {
@@ -239,7 +240,7 @@ impl Tool for RightClickTool {
         };
 
         let fg = delivery_mode.is_foreground() && window_id.is_some();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<()> {
             let do_it = move || -> anyhow::Result<()> {
                 let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 if let Some(wid) = window_id {

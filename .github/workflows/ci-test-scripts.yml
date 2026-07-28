@@ -34,6 +34,8 @@ jobs:
 
       - name: Install dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap libcap2-bin
           python -m pip install --upgrade pip
           pip install jsonschema pytest toml
 

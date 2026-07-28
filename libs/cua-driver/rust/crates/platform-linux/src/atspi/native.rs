@@ -4,7 +4,7 @@
 //! no Python, `pyatspi`, or GObject-introspection typelibs are needed at
 //! runtime. The zbus calls are async, so each public entry point drives a
 //! small shared Tokio runtime via `block_on` (callers already invoke these
-//! from `tokio::task::spawn_blocking`, so blocking here is safe).
+//! from `cua_driver_core::blocking::spawn`, so blocking here is safe).
 //!
 //! Element indices match the markdown produced by [`walk_tree`]: a depth-first,
 //! pre-order traversal of the target application's windows, numbering the
@@ -15,16 +15,20 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use atspi::connection::{AccessibilityConnection, P2P};
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::{CoordType, Interface, State};
+use atspi_connection::AccessibilityConnection;
 
 use super::AtspiNode;
 
 /// Per-call D-Bus timeout: a single unresponsive accessible (common in large,
 /// lazily-built trees like Chromium's) must not stall the whole walk.
 const CALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// Eager listener registration must never delay daemon readiness indefinitely.
+/// A timed-out `OnceCell` initializer is cancelled and can be retried by the
+/// first real AT-SPI operation.
+const LISTENER_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// Overall budget for one tree walk / operation.
 const OP_TIMEOUT: Duration = Duration::from_secs(25);
 
@@ -91,7 +95,11 @@ static SHARED_CONNECTION: tokio::sync::OnceCell<AccessibilityConnection> =
 async fn shared_connection() -> Result<&'static AccessibilityConnection> {
     SHARED_CONNECTION
         .get_or_try_init(|| async {
-            let conn = AccessibilityConnection::new()
+            let bus_address = crate::a11y::trusted_accessibility_bus_address()?;
+            let address = bus_address
+                .parse()
+                .map_err(|error| anyhow!("invalid trusted AT-SPI bus address: {error}"))?;
+            let conn = AccessibilityConnection::from_address(address)
                 .await
                 .map_err(|error| anyhow!("AT-SPI connect failed: {error}"))?;
             if let Err(error) = conn.add_registry_event::<atspi::ObjectEvents>().await {
@@ -105,7 +113,15 @@ async fn shared_connection() -> Result<&'static AccessibilityConnection> {
 /// Establish the process-lifetime listener before accessibility-aware apps are
 /// launched. Idempotent; later calls reuse the same connection.
 pub fn ensure_listener_active() -> Result<()> {
-    let connect = || runtime().block_on(async { shared_connection().await.map(|_| ()) });
+    crate::a11y::trusted_accessibility_bus_address()?;
+    let connect = || {
+        runtime().block_on(async {
+            tokio::time::timeout(LISTENER_STARTUP_TIMEOUT, shared_connection())
+                .await
+                .map_err(|_| anyhow!("AT-SPI listener initialization timed out"))??;
+            Ok(())
+        })
+    };
     if tokio::runtime::Handle::try_current().is_ok() {
         // The daemon builds its registry from its Tokio entry-point. Calling
         // Runtime::block_on there panics even though this module owns a separate
@@ -141,6 +157,13 @@ struct Visited<'a> {
     /// Chromium keeps its document on the application's ordinary AT-SPI bus,
     /// where descendant Window extents already include the document origin.
     on_web_process_bus: bool,
+    /// Stable identity of the AT-SPI bus/object path for action-time binding.
+    element_key: u64,
+    /// Stable AT-SPI identity and application-child ordinal of the top-level
+    /// accessible window that owns this node. These are carried down the walk
+    /// so a key-addressed action cannot cross to another window of one process.
+    top_level_key: u64,
+    top_level_ordinal: usize,
     acc: AccessibleProxy<'a>,
 }
 
@@ -180,25 +203,11 @@ async fn accessible_for<'a>(
     conn: &'a AccessibilityConnection,
     oref: &RawObjectRef,
 ) -> Result<AccessibleProxy<'a>> {
-    // Keep the atspi crate's peer-to-peer path when this connection actually
-    // knows the peer. Late WebKit WebProcess children are not in the initial
-    // peer snapshot; object_as_accessible's bus fallback omits their destination
-    // and targets the Accessible interface name instead. Build an explicit bus
-    // proxy below for those late peers and for well-known references.
-    if oref.name.starts_with(':') {
-        let name = atspi::zbus::names::UniqueName::try_from(oref.name.clone())
-            .map_err(|e| anyhow!("bad a11y unique name: {e}"))?;
-        let bus_name = atspi::zbus::names::BusName::Unique(name.as_ref());
-        if conn.get_peer(&bus_name).is_some() {
-            let path = atspi::zbus::zvariant::ObjectPath::try_from(oref.path.clone())
-                .map_err(|e| anyhow!("bad a11y path: {e}"))?;
-            let object = atspi::ObjectRef::new_owned(name, path);
-            return conn
-                .object_as_accessible(&object)
-                .await
-                .map_err(|e| anyhow!("AccessibleProxy build failed: {e}"));
-        }
-    }
+    // Do not eagerly open every application's optional P2P accessibility
+    // socket: one stale peer can block initialization for the whole driver.
+    // Object references already carry an exact bus destination, so build the
+    // central AT-SPI-bus proxy explicitly and let the per-call/operation
+    // deadlines below fail closed for an unresponsive application.
     AccessibleProxy::builder(conn.connection())
         .cache_properties(atspi::zbus::proxy::CacheProperties::No)
         .destination(oref.name.clone())
@@ -218,6 +227,25 @@ async fn accessible_for<'a>(
 struct RawObjectRef {
     name: String,
     path: String,
+}
+
+fn element_key_for_object(object: &RawObjectRef) -> u64 {
+    // Stable FNV-1a over the exact AT-SPI destination + object path. Unlike the
+    // snapshot ordinal, this survives unrelated tree insertions; a collision is
+    // still detected by key-based operations before any mutation.
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in object
+        .name
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(std::iter::once(0))
+        .chain(object.path.as_bytes().iter().copied())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 impl RawObjectRef {
@@ -363,19 +391,29 @@ async fn collect_visited_bounded<'a>(
     };
     let zconn = conn.connection();
 
-    // Stack of (object ref, depth, in_web_doc). Seed with the app's windows;
-    // push children reversed so siblings pop left-to-right and each subtree
-    // completes before the next sibling (pre-order). `in_web_doc` is inherited
-    // from ancestors so editables in page content can be told from chrome.
-    let mut stack: Vec<(RawObjectRef, usize, bool)> = match call(app.get_children()).await {
-        Some(Ok(children)) => children
-            .into_iter()
-            .filter_map(|child| RawObjectRef::from_atspi(&child))
-            .rev()
-            .map(|r| (r, 0usize, false))
-            .collect(),
-        _ => Vec::new(),
-    };
+    // Stack of (object ref, depth, in_web_doc, top-level key, top-level ordinal).
+    // Seed with the app's windows; push children reversed so siblings pop
+    // left-to-right and each subtree completes before the next sibling
+    // (pre-order). `in_web_doc` is inherited from ancestors so editables in
+    // page content can be told from chrome.
+    let mut stack: Vec<(RawObjectRef, usize, bool, u64, usize)> =
+        match call(app.get_children()).await {
+            Some(Ok(children)) => {
+                let mut roots = children
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(ordinal, child)| {
+                        RawObjectRef::from_atspi(&child).map(|root| {
+                            let key = element_key_for_object(&root);
+                            (root, 0usize, false, key, ordinal)
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                roots.reverse();
+                roots
+            }
+            _ => Vec::new(),
+        };
 
     let mut visited: Vec<Visited<'a>> = Vec::new();
     // Guard against pathological/looping trees. Defaults to 5 000 (the
@@ -397,7 +435,8 @@ async fn collect_visited_bounded<'a>(
     // few seconds rather than ~25s.
     let mut consecutive_timeouts = 0u32;
 
-    while let Some((oref, depth, inherited_web_doc)) = stack.pop() {
+    while let Some((oref, depth, inherited_web_doc, top_level_key, top_level_ordinal)) = stack.pop()
+    {
         if budget == 0 {
             dlog!("node budget exhausted; truncating walk");
             break;
@@ -558,7 +597,13 @@ async fn collect_visited_bounded<'a>(
             match children_r {
                 Some(Ok(children)) => {
                     for c in children.into_iter().rev() {
-                        stack.push((c, depth + 1, child_in_web_doc));
+                        stack.push((
+                            c,
+                            depth + 1,
+                            child_in_web_doc,
+                            top_level_key,
+                            top_level_ordinal,
+                        ));
                     }
                 }
                 Some(Err(error)) => dlog!("  get_children failed: {error:#}"),
@@ -579,6 +624,9 @@ async fn collect_visited_bounded<'a>(
             focused,
             in_web_doc,
             on_web_process_bus: is_web_process_bus(&oref.name),
+            element_key: element_key_for_object(&oref),
+            top_level_key,
+            top_level_ordinal,
             acc,
         });
     }
@@ -639,7 +687,7 @@ fn render(visited: &[Visited<'_>]) -> (String, Vec<AtspiNode>) {
                 checked: v.checked,
                 description: None,
                 actions: v.actions.clone(),
-                element_key: idx as u64,
+                element_key: v.element_key,
                 depth: v.depth,
                 parent_element_index,
                 in_web_content: v.in_web_doc,
@@ -1299,6 +1347,164 @@ pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
     )
 }
 
+/// Resolve the AT-SPI top-level ancestry that corresponds to an exact native
+/// window. A compositor-backed window ID is not generally an AT-SPI object ID,
+/// so the browser-setup singleton contract is the correlation authority. When
+/// the ID is the AT-SPI fallback's synthetic `(pid, frame ordinal)` ID, retain
+/// that stronger direct match as well. Any ambiguous ancestry fails closed.
+fn exact_window_top_level_key(roots: &[(u64, usize)], pid: u32, window_id: u64) -> Result<u64> {
+    let mut unique = roots.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+
+    let direct = unique
+        .iter()
+        .filter(|(_, ordinal)| (((pid as u64) << 16) | (*ordinal as u64)).max(1) == window_id)
+        .map(|(key, _)| *key)
+        .collect::<Vec<_>>();
+    match direct.as_slice() {
+        [key] => return Ok(*key),
+        [] => {}
+        _ => anyhow::bail!("AT-SPI exact window ancestry is ambiguous"),
+    }
+
+    match unique.as_slice() {
+        [(key, _)] => Ok(*key),
+        [] => anyhow::bail!("AT-SPI exact window has no top-level ancestry"),
+        _ => anyhow::bail!(
+            "AT-SPI application exposes multiple top-level ancestries for exact window {window_id}"
+        ),
+    }
+}
+
+fn ensure_element_descends_from_exact_window(
+    element_key: u64,
+    actual_top_level: u64,
+    expected_top_level: u64,
+    window_id: u64,
+) -> Result<()> {
+    if actual_top_level != expected_top_level {
+        anyhow::bail!(
+            "AT-SPI element key {element_key:#x} is not descended from exact window {window_id}"
+        );
+    }
+    Ok(())
+}
+
+/// Perform an expected advertised action on the exact AT-SPI object returned by
+/// an earlier snapshot. Stable semantics and the D-Bus acknowledgement are
+/// checked on the retained action-time proxy. The same scan also binds the
+/// object to the exact native window's AT-SPI ancestry, and the immutable
+/// compositor proof is revalidated immediately before `do_action`.
+pub fn perform_verified_action_by_key(
+    target_proof: &crate::wayland::ExactTargetProof,
+    element_key: u64,
+    expected_role: &str,
+    expected_name: &str,
+    expected_checked: Option<bool>,
+    expected_actions: &[String],
+    expected_action: &str,
+) -> Result<(String, bool)> {
+    // Run the initial compositor check outside the private AT-SPI runtime: the
+    // window enumerator may itself use AT-SPI as a Wayland fallback.
+    crate::wayland::validate_single_exact_target(target_proof)?;
+    let target_proof = target_proof.clone();
+    let pid = target_proof.pid();
+    let window_id = target_proof.window_id();
+    bounded(
+        async {
+            let conn = shared_connection().await?;
+            let visited = collect_visited(conn, pid)
+                .await?
+                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+            let roots = visited
+                .iter()
+                .filter(|node| node.depth == 0)
+                .map(|node| (node.top_level_key, node.top_level_ordinal))
+                .collect::<Vec<_>>();
+            let expected_top_level = exact_window_top_level_key(&roots, pid, window_id)?;
+
+            // Detect key collisions across the entire process tree before
+            // checking ancestry. A duplicate key is never safe, even when one
+            // copy happens to sit below the expected root.
+            let mut matches = visited
+                .iter()
+                .filter(|node| is_indexable(node) && node.element_key == element_key);
+            let target = matches.next().ok_or_else(|| {
+                anyhow!("AT-SPI element key {element_key:#x} is stale for pid {pid}")
+            })?;
+            if matches.next().is_some() {
+                return Err(anyhow!(
+                    "AT-SPI element key {element_key:#x} is ambiguous for pid {pid}"
+                ));
+            }
+            ensure_element_descends_from_exact_window(
+                element_key,
+                target.top_level_key,
+                expected_top_level,
+                window_id,
+            )?;
+            if target.role != expected_role
+                || target.name != expected_name
+                || target.checked != expected_checked
+                || target.actions != expected_actions
+            {
+                anyhow::bail!(
+                    "AT-SPI element key {element_key:#x} changed semantic identity before action"
+                );
+            }
+            let action_index = target
+                .actions
+                .iter()
+                .position(|action| action.eq_ignore_ascii_case(expected_action))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "AT-SPI element key {element_key:#x} no longer exposes exact action {expected_action:?}"
+                    )
+                })?;
+            let suspected_noop = is_passive_role(&target.role);
+            let action = target.actions[action_index].clone();
+            let proxy = target
+                .acc
+                .proxies()
+                .await
+                .map_err(|error| anyhow!("interface proxies unavailable: {error}"))?
+                .action()
+                .await
+                .map_err(|error| anyhow!("Action unavailable: {error}"))?;
+
+            // This is the mutation boundary. Use the carried, structurally
+            // immutable proof and one authoritative singleton-window snapshot;
+            // never reconstruct authority from the PID or object key.
+            // Revalidate on a blocking worker so a Wayland AT-SPI fallback
+            // cannot recursively block this module's private Tokio runtime.
+            // No fallible await remains between this proof check and doAction.
+            let proof_for_action = target_proof.clone();
+            cua_driver_core::blocking::spawn(move || {
+                crate::wayland::validate_single_exact_target(&proof_for_action)
+            })
+            .await
+            .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
+            let accepted = proxy
+                .do_action(action_index as i32)
+                .await
+                .map_err(|error| anyhow!("doAction failed: {error}"))?;
+            if !accepted {
+                return Err(anyhow!(
+                    "AT-SPI rejected exact action {expected_action:?} for element key {element_key:#x}"
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok((action, suspected_noop))
+        },
+        || {
+            Err(anyhow!(
+                "perform_verified_action_by_key timed out for pid {pid} window {window_id} (app unresponsive to AT-SPI)"
+            ))
+        },
+    )
+}
+
 /// Invoke an indexed scroll target's directional AT-SPI action.
 ///
 /// Chromium exposes scrollable web regions as named actions such as
@@ -1408,6 +1614,13 @@ pub fn scroll_element(pid: u32, idx: usize, direction: &str, amount: usize) -> R
 
 /// Give an indexed element keyboard focus through AT-SPI Component.GrabFocus
 /// without activating or raising its toplevel window.
+///
+/// `GrabFocus` acknowledges the request before Chromium/Electron necessarily
+/// updates its renderer-owned focused control. Sending key events immediately
+/// after the acknowledgement can therefore split one string between the old
+/// and new controls. Wait for the target's Focused state to become observable;
+/// if a toolkit does not publish that state, retain the historical successful
+/// result after a bounded settling interval.
 pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
     bounded(
         async {
@@ -1429,11 +1642,33 @@ pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
                 .component()
                 .await
                 .map_err(|e| anyhow!("Component interface unavailable: {e}"))?;
-            match call(component.grab_focus()).await {
-                Some(Ok(focused)) => Ok(focused),
-                Some(Err(e)) => Err(anyhow!("Component.GrabFocus failed for element {idx}: {e}")),
-                None => Err(anyhow!("Component.GrabFocus timed out for element {idx}")),
+            let accepted = match call(component.grab_focus()).await {
+                Some(Ok(focused)) => focused,
+                Some(Err(e)) => {
+                    return Err(anyhow!("Component.GrabFocus failed for element {idx}: {e}"))
+                }
+                None => return Err(anyhow!("Component.GrabFocus timed out for element {idx}")),
+            };
+            if !accepted {
+                return Ok(false);
             }
+
+            let settle_deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+            while tokio::time::Instant::now() < settle_deadline {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    target.acc.get_state(),
+                )
+                .await
+                {
+                    Ok(Ok(state)) if state.contains(State::Focused) => return Ok(true),
+                    _ => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                }
+            }
+            Ok(true)
         },
         || Err(anyhow!("focus_element timed out for pid {pid}")),
     )
@@ -1806,6 +2041,92 @@ pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> 
     )
 }
 
+pub fn get_verified_element_bounds_by_key(
+    pid: u32,
+    window_id: u64,
+    element_key: u64,
+    expected_role: &str,
+    expected_name: &str,
+    expected_checked: Option<bool>,
+    expected_actions: &[String],
+) -> Result<(i32, i32, u32, u32)> {
+    bounded(
+        async {
+            let conn = shared_connection().await?;
+            let visited = collect_visited(conn, pid)
+                .await?
+                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+            let web_document_origin = web_document_origin_for_visited(&visited, pid)
+                .await
+                .unwrap_or((0, 0));
+            let mut matches = visited
+                .iter()
+                .filter(|node| is_indexable(node) && node.element_key == element_key);
+            let target = matches.next().ok_or_else(|| {
+                anyhow!("AT-SPI element key {element_key:#x} is stale for pid {pid}")
+            })?;
+            if matches.next().is_some() {
+                return Err(anyhow!(
+                    "AT-SPI element key {element_key:#x} is ambiguous for pid {pid}"
+                ));
+            }
+            if target.role != expected_role
+                || target.name != expected_name
+                || target.checked != expected_checked
+                || target.actions != expected_actions
+            {
+                return Err(anyhow!(
+                    "AT-SPI element key {element_key:#x} changed semantic identity before bounds lookup"
+                ));
+            }
+            if !target.has_component {
+                return Err(anyhow!(
+                    "AT-SPI element key {element_key:#x} exposes no Component interface"
+                ));
+            }
+            let component = target
+                .acc
+                .proxies()
+                .await
+                .map_err(|error| anyhow!("interface proxies unavailable: {error}"))?
+                .component()
+                .await
+                .map_err(|error| anyhow!("Component unavailable: {error}"))?;
+            match window_to_screen_offset(pid, window_id, None) {
+                Some((offset_x, offset_y)) => {
+                    let (x, y, width, height) = component
+                        .get_extents(CoordType::Window)
+                        .await
+                        .map_err(|error| anyhow!("getExtents failed: {error}"))?;
+                    let (document_x, document_y) = if target.in_web_doc {
+                        web_document_origin
+                    } else {
+                        (0, 0)
+                    };
+                    Ok((
+                        x + offset_x + document_x,
+                        y + offset_y + document_y,
+                        width.max(0) as u32,
+                        height.max(0) as u32,
+                    ))
+                }
+                None => {
+                    let (x, y, width, height) = component
+                        .get_extents(CoordType::Screen)
+                        .await
+                        .map_err(|error| anyhow!("getExtents failed: {error}"))?;
+                    Ok((x, y, width.max(0) as u32, height.max(0) as u32))
+                }
+            }
+        },
+        || {
+            Err(anyhow!(
+                "get_verified_element_bounds_by_key timed out for pid {pid} window {window_id} (app unresponsive to AT-SPI)"
+            ))
+        },
+    )
+}
+
 /// Real on-screen origin (root-relative top-left) of an X11 window, or `None`
 /// if it can't be resolved. Mirrors `list_windows`' geometry path.
 fn x11_window_origin(xid: u64) -> Option<(i32, i32)> {
@@ -1932,7 +2253,7 @@ fn authoritative_wayland_origin(pid: u32, xid: u64, title: Option<&str>) -> Opti
     if !crate::wayland::is_wayland() {
         return None;
     }
-    crate::wayland::inject_accessibility_offset(pid)
+    crate::wayland::inject_accessibility_offset(xid)
         .or_else(|| crate::wayland::sway_ipc::window_origin_for_pid(pid))
         .or_else(|| {
             (xid != 0)
@@ -2254,10 +2575,12 @@ async fn element_bounds_for_visited(
 mod coord_tests {
     use super::parse_gtk_frame_extents;
     use super::{
-        combine_wayland_content_offsets, is_indexable_capabilities, is_passive_role,
-        is_web_process_bus, prefer_authoritative_wayland_origin, rebase_renderer_window_offset,
-        screen_extent_rebase, select_click_target,
+        combine_wayland_content_offsets, ensure_element_descends_from_exact_window,
+        exact_window_top_level_key, is_indexable_capabilities, is_passive_role, is_web_process_bus,
+        prefer_authoritative_wayland_origin, rebase_renderer_window_offset, screen_extent_rebase,
+        select_click_target,
     };
+    use super::{element_key_for_object, RawObjectRef};
 
     #[test]
     fn editable_only_nodes_are_addressable() {
@@ -2265,6 +2588,74 @@ mod coord_tests {
         assert!(is_indexable_capabilities(true, false, false));
         assert!(is_indexable_capabilities(false, false, true));
         assert!(!is_indexable_capabilities(false, false, false));
+    }
+
+    #[test]
+    fn element_keys_bind_bus_destination_and_object_path() {
+        let first = RawObjectRef {
+            name: ":1.44".to_owned(),
+            path: "/org/a11y/atspi/accessible/7".to_owned(),
+        };
+        let same = first.clone();
+        let other_path = RawObjectRef {
+            path: "/org/a11y/atspi/accessible/8".to_owned(),
+            ..first.clone()
+        };
+        let other_destination = RawObjectRef {
+            name: ":1.45".to_owned(),
+            ..first.clone()
+        };
+
+        assert_eq!(
+            element_key_for_object(&first),
+            element_key_for_object(&same)
+        );
+        assert_ne!(
+            element_key_for_object(&first),
+            element_key_for_object(&other_path)
+        );
+        assert_ne!(
+            element_key_for_object(&first),
+            element_key_for_object(&other_destination)
+        );
+    }
+
+    #[test]
+    fn exact_window_ancestry_accepts_the_single_accessible_toplevel() {
+        assert_eq!(
+            exact_window_top_level_key(&[(0xa11, 0)], 42, 0xdead_beef).unwrap(),
+            0xa11
+        );
+    }
+
+    #[test]
+    fn exact_window_ancestry_uses_matching_native_ordinal() {
+        let second_window_id = ((42_u64) << 16) | 1;
+        assert_eq!(
+            exact_window_top_level_key(&[(0xa11, 0), (0xb22, 1)], 42, second_window_id).unwrap(),
+            0xb22
+        );
+    }
+
+    #[test]
+    fn exact_window_ancestry_fails_closed_when_roots_are_ambiguous() {
+        let error =
+            exact_window_top_level_key(&[(0xa11, 0), (0xb22, 1)], 42, 0xdead_beef).unwrap_err();
+        assert!(error.to_string().contains("multiple top-level ancestries"));
+    }
+
+    #[test]
+    fn exact_window_ancestry_fails_closed_on_duplicate_ordinal() {
+        let first_window_id = (42_u64) << 16;
+        let error =
+            exact_window_top_level_key(&[(0xa11, 0), (0xb22, 0)], 42, first_window_id).unwrap_err();
+        assert!(error.to_string().contains("window ancestry is ambiguous"));
+    }
+
+    #[test]
+    fn verified_element_ancestry_rejects_same_pid_other_window() {
+        assert!(ensure_element_descends_from_exact_window(0xc33, 0xb22, 0xa11, 99).is_err());
+        assert!(ensure_element_descends_from_exact_window(0xc33, 0xa11, 0xa11, 99).is_ok());
     }
 
     #[test]

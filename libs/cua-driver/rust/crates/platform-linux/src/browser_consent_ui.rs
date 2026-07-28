@@ -31,6 +31,20 @@ fn role_is(node: &AtspiNode, accepted: &[&str]) -> bool {
     accepted.iter().any(|candidate| role == *candidate)
 }
 
+fn trusted_semantic_action(node: &AtspiNode) -> Option<&str> {
+    let actions = node
+        .actions
+        .iter()
+        .filter(|action| {
+            matches!(
+                action.trim().to_ascii_lowercase().as_str(),
+                "activate" | "click" | "press"
+            )
+        })
+        .collect::<Vec<_>>();
+    (actions.len() == 1).then(|| actions[0].as_str())
+}
+
 fn is_in_web_content(nodes: &[AtspiNode], node: &AtspiNode) -> bool {
     let mut parent = node.parent_element_index;
     for _ in 0..nodes.len() {
@@ -72,10 +86,35 @@ fn remote_debugging_prompt_present(nodes: &[AtspiNode]) -> bool {
         && body.contains("navigate to any url")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExactAllowAction {
+    element_index: usize,
+    element_key: u64,
+    role: String,
+    name: String,
+    checked: Option<bool>,
+    actions: Vec<String>,
+    action: String,
+}
+
+fn allow_action(node: &AtspiNode) -> ExactAllowAction {
+    ExactAllowAction {
+        element_index: node.element_index.expect("matched actionable index"),
+        element_key: node.element_key,
+        role: node.role.clone(),
+        name: node.name.clone().unwrap_or_default(),
+        checked: node.checked,
+        actions: node.actions.clone(),
+        action: trusted_semantic_action(node)
+            .expect("matched semantic action")
+            .to_owned(),
+    }
+}
+
 fn exact_allow_button(
     nodes: &[AtspiNode],
     bounds: &[(usize, i32, i32, u32, u32)],
-) -> Result<Option<usize>, BrowserRefusal> {
+) -> Result<Option<ExactAllowAction>, BrowserRefusal> {
     if !remote_debugging_prompt_present(nodes) {
         return Ok(None);
     }
@@ -83,18 +122,8 @@ fn exact_allow_button(
         .filter(|node| {
             role_is(node, &["push button", "button"])
                 && normalized_text(node) == "allow"
-                && !node.actions.is_empty()
+                && trusted_semantic_action(node).is_some()
                 && node.element_index.is_some()
-        })
-        .map(|node| {
-            (
-                node.element_index.expect("filtered actionable index"),
-                node.element_key,
-                node.depth,
-                node.role.clone(),
-                node.actions.clone(),
-                node.parent_element_index,
-            )
         })
         .collect::<Vec<_>>();
     if matches.len() > 1 {
@@ -106,109 +135,38 @@ fn exact_allow_button(
                 })
                 .map(|(_, x, y, width, height)| (*x, *y, *width, *height))
         };
-        let first_bounds = candidate_bounds(matches[0].0);
+        let first_bounds = candidate_bounds(matches[0].element_index.unwrap());
         let same_physical_control = first_bounds.is_some()
             && matches.iter().all(|candidate| {
-                candidate.3 == matches[0].3
-                    && candidate.4 == matches[0].4
-                    && candidate_bounds(candidate.0) == first_bounds
+                candidate.role == matches[0].role
+                    && candidate.actions == matches[0].actions
+                    && candidate_bounds(candidate.element_index.unwrap()) == first_bounds
             });
         if same_physical_control {
             return Ok(matches
                 .iter()
-                .max_by_key(|candidate| candidate.2)
-                .map(|candidate| candidate.0));
+                .max_by_key(|candidate| candidate.depth)
+                .map(|node| allow_action(node)));
         }
     }
     match matches.as_slice() {
         [] => Ok(None),
-        [(index, ..)] => Ok(Some(*index)),
+        [node] => Ok(Some(allow_action(node))),
         _ => Err(refusal(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             "multiple exact Allow actions matched the browser consent prompt",
         )
         .with_detail(serde_json::json!({
-            "candidates": matches.iter().map(|(element_index, element_key, depth, role, actions, parent_element_index)| {
-                let parent = parent_element_index.and_then(|parent_index| nodes.iter().find(|node| node.element_index == Some(parent_index)));
-                let bounds = bounds.iter().find(|(index, ..)| index == element_index);
-                serde_json::json!({
-                "element_index": element_index,
-                "element_key": element_key,
-                "depth": depth,
-                "role": role,
-                "actions": actions,
-                "parent_element_index": parent_element_index,
-                "parent_role": parent.map(|node| node.role.as_str()),
-                "parent_name": parent.and_then(|node| node.name.as_deref()),
-                "bounds": bounds.map(|(_, x, y, width, height)| serde_json::json!({"x": x, "y": y, "width": width, "height": height})),
-            })}).collect::<Vec<_>>()
+            "candidates": matches.iter().map(|node| serde_json::json!({
+                "element_index": node.element_index,
+                "element_key": node.element_key,
+                "depth": node.depth,
+                "role": node.role,
+                "actions": node.actions,
+                "parent_element_index": node.parent_element_index,
+            })).collect::<Vec<_>>()
         }))),
     }
-}
-
-fn prove_window_owner(pid: u32, window_id: u64) -> Result<(), BrowserRefusal> {
-    let owned = crate::wayland::list_windows_dispatch(Some(pid))
-        .into_iter()
-        .any(|window| window.xid == window_id);
-    if !owned {
-        return Err(refusal(
-            BrowserRefusalCode::BrowserBindingStale,
-            "the approved browser window changed ownership before consent",
-        ));
-    }
-    Ok(())
-}
-
-fn with_target_foreground<T>(
-    pid: u32,
-    window_id: u64,
-    body: impl FnOnce() -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-        if let Some(window) =
-            crate::wayland::sway_ipc::window_for_id(window_id).filter(|window| window.pid == pid)
-        {
-            crate::wayland::sway_ipc::with_focused_container(window.id, body)
-        } else {
-            crate::wayland::shell_helper::with_focused_window(pid, window_id, body)
-        }
-    } else {
-        crate::input::with_x11_foreground(window_id, 80, body)
-    }
-}
-
-fn exact_button_center(
-    bounds: &[(usize, i32, i32, u32, u32)],
-    element_index: usize,
-) -> anyhow::Result<(i32, i32)> {
-    let (_, x, y, width, height) = bounds
-        .iter()
-        .find(|(index, _, _, width, height)| *index == element_index && *width > 1 && *height > 1)
-        .ok_or_else(|| anyhow::anyhow!("the exact Allow action had empty screen bounds"))?;
-    let center_x = x
-        .checked_add(i32::try_from(width / 2)?)
-        .ok_or_else(|| anyhow::anyhow!("Allow button center x overflowed"))?;
-    let center_y = y
-        .checked_add(i32::try_from(height / 2)?)
-        .ok_or_else(|| anyhow::anyhow!("Allow button center y overflowed"))?;
-    Ok((center_x, center_y))
-}
-
-fn trusted_allow_click(pid: u32, window_id: u64) -> anyhow::Result<()> {
-    with_target_foreground(pid, window_id, || {
-        let tree = crate::atspi::walk_tree(pid, window_id, None);
-        let index = exact_allow_button(&tree.nodes, &tree.bounds)
-            .map_err(|error| anyhow::anyhow!(error.message))?
-            .ok_or_else(|| {
-                anyhow::anyhow!("the exact Chromium remote-debugging consent action became stale")
-            })?;
-        let (center_x, center_y) = exact_button_center(&tree.bounds, index)?;
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            crate::wayland::click_desktop(center_x, center_y, 1, 1)
-        } else {
-            crate::input::send_click_xtest_desktop(center_x, center_y, 1, 1)
-        }
-    })
 }
 
 pub async fn handle(
@@ -220,16 +178,25 @@ pub async fn handle(
             "the approved browser pid is outside the Linux process-id range",
         )
     })?;
-    prove_window_owner(pid, request.window_id)?;
+    let target =
+        crate::wayland::establish_exact_target(pid, request.window_id).map_err(|error| {
+            refusal(
+                BrowserRefusalCode::BrowserBindingStale,
+                format!("the approved browser window is not exact: {error}"),
+            )
+        })?;
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut saw_prompt = false;
-    let mut accessibility_action_at = None;
-    let mut trusted_click_attempted = false;
     loop {
-        prove_window_owner(pid, request.window_id)?;
+        crate::wayland::validate_exact_target(&target).map_err(|error| {
+            refusal(
+                BrowserRefusalCode::BrowserBindingStale,
+                format!("the approved browser window changed before consent: {error}"),
+            )
+        })?;
         let window_id = request.window_id;
         let tree =
-            tokio::task::spawn_blocking(move || crate::atspi::walk_tree(pid, window_id, None))
+            cua_driver_core::blocking::spawn(move || crate::atspi::walk_tree(pid, window_id, None))
                 .await
                 .map_err(|error| {
                     refusal(
@@ -240,55 +207,50 @@ pub async fn handle(
         let prompt_present = remote_debugging_prompt_present(&tree.nodes);
         saw_prompt |= prompt_present;
         match exact_allow_button(&tree.nodes, &tree.bounds)? {
-            Some(index) if accessibility_action_at.is_none() => {
-                tokio::task::spawn_blocking(move || crate::atspi::perform_action(pid, index))
-                    .await
-                    .map_err(|error| {
-                        refusal(
-                            BrowserRefusalCode::BrowserRouteUnavailable,
-                            format!("could not dispatch the exact browser consent action: {error}"),
-                        )
-                    })?
-                    .map_err(|error| {
-                        refusal(
-                            BrowserRefusalCode::BrowserWrongTargetRefused,
-                            format!("the exact browser consent action failed: {error}"),
-                        )
-                    })?;
-                accessibility_action_at = Some(Instant::now());
-            }
-            Some(_)
-                if !trusted_click_attempted
-                    && accessibility_action_at.is_some_and(|attempted| {
-                        attempted.elapsed() >= Duration::from_millis(150)
-                    }) =>
-            {
-                let window_id = request.window_id;
-                tokio::task::spawn_blocking(move || trusted_allow_click(pid, window_id))
-                    .await
-                    .map_err(|error| {
-                        refusal(
-                            BrowserRefusalCode::BrowserRouteUnavailable,
-                            format!(
-                                "could not dispatch the trusted browser consent click: {error}"
-                            ),
-                        )
-                    })?
-                    .map_err(|error| {
-                        refusal(
-                            BrowserRefusalCode::BrowserWrongTargetRefused,
-                            format!("the trusted browser consent click failed: {error}"),
-                        )
-                    })?;
-                trusted_click_attempted = true;
+            Some(allow) => {
+                let expected_action = allow.action.clone();
+                let action_target = target.clone();
+                let result = cua_driver_core::blocking::spawn(move || {
+                    // Revalidate the immutable compositor identity in the same
+                    // blocking action transaction as the stable semantic key.
+                    crate::atspi::perform_verified_action_by_key(
+                        &action_target,
+                        allow.element_key,
+                        &allow.role,
+                        &allow.name,
+                        allow.checked,
+                        &allow.actions,
+                        &allow.action,
+                    )
+                })
+                .await
+                .map_err(|error| {
+                    refusal(
+                        BrowserRefusalCode::BrowserRouteUnavailable,
+                        format!("could not dispatch the exact browser consent action: {error}"),
+                    )
+                })?
+                .map_err(|error| {
+                    refusal(
+                        BrowserRefusalCode::BrowserWrongTargetRefused,
+                        format!("the exact browser consent action failed: {error}"),
+                    )
+                })?;
+                if result.0 != expected_action || result.1 {
+                    return Err(refusal(
+                        BrowserRefusalCode::BrowserWrongTargetRefused,
+                        "the exact browser consent action was not explicitly acknowledged",
+                    ));
+                }
+                // The verified helper re-walks at action time, matches the
+                // stable D-Bus object key and complete semantic identity,
+                // selects this named action, and rejects do_action(false).
+                return Ok(BrowserConsentOutcome::Accepted);
             }
             None if saw_prompt && !prompt_present => {
-                if accessibility_action_at.is_some() {
-                    return Ok(BrowserConsentOutcome::Accepted);
-                }
                 return Err(refusal(
                     BrowserRefusalCode::BrowserConsentRevoked,
-                    "the person dismissed the browser consent prompt",
+                    "the browser consent prompt disappeared without an explicitly acknowledged Allow action",
                 ));
             }
             None if Instant::now() >= deadline => {
@@ -319,7 +281,7 @@ mod tests {
             checked: None,
             description: None,
             actions: actions.iter().map(|value| (*value).to_owned()).collect(),
-            element_key: 0,
+            element_key: 0x77,
             depth: 0,
             parent_element_index: None,
             in_web_content: false,
@@ -340,8 +302,11 @@ mod tests {
     }
 
     #[test]
-    fn matcher_requires_exact_security_prompt_and_unique_allow_action() {
-        assert_eq!(exact_allow_button(&prompt(), &[]).unwrap(), Some(7));
+    fn matcher_returns_stable_key_and_named_action() {
+        let allow = exact_allow_button(&prompt(), &[]).unwrap().unwrap();
+        assert_eq!(allow.element_index, 7);
+        assert_eq!(allow.element_key, 0x77);
+        assert_eq!(allow.action, "click");
         assert!(
             exact_allow_button(&[node("push button", "Allow", &["click"])], &[])
                 .unwrap()
@@ -352,7 +317,10 @@ mod tests {
     #[test]
     fn matcher_refuses_ambiguous_allow_actions() {
         let mut nodes = prompt();
-        nodes.push(node("push button", "Allow", &["click"]));
+        let mut duplicate = node("push button", "Allow", &["press"]);
+        duplicate.element_index = Some(8);
+        duplicate.element_key = 0x88;
+        nodes.push(duplicate);
         assert_eq!(
             exact_allow_button(&nodes, &[]).unwrap_err().code,
             BrowserRefusalCode::BrowserWrongTargetRefused
@@ -360,16 +328,29 @@ mod tests {
     }
 
     #[test]
+    fn matcher_refuses_ambiguous_semantic_action_on_one_button() {
+        let mut nodes = prompt();
+        nodes.last_mut().unwrap().actions = vec!["click".into(), "press".into()];
+        assert!(exact_allow_button(&nodes, &[]).unwrap().is_none());
+    }
+
+    #[test]
     fn matcher_collapses_duplicate_atspi_paths_for_one_physical_button() {
         let mut nodes = prompt();
         let mut duplicate = node("push button", "Allow", &["click"]);
         duplicate.element_index = Some(8);
-        duplicate.element_key = 8;
+        duplicate.element_key = 0x88;
         duplicate.depth = 2;
         nodes.last_mut().unwrap().depth = 1;
         nodes.push(duplicate);
         let bounds = vec![(7, 10, 20, 80, 30), (8, 10, 20, 80, 30)];
-        assert_eq!(exact_allow_button(&nodes, &bounds).unwrap(), Some(8));
+        assert_eq!(
+            exact_allow_button(&nodes, &bounds)
+                .unwrap()
+                .unwrap()
+                .element_key,
+            0x88
+        );
     }
 
     #[test]
@@ -382,16 +363,6 @@ mod tests {
             child.parent_element_index = Some(42);
             child.in_web_content = true;
         }
-        assert_eq!(exact_allow_button(&nodes, &[]).unwrap(), None);
-    }
-
-    #[test]
-    fn exact_button_center_requires_nonempty_bounds() {
-        assert_eq!(
-            exact_button_center(&[(7, 10, 20, 80, 30)], 7).unwrap(),
-            (50, 35)
-        );
-        assert!(exact_button_center(&[(7, 10, 20, 1, 30)], 7).is_err());
-        assert!(exact_button_center(&[(8, 10, 20, 80, 30)], 7).is_err());
+        assert!(exact_allow_button(&nodes, &[]).unwrap().is_none());
     }
 }

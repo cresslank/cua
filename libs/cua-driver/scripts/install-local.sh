@@ -22,6 +22,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
+if [[ "${1:-}" == "--print-hardened-contract" ]]; then
+    printf '%s\n' 'cua-driver-local-installer-v3:clean-exact-git,bwrap-ro-source,bwrap-ro-dependencies,offline-build,provenance-v3,transaction-lock,no-global-worker-kill,linux-only'
+    exit 0
+fi
+
 # --- Lightweight flag parsing -----------------------------------------------
 # Consume backend flags (no-ops for compat) and forward the rest to the Rust helper.
 FORWARDED_ARGS=()

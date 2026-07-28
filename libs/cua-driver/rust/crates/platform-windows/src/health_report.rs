@@ -99,7 +99,7 @@ fn skip_not_applicable(name: &str) -> CheckEntry {
 async fn check_ax_capability() -> CheckEntry {
     // CoCreateInstance is synchronous and can take a few ms; keep the
     // async runtime responsive by punting to spawn_blocking.
-    let result = tokio::task::spawn_blocking(crate::diagnostics::ui_automation_available)
+    let result = cua_driver_core::blocking::spawn(crate::diagnostics::ui_automation_available)
         .await
         .unwrap_or(Err("UIA probe task panicked".to_owned()));
     match result {
@@ -122,7 +122,7 @@ async fn check_ax_capability() -> CheckEntry {
 }
 
 async fn check_screen_capture_capability() -> CheckEntry {
-    let result = tokio::task::spawn_blocking(probe_d3d11_device)
+    let result = cua_driver_core::blocking::spawn(probe_d3d11_device)
         .await
         .unwrap_or(Err("D3D11 probe task panicked".to_owned()));
     match result {

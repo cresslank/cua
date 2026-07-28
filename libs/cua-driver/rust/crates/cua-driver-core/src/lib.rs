@@ -46,11 +46,13 @@ pub fn parent_liveness_stdin_enabled() -> bool {
 }
 
 pub mod authorization;
+pub mod blocking;
 pub mod browser;
 pub mod capture_mode;
 pub mod capture_scope;
 pub mod cdp;
 pub mod consent;
+pub mod cursor_events;
 pub mod cursor_sampler;
 pub mod daemon;
 pub mod element_cache;

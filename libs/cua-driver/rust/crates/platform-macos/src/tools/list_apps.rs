@@ -50,7 +50,7 @@ impl Tool for ListAppsTool {
     }
 
     async fn invoke(&self, _args: Value) -> ToolResult {
-        let apps = tokio::task::spawn_blocking(crate::apps::list_all_apps)
+        let apps = cua_driver_core::blocking::spawn(crate::apps::list_all_apps)
             .await
             .unwrap_or_default();
         let text = crate::apps::format_app_list(&apps);

@@ -27,8 +27,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "linux")]
 use cursor_overlay::ZOrderEnforcer;
 use cursor_overlay::{
-    CursorConfig, CursorKey, KeyedOverlayCommand, OverlayCommand, OverlayMsg, Palette,
-    RenderStateCore,
+    CursorConfig, CursorKey, KeyedOverlayCommand, OverlayCommand, OverlayMsg, RenderStateCore,
 };
 
 // ── Global channel ────────────────────────────────────────────────────────
@@ -72,9 +71,8 @@ struct RenderMap {
 }
 
 fn render_state_for_key(template: &CursorConfig, key: &str) -> RenderState {
-    let mut rs = RenderState::new(template.clone());
-    rs.core.palette = Palette::for_instance(key);
-    rs
+    let _ = key;
+    RenderState::new(template.clone())
 }
 
 fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
@@ -111,20 +109,57 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
 }
 
 pub fn init(cfg: CursorConfig) {
-    let (tx, rx) = std::sync::mpsc::sync_channel(4096);
-    let _ = CMD_TX.set(tx);
-    *CMD_RX_CELL.lock().unwrap() = Some(rx);
-    *ARRIVAL_TX.lock().unwrap() = Some(HashMap::new());
-    let mut cursors = HashMap::new();
-    cursors.insert("default".to_owned(), RenderState::new(cfg.clone()));
-    *RENDER.lock().unwrap() = Some(RenderMap {
-        cursors,
-        scr_w: 1920,
-        scr_h: 1080,
-        template: cfg,
-        ended: HashSet::new(),
-        last_active: None,
+    static INITIALIZED: OnceLock<()> = OnceLock::new();
+    INITIALIZED.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(4096);
+        CMD_TX
+            .set(tx)
+            .expect("cursor overlay sender is initialized exactly once");
+        *CMD_RX_CELL.lock().unwrap() = Some(rx);
+        *ARRIVAL_TX.lock().unwrap() = Some(HashMap::new());
+        let mut cursors = HashMap::new();
+        cursors.insert("default".to_owned(), RenderState::new(cfg.clone()));
+        *RENDER.lock().unwrap() = Some(RenderMap {
+            cursors,
+            scr_w: 1920,
+            scr_h: 1080,
+            template: cfg,
+            ended: HashSet::new(),
+            last_active: None,
+        });
     });
+    cua_driver_core::cursor_events::install_cursor_event_sink(std::sync::Arc::new(
+        |event: cua_driver_core::cursor_events::CursorEvent| {
+            use cua_driver_core::cursor_events::{CursorEvent, CursorEventPhase};
+            let (session, cmd) = match event {
+                CursorEvent::Action {
+                    session,
+                    phase: CursorEventPhase::Begin,
+                    semantics,
+                } => (
+                    session,
+                    OverlayCommand::BeginAction {
+                        action: semantics.action,
+                        delivery: semantics.delivery,
+                        target: semantics.target,
+                    },
+                ),
+                CursorEvent::Action {
+                    session,
+                    phase: CursorEventPhase::End,
+                    semantics,
+                } => (session, OverlayCommand::EndAction(semantics.action)),
+                CursorEvent::SelectTheme { session, selection } => (
+                    session,
+                    OverlayCommand::SetTheme {
+                        theme_id: selection.theme_id,
+                        reduced_motion: selection.reduced_motion,
+                    },
+                ),
+            };
+            send_command_for(session, cmd);
+        },
+    ));
 }
 
 pub fn send_command(cmd: OverlayCommand) {
@@ -277,6 +312,25 @@ pub fn current_motion_for(key: &str) -> cursor_overlay::MotionConfig {
             })
         })
         .unwrap_or_default()
+}
+
+pub fn current_theme_state_for(
+    key: &str,
+) -> Option<(
+    String,
+    String,
+    String,
+    Option<String>,
+    cursor_overlay::CursorVisualState,
+)> {
+    let guard = RENDER.lock().ok()?;
+    let map = guard.as_ref()?;
+    let state = map
+        .cursors
+        .get(key)
+        .or_else(|| map.cursors.get("default"))?;
+    let (id, version, profile, fallback) = state.core.active_theme_metadata();
+    Some((id, version, profile, fallback, state.core.visual.clone()))
 }
 
 fn seed_start_if_sentinel(key: &CursorKey, target_x: f64, target_y: f64) -> bool {
@@ -1439,7 +1493,10 @@ mod tests {
                 &mut map,
                 Some(OverlayMsg::Cmd(KeyedOverlayCommand {
                     key: "other".to_owned(),
-                    cmd: OverlayCommand::SetPalette(Palette::for_instance("other")),
+                    cmd: OverlayCommand::SetTheme {
+                        theme_id: cursor_overlay::DEFAULT_THEME_ID.to_owned(),
+                        reduced_motion: cursor_overlay::ReducedMotion::Auto,
+                    },
                 })),
                 &rx,
                 0.1,

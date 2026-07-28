@@ -131,7 +131,7 @@ impl Tool for DragTool {
                 ClickButton::Right => DragButton::Right,
                 ClickButton::Middle => DragButton::Middle,
             };
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::blocking::spawn(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::mouse::drag_at_xy_foreground(
                     from_x,
@@ -245,7 +245,7 @@ impl Tool for DragTool {
         // Also compute window-local logical coords for CGEventSetWindowLocation.
         let (from_sx, from_sy, from_lx, from_ly, to_sx, to_sy, to_lx, to_ly) =
             if let Some(wid) = window_id {
-                let result = tokio::task::spawn_blocking(move || {
+                let result = cua_driver_core::blocking::spawn(move || {
                     let bounds = crate::windows::window_bounds_by_id(wid);
                     let scale: f64 = if let Some(ref b) = bounds {
                         if let Ok(png) = crate::capture::screenshot_window_bytes(wid) {
@@ -323,7 +323,7 @@ impl Tool for DragTool {
             prior_front,
             "drag.CGEvent",
             || async move {
-                tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                cua_driver_core::blocking::spawn(move || -> anyhow::Result<()> {
                     let do_it = move || -> anyhow::Result<()> {
                         let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                         if fg {

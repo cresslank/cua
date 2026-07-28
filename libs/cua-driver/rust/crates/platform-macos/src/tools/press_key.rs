@@ -92,7 +92,7 @@ impl Tool for PressKeyTool {
             let key = input.key;
             let modifiers = input.modifiers.unwrap_or_default();
             let key_for_input = key.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::blocking::spawn(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::keyboard::press_key_global(&key_for_input, &modifier_refs)
             })
@@ -225,14 +225,14 @@ impl Tool for PressKeyTool {
                 // Pre-focus the element under suppression so its
                 // side-effects are captured by the snapshot + lease.
                 if let Some(element_ptr) = pre_focus_ptr {
-                    let _ = tokio::task::spawn_blocking(move || {
+                    let _ = cua_driver_core::blocking::spawn(move || {
                         crate::input::ax_actions::focus_element(element_ptr)
                     })
                     .await;
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                 }
 
-                tokio::task::spawn_blocking(move || {
+                cua_driver_core::blocking::spawn(move || {
                     let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                     // foreground rung: NSMenu activation (raise+restore), only when
                     // explicitly requested and addressing a window without an element.

@@ -36,8 +36,10 @@ def test_private_environment_drops_human_desktop_endpoints(tmp_path, monkeypatch
     assert env["HOME"] == str(tmp_path / "state/home")
     assert env["XDG_STATE_HOME"].endswith("instances/lane-a/state")
     assert env["CUA_INJECT_SOCKET"].endswith("/cua-inject-v2.sock")
-    assert env["CUA_BROWSER_PROFILE_DIR"].endswith("instances/lane-a/browser-profile")
-    assert env["CUA_DRIVER_BROWSER_PROFILE_ROOT"] == env["CUA_BROWSER_PROFILE_DIR"]
+    assert env["CUA_DRIVER_BROWSER_PROFILE_ROOT"].endswith(
+        "instances/lane-a/browser-profile"
+    )
+    assert env["CUA_BROWSER_PROFILE_DIR"] == env["CUA_DRIVER_BROWSER_PROFILE_ROOT"]
 
 
 def test_dry_run_has_no_compositor_side_effect(tmp_path, capsys):
@@ -63,6 +65,10 @@ def test_private_atspi_address_is_propagated(monkeypatch):
     module._configure_atspi(env)
 
     assert env["AT_SPI_BUS_ADDRESS"] == "unix:path=/tmp/private-atspi"
+    assert (
+        env["CUA_DRIVER_PRIVATE_AT_SPI_BUS_ADDRESS"]
+        == "unix:path=/tmp/private-atspi"
+    )
     assert calls[0][0][2] == "--session"
     assert calls[1][0][2:4] == ["--address", "unix:path=/tmp/private-atspi"]
 

@@ -127,7 +127,7 @@ impl Tool for HotkeyTool {
                 );
             };
             let display = raw_keys.join("+");
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::blocking::spawn(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::keyboard::press_key_global(&key, &modifier_refs)
             })
@@ -234,7 +234,7 @@ impl Tool for HotkeyTool {
             prior_front,
             "hotkey.CGEvent",
             || async move {
-                tokio::task::spawn_blocking(move || {
+                cua_driver_core::blocking::spawn(move || {
                     let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                     match (fg, px_focus, window_id) {
                         // Chrome's native omnibox and Chromium/Electron inputs

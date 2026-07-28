@@ -100,6 +100,7 @@ $ProgressPreference = "SilentlyContinue"
 $Repo       = "trycua/cua"
 $TagPrefix  = "cua-driver-rs-v"
 $BinaryName = "cua-driver.exe"
+$ThemeBinaryName = "cua-cursor-theme.exe"
 
 # Baked-version constant — kept in lock-step with the latest published
 # cua-driver-rs-v* release tag by the Release Please release pull request
@@ -1097,11 +1098,17 @@ if (-not $skipDownload) {
         $stageDir = Get-ReleaseAsset $version $archLabel $tmpRoot
         New-Item -ItemType Directory -Force -Path $versionedDir | Out-Null
         Copy-Item -LiteralPath (Join-Path $stageDir $BinaryName) -Destination (Join-Path $versionedDir $BinaryName) -Force
+        $themeStage = Join-Path $stageDir $ThemeBinaryName
+        if (-not (Test-Path -LiteralPath $themeStage)) {
+            throw "release archive is missing required $ThemeBinaryName"
+        }
+        Copy-Item -LiteralPath $themeStage -Destination (Join-Path $versionedDir $ThemeBinaryName) -Force
         Write-Step "installed $versionedDir\$BinaryName (version $version, target $target)"
-        # Optional sibling: the uiAccess'd worker (cua-driver-uia.exe). Started
-        # shipping with cua-driver-rs-v0.2.8; absent in earlier releases. Copy
-        # it when present so `cua-driver autostart enable` can register the
-        # second ShellExecute-based scheduled task. See #1602.
+        # Optional sibling: the reserved uiAccess worker
+        # (cua-driver-uia.exe). It started shipping with
+        # cua-driver-rs-v0.2.8 and is absent in earlier releases. Copy it when
+        # present for a future authenticated daemon-internal forwarding path;
+        # current autostart does not launch it. See #1602.
         $uiaStage = Join-Path $stageDir 'cua-driver-uia.exe'
         if (Test-Path -LiteralPath $uiaStage) {
             Copy-Item -LiteralPath $uiaStage -Destination (Join-Path $versionedDir 'cua-driver-uia.exe') -Force

@@ -27,6 +27,11 @@ from ._native import (
     ImageContent,
     MacOsPermissionStatus,
     PrivateWorkerOptions,
+    ProtectedConsentAction,
+    ProtectedConsentDecision,
+    ProtectedConsentHost,
+    ProtectedConsentHostError,
+    ProtectedConsentRequest,
     RuntimeAuthorizationOptions,
     SdkClientKind,
     SessionPermissionMode,
@@ -41,6 +46,9 @@ from ._native_contract import (
     CaptureScope,
     ClickButton,
     ClickInput,
+    CursorAction,
+    CursorReducedMotion,
+    CursorThemeSelection,
     DesktopScope,
     DragInput,
     EndSessionInput,
@@ -48,6 +56,7 @@ from ._native_contract import (
     EffectiveScope,
     EscalateSessionInput,
     EscalationReason,
+    GetAgentCursorStateInput,
     GetCursorPositionInput,
     GetDesktopStateInput,
     GetScreenSizeInput,
@@ -60,6 +69,9 @@ from ._native_contract import (
     ScrollDirection,
     ScrollInput,
     SessionStateOutput,
+    SetAgentCursorEnabledInput,
+    SetAgentCursorMotionInput,
+    SetAgentCursorThemeInput,
     StartSessionInput,
     StartSessionOutput,
     TypeTextInput,
@@ -85,6 +97,14 @@ def _create_configured_python_sdk(cls, options):
     return cls.create_configured_with_client_kind(options, SdkClientKind.PYTHON)
 
 
+def _create_configured_with_protected_host_python_sdk(cls, options, host):
+    """Create a trusted protected-host runtime tagged as a Python SDK host."""
+
+    return cls.create_configured_with_protected_host_and_client_kind(
+        options, host, SdkClientKind.PYTHON
+    )
+
+
 def _create_private_worker_python_sdk(cls, options):
     """Create a supervised worker runtime tagged as a Python SDK host."""
 
@@ -94,6 +114,9 @@ def _create_private_worker_python_sdk(cls, options):
 _NativeCuaDriver.connect = classmethod(_connect_python_sdk)
 _NativeCuaDriver.create = classmethod(_create_python_sdk)
 _NativeCuaDriver.create_configured = classmethod(_create_configured_python_sdk)
+_NativeCuaDriver.create_configured_with_protected_host = classmethod(
+    _create_configured_with_protected_host_python_sdk
+)
 _NativeCuaDriver.create_private_worker = classmethod(_create_private_worker_python_sdk)
 CuaDriver = _NativeCuaDriver
 
@@ -105,6 +128,9 @@ __all__ = [
     "ConfiguredDriverOptions",
     "CuaDriver",
     "CuaDriverSession",
+    "CursorAction",
+    "CursorReducedMotion",
+    "CursorThemeSelection",
     "DesktopScope",
     "DragInput",
     "DriverError",
@@ -126,6 +152,7 @@ __all__ = [
     "EscalateSessionInput",
     "EscalationReason",
     "GetCursorPositionInput",
+    "GetAgentCursorStateInput",
     "GetDesktopStateInput",
     "GetScreenSizeInput",
     "GetSessionStateInput",
@@ -135,6 +162,11 @@ __all__ = [
     "MoveCursorInput",
     "Platform",
     "PrivateWorkerOptions",
+    "ProtectedConsentAction",
+    "ProtectedConsentDecision",
+    "ProtectedConsentHost",
+    "ProtectedConsentHostError",
+    "ProtectedConsentRequest",
     "PressKeyInput",
     "RuntimeAuthorizationOptions",
     "ScrollBy",
@@ -142,6 +174,9 @@ __all__ = [
     "ScrollInput",
     "SessionStateOutput",
     "SessionPermissionMode",
+    "SetAgentCursorEnabledInput",
+    "SetAgentCursorMotionInput",
+    "SetAgentCursorThemeInput",
     "StartSessionInput",
     "StartSessionOutput",
     "ToolResult",
