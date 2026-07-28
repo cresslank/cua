@@ -32,6 +32,10 @@ def release_contracts(version: str) -> tuple[ArchiveContract, ...]:
         "libcua_driver_sdk.so",
         "cua_driver_node_runtime.node",
         "cua_driver_abi.h",
+        "wayland-helper/install.sh",
+        "wayland-helper/winrects@cua/extension.js",
+        "wayland-helper/winrects@cua/metadata.json",
+        "wayland-helper/winrects@cua/policy.js",
     )
     for arch in ("x86_64", "arm64"):
         stage = f"cua-driver-rs-{version}-linux-{arch}"
@@ -43,12 +47,17 @@ def release_contracts(version: str) -> tuple[ArchiveContract, ...]:
                     (
                         f"{stage}/cua-driver",
                         f"{stage}/cua-cursor-theme",
+                        f"{stage}/wayland-helper/install.sh",
                     ),
                 ),
                 ArchiveContract(
                     f"{stage}-binary.tar.gz",
                     linux_payload,
-                    ("cua-driver", "cua-cursor-theme"),
+                    (
+                        "cua-driver",
+                        "cua-cursor-theme",
+                        "wayland-helper/install.sh",
+                    ),
                 ),
             )
         )
