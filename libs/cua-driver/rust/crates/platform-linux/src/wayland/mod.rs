@@ -1603,6 +1603,12 @@ fn canonical_raw_input_parent(euid: u32) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("/run/user/{euid}"))
 }
 
+const HOST_RAW_INPUT_LOCK_NAME: &str = "cua-driver-gnome-raw-input.lock";
+
+fn canonical_raw_input_lock_path(euid: u32) -> std::path::PathBuf {
+    canonical_raw_input_parent(euid).join(HOST_RAW_INPUT_LOCK_NAME)
+}
+
 fn open_canonical_raw_input_lock(
 ) -> anyhow::Result<(std::fs::File, std::fs::File, std::path::PathBuf)> {
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -1637,7 +1643,7 @@ fn open_canonical_raw_input_lock(
         );
     }
 
-    let name = std::ffi::CString::new("host-raw-input.lock").unwrap();
+    let name = std::ffi::CString::new(HOST_RAW_INPUT_LOCK_NAME).unwrap();
     let fd = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -1675,7 +1681,7 @@ fn open_canonical_raw_input_lock(
             "input_unavailable: canonical raw-input lock failed owner/type/link/mode/inode validation"
         );
     }
-    Ok((parent, file, parent_path.join("host-raw-input.lock")))
+    Ok((parent, file, canonical_raw_input_lock_path(euid)))
 }
 
 fn acquire_host_raw_input_lease_with_timeout(
@@ -2349,9 +2355,20 @@ pub fn drag(
     to_x: i32,
     to_y: i32,
     steps: u32,
+    duration_ms: u64,
     button: u8,
 ) -> anyhow::Result<()> {
-    drag_with_outcome(target, from_x, from_y, to_x, to_y, steps, button).map(|_| ())
+    drag_with_outcome(
+        target,
+        from_x,
+        from_y,
+        to_x,
+        to_y,
+        steps,
+        duration_ms,
+        button,
+    )
+    .map(|_| ())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2362,6 +2379,7 @@ pub fn drag_with_outcome(
     to_x: i32,
     to_y: i32,
     steps: u32,
+    duration_ms: u64,
     button: u8,
 ) -> anyhow::Result<Option<shell_helper::ForegroundTerminalOutcome>> {
     validate_exact_target(&target)?;
@@ -2380,7 +2398,7 @@ pub fn drag_with_outcome(
     if is_gnome_wayland_session() {
         require_gnome_pointer_transport_ready()?;
         return with_foreground_input(&target, || {
-            libei_drag(from_x, from_y, to_x, to_y, steps, button)
+            libei_drag(from_x, from_y, to_x, to_y, steps, duration_ms, button)
         });
     }
     with_libei_fallback(
@@ -2393,7 +2411,7 @@ pub fn drag_with_outcome(
         || {
             libei_wait_pointer_ready()?;
             with_foreground_input(&target, || {
-                libei_drag(from_x, from_y, to_x, to_y, steps, button)
+                libei_drag(from_x, from_y, to_x, to_y, steps, duration_ms, button)
             })
             .map(|_| ())
         },
@@ -2408,6 +2426,7 @@ pub fn drag_desktop(
     to_x: i32,
     to_y: i32,
     steps: u32,
+    duration_ms: u64,
     button: u8,
 ) -> anyhow::Result<()> {
     reject_unsafe_gnome_desktop_input("drag")?;
@@ -2415,7 +2434,7 @@ pub fn drag_desktop(
         || drag_vptr(None, from_x, from_y, to_x, to_y, steps, button),
         || {
             libei_wait_pointer_ready()?;
-            libei_drag(from_x, from_y, to_x, to_y, steps, button)
+            libei_drag(from_x, from_y, to_x, to_y, steps, duration_ms, button)
         },
     )
 }
@@ -2890,6 +2909,7 @@ fn libei_drag(
     _to_x: i32,
     _to_y: i32,
     _steps: u32,
+    _duration_ms: u64,
     _button: u8,
 ) -> anyhow::Result<()> {
     unreachable!("libei fallback compiled out (no portal-input feature)")
@@ -2984,6 +3004,7 @@ fn libei_drag(
     to_x: i32,
     to_y: i32,
     steps: u32,
+    duration_ms: u64,
     button: u8,
 ) -> anyhow::Result<()> {
     // ei_button exposes separate Press/Released states, so the libei worker can
@@ -3002,6 +3023,7 @@ fn libei_drag(
         cx(to_x) as f64,
         cy(to_y) as f64,
         steps,
+        duration_ms,
         btn,
     )?;
     record_synth_cursor(cx(to_x), cy(to_y));
@@ -4171,6 +4193,14 @@ const _BTN_LEFT_ALIAS: u32 = BTN_LEFT;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_raw_input_lock_matches_private_worker_contract() {
+        assert_eq!(
+            canonical_raw_input_lock_path(1000),
+            std::path::PathBuf::from("/run/user/1000/cua-driver-gnome-raw-input.lock")
+        );
+    }
 
     fn window(xid: u64, pid: Option<u32>, title: &str) -> WindowInfo {
         WindowInfo {

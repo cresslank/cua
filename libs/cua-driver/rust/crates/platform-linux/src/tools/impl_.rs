@@ -4695,6 +4695,7 @@ impl Tool for DragTool {
                         to_x.round() as i32,
                         to_y.round() as i32,
                         steps as u32,
+                        duration_ms,
                         button,
                     )
                 } else {
@@ -4846,7 +4847,16 @@ impl Tool for DragTool {
             ));
             let drag_result = cua_driver_core::blocking::spawn(move || {
                 let target = crate::wayland::establish_exact_target(pid, xid)?;
-                crate::wayland::drag_with_outcome(target, fxi, fyi, txi, tyi, steps_u32, button)
+                crate::wayland::drag_with_outcome(
+                    target,
+                    fxi,
+                    fyi,
+                    txi,
+                    tyi,
+                    steps_u32,
+                    duration_ms,
+                    button,
+                )
             })
             .await;
             crate::overlay::send_command_for(
