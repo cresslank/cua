@@ -1525,6 +1525,9 @@ pub(crate) fn validate_single_exact_target(target: &ExactTargetProof) -> anyhow:
 #[derive(Debug)]
 pub(super) struct HostRawInputLease {
     _process: std::sync::MutexGuard<'static, ()>,
+    // Retain both descriptors so the validated directory identity and its
+    // descriptor-relative lock file remain one transaction through restore.
+    _parent_dir: std::fs::File,
     _session_file: std::fs::File,
 }
 
@@ -1596,11 +1599,89 @@ pub(super) fn acquire_host_raw_input_lease() -> anyhow::Result<HostRawInputLease
     acquire_host_raw_input_lease_with_timeout(std::time::Duration::from_secs(2))
 }
 
+fn canonical_raw_input_parent(euid: u32) -> std::path::PathBuf {
+    std::path::PathBuf::from(format!("/run/user/{euid}"))
+}
+
+fn open_canonical_raw_input_lock(
+) -> anyhow::Result<(std::fs::File, std::fs::File, std::path::PathBuf)> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    // This kernel-managed absolute per-effective-UID runtime directory is
+    // intentionally independent of XDG_RUNTIME_DIR, TMPDIR, HOME, and cwd. Its
+    // root-owned parent prevents a same-UID process from renaming the validated
+    // directory out from under this descriptor transaction.
+    let euid = unsafe { libc::geteuid() };
+    let parent_path = canonical_raw_input_parent(euid);
+    let parent = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&parent_path)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "input_unavailable: cannot securely open {}: {error}",
+                parent_path.display()
+            )
+        })?;
+    let parent_meta = parent.metadata()?;
+    let parent_path_meta = std::fs::symlink_metadata(&parent_path)?;
+    if !parent_meta.is_dir()
+        || parent_meta.uid() != euid
+        || parent_meta.mode() & 0o777 != 0o700
+        || parent_meta.dev() != parent_path_meta.dev()
+        || parent_meta.ino() != parent_path_meta.ino()
+    {
+        anyhow::bail!(
+            "input_unavailable: canonical raw-input directory failed owner/type/mode/inode validation"
+        );
+    }
+
+    let name = std::ffi::CString::new("host-raw-input.lock").unwrap();
+    let fd = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        return Err(anyhow::anyhow!(
+            "input_unavailable: cannot open canonical raw-input lock: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let meta = file.metadata()?;
+    let mut path_stat: libc::stat = unsafe { std::mem::zeroed() };
+    let stat_result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut path_stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if stat_result != 0
+        || !meta.is_file()
+        || meta.uid() != euid
+        || meta.nlink() != 1
+        || meta.mode() & 0o777 != 0o600
+        || meta.dev() != path_stat.st_dev as u64
+        || meta.ino() != path_stat.st_ino as u64
+    {
+        anyhow::bail!(
+            "input_unavailable: canonical raw-input lock failed owner/type/link/mode/inode validation"
+        );
+    }
+    Ok((parent, file, parent_path.join("host-raw-input.lock")))
+}
+
 fn acquire_host_raw_input_lease_with_timeout(
     timeout: std::time::Duration,
 ) -> anyhow::Result<HostRawInputLease> {
     use std::os::fd::AsRawFd;
-    use std::os::unix::fs::OpenOptionsExt;
 
     let deadline = std::time::Instant::now() + timeout;
     let process = loop {
@@ -1620,26 +1701,7 @@ fn acquire_host_raw_input_lease_with_timeout(
         }
     };
 
-    let runtime_dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            // SAFETY: getuid has no preconditions and does not dereference data.
-            let uid = unsafe { libc::getuid() };
-            std::path::PathBuf::from(format!("/run/user/{uid}"))
-        });
-    let lock_path = runtime_dir.join("cua-driver-gnome-raw-input.lock");
-    let session_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .mode(0o600)
-        .open(&lock_path)
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "input_unavailable: cannot open {}: {error}",
-                lock_path.display()
-            )
-        })?;
+    let (parent_dir, session_file, lock_path) = open_canonical_raw_input_lock()?;
 
     loop {
         // SAFETY: session_file owns a valid descriptor for the duration of the
@@ -1649,6 +1711,7 @@ fn acquire_host_raw_input_lease_with_timeout(
         if result == 0 {
             return Ok(HostRawInputLease {
                 _process: process,
+                _parent_dir: parent_dir,
                 _session_file: session_file,
             });
         }
@@ -4195,6 +4258,14 @@ mod tests {
         assert!(desktop_name_is_gnome("GNOME:GNOME-Classic"));
         assert!(!desktop_name_is_gnome("KDE"));
         assert!(!desktop_name_is_gnome("sway"));
+    }
+
+    #[test]
+    fn canonical_host_lease_path_is_absolute_per_uid_and_environment_independent() {
+        assert_eq!(
+            canonical_raw_input_parent(4242),
+            std::path::PathBuf::from("/run/user/4242")
+        );
     }
 
     #[test]

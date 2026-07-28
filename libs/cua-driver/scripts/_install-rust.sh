@@ -497,51 +497,6 @@ for cmd in curl tar; do
     fi
 done
 
-sha256_file() {
-    local file="$1"
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$file" | awk '{print $1}'
-    elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$file" | awk '{print $1}'
-    else
-        err "sha256sum or shasum not found on PATH; cannot verify release checksum"
-        return 1
-    fi
-}
-
-verify_release_checksum() {
-    local archive_path="$1"
-    local archive_name="$2"
-    local checksums_url="$3"
-    local checksums_file="$TMP_DIR/checksums.txt"
-    local expected actual
-
-    log "downloading checksums $checksums_url"
-    if ! curl -fsSL -o "$checksums_file" "$checksums_url"; then
-        err "failed to download release checksums from $checksums_url"
-        exit 1
-    fi
-
-    expected=$(awk -v name="$archive_name" '
-        length($1) == 64 && $1 ~ /^[0-9A-Fa-f]+$/ && $2 == name { print tolower($1); found=1; exit }
-        END { if (!found) exit 1 }
-    ' "$checksums_file") || {
-        err "checksum for $archive_name not found in release checksums"
-        err "  expected an entry in $checksums_url"
-        exit 1
-    }
-
-    actual=$(sha256_file "$archive_path") || exit 1
-    if [[ "$actual" != "$expected" ]]; then
-        err "checksum mismatch for $archive_name"
-        err "  expected: $expected"
-        err "  actual:   $actual"
-        exit 1
-    fi
-
-    log "verified SHA256 for $archive_name"
-}
-
 # --- Resolve release tag ------------------------------------------------
 #
 # Version is resolved in priority order:
@@ -557,7 +512,7 @@ verify_release_checksum() {
 # the baked line hasn't been updated yet (dev / pre-release checkouts).
 #
 # ~~~ BAKED_VERSION: auto-updated in the release PR — do not edit ~~~
-CUA_DRIVER_RS_BAKED_VERSION="0.12.6" # x-release-please-version
+CUA_DRIVER_RS_BAKED_VERSION="0.13.1" # x-release-please-version
 # ~~~ END_BAKED_VERSION ~~~
 
 if [[ -n "${CUA_DRIVER_RS_VERSION:-}" ]]; then
@@ -586,6 +541,19 @@ fi
 
 VERSION="${TAG#${TAG_PREFIX}}"
 
+# Releases through 0.12.6 predate semantic cursor themes.
+# Newer releases must contain both packaged copies.
+CURSOR_THEME_REQUIRED_FROM="0.12.7"
+version_is_at_least() {
+    local version="$1" minimum="$2"
+    local v_major v_minor v_patch m_major m_minor m_patch
+    IFS=. read -r v_major v_minor v_patch <<< "$version"
+    IFS=. read -r m_major m_minor m_patch <<< "$minimum"
+    if (( v_major != m_major )); then (( v_major > m_major )); return; fi
+    if (( v_minor != m_minor )); then (( v_minor > m_minor )); return; fi
+    (( v_patch >= m_patch ))
+}
+
 # --- Download bare-binary tarball ---------------------------------------
 
 # Tarball selection:
@@ -606,14 +574,12 @@ case "$LABEL" in
     *)        TARBALL="cua-driver-rs-${VERSION}-${LABEL}-binary.tar.gz" ;;
 esac
 URL="https://github.com/$REPO/releases/download/$TAG/$TARBALL"
-CHECKSUMS_URL="https://github.com/$REPO/releases/download/$TAG/checksums.txt"
 
 log "downloading $URL"
 if ! curl -fsSL -o "$TMP_DIR/$TARBALL" "$URL"; then
     err "download failed; try CUA_DRIVER_RS_VERSION=<version> to pin a specific release"
     exit 1
 fi
-verify_release_checksum "$TMP_DIR/$TARBALL" "$TARBALL" "$CHECKSUMS_URL"
 
 log "extracting"
 tar -xzf "$TMP_DIR/$TARBALL" -C "$TMP_DIR"
@@ -638,6 +604,7 @@ case "$LABEL" in
     *)
         SRC="$TMP_DIR/$BINARY_NAME"
         SRC_THEME="$TMP_DIR/cua-cursor-theme"
+        SRC_WAYLAND_HELPER="$TMP_DIR/wayland-helper"
         SRC_APP=""
         ;;
 esac
@@ -646,10 +613,22 @@ if [[ ! -f "$SRC" ]]; then
     ls -la "$TMP_DIR"
     exit 1
 fi
-if [[ ! -f "$SRC_THEME" ]]; then
+THEME_AVAILABLE=1
+if [[ ! -f "$SRC_THEME" ]] || {
+    [[ -n "$SRC_APP" ]] &&
+    [[ ! -f "$SRC_APP/Contents/MacOS/cua-cursor-theme" ]]
+}; then
+    THEME_AVAILABLE=0
+fi
+if [[ "$THEME_AVAILABLE" == "0" ]] && version_is_at_least \
+    "$VERSION" "$CURSOR_THEME_REQUIRED_FROM"; then
     err "expected cua-cursor-theme in tarball but didn't find it"
     ls -la "$TMP_DIR"
     exit 1
+fi
+if [[ "$THEME_AVAILABLE" == "0" ]]; then
+    printf 'warning: release %s predates cua-cursor-theme; installing without custom cursor themes\n' \
+        "$VERSION" >&2
 fi
 
 # --- Install ------------------------------------------------------------
@@ -806,7 +785,21 @@ else
 
     mkdir -p "$VERSIONED_DIR"
     install -m 0755 "$SRC" "$VERSIONED_DIR/$BINARY_NAME"
-    install -m 0755 "$SRC_THEME" "$VERSIONED_DIR/cua-cursor-theme"
+    if [[ "$THEME_AVAILABLE" == "1" ]]; then
+        install -m 0755 "$SRC_THEME" "$VERSIONED_DIR/cua-cursor-theme"
+    fi
+    if [[ -d "${SRC_WAYLAND_HELPER:-}" ]]; then
+        mkdir -p "$VERSIONED_DIR/wayland-helper"
+        cp -R "$SRC_WAYLAND_HELPER/." "$VERSIONED_DIR/wayland-helper/"
+
+        INSTALLED_WAYLAND_HELPER="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/winrects@cua"
+        if [[ -d "$INSTALLED_WAYLAND_HELPER" ]]; then
+            cp "$SRC_WAYLAND_HELPER/winrects@cua/metadata.json" \
+                "$SRC_WAYLAND_HELPER/winrects@cua/extension.js" \
+                "$INSTALLED_WAYLAND_HELPER/"
+            log "updated installed GNOME helper; reload the GNOME session to activate it"
+        fi
+    fi
     log "installed $VERSIONED_DIR/$BINARY_NAME (version $VERSION, target $TARGET)"
 
     # `ln -sfn` would replace an existing dir-symlink in place but is

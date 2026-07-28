@@ -938,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "cua-driver"
-version = "0.12.6"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -973,7 +973,7 @@ dependencies = [
 
 [[package]]
 name = "cua-driver-bindgen"
-version = "0.12.6"
+version = "0.13.1"
 dependencies = [
  "cbindgen",
  "uniffi",
@@ -981,7 +981,7 @@ dependencies = [
 
 [[package]]
 name = "cua-driver-contract"
-version = "0.12.6"
+version = "0.13.1"
 dependencies = [
  "schemars",
  "serde",
@@ -991,7 +991,7 @@ dependencies = [
 
 [[package]]
 name = "cua-driver-core"
-version = "0.12.6"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1018,7 +1018,7 @@ dependencies = [
 
 [[package]]
 name = "cua-driver-sdk"
-version = "0.12.6"
+version = "0.13.1"
 dependencies = [
  "async-trait",
  "core-foundation",
@@ -1042,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "cua-driver-testkit"
-version = "0.12.6"
+version = "0.13.1"
 dependencies = [
  "core-foundation",
  "libc",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "cua-driver-uia"
-version = "0.12.6"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "cua-driver-core",
@@ -1071,32 +1071,33 @@ dependencies = [
 
 [[package]]
 name = "cursor-overlay"
-version = "0.12.6"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "cua-driver-contract",
+ "fontdue",
  "image",
  "postcard",
  "serde",
  "serde_json",
  "sha2",
- "tiny-skia 0.11.4",
+ "tiny-skia",
  "tracing",
  "zstd",
 ]
 
 [[package]]
 name = "cursor-theme-cli"
-version = "0.12.6"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "cursor-overlay",
  "image",
- "rasterlottie",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "tiny-skia",
  "zip",
 ]
 
@@ -1393,6 +1394,15 @@ name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
+
+[[package]]
+name = "fontdue"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e57e16b3fe8ff4364c0661fdaac543fb38b29ea9bc9c2f45612d90adf931d2b"
+dependencies = [
+ "ttf-parser",
+]
 
 [[package]]
 name = "foreign-types"
@@ -2464,9 +2474,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "openssl"
-version = "0.10.81"
+version = "0.10.80"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77823a27f0babb03091cb9ed9ef80af3b39dbc82f97e8fa530374b7dafd87a45"
+checksum = "a45fa2aa886c42762255da344f0a0d313e254066c46aad76f300c3d3da62d967"
 dependencies = [
  "bitflags 2.11.1",
  "cfg-if",
@@ -2588,7 +2598,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pip-preview"
-version = "0.12.6"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -2648,7 +2658,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "platform-linux"
-version = "0.12.6"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -2674,7 +2684,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "tiny-skia 0.11.4",
+ "tiny-skia",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2692,7 +2702,7 @@ dependencies = [
 
 [[package]]
 name = "platform-macos"
-version = "0.12.6"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2717,7 +2727,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "tiny-skia 0.11.4",
+ "tiny-skia",
  "tokio",
  "tokio-tungstenite",
  "tracing",
@@ -2726,7 +2736,7 @@ dependencies = [
 
 [[package]]
 name = "platform-windows"
-version = "0.12.6"
+version = "0.13.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2740,7 +2750,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
- "tiny-skia 0.11.4",
+ "tiny-skia",
  "tokio",
  "tracing",
  "windows 0.58.0",
@@ -2846,11 +2856,12 @@ checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
 
 [[package]]
 name = "quick-xml"
-version = "0.41.0"
+version = "0.39.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
 dependencies = [
  "memchr",
+ "serde",
 ]
 
 [[package]]
@@ -2926,20 +2937,6 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
-
-[[package]]
-name = "rasterlottie"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "384686130a2b365f82258f5e444c512e57989addcf2b45e9913c4ef6f0e95a24"
-dependencies = [
- "rustc-hash 2.1.3",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tiny-skia 0.12.0",
- "zip",
-]
 
 [[package]]
 name = "redox_syscall"
@@ -3682,22 +3679,7 @@ dependencies = [
  "bytemuck",
  "cfg-if",
  "log",
- "tiny-skia-path 0.11.4",
-]
-
-[[package]]
-name = "tiny-skia"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47ffee5eaaf5527f630fb0e356b90ebdec84d5d18d937c5e440350f88c5a91ea"
-dependencies = [
- "arrayref",
- "arrayvec",
- "bytemuck",
- "cfg-if",
- "log",
- "png",
- "tiny-skia-path 0.12.0",
+ "tiny-skia-path",
 ]
 
 [[package]]
@@ -3705,17 +3687,6 @@ name = "tiny-skia-path"
 version = "0.11.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9c9e7fc0c2e86a30b117d0462aa261b72b7a99b7ebd7deb3a14ceda95c5bdc93"
-dependencies = [
- "arrayref",
- "bytemuck",
- "strict-num",
-]
-
-[[package]]
-name = "tiny-skia-path"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edca365c3faccca67d06593c5980fa6c57687de727a03131735bb85f01fdeeb9"
 dependencies = [
  "arrayref",
  "bytemuck",
@@ -3947,6 +3918,12 @@ dependencies = [
  "tracing-core",
  "tracing-log",
 ]
+
+[[package]]
+name = "ttf-parser"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2c591d83f69777866b9126b24c6dd9a18351f177e49d625920d19f989fd31cf8"
 
 [[package]]
 name = "tungstenite"
@@ -4450,9 +4427,9 @@ dependencies = [
 
 [[package]]
 name = "wayland-scanner"
-version = "0.31.11"
+version = "0.31.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "338e30461b3a2b67d70eb30a6d89f8e0c93a833e07d2ae89085cd070c4a00ac0"
+checksum = "9c324a910fd86ebdc364a3e61ec1f11737d3b1d6c273c0239ee8ff4bc0d24b4a"
 dependencies = [
  "proc-macro2",
  "quick-xml",
@@ -5127,9 +5104,9 @@ dependencies = [
 
 [[package]]
 name = "zbus_names"
-version = "4.3.4"
+version = "4.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8bf88b4a3ff53e883001e0e0115b297a9d53c31b9c1edd2bfdd853e3428624e"
+checksum = "7074f3e50b894eac91750142016d30d0a89be8e67dbfd9704fb875825760e52d"
 dependencies = [
  "serde",
  "winnow 1.0.3",
@@ -5138,12 +5115,12 @@ dependencies = [
 
 [[package]]
 name = "zbus_xml"
-version = "5.2.1"
+version = "5.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d1586c021a01ca0a9216dcd874e546382e156a5cbab5fab6cb5f10087e22682a"
+checksum = "a8067892e940ed1727dea64690378601603b31d62dfde019a5335fbb7c0e0ed9"
 dependencies = [
+ "quick-xml",
  "serde",
- "winnow 1.0.3",
  "zbus_names",
  "zvariant",
 ]
@@ -5311,9 +5288,9 @@ dependencies = [
 
 [[package]]
 name = "zvariant"
-version = "5.13.1"
+version = "5.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bee2a0bcd2a907786a456fff45aaaaf54c9ba5f50b71ae9ec1a4edd200c94911"
+checksum = "a192a0bde63360d77a7523c833d4b4ce6070a927e2c53246e4c540b1a3e27be0"
 dependencies = [
  "endi",
  "enumflags2",
@@ -5325,9 +5302,9 @@ dependencies = [
 
 [[package]]
 name = "zvariant_derive"
-version = "5.13.1"
+version = "5.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38a708216a18780796770bfe3f4739c7c83a3e8f789b755534bbbc06e4e23e12"
+checksum = "90bc6cde9c01c511074be97f7ccb6c19d0da89e3f8662e812e999dcfd4638737"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -5338,9 +5315,9 @@ dependencies = [
 
 [[package]]
 name = "zvariant_utils"
-version = "3.5.0"
+version = "3.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90cb9383f9b45290407a1258b202d3f8f01db719eb60b4e4055c6375af4fc7c7"
+checksum = "1e8535915cfa75547e559d8c68e8139909a4aeee076831e4ef7fc59d8172c4d6"
 dependencies = [
  "proc-macro2",
  "quote",

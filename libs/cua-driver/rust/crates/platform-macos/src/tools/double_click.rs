@@ -114,7 +114,7 @@ impl Tool for DoubleClickTool {
             // Thread the resolved session cursor key into the blocking AX path
             // so its ClickPulse lands on THIS session's cursor, not "default".
             let ck = cursor_key.clone();
-            let result = cua_driver_core::blocking::spawn(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 ax_double_click(pid, wid, element_ptr, idx, &ck)
             })
             .await;
@@ -141,46 +141,19 @@ impl Tool for DoubleClickTool {
         };
 
         // Scale back from downscaled-image space to native pixels when needed.
-        if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        if let Some(ratio) = self.state.resize_registry.ratio(pid, window_id) {
             cx *= ratio;
             cy *= ratio;
         }
 
         // Window-local → screen coordinate translation + win-local logical coords
-        // for CGEventSetWindowLocation (matches click.rs enhancement).
+        // for CGEventSetWindowLocation (shared with click.rs via px_frame, which
+        // refuses a window with no live frame instead of silently treating the
+        // local point as screen-absolute).
         let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(wid) = window_id {
-            let result = cua_driver_core::blocking::spawn(move || {
-                let bounds = crate::windows::window_bounds_by_id(wid);
-                let scale: f64 = if let Some(ref b) = bounds {
-                    if let Ok(png) = crate::capture::screenshot_window_bytes(wid) {
-                        if png.len() >= 24 {
-                            let pw =
-                                u32::from_be_bytes([png[16], png[17], png[18], png[19]]) as f64;
-                            let lw = b.width;
-                            if lw > 0.0 && pw > lw {
-                                pw / lw
-                            } else {
-                                1.0
-                            }
-                        } else {
-                            1.0
-                        }
-                    } else {
-                        1.0
-                    }
-                } else {
-                    1.0
-                };
-                (bounds, scale)
-            })
-            .await
-            .unwrap_or((None, 1.0));
-            if let (Some(b), scale) = result {
-                let wx = cx / scale;
-                let wy = cy / scale;
-                (b.x + wx, b.y + wy, wx, wy)
-            } else {
-                (cx, cy, cx, cy)
+            match super::px_frame::resolve_or_refuse(wid).await {
+                Ok(frame) => frame.to_screen(cx, cy),
+                Err(refusal) => return refusal,
             }
         } else {
             (cx, cy, cx, cy)
@@ -204,7 +177,7 @@ impl Tool for DoubleClickTool {
         );
 
         let fg = delivery_mode.is_foreground() && window_id.is_some();
-        let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<()> {
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
             let do_click = move || -> anyhow::Result<()> {
                 if let Some(wid) = window_id {
                     crate::input::mouse::click_at_xy_with_window_local(

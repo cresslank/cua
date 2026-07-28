@@ -50,6 +50,7 @@ fn configure_startup_permission_mode(
     allow_legacy_existing_profile_approval: bool,
     session_policy: Option<&str>,
     approve_session_policy: bool,
+    grants: &[String],
 ) -> anyhow::Result<()> {
     if let Some(mode) = permission_mode {
         std::env::set_var(cua_driver_core::authorization::PERMISSION_MODE_ENV, mode);
@@ -86,6 +87,12 @@ fn configure_startup_permission_mode(
             "1",
         );
     }
+    let mode =
+        cua_driver_core::authorization::configured_permission_mode().map_err(anyhow::Error::msg)?;
+    if !grants.is_empty() && mode != cua_driver_core::authorization::PermissionMode::Standard {
+        anyhow::bail!("--grant is valid only in standard permission mode");
+    }
+    cua_driver_core::authorization::configure_launch_grants(grants).map_err(anyhow::Error::msg)?;
     cua_driver_core::authorization::validate_startup_authorization()?;
     if cua_driver_core::authorization::configured_permission_mode()
         .is_ok_and(|mode| mode == cua_driver_core::authorization::PermissionMode::Unrestricted)
@@ -296,6 +303,8 @@ fn build_driver(
         // initialization deadlock.
         prepare_desktop_environment: true,
         register_host_tools: Some(check_update_tool::register_into),
+        authorization_host: None,
+        activity_observer: None,
     })
 }
 
@@ -311,6 +320,8 @@ fn build_driver_without_cursor() -> Arc<cua_driver_sdk::CuaDriver> {
         claude_code_compatibility: false,
         prepare_desktop_environment: false,
         register_host_tools: Some(check_update_tool::register_into),
+        authorization_host: None,
+        activity_observer: None,
     })
     .expect("test host requires an available headless runtime")
 }
@@ -331,6 +342,8 @@ fn inspect_tools_without_runtime() -> serde_json::Value {
         claude_code_compatibility: false,
         prepare_desktop_environment: false,
         register_host_tools: Some(check_update_tool::register_into),
+        authorization_host: None,
+        activity_observer: None,
     })
 }
 
@@ -346,7 +359,7 @@ fn run_mcp_direct(compatibility_mode: bool) -> anyhow::Result<()> {
     cua_driver_core::authorization::validate_startup_authorization()?;
     cua_driver_core::policy::validate_configured_policy()?;
     let cursor = cursor_overlay::CursorConfig::from_args();
-    // A plain stdio MCP process does not provide the certified AppKit
+    // A plain stdio MCP process does not provide the required AppKit
     // main-thread host adapter. Explicit direct mode on macOS must therefore
     // expose facility_unavailable instead of initializing an overlay that can
     // report success without a usable UI owner. Private-worker and app-service
@@ -531,6 +544,7 @@ fn main() {
             approve_session_policy,
             no_permissions_gate,
             claude_code_compat,
+            grants,
         } => {
             if let Err(error) = configure_startup_permission_mode(
                 permission_mode.as_deref(),
@@ -538,6 +552,7 @@ fn main() {
                 allow_legacy_existing_profile_approval,
                 session_policy.as_deref(),
                 approve_session_policy,
+                &grants,
             ) {
                 eprintln!("cua-driver: authorization startup error: {error}");
                 std::process::exit(64);
@@ -793,6 +808,7 @@ fn main() {
             socket,
             direct,
             claude_code_compat,
+            grants,
         } => {
             let startup_started = std::time::Instant::now();
             // Long-running MCP proxy — kick off the background update check
@@ -800,25 +816,34 @@ fn main() {
             version_check::maybe_announce_update();
             let result = match mcp_uses_direct_runtime(socket.as_deref(), direct) {
                 Ok(true) => {
-                    telemetry::capture_mcp_startup_completed(
-                        "sdk_owned_runtime",
-                        "not_applicable",
-                        true,
-                        startup_started.elapsed(),
-                    );
-                    run_mcp_direct(claude_code_compat)
+                    if let Err(error) =
+                        configure_startup_permission_mode(None, false, false, None, false, &grants)
+                    {
+                        Err(error)
+                    } else {
+                        telemetry::capture_mcp_startup_completed(
+                            "sdk_owned_runtime",
+                            "not_applicable",
+                            true,
+                            startup_started.elapsed(),
+                        );
+                        run_mcp_direct(claude_code_compat)
+                    }
                 }
                 Err(error) => Err(error),
-                Ok(false) => {
-                    cli::run_mcp_via_daemon_proxy(socket, claude_code_compat, |daemon, success| {
+                Ok(false) => cli::run_mcp_via_daemon_proxy(
+                    socket,
+                    claude_code_compat,
+                    &grants,
+                    |daemon, success| {
                         telemetry::capture_mcp_startup_completed(
                             "daemon_proxy",
                             daemon.telemetry_value(),
                             success,
                             startup_started.elapsed(),
                         )
-                    })
-                }
+                    },
+                ),
             };
             if let Err(e) = result {
                 eprintln!("cua-driver-rs: {e}");
@@ -900,6 +925,7 @@ fn main() -> anyhow::Result<()> {
             approve_session_policy,
             no_permissions_gate,
             claude_code_compat,
+            grants,
         } => {
             configure_startup_permission_mode(
                 permission_mode.as_deref(),
@@ -907,6 +933,7 @@ fn main() -> anyhow::Result<()> {
                 allow_legacy_existing_profile_approval,
                 session_policy.as_deref(),
                 approve_session_policy,
+                &grants,
             )?;
             responsibility::reexec_disclaimed_if_needed();
             telemetry::capture_start(
@@ -1045,6 +1072,7 @@ fn main() -> anyhow::Result<()> {
             socket,
             direct,
             claude_code_compat,
+            grants,
         } => {
             let startup_started = std::time::Instant::now();
             // Long-running MCP proxy — kick off the background update check
@@ -1052,6 +1080,7 @@ fn main() -> anyhow::Result<()> {
             version_check::maybe_announce_update();
             let result = match mcp_uses_direct_runtime(socket.as_deref(), direct) {
                 Ok(true) => {
+                    configure_startup_permission_mode(None, false, false, None, false, &grants)?;
                     telemetry::capture_mcp_startup_completed(
                         "sdk_owned_runtime",
                         "not_applicable",
@@ -1061,16 +1090,19 @@ fn main() -> anyhow::Result<()> {
                     run_mcp_direct(claude_code_compat)
                 }
                 Err(error) => Err(error),
-                Ok(false) => {
-                    cli::run_mcp_via_daemon_proxy(socket, claude_code_compat, |daemon, success| {
+                Ok(false) => cli::run_mcp_via_daemon_proxy(
+                    socket,
+                    claude_code_compat,
+                    &grants,
+                    |daemon, success| {
                         telemetry::capture_mcp_startup_completed(
                             "daemon_proxy",
                             daemon.telemetry_value(),
                             success,
                             startup_started.elapsed(),
                         )
-                    })
-                }
+                    },
+                ),
             };
             if let Err(e) = result {
                 eprintln!("cua-driver-rs: {e}");

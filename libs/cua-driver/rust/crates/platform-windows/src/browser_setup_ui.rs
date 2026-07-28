@@ -3,14 +3,20 @@
 use std::time::{Duration, Instant};
 use std::{
     collections::HashMap,
+    fs::{File, OpenOptions},
+    io::Write,
+    os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+    path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 
 use cua_driver_core::browser::{
-    BrowserRefusal, BrowserRefusalCode, BrowserSetupDescriptor,
+    BrowserProduct, BrowserRefusal, BrowserRefusalCode, BrowserSetupDescriptor,
     EXISTING_PROFILE_SETUP_READY_TIMEOUT,
 };
 use windows::core::{Interface, BSTR};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Storage::FileSystem::{GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION};
 use windows::Win32::UI::Accessibility::{
     IUIAutomationElement, IUIAutomationInvokePattern, IUIAutomationTogglePattern,
     IUIAutomationValuePattern, ToggleState_Off, ToggleState_On, UIA_InvokePatternId,
@@ -268,6 +274,169 @@ unsafe fn toggle(element_ptr: usize) -> Result<(), BrowserRefusal> {
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProfileResourceKey {
+    volume: u32,
+    index: u64,
+}
+
+struct SetupReservation {
+    profile_path: PathBuf,
+    marker_path: PathBuf,
+    key: ProfileResourceKey,
+    _profile_dir: File,
+    release_on_drop: bool,
+}
+
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+fn default_profile_path(descriptor: &BrowserSetupDescriptor) -> Result<PathBuf, BrowserRefusal> {
+    let root = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
+        refusal(
+            BrowserRefusalCode::BrowserRouteUnavailable,
+            "LOCALAPPDATA is unavailable for browser profile identity",
+        )
+    })?;
+    let relative = match descriptor.product {
+        BrowserProduct::GoogleChrome => "Google\\Chrome\\User Data",
+        BrowserProduct::MicrosoftEdge => "Microsoft\\Edge\\User Data",
+        BrowserProduct::Chromium => "Chromium\\User Data",
+        _ => {
+            return Err(refusal(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                "browser setup has no stable default profile identity",
+            ))
+        }
+    };
+    Ok(PathBuf::from(root).join(relative))
+}
+
+fn profile_key(file: &File) -> Result<ProfileResourceKey, BrowserRefusal> {
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }.map_err(
+        |error| {
+            refusal(
+                BrowserRefusalCode::BrowserBindingStale,
+                format!("could not query stable browser profile identity: {error}"),
+            )
+        },
+    )?;
+    if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(refusal(
+            BrowserRefusalCode::BrowserBindingStale,
+            "browser profile is not a direct non-reparse directory",
+        ));
+    }
+    Ok(ProfileResourceKey {
+        volume: information.dwVolumeSerialNumber,
+        index: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    })
+}
+
+impl SetupReservation {
+    fn acquire(profile_path: &Path) -> Result<Self, BrowserRefusal> {
+        let profile_path = profile_path.to_path_buf();
+        let profile_dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&profile_path)
+            .map_err(|error| {
+                refusal(
+                    BrowserRefusalCode::BrowserBindingStale,
+                    format!("could not securely open browser profile: {error}"),
+                )
+            })?;
+        let key = profile_key(&profile_dir)?;
+        let marker_path = profile_path.join(format!(
+            ".cua-driver-setup-{:08x}-{:016x}.active",
+            key.volume, key.index
+        ));
+        let mut marker = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&marker_path)
+            .map_err(|error| {
+                refusal(
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        BrowserRefusalCode::BrowserBindingAmbiguous
+                    } else {
+                        BrowserRefusalCode::BrowserRouteUnavailable
+                    },
+                    format!("browser profile has a pending or poisoned setup transaction: {error}"),
+                )
+            })?;
+        marker
+            .write_all(b"active\n")
+            .and_then(|_| marker.sync_all())
+            .map_err(|error| {
+                refusal(
+                    BrowserRefusalCode::BrowserRouteUnavailable,
+                    format!("could not persist browser setup poison: {error}"),
+                )
+            })?;
+        // Reprove the path still denotes the retained directory after creating
+        // the durable marker; otherwise leave the marker poisoned.
+        let reproved = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&profile_path)
+            .map_err(|error| {
+                refusal(
+                    BrowserRefusalCode::BrowserBindingStale,
+                    format!("browser profile moved while reserving it: {error}"),
+                )
+            })?;
+        if profile_key(&reproved)? != key {
+            return Err(refusal(
+                BrowserRefusalCode::BrowserBindingStale,
+                "browser profile identity changed while reserving setup",
+            ));
+        }
+        Ok(Self {
+            profile_path,
+            marker_path,
+            key,
+            _profile_dir: profile_dir,
+            release_on_drop: true,
+        })
+    }
+
+    fn retain_fail_closed(&mut self) {
+        self.release_on_drop = false;
+    }
+    fn release_when_dropped(&mut self) {
+        self.release_on_drop = true;
+    }
+}
+
+impl Drop for SetupReservation {
+    fn drop(&mut self) {
+        if !self.release_on_drop {
+            return;
+        }
+        let same = OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&self.profile_path)
+            .ok()
+            .and_then(|file| profile_key(&file).ok())
+            == Some(self.key);
+        if !same || std::fs::remove_file(&self.marker_path).is_err() {
+            eprintln!("cua-driver: browser setup reservation remains poisoned");
+        }
+    }
+}
+
+pub fn ensure_profile_discoverable(
+    descriptor: &BrowserSetupDescriptor,
+) -> Result<(), BrowserRefusal> {
+    let profile = default_profile_path(descriptor)?;
+    drop(SetupReservation::acquire(&profile)?);
+    Ok(())
+}
+
 pub struct SetupUiHandle {
     hwnd: u64,
     descriptor: &'static BrowserSetupDescriptor,
@@ -277,24 +446,45 @@ pub struct SetupUiHandle {
     pub foregrounded_window: bool,
     pub injected_global_input: bool,
     enable_attempted: bool,
+    remote_debugging_mutation_possible: bool,
+    terminal_cleanup_attempted: bool,
+    reservation: SetupReservation,
 }
 
 impl SetupUiHandle {
     fn rollback_remote_debugging(&mut self) -> bool {
-        if !self.enabled_remote_debugging {
+        if !self.enabled_remote_debugging && !self.remote_debugging_mutation_possible {
             return true;
         }
         let tree = crate::uia::walk_tree(self.hwnd, None);
         let checkbox = exact_setup_checkbox(&tree.nodes, self.descriptor);
-        let restored = match checkbox {
+        let action_succeeded = match checkbox {
             Ok(Some(element)) => unsafe {
-                matches!(checkbox_state(element), Ok(CheckboxState::On)) && toggle(element).is_ok()
+                match checkbox_state(element) {
+                    Ok(CheckboxState::Off) => true,
+                    Ok(CheckboxState::On) => toggle(element).is_ok(),
+                    Err(_) => false,
+                }
             },
             _ => false,
         };
         release_nodes(&tree.nodes);
+        // Toggle success is not proof. Rewalk and positively observe the exact
+        // checkbox Off before releasing the profile transaction.
+        let restored = action_succeeded && {
+            let proof = crate::uia::walk_tree(self.hwnd, None);
+            let off = matches!(
+                exact_setup_checkbox(&proof.nodes, self.descriptor),
+                Ok(Some(element)) if unsafe {
+                    matches!(checkbox_state(element), Ok(CheckboxState::Off))
+                }
+            );
+            release_nodes(&proof.nodes);
+            off
+        };
         if restored {
             self.enabled_remote_debugging = false;
+            self.remote_debugging_mutation_possible = false;
         }
         restored
     }
@@ -306,7 +496,13 @@ impl SetupUiHandle {
         let focused_setup_address_field = self.focused_setup_address_field;
         let foregrounded_window = self.foregrounded_window;
         let injected_global_input = self.injected_global_input;
-        let closed_setup_page = self.close().unwrap_or(false);
+        let closed_setup_page = self.close().unwrap_or(!opened_setup_page);
+        if restored_remote_debugging && closed_setup_page {
+            self.reservation.release_when_dropped();
+        } else {
+            self.reservation.retain_fail_closed();
+        }
+        self.terminal_cleanup_attempted = true;
         let mut error = error;
         let cause = error.detail.take();
         error.with_detail(serde_json::json!({
@@ -325,6 +521,8 @@ impl SetupUiHandle {
 
     pub fn close_for_success(mut self) -> Result<Option<bool>, BrowserRefusal> {
         if !self.opened_setup_page {
+            self.reservation.release_when_dropped();
+            self.terminal_cleanup_attempted = true;
             return Ok(None);
         }
         let tree = crate::uia::walk_tree(self.hwnd, None);
@@ -346,10 +544,12 @@ impl SetupUiHandle {
             return Err(self.abort(error));
         }
         self.opened_setup_page = false;
+        self.reservation.release_when_dropped();
+        self.terminal_cleanup_attempted = true;
         Ok(Some(true))
     }
 
-    pub fn close(self) -> Option<bool> {
+    pub fn close(&mut self) -> Option<bool> {
         if !self.opened_setup_page {
             return None;
         }
@@ -360,6 +560,23 @@ impl SetupUiHandle {
             proven
                 && crate::input::keyboard::send_key_synthesized(self.hwnd, "w", &["ctrl"]).is_ok(),
         )
+    }
+}
+
+impl Drop for SetupUiHandle {
+    fn drop(&mut self) {
+        if self.terminal_cleanup_attempted {
+            return;
+        }
+        let restored = self.rollback_remote_debugging();
+        let had_setup_page = self.opened_setup_page;
+        let closed = self.close().unwrap_or(!had_setup_page);
+        if restored && closed {
+            self.reservation.release_when_dropped();
+        } else {
+            self.reservation.retain_fail_closed();
+        }
+        self.terminal_cleanup_attempted = true;
     }
 }
 
@@ -408,6 +625,9 @@ pub fn enable(
     hwnd: u64,
     descriptor: &'static BrowserSetupDescriptor,
 ) -> Result<SetupUiHandle, BrowserRefusal> {
+    // Reserve the stable profile resource before the first tree read/mutation.
+    let profile = default_profile_path(descriptor)?;
+    let mut reservation = Some(SetupReservation::acquire(&profile)?);
     let initial = crate::uia::walk_tree(hwnd, None);
     let initial_checkbox = exact_setup_checkbox(&initial.nodes, descriptor);
     let mut handle = match initial_checkbox {
@@ -420,6 +640,9 @@ pub fn enable(
             foregrounded_window: false,
             injected_global_input: false,
             enable_attempted: false,
+            remote_debugging_mutation_possible: false,
+            terminal_cleanup_attempted: false,
+            reservation: reservation.take().expect("setup reservation available"),
         },
         Ok(None) => {
             let tab_count_before = initial
@@ -444,6 +667,12 @@ pub fn enable(
                     return Err(error);
                 }
             };
+            // Invoke may mutate even when UIA reports failure. Persist poison
+            // before the call so response loss cannot authorize discovery.
+            reservation
+                .as_mut()
+                .expect("setup reservation available")
+                .retain_fail_closed();
             let invoked = unsafe { invoke(new_tab) };
             release_nodes(&initial.nodes);
             invoked?;
@@ -457,6 +686,9 @@ pub fn enable(
                 foregrounded_window: false,
                 injected_global_input: false,
                 enable_attempted: false,
+                remote_debugging_mutation_possible: false,
+                terminal_cleanup_attempted: false,
+                reservation: reservation.take().expect("setup reservation available"),
             };
 
             let deadline = Instant::now() + Duration::from_secs(3);
@@ -564,9 +796,14 @@ pub fn enable(
                         }
                         Ok(true)
                     }
-                    Ok(CheckboxState::Off) if !handle.enable_attempted => unsafe {
-                        toggle(element).map(|_| false)
-                    },
+                    Ok(CheckboxState::Off) if !handle.enable_attempted => {
+                        // Arm rollback and durable poison before Toggle: an
+                        // HRESULT/transport failure may follow a real mutation.
+                        handle.enable_attempted = true;
+                        handle.remote_debugging_mutation_possible = true;
+                        handle.reservation.retain_fail_closed();
+                        unsafe { toggle(element).map(|_| false) }
+                    }
                     Ok(CheckboxState::Off) => Ok(false),
                     Err(error) => Err(error),
                 };

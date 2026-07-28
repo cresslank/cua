@@ -465,6 +465,8 @@ async fn run_async(
             // accessibility setup.
             prepare_desktop_environment: true,
             register_host_tools: Some(crate::check_update_tool::register_into),
+            authorization_host: None,
+            activity_observer: None,
         },
     ) {
         Ok(driver) => driver,

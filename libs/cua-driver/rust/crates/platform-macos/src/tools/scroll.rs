@@ -138,7 +138,7 @@ impl Tool for ScrollTool {
                 ScrollDirection::Left => (0, step),
             };
             let (x, y) = super::desktop_screenshot_point(x, y).await;
-            let result = cua_driver_core::blocking::spawn(move || {
+            let result = tokio::task::spawn_blocking(move || {
                 crate::input::mouse::scroll_wheel_desktop(x, y, delta_y, delta_x, amount)
             })
             .await;
@@ -238,7 +238,7 @@ impl Tool for ScrollTool {
                 let by_for_ax = by.clone();
                 let foreground = delivery_mode.is_foreground();
                 let ax_result =
-                    cua_driver_core::blocking::spawn(move || -> anyhow::Result<(bool, bool)> {
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, bool)> {
                         let Some(element_guard) = native_element_guard else {
                             return Ok((false, false));
                         };
@@ -334,7 +334,7 @@ impl Tool for ScrollTool {
             // coordinates and window bounds are logical top-left points, so no
             // Retina scaling is needed here.
             let wid = window_id;
-            cua_driver_core::blocking::spawn(move || {
+            tokio::task::spawn_blocking(move || {
                 // Web content can be present in AX while its frame is below
                 // the outer page viewport. Ask the accessibility hierarchy to
                 // reveal the target before taking the screen-space center;
@@ -373,55 +373,32 @@ impl Tool for ScrollTool {
                 );
             }
             // Pixel path: x,y are window-local screenshot pixels. Mirror the
-            // click pixel path — undo any session downscale, then add the
-            // window origin and divide out the Retina backing scale.
-            if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+            // click pixel path — undo any session downscale, then translate
+            // through the shared window frame (which refuses a window with no
+            // live frame rather than scrolling at screen-absolute coords).
+            if let Some(ratio) = self.state.resize_registry.ratio(pid, window_id) {
                 cx *= ratio;
                 cy *= ratio;
             }
-            let wid = window_id;
-            cua_driver_core::blocking::spawn(move || {
-                if let Some(wid) = wid {
-                    let bounds = crate::windows::window_bounds_by_id(wid);
-                    let scale: f64 = if let Some(ref b) = bounds {
-                        if let Ok(png) = crate::capture::screenshot_window_bytes(wid) {
-                            if png.len() >= 24 {
-                                let pw =
-                                    u32::from_be_bytes([png[16], png[17], png[18], png[19]]) as f64;
-                                if b.width > 0.0 && pw > b.width {
-                                    pw / b.width
-                                } else {
-                                    1.0
-                                }
-                            } else {
-                                1.0
-                            }
-                        } else {
-                            1.0
-                        }
-                    } else {
-                        1.0
-                    };
-                    if let Some(b) = bounds {
-                        let (wx, wy) = (cx / scale, cy / scale);
-                        return WheelTarget {
-                            screen_x: b.x + wx,
-                            screen_y: b.y + wy,
-                            win_local: Some((wx, wy)),
-                            wid: Some(wid),
-                        };
-                    }
+            let Some(wid) = window_id else {
+                // Unreachable: the None case refused above. Kept explicit so a
+                // future edit cannot reintroduce the screen-absolute fallback.
+                return ToolResult::error(
+                    "window_id is required when scrolling by window-local x,y pixels.".to_string(),
+                );
+            };
+            match super::px_frame::resolve_or_refuse(wid).await {
+                Ok(frame) => {
+                    let (sx, sy, lx, ly) = frame.to_screen(cx, cy);
+                    Some(WheelTarget {
+                        screen_x: sx,
+                        screen_y: sy,
+                        win_local: Some((lx, ly)),
+                        wid: Some(wid),
+                    })
                 }
-                // No window_id → treat x,y as screen coordinates.
-                WheelTarget {
-                    screen_x: cx,
-                    screen_y: cy,
-                    win_local: None,
-                    wid: None,
-                }
-            })
-            .await
-            .ok()
+                Err(refusal) => return refusal,
+            }
         } else {
             None
         };
@@ -464,7 +441,7 @@ impl Tool for ScrollTool {
                 prior_front,
                 "scroll.CGScrollWheel",
                 || async move {
-                    cua_driver_core::blocking::spawn(move || -> anyhow::Result<()> {
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                         let do_it = move || -> anyhow::Result<()> {
                             crate::input::mouse::scroll_wheel_at_xy(
                                 pid,
@@ -546,14 +523,14 @@ impl Tool for ScrollTool {
                 // Pre-focus the element under suppression so its
                 // side-effects are captured by the snapshot + lease.
                 if let Some(element_ptr) = pre_focus_ptr {
-                    let _ = cua_driver_core::blocking::spawn(move || {
+                    let _ = tokio::task::spawn_blocking(move || {
                         crate::input::ax_actions::focus_element(element_ptr)
                     })
                     .await;
                     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
                 }
 
-                cua_driver_core::blocking::spawn(move || {
+                tokio::task::spawn_blocking(move || {
                     for _ in 0..amount {
                         crate::input::keyboard::press_key(pid, &key, &[])?;
                         std::thread::sleep(std::time::Duration::from_millis(50));
