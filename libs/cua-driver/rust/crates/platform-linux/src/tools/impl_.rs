@@ -1,5 +1,6 @@
 //! Real Linux tool implementations (compiled only on Linux).
 
+use anyhow::Context;
 use async_trait::async_trait;
 use cua_driver_contract::{
     ClickButton, ClickInput, DragInput, GetCursorPositionInput, GetDesktopStateInput,
@@ -912,15 +913,22 @@ impl Tool for LaunchAppTool {
         }
 
         let result = cua_driver_core::blocking::spawn(
-            move || -> anyhow::Result<(String, Option<u32>, String)> {
+            move || -> anyhow::Result<(String, Option<(u32, Vec<Value>)>, String)> {
                 // Open URLs via xdg-open.
                 if !urls.is_empty() {
-                    for url in &urls {
-                        std::process::Command::new("xdg-open")
+                    let permits = (0..urls.len())
+                        .map(|_| super::child_reaper::AppLaunchPermit::reserve())
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    for (url, permit) in urls.iter().zip(permits) {
+                        let child = std::process::Command::new("xdg-open")
                             .arg(url)
                             .stdin(Stdio::null())
                             .stdout(Stdio::null())
                             .spawn()?;
+                        permit
+                            .guard(child)
+                            .handoff()
+                            .context("registering xdg-open child with app reaper")?;
                     }
                     return Ok((
                         format!("Opened {} URL(s) via xdg-open.", urls.len()),
@@ -955,23 +963,44 @@ impl Tool for LaunchAppTool {
                     {
                         launch.arg("--force-renderer-accessibility");
                     }
+                    let permit = super::child_reaper::AppLaunchPermit::reserve()?;
                     match launch.spawn() {
                         Ok(child) => {
+                            let child = permit.guard(child);
                             let pid = child.id();
+                            let deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(3);
+                            let windows = loop {
+                                let windows = crate::wayland::list_windows_dispatch(Some(pid));
+                                if !windows.is_empty() || std::time::Instant::now() >= deadline {
+                                    break windows
+                                        .iter()
+                                        .map(window_record_json)
+                                        .collect::<Vec<_>>();
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                            };
+                            child
+                                .handoff()
+                                .context("registering launched app child with app reaper")?;
                             return Ok((
                                 format!("✅ Launched {cmd} (pid {pid}) in background."),
-                                Some(pid),
+                                Some((pid, windows)),
                                 cmd.to_owned(),
                             ));
                         }
                         Err(_) => {
                             // Fall back to xdg-open for .desktop app names. xdg-open may
                             // spawn a helper and exit, so do not claim its pid is the app pid.
-                            std::process::Command::new("xdg-open")
+                            let child = std::process::Command::new("xdg-open")
                                 .arg(cmd)
                                 .stdin(Stdio::null())
                                 .stdout(Stdio::null())
                                 .spawn()?;
+                            permit
+                                .guard(child)
+                                .handoff()
+                                .context("registering fallback xdg-open child with app reaper")?;
                             return Ok((
                                 format!("Opened '{cmd}' via xdg-open."),
                                 None,
@@ -986,29 +1015,24 @@ impl Tool for LaunchAppTool {
         .await;
 
         match result {
-            Ok(Ok((message, pid_opt, name))) => {
-                if let Some(pid) = pid_opt {
-                    let windows = cua_driver_core::blocking::spawn(move || {
-                        let deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(3);
-                        loop {
-                            let windows = crate::wayland::list_windows_dispatch(Some(pid));
-                            if !windows.is_empty() || std::time::Instant::now() >= deadline {
-                                return windows.iter().map(window_record_json).collect::<Vec<_>>();
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                        }
-                    })
-                    .await
-                    .unwrap_or_default();
-                    ToolResult::text(message).with_structured(json!({
+            Ok(Ok((message, launch_opt, name))) => {
+                if let Some((pid, windows)) = launch_opt {
+                    let mut structured = json!({
                         "pid": pid,
                         "bundle_id": Value::Null,
                         "name": name,
                         "running": true,
                         "active": false,
                         "windows": windows,
-                    }))
+                    });
+                    // std::process::Command does not return an atomic pidfd. A
+                    // numeric PID therefore cannot prove launch ownership if
+                    // SIGCHLD auto-reaping or another process-wide waiter is
+                    // active. Mark attestation unavailable so core strips this
+                    // private field and deliberately skips PID-based fallback.
+                    structured[cua_driver_core::tool::DRIVER_OWNED_PROCESS_FINGERPRINT_FIELD] =
+                        Value::Null;
+                    ToolResult::text(message).with_structured(structured)
                 } else {
                     ToolResult::text(message).with_structured(json!({
                         "pid": Value::Null,
@@ -1023,6 +1047,34 @@ impl Tool for LaunchAppTool {
             Ok(Err(e)) => ToolResult::error(format!("Failed to launch: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod launch_app_reaping_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn short_lived_launch_disables_pid_ownership_and_is_reaped() {
+        let result = LaunchAppTool.invoke(json!({ "launch_path": "true" })).await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let structured = result.structured_content.expect("structured launch result");
+        assert_eq!(
+            structured.get(cua_driver_core::tool::DRIVER_OWNED_PROCESS_FINGERPRINT_FIELD),
+            Some(&Value::Null),
+            "std::process::Command launches must not claim PID ownership"
+        );
+        let pid = structured["pid"].as_u64().expect("positive launch pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::path::Path::new(&format!("/proc/{pid}")).exists()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "launched child {pid} was not reaped"
+        );
     }
 }
 

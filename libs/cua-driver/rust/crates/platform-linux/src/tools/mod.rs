@@ -6,6 +6,8 @@
 use cua_driver_core::tool::ToolRegistry;
 
 #[cfg(target_os = "linux")]
+mod child_reaper;
+#[cfg(target_os = "linux")]
 mod impl_;
 #[cfg(target_os = "linux")]
 pub(crate) mod page;

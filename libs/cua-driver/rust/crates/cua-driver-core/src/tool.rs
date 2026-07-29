@@ -78,6 +78,11 @@ fn desktop_action_coordinator() -> &'static tokio::sync::Mutex<()> {
 
 pub use cua_driver_contract::{CAPABILITY_VERSION, TOOLS_LIST_SCHEMA_VERSION};
 
+/// Private launch-tool result field carrying a process fingerprint captured
+/// while the platform still owns the child handle and PID reuse is impossible.
+#[doc(hidden)]
+pub const DRIVER_OWNED_PROCESS_FINGERPRINT_FIELD: &str = "_driver_owned_process_fingerprint";
+
 /// Metadata for a single tool.
 #[derive(Debug, Clone)]
 pub struct ToolDef {
@@ -481,6 +486,71 @@ impl TrustedInvocationEvidence {
                 Value::Bool(true),
             );
         }
+    }
+}
+
+/// Remove and decode the platform's private launch fingerprint marker.
+///
+/// `None` means a legacy platform supplied no marker and core may perform its
+/// existing post-invoke attestation. `Some(None)` means the platform attempted
+/// pre-reap attestation but could not prove an identity, so ownership must stay
+/// unbound rather than falling back to a PID that may already have been reused.
+fn take_driver_owned_process_fingerprint(
+    result: &mut ToolResult,
+) -> Option<Option<crate::browser::ProcessFingerprint>> {
+    let value = result
+        .structured_content
+        .as_mut()?
+        .as_object_mut()?
+        .remove(DRIVER_OWNED_PROCESS_FINGERPRINT_FIELD)?;
+    if value.is_null() {
+        Some(None)
+    } else {
+        Some(serde_json::from_value(value).ok())
+    }
+}
+
+#[cfg(test)]
+mod launch_fingerprint_marker_tests {
+    use super::*;
+
+    #[test]
+    fn pre_reap_fingerprint_is_decoded_and_removed_from_public_output() {
+        let fingerprint = crate::browser::ProcessFingerprint {
+            pid: 42,
+            start_time: Some(7),
+            executable: Some("/usr/bin/example".to_owned()),
+        };
+        let mut result = ToolResult::text("launched").with_structured(serde_json::json!({
+            "pid": 42,
+            DRIVER_OWNED_PROCESS_FINGERPRINT_FIELD: fingerprint,
+        }));
+
+        let decoded = take_driver_owned_process_fingerprint(&mut result)
+            .flatten()
+            .expect("decode fingerprint");
+        assert_eq!(decoded.pid, 42);
+        assert!(result
+            .structured_content
+            .as_ref()
+            .and_then(|value| value.get(DRIVER_OWNED_PROCESS_FINGERPRINT_FIELD))
+            .is_none());
+    }
+
+    #[test]
+    fn unavailable_pre_reap_fingerprint_disables_pid_fallback() {
+        let mut result = ToolResult::text("launched").with_structured(serde_json::json!({
+            "pid": 42,
+            DRIVER_OWNED_PROCESS_FINGERPRINT_FIELD: null,
+        }));
+        assert_eq!(
+            take_driver_owned_process_fingerprint(&mut result),
+            Some(None)
+        );
+
+        let mut legacy =
+            ToolResult::text("launched").with_structured(serde_json::json!({"pid": 42}));
+        assert_eq!(take_driver_owned_process_fingerprint(&mut legacy), None);
     }
 }
 
@@ -1239,6 +1309,11 @@ impl ToolRegistry {
             .flatten();
 
         let mut result = tool.invoke(args.clone()).await;
+        let supplied_launch_fingerprint = if resolved_name == "launch_app" {
+            take_driver_owned_process_fingerprint(&mut result)
+        } else {
+            None
+        };
         if resolved_name == "launch_app" && result.is_error != Some(true) {
             if let (Some(session), Some(before), Some(pid)) = (
                 runtime_session.as_deref(),
@@ -1250,7 +1325,12 @@ impl ToolRegistry {
                     .and_then(Value::as_i64),
             ) {
                 if pid > 0 && !before.contains(&pid) {
-                    if let Some(fingerprint) = self.attest_process_fingerprint(pid).await {
+                    let fingerprint = match supplied_launch_fingerprint {
+                        Some(Some(fingerprint)) if fingerprint.pid == pid => Some(fingerprint),
+                        Some(_) => None,
+                        None => self.attest_process_fingerprint(pid).await,
+                    };
+                    if let Some(fingerprint) = fingerprint {
                         self.protected_resource_ownership
                             .mark_driver_owned_process(session, fingerprint);
                     }
