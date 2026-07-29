@@ -53,11 +53,6 @@ browser broker.
 Do not launch multiple browser processes against the directory or bypass browser
 profile locks.
 
-Hermes' `BrowserProfileBroker` uses exact CDP target ids, per-context locks, a
-profile-global lock, and explicit compositor-surface bindings. A random temporary
-title nonce may prove the initial CDP-target/surface join, but all later actions
-use the sticky exact ids.
-
 ## Validation boundary
 
 Building and unit testing this code does not launch a compositor. The native E2E

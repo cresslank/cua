@@ -1,9 +1,8 @@
 use cursor_overlay::{
-    theme::paint_default_theme, CursorAction, CursorVisualState, DeliveryModifier, ReducedMotion,
+    render_frame, CursorAction, CursorConfig, DeliveryModifier, OverlayCommand, RenderStateCore,
     TargetModifier,
 };
 use std::{fs, path::Path};
-use tiny_skia::Pixmap;
 
 const SIZE: u32 = 256;
 const FPS: u32 = 30;
@@ -54,6 +53,47 @@ fn main() {
             scope.spawn(move || export_state(&path, action, delivery, target));
         }
     });
+    export_session_badge(&output.join("session").join("badge"));
+}
+
+fn export_session_badge(output: &Path) {
+    fs::create_dir_all(output).expect("create session badge frame output");
+    for frame in 0..FPS * DURATION_SECS {
+        let mut config = CursorConfig::default();
+        config.cursor_id = "gallery-session".into();
+        let mut core = RenderStateCore::new(config);
+        core.motion.idle_hide_ms = 0.0;
+        core.pos = (
+            f64::from(SIZE) / (2.0 * f64::from(PREVIEW_BACKING_SCALE)),
+            64.0,
+        );
+        core.apply_command_base(
+            OverlayCommand::SetSessionLabel("Research".into()),
+            false,
+            false,
+        );
+        core.apply_command_base(
+            OverlayCommand::BeginAction {
+                action: CursorAction::Observe,
+                delivery: Some(DeliveryModifier::Background),
+                target: Some(TargetModifier::Browser),
+            },
+            false,
+            false,
+        );
+        core.tick_motion(f64::from(frame) / f64::from(FPS));
+        let pixmap = render_frame(&core, SIZE, SIZE, 0.0, 0.0, None, PREVIEW_BACKING_SCALE);
+        let pixels = unpremultiply_rgba(pixmap.data().to_vec());
+        image::save_buffer_with_format(
+            output.join(format!("{frame:04}.png")),
+            &pixels,
+            SIZE,
+            SIZE,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .expect("write session badge frame");
+    }
 }
 
 fn export_state(
@@ -64,26 +104,26 @@ fn export_state(
 ) {
     fs::create_dir_all(output).expect("create frame output");
     for frame in 0..FPS * DURATION_SECS {
-        let mut pixmap = Pixmap::new(SIZE, SIZE).expect("create frame");
-        let visual = CursorVisualState {
-            requested_action: action,
-            resolved_action: action,
-            delivery,
-            target,
-            elapsed_secs: f64::from(frame) / f64::from(FPS),
-            ending_secs: None,
-            reduced_motion: ReducedMotion::Off,
-            preempted_count: 0,
-        };
-        paint_default_theme(
-            &mut pixmap,
-            &visual,
-            SIZE as f32 / 2.0,
-            SIZE as f32 / 2.0,
-            std::f32::consts::FRAC_PI_4,
-            PREVIEW_BACKING_SCALE,
-            1.0,
+        let mut config = CursorConfig::default();
+        config.cursor_id = "gallery-session".into();
+        let mut core = RenderStateCore::new(config);
+        core.motion.idle_hide_ms = 0.0;
+        core.pos = (
+            f64::from(SIZE) / (2.0 * f64::from(PREVIEW_BACKING_SCALE)),
+            f64::from(SIZE) / (2.0 * f64::from(PREVIEW_BACKING_SCALE)),
         );
+        core.heading = f64::from(std::f32::consts::FRAC_PI_4);
+        core.apply_command_base(
+            OverlayCommand::BeginAction {
+                action,
+                delivery,
+                target,
+            },
+            false,
+            false,
+        );
+        core.visual.elapsed_secs = f64::from(frame) / f64::from(FPS);
+        let pixmap = render_frame(&core, SIZE, SIZE, 0.0, 0.0, None, PREVIEW_BACKING_SCALE);
         let pixels = unpremultiply_rgba(pixmap.data().to_vec());
         image::save_buffer_with_format(
             output.join(format!("{frame:04}.png")),

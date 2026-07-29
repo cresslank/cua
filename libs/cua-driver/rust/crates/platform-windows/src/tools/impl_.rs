@@ -208,6 +208,34 @@ async fn overlay_glide_to(key: &str, sx: f64, sy: f64) {
     }
     crate::overlay::animate_cursor_to(key.to_owned(), sx, sy).await;
 }
+
+async fn track_overlay_drag(
+    key: String,
+    from: (f64, f64),
+    to: (f64, f64),
+    duration_ms: u64,
+    steps: usize,
+) {
+    if key.is_empty() || !crate::overlay::is_enabled(&key) {
+        return;
+    }
+    crate::overlay::send_command(
+        key.clone(),
+        cursor_overlay::OverlayCommand::SetPressed(true),
+    );
+    let steps = steps.max(1);
+    let step_delay = std::time::Duration::from_millis(duration_ms / steps as u64);
+    for index in 0..=steps {
+        let t = index as f64 / steps as f64;
+        let x = from.0 + (to.0 - from.0) * t;
+        let y = from.1 + (to.1 - from.1) * t;
+        crate::overlay::send_command(key.clone(), cursor_overlay::track_pointer_command(x, y));
+        if index < steps && !step_delay.is_zero() {
+            tokio::time::sleep(step_delay).await;
+        }
+    }
+    crate::overlay::send_command(key, cursor_overlay::OverlayCommand::SetPressed(false));
+}
 use cua_driver_contract::{
     ClickButton, ClickInput, DragInput, GetCursorPositionInput, GetDesktopStateInput,
     GetScreenSizeInput, HotkeyInput, MoveCursorInput, PressKeyInput, ScrollDirection, ScrollInput,
@@ -837,6 +865,14 @@ impl Tool for GetWindowStateTool {
                 element trees. When applied, BOTH the markdown and the structured \
                 elements are truncated identically. Omit both for current default behaviour \
                 (≤5 000 elements, depth ≤25).\n\n\
+                CHROMIUM COVERAGE: a browser-owned permission bubble can be \
+                composited outside the requested native window. Chromium-family \
+                snapshots therefore describe this limit in structuredContent.capture_coverage. \
+                After a verified ineffective window action, call escalate_session, take a \
+                fresh get_desktop_state snapshot, act explicitly in desktop scope if needed, \
+                then verify with another fresh desktop snapshot. \
+                This is separate from page JavaScript dialogs, which remain on \
+                browser_dialog.\n\n\
                 Windows requires no special permissions.".into(),
             input_schema: json!({"type":"object","required":["pid","window_id"],"properties":{
                 "session": cua_driver_core::tool_schema::session_schema(),
@@ -1169,6 +1205,11 @@ impl Tool for GetWindowStateTool {
                     structured["screenshot_error"] = json!(err);
                 }
 
+                cua_driver_core::window_inspection::mark_browser_chrome_capture_coverage(
+                    &mut structured,
+                    is_standalone_chromium_browser_process(pid),
+                );
+
                 ToolResult {
                     content,
                     is_error: None,
@@ -1261,6 +1302,13 @@ fn is_chromium_browser_target(target: &str) -> bool {
             | "browser" // Yandex Browser's exe is browser.exe
             | "arc"
     )
+}
+
+fn is_standalone_chromium_browser_process(pid: u32) -> bool {
+    crate::win32::list_processes()
+        .into_iter()
+        .find(|process| process.pid == pid)
+        .is_some_and(|process| is_chromium_browser_target(&process.name))
 }
 
 /// Anti-throttling flags injected on hidden Chromium launches (#1620).
@@ -3631,6 +3679,19 @@ impl Tool for TypeTextTool {
                 }
             }
         };
+        if let Some(idx) = elem_idx {
+            if let Some((cx, cy)) =
+                self.state
+                    .element_cache
+                    .get_element_center(pid, hwnd, idx as usize)
+            {
+                pin_overlay_above(&cursor_key, hwnd);
+                overlay_glide_to(&cursor_key, cx as f64, cy as f64).await;
+                self.state
+                    .cursor_registry
+                    .update_position(&cursor_key, cx as f64, cy as f64);
+            }
+        }
         let text_len = text.chars().count();
 
         // Native ConsoleHost can accept every synthesized Unicode event while
@@ -6254,6 +6315,7 @@ impl Tool for DragTool {
     async fn invoke(&self, args: Value) -> ToolResult {
         use crate::input::delivery::{DeliveryMode, EventKind};
         use cua_driver_core::tool_args::ArgsExt;
+        let cursor_key = resolve_cursor_key(&args);
         if args.get("scope").and_then(Value::as_str) == Some("desktop")
             && args.get("pid").is_none()
             && args.get("window_id").is_none()
@@ -6273,7 +6335,7 @@ impl Tool for DragTool {
                 Ok(hwnd) => hwnd,
                 Err(error) => return ToolResult::error(error.to_string()),
             };
-            return match cua_driver_core::blocking::spawn(move || {
+            let native_drag = cua_driver_core::blocking::spawn(move || {
                 crate::input::mouse::send_drag_synthesized(
                     hwnd,
                     from_x,
@@ -6284,9 +6346,16 @@ impl Tool for DragTool {
                     steps,
                     &button,
                 )
-            })
-            .await
-            {
+            });
+            let visual_drag = track_overlay_drag(
+                cursor_key.clone(),
+                (f64::from(from_x), f64::from(from_y)),
+                (f64::from(to_x), f64::from(to_y)),
+                duration_ms,
+                steps,
+            );
+            let (native_drag, ()) = tokio::join!(native_drag, visual_drag);
+            return match native_drag {
                 Ok(Ok(())) => ToolResult::text(format!(
                     "Dragged from ({from_x}, {from_y}) to ({to_x}, {to_y}) (scope:desktop)."
                 ))
@@ -6307,7 +6376,6 @@ impl Tool for DragTool {
         let pid = raw_pid as u32;
         let delivery = DeliveryMode::from_args(&args);
 
-        let cursor_key = resolve_cursor_key(&args);
         // Accepts numeric JSON as either float or integer — coerce both to f64.
         let coerce = |key: &str| -> Option<f64> {
             args.opt_f64(key)
@@ -6426,24 +6494,21 @@ impl Tool for DragTool {
                     steps.max(8),
                     &btn,
                 )
-            })
-            .await;
+            });
+            let visual_drag = track_overlay_drag(
+                cursor_key.clone(),
+                (f64::from(sx_from), f64::from(sy_from)),
+                (f64::from(sx_to), f64::from(sy_to)),
+                duration_ms,
+                steps,
+            );
+            let (inj, ()) = tokio::join!(inj, visual_drag);
             return match inj {
-                Ok(Ok(())) => {
-                    overlay_glide_to(&cursor_key, sx_to as f64, sy_to as f64).await;
-                    crate::overlay::send_command(
-                        cursor_key.clone(),
-                        cursor_overlay::OverlayCommand::ClickPulse {
-                            x: sx_to as f64,
-                            y: sy_to as f64,
-                        },
-                    );
-                    ToolResult::text(format!(
-                        "✅ Sent drag via synthetic-pen injection on pid {raw_pid} \
+                Ok(Ok(())) => ToolResult::text(format!(
+                    "✅ Sent drag via synthetic-pen injection on pid {raw_pid} \
                          from screen ({sx_from},{sy_from}) → ({sx_to},{sy_to}) \
                          (delivery_mode:background, PostMessage would have been dropped)."
-                    ))
-                }
+                )),
                 Ok(Err(e)) => crate::input::delivery::background_unavailable_error_with_cause(
                     hwnd,
                     EventKind::MouseMove,
@@ -6460,6 +6525,7 @@ impl Tool for DragTool {
         // foreground-lock constraint as send_click_synthesized.
         if delivery == DeliveryMode::Foreground {
             let btn_fg = button.clone();
+            pin_overlay_above(&cursor_key, hwnd);
             let prev_fg_addr = unsafe {
                 windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow().0 as usize
             };
@@ -6474,8 +6540,15 @@ impl Tool for DragTool {
                     steps,
                     &btn_fg,
                 )
-            })
-            .await;
+            });
+            let visual_drag = track_overlay_drag(
+                cursor_key.clone(),
+                (f64::from(sx_from), f64::from(sy_from)),
+                (f64::from(sx_to), f64::from(sy_to)),
+                duration_ms,
+                steps,
+            );
+            let (send_result, ()) = tokio::join!(send_result, visual_drag);
             tokio::spawn(restore_foreground_polling_best_effort(prev_fg_addr, pid));
             let button_suffix = if button == "left" {
                 String::new()
@@ -6501,7 +6574,7 @@ impl Tool for DragTool {
         // structured background_unavailable error so callers escalate to
         // delivery_mode:"foreground" per the documented ladder instead of
         // trusting a drag that did nothing.
-        let nc_hit = tokio::task::spawn_blocking(move || {
+        let nc_hit = cua_driver_core::blocking::spawn(move || {
             crate::input::mouse::non_client_move_resize_hit(hwnd, sx_from, sy_from)
         })
         .await
@@ -6526,13 +6599,9 @@ impl Tool for DragTool {
         // sufficient — the 80 ms z-order tick keeps it asserted thereafter.
         pin_overlay_above(&cursor_key, hwnd);
 
-        // Animate the agent cursor to the drag-start, fire a press pulse,
-        // run the actual drag synthesis, then glide to the drag-end and
-        // fire a release pulse. Mirrors macOS `tools/drag.rs:191-242`.
-        // Cursor doesn't follow the interpolated PostMessage path during
-        // the drag itself (the timing coordination would be invasive);
-        // pre- and post-glides plus the press/release pulses are enough
-        // signal for a user watching the agent operate.
+        // Move the agent cursor to the drag-start, show the press state, and
+        // track the same interpolated step count and duration while the
+        // posted-message drag runs.
         overlay_glide_to(&cursor_key, sx_from as f64, sy_from as f64).await;
         crate::overlay::send_command(
             cursor_key.clone(),
@@ -6557,22 +6626,15 @@ impl Tool for DragTool {
                 steps,
                 &button_c,
             )
-        })
-        .await;
-
-        // Drag finished — glide the visual cursor to the drag-end and
-        // pulse the release. Skipped on error so the cursor doesn't lie
-        // about a successful endpoint.
-        if matches!(&result, Ok(Ok(()))) {
-            overlay_glide_to(&cursor_key, sx_to as f64, sy_to as f64).await;
-            crate::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::ClickPulse {
-                    x: sx_to as f64,
-                    y: sy_to as f64,
-                },
-            );
-        }
+        });
+        let visual_drag = track_overlay_drag(
+            cursor_key.clone(),
+            (f64::from(sx_from), f64::from(sy_from)),
+            (f64::from(sx_to), f64::from(sy_to)),
+            duration_ms,
+            steps,
+        );
+        let (result, ()) = tokio::join!(result, visual_drag);
 
         match result {
             Ok(Ok(())) => {

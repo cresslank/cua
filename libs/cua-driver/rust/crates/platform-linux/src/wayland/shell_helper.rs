@@ -39,7 +39,11 @@ const DBUS_IFACE: &str = "org.freedesktop.DBus";
 const INTROSPECT_DEST: &str = "org.gnome.Shell.Introspect";
 const INTROSPECT_PATH: &str = "/org/gnome/Shell/Introspect";
 const INTROSPECT_IFACE: &str = "org.gnome.Shell.Introspect";
-const REQUIRED_PROTOCOL: u64 = 4;
+/// Public helper API carried by `GetVersion`; follows the upstream cursor and
+/// session-badge contract and is intentionally independent from the exact-
+/// target capability protocol advertised by `GetCapabilities`.
+const REQUIRED_HELPER_API_VERSION: u32 = 8;
+const REQUIRED_EXACT_TARGET_PROTOCOL: u64 = 4;
 static OVERLAY_DISPATCH_TX: OnceLock<Option<std::sync::mpsc::SyncSender<OverlayDispatchRequest>>> =
     OnceLock::new();
 static FOREGROUND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -50,11 +54,41 @@ const OVERLAY_HELPER_PROBE_TTL: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 enum OverlayDispatchRequest {
-    Pin { owner: String, window_id: u64 },
-    Move { owner: String, x: i32, y: i32 },
-    ClickPulse { owner: String, x: i32, y: i32 },
-    Hide { owner: String },
-    Remove { owner: String },
+    Pin {
+        owner: String,
+        window_id: u64,
+    },
+    Move {
+        owner: String,
+        x: i32,
+        y: i32,
+    },
+    ClickPulse {
+        owner: String,
+        x: i32,
+        y: i32,
+    },
+    SetColor {
+        owner: String,
+        fill_color: String,
+    },
+    SetState {
+        owner: String,
+        action: String,
+        delivery: String,
+        target: String,
+        active: bool,
+    },
+    SetSessionLabel {
+        owner: String,
+        label: String,
+    },
+    Hide {
+        owner: String,
+    },
+    Remove {
+        owner: String,
+    },
 }
 
 impl OverlayDispatchRequest {
@@ -63,6 +97,9 @@ impl OverlayDispatchRequest {
             Self::Pin { .. } => "pin",
             Self::Move { .. } => "move",
             Self::ClickPulse { .. } => "click_pulse",
+            Self::SetColor { .. } => "set_color",
+            Self::SetState { .. } => "set_state",
+            Self::SetSessionLabel { .. } => "set_session_label",
             Self::Hide { .. } => "hide",
             Self::Remove { .. } => "remove",
         }
@@ -95,6 +132,19 @@ fn dispatch_overlay_request(
     let Some(destination) = shell_owner(false) else {
         return;
     };
+    if matches!(
+        request,
+        OverlayDispatchRequest::SetColor { .. }
+            | OverlayDispatchRequest::SetState { .. }
+            | OverlayDispatchRequest::SetSessionLabel { .. }
+    ) && shell_owner(true).is_none()
+    {
+        // The exact-target protocol is intentionally independent from the
+        // semantic-cursor API.  A protocol-v4 helper already loaded by GNOME
+        // remains usable until the next login, but it must not receive v8-only
+        // cursor badge methods.
+        return;
+    }
     match request {
         OverlayDispatchRequest::Pin { .. } => {}
         OverlayDispatchRequest::Move { owner, x, y } => {
@@ -125,6 +175,45 @@ fn dispatch_overlay_request(
                 Some(IFACE),
                 "ClickPulseFor",
                 &(owner.as_str(), target.target_id.as_str(), x, y),
+            );
+        }
+        OverlayDispatchRequest::SetColor { owner, fill_color } => {
+            let _ = connection.call_method(
+                Some(destination.as_str()),
+                PATH,
+                Some(IFACE),
+                "SetCursorColorFor",
+                &(owner.as_str(), fill_color.as_str()),
+            );
+        }
+        OverlayDispatchRequest::SetState {
+            owner,
+            action,
+            delivery,
+            target,
+            active,
+        } => {
+            let _ = connection.call_method(
+                Some(destination.as_str()),
+                PATH,
+                Some(IFACE),
+                "SetCursorStateFor",
+                &(
+                    owner.as_str(),
+                    action.as_str(),
+                    delivery.as_str(),
+                    target.as_str(),
+                    active,
+                ),
+            );
+        }
+        OverlayDispatchRequest::SetSessionLabel { owner, label } => {
+            let _ = connection.call_method(
+                Some(destination.as_str()),
+                PATH,
+                Some(IFACE),
+                "SetSessionLabelFor",
+                &(owner.as_str(), label.as_str()),
             );
         }
         OverlayDispatchRequest::Hide { owner } => {
@@ -159,6 +248,9 @@ fn prepare_overlay_dispatch(
         }
         OverlayDispatchRequest::Move { owner, .. }
         | OverlayDispatchRequest::ClickPulse { owner, .. }
+        | OverlayDispatchRequest::SetColor { owner, .. }
+        | OverlayDispatchRequest::SetState { owner, .. }
+        | OverlayDispatchRequest::SetSessionLabel { owner, .. }
         | OverlayDispatchRequest::Hide { owner } => targets.contains_key(owner),
         OverlayDispatchRequest::Remove { owner } => {
             targets.remove(owner);
@@ -389,13 +481,13 @@ impl Drop for ForegroundTransaction {
 }
 
 pub fn available() -> bool {
-    // Protocol-v4 helpers already attest the exact contract through
-    // GetCapabilities. GetVersion was added later as an upstream compatibility
-    // method, so requiring it would unnecessarily disable a currently loaded
-    // v4 helper until the next GNOME login after an extension-file update.
+    // GetCapabilities is the exact-target contract. Do not require the v8
+    // semantic-cursor GetVersion here: GNOME cannot safely reload extensions
+    // in place, so a still-loaded protocol-v4 helper must remain usable until
+    // the next login after updated files are staged.
     shell_owner(false).is_some()
         && capabilities().is_some_and(|capabilities| {
-            capabilities.protocol_version == REQUIRED_PROTOCOL
+            capabilities.protocol_version == REQUIRED_EXACT_TARGET_PROTOCOL
                 && !capabilities.epoch.is_empty()
                 && capabilities
                     .capabilities
@@ -509,7 +601,7 @@ fn gdbus_call_with_timeout(method: &str, args: &[String], timeout: Duration) -> 
 /// callers can additionally require the extension's current API. Addressing
 /// the unique name closes the race where another process replaces the public
 /// name after ownership is checked.
-fn shell_owner(require_protocol: bool) -> Option<String> {
+fn shell_owner(require_helper_api: bool) -> Option<String> {
     let owner_raw = gdbus_call_target(
         DBUS_DEST,
         DBUS_PATH,
@@ -542,7 +634,7 @@ fn shell_owner(require_protocol: bool) -> Option<String> {
         return None;
     }
 
-    if require_protocol {
+    if require_helper_api {
         let version_raw = gdbus_call_target(
             &owner,
             PATH,
@@ -550,7 +642,7 @@ fn shell_owner(require_protocol: bool) -> Option<String> {
             &[],
             Duration::from_millis(800),
         )?;
-        if u64::from(parse_first_u32(&version_raw)?) != REQUIRED_PROTOCOL {
+        if parse_first_u32(&version_raw)? < REQUIRED_HELPER_API_VERSION {
             return None;
         }
     }
@@ -660,7 +752,9 @@ fn decode_capture_payload(raw: &str, expected_target: &str) -> anyhow::Result<Ve
     let payload = extract_json_object(&raw)
         .and_then(|json| serde_json::from_str::<CapturePayload>(json).ok())
         .ok_or_else(|| anyhow::anyhow!("GNOME capture returned an invalid atomic payload"))?;
-    if payload.protocol_version != REQUIRED_PROTOCOL || payload.target != expected_target {
+    if payload.protocol_version != REQUIRED_EXACT_TARGET_PROTOCOL
+        || payload.target != expected_target
+    {
         anyhow::bail!("target_changed_during_capture: GNOME capture proof did not match request");
     }
     if payload.rect.width == 0
@@ -1066,7 +1160,7 @@ fn parse_shell_windows(raw: &str) -> Option<Vec<ShellWindow>> {
     let mut parsed = Vec::with_capacity(windows.len());
     for window in windows {
         let protocol = window.get("protocol_version")?.as_u64()?;
-        if protocol != REQUIRED_PROTOCOL {
+        if protocol != REQUIRED_EXACT_TARGET_PROTOCOL {
             return None;
         }
         let native_id = window.get("id")?.as_u64()?;
@@ -1208,6 +1302,36 @@ pub fn click_pulse(owner: &str, x: i32, y: i32) -> bool {
         owner: owner.to_owned(),
         x,
         y,
+    })
+}
+
+pub fn set_cursor_color(owner: &str, fill_color: &str) -> bool {
+    enqueue_overlay_request(OverlayDispatchRequest::SetColor {
+        owner: owner.to_owned(),
+        fill_color: fill_color.to_owned(),
+    })
+}
+
+pub fn set_cursor_state(
+    owner: &str,
+    action: &str,
+    delivery: &str,
+    target: &str,
+    active: bool,
+) -> bool {
+    enqueue_overlay_request(OverlayDispatchRequest::SetState {
+        owner: owner.to_owned(),
+        action: action.to_owned(),
+        delivery: delivery.to_owned(),
+        target: target.to_owned(),
+        active,
+    })
+}
+
+pub fn set_session_label(owner: &str, label: &str) -> bool {
+    enqueue_overlay_request(OverlayDispatchRequest::SetSessionLabel {
+        owner: owner.to_owned(),
+        label: label.to_owned(),
     })
 }
 

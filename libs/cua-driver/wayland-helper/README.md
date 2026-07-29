@@ -9,11 +9,13 @@ normal Wayland client cannot do these things globally.
 
 It exposes `org.cua.WinRects` on the session bus:
 
-- `GetVersion() -> uint` — a protocol identifier. The driver only accepts it
-  after resolving the helper's immutable D-Bus owner and proving that owner is
-  the current user's system-installed `gnome-shell` process.
-- `GetCapabilities() -> json` — protocol version, helper epoch, and exact-target
-  capabilities. Driver/helper version skew fails closed.
+- `GetVersion() -> uint` — the upstream helper API version (v8 for semantic
+  cursor/session-badge rendering). The driver accepts it only after resolving
+  the helper's immutable D-Bus owner and proving that owner is the current
+  user's system-installed `gnome-shell` process.
+- `GetCapabilities() -> json` — an independent exact-target protocol version,
+  helper epoch, and exact-target capabilities. Driver/helper version skew fails
+  closed.
 - `GetRects() -> json` — every window's epoch-qualified target id, workspace,
   monitor, sticky/visibility state, frame geometry, and surface-buffer
   origin. cua-driver combines the buffer origin with AT-SPI
@@ -44,6 +46,10 @@ It exposes `org.cua.WinRects` on the session bus:
   their target is not actually visible on the active workspace. The D-Bus
   connection's unique owner, not the caller label alone, owns those actors;
   `NameOwnerChanged` cleanup reaps them after normal or abnormal process exit.
+- `SetCursorState` / `SetCursorColor` / `SetSessionLabel` retain the upstream v8
+  semantic cursor and host-owned session-badge API. Exact-target callers use the
+  corresponding `...For(owner, ...)` variants so each connection-owned cursor
+  keeps independent action, color, and label state.
 
 It runs in the shell's privileged context, so **no xdg-desktop-portal grant** is
 needed (unlike libei/RemoteDesktop).

@@ -24,6 +24,8 @@ use std::sync::{Mutex, OnceLock};
 #[cfg(target_os = "linux")]
 use std::time::{Duration, Instant};
 
+#[cfg(all(test, target_os = "linux"))]
+use cursor_overlay::CursorAction;
 #[cfg(target_os = "linux")]
 use cursor_overlay::ZOrderEnforcer;
 use cursor_overlay::{
@@ -71,8 +73,9 @@ struct RenderMap {
 }
 
 fn render_state_for_key(template: &CursorConfig, key: &str) -> RenderState {
-    let _ = key;
-    RenderState::new(template.clone())
+    let mut config = template.clone();
+    config.cursor_id = key.to_owned();
+    RenderState::new(config)
 }
 
 fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
@@ -227,6 +230,10 @@ pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
             // key, bound to an exact incarnation-qualified target. Never send an
             // unpinned cursor command: a global actor without a target visibility
             // scope is intentionally unsupported.
+            let _ = crate::wayland::shell_helper::set_cursor_color(
+                &key,
+                &cursor_overlay::session_fill_hex(&key),
+            );
             match &cmd {
                 cursor_overlay::OverlayCommand::PinAbove(window_id) => {
                     let _ = crate::wayland::shell_helper::pin_cursor(&key, *window_id);
@@ -237,6 +244,35 @@ pub fn send_command_for(key: CursorKey, cmd: OverlayCommand) {
                 }
                 cursor_overlay::OverlayCommand::ClickPulse { x, y } => {
                     let _ = crate::wayland::shell_helper::click_pulse(&key, *x as i32, *y as i32);
+                }
+                cursor_overlay::OverlayCommand::BeginAction {
+                    action,
+                    delivery,
+                    target,
+                } => {
+                    let _ = crate::wayland::shell_helper::set_cursor_state(
+                        &key,
+                        action.as_str(),
+                        delivery.as_ref().map_or("", |value| value.as_str()),
+                        target.as_ref().map_or("", |value| value.as_str()),
+                        true,
+                    );
+                }
+                cursor_overlay::OverlayCommand::EndAction(action) => {
+                    let _ = crate::wayland::shell_helper::set_cursor_state(
+                        &key,
+                        action.as_str(),
+                        "",
+                        "",
+                        false,
+                    );
+                }
+                cursor_overlay::OverlayCommand::SetSessionLabel(label) => {
+                    let label = cursor_overlay::sanitize_session_label(label);
+                    let _ = crate::wayland::shell_helper::set_session_label(
+                        &key,
+                        label.as_deref().unwrap_or(""),
+                    );
                 }
                 cursor_overlay::OverlayCommand::SetEnabled(false) => {
                     crate::wayland::shell_helper::hide_cursor(&key);
@@ -508,6 +544,7 @@ impl RenderState {
         self.core.path.is_some()
             || self.core.spring.is_some()
             || self.core.click_t.is_some()
+            || self.core.session_badge_needs_frame_tick()
             || (self.core.motion.idle_hide_ms > 0.0
                 && self.core.visible
                 && self.core.pos.0 >= -100.0
@@ -823,12 +860,18 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
         let now = Instant::now();
         let elapsed_dt = now.duration_since(last_tick).as_secs_f64();
         last_tick = now;
+        let hardware_pointer = conn
+            .query_pointer(root)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .map(|reply| (f64::from(reply.root_x), f64::from(reply.root_y)));
 
         // Drain commands and tick.
         let (
             arrived,
             pinned_wid,
             had_msg,
+            hover_changed,
             next_frame_tick_needed,
             next_z_order_tick_needed,
             next_idle_wait_interval,
@@ -843,6 +886,10 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
                     maintenance_timeout,
                     frame_tick_needed,
                 );
+                let mut hover_changed = false;
+                for rs in map.cursors.values_mut() {
+                    hover_changed |= rs.core.update_session_badge_hover(hardware_pointer);
+                }
                 let pinned_wid = map
                     .last_active
                     .as_ref()
@@ -855,6 +902,7 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
                     arrived,
                     pinned_wid,
                     had_msg,
+                    hover_changed,
                     next_frame_tick_needed,
                     next_z_order_tick_needed,
                     next_idle_wait_interval,
@@ -877,7 +925,7 @@ fn run_overlay_thread(cfg: CursorConfig, rx: std::sync::mpsc::Receiver<OverlayMs
         // Render after a command, during an active animation/fade, and once
         // more as the final active state settles. This leaves the X11 window in
         // its completed/cleared state before the next blocking receive.
-        if had_msg || frame_tick_needed || next_frame_tick_needed {
+        if had_msg || hover_changed || frame_tick_needed || next_frame_tick_needed {
             let tiles = {
                 let guard = RENDER.lock().unwrap();
                 guard.as_ref().map(render_x11_tiles)
@@ -1023,6 +1071,9 @@ fn x11_compositor_present(conn: &impl x11rb::connection::Connection, screen_num:
 /// independent of the root-window area without clipping antialiasing.
 #[cfg(target_os = "linux")]
 const X11_CURSOR_TILE_MARGIN: f64 = 64.0;
+#[cfg(target_os = "linux")]
+const X11_BADGED_CURSOR_HORIZONTAL_MARGIN: f64 =
+    cursor_overlay::session_badge_extents().horizontal as f64 + 2.0;
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1051,9 +1102,14 @@ fn cursor_tile_bounds(
 
     let screen_width = i32::try_from(screen_width).ok()?;
     let screen_height = i32::try_from(screen_height).ok()?;
-    let left = (core.pos.0 - X11_CURSOR_TILE_MARGIN).floor() as i32;
+    let horizontal_margin = if core.session_badge_is_visible() {
+        X11_BADGED_CURSOR_HORIZONTAL_MARGIN
+    } else {
+        X11_CURSOR_TILE_MARGIN
+    };
+    let left = (core.pos.0 - horizontal_margin).floor() as i32;
     let top = (core.pos.1 - X11_CURSOR_TILE_MARGIN).floor() as i32;
-    let right = (core.pos.0 + X11_CURSOR_TILE_MARGIN).ceil() as i32;
+    let right = (core.pos.0 + horizontal_margin).ceil() as i32;
     let bottom = (core.pos.1 + X11_CURSOR_TILE_MARGIN).ceil() as i32;
 
     let left = left.clamp(0, screen_width);
@@ -1238,6 +1294,12 @@ fn bgra_and_visible_shape(
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keyed_render_state_carries_the_session_color_identity() {
+        let state = render_state_for_key(&CursorConfig::default(), "session-blueprint");
+        assert_eq!(state.core.cfg.cursor_id, "session-blueprint");
+    }
 
     fn default_render_map() -> RenderMap {
         let cfg = CursorConfig::default();
@@ -1691,6 +1753,43 @@ mod tests {
         assert_eq!(tile.bounds.height, 128);
         assert_eq!(tile.pixmap.data().len(), 128 * 128 * 4);
         assert!(tile.pixmap.data().len() < (map.scr_w * map.scr_h * 4) as usize);
+    }
+
+    #[test]
+    fn session_badge_expands_only_the_local_cursor_tile() {
+        let mut map = default_render_map();
+        map.scr_w = 7680;
+        map.scr_h = 2160;
+        let cursor = map.cursors.get_mut("default").unwrap();
+        cursor.core.pos = (4000.0, 1000.0);
+        cursor.apply_command(OverlayCommand::SetSessionLabel("research-run".to_owned()));
+
+        let tiles = render_x11_tiles(&map);
+
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].bounds.width, 208);
+        assert_eq!(tiles[0].bounds.height, 128);
+        assert!(tiles[0].pixmap.data().len() < (map.scr_w * map.scr_h * 4) as usize);
+    }
+
+    #[test]
+    fn modifier_only_badge_expands_the_local_cursor_tile() {
+        let mut map = default_render_map();
+        map.scr_w = 7680;
+        map.scr_h = 2160;
+        let cursor = map.cursors.get_mut("default").unwrap();
+        cursor.core.pos = (4000.0, 1000.0);
+        cursor.apply_command(OverlayCommand::BeginAction {
+            action: CursorAction::Click,
+            delivery: Some(cursor_overlay::DeliveryModifier::Foreground),
+            target: Some(cursor_overlay::TargetModifier::Pixel),
+        });
+
+        let tiles = render_x11_tiles(&map);
+
+        assert_eq!(tiles.len(), 1);
+        assert_eq!(tiles[0].bounds.width, 208);
+        assert_eq!(tiles[0].bounds.height, 128);
     }
 
     #[test]

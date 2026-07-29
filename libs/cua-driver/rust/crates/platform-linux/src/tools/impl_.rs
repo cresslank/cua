@@ -1597,10 +1597,6 @@ fn held_target_mismatch(
     }
 }
 
-async fn overlay_glide_to(sx: f64, sy: f64) {
-    overlay_glide_to_for("default", sx, sy).await;
-}
-
 fn overlay_snap_to_for(cursor_id: &str, sx: f64, sy: f64, heading: Option<f64>) {
     crate::overlay::send_command_for(
         cursor_id.to_owned(),
@@ -1639,6 +1635,37 @@ async fn overlay_glide_to_for(cursor_id: &str, sx: f64, sy: f64) {
         return;
     }
     crate::overlay::animate_cursor_to_for(cursor_id.to_owned(), sx, sy).await;
+}
+
+async fn track_overlay_drag_for(
+    cursor_id: String,
+    from: (f64, f64),
+    to: (f64, f64),
+    duration_ms: u64,
+    steps: usize,
+) {
+    if !crate::overlay::is_enabled_for(&cursor_id) {
+        return;
+    }
+    crate::overlay::send_command_for(
+        cursor_id.clone(),
+        cursor_overlay::OverlayCommand::SetPressed(true),
+    );
+    let steps = steps.max(1);
+    let step_delay = std::time::Duration::from_millis(duration_ms / steps as u64);
+    for index in 0..=steps {
+        let t = index as f64 / steps as f64;
+        let x = from.0 + (to.0 - from.0) * t;
+        let y = from.1 + (to.1 - from.1) * t;
+        crate::overlay::send_command_for(
+            cursor_id.clone(),
+            cursor_overlay::track_pointer_command(x, y),
+        );
+        if index < steps && !step_delay.is_zero() {
+            tokio::time::sleep(step_delay).await;
+        }
+    }
+    crate::overlay::send_command_for(cursor_id, cursor_overlay::OverlayCommand::SetPressed(false));
 }
 
 fn process_name(pid: u32) -> Option<String> {
@@ -2469,6 +2496,22 @@ impl Tool for TypeTextTool {
             );
         }
 
+        let cursor_id = resolve_cursor_key(&args);
+        if let Some(idx) = resolved_elem_idx {
+            crate::overlay::send_command_for(
+                cursor_id.clone(),
+                cursor_overlay::OverlayCommand::PinAbove(xid),
+            );
+            if let Ok(Ok((screen_x, screen_y))) =
+                cua_driver_core::blocking::spawn(move || element_screen_center(pid, idx)).await
+            {
+                overlay_glide_to_for(&cursor_id, screen_x, screen_y).await;
+                self.state
+                    .cursor_registry
+                    .update_position(&cursor_id, screen_x, screen_y);
+            }
+        }
+
         let text_len = text.chars().count();
         // Native toolkit editables have a stronger focus-free route than raw
         // compositor keyboard injection. Keep Chromium/WebKit on real key events
@@ -2695,21 +2738,6 @@ impl Tool for TypeTextTool {
                 Ok(Err(e)) => ToolResult::error(e.to_string()),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
-        }
-        // Pulse the agent cursor onto the field being typed into (when an
-        // element_index OR element_token is supplied — token resolution
-        // already ran above so `resolved_elem_idx` covers both).
-        if let Some(idx) = resolved_elem_idx {
-            crate::overlay::send_command(cursor_overlay::OverlayCommand::PinAbove(xid));
-            if let Ok(Ok((sx, sy))) =
-                cua_driver_core::blocking::spawn(move || element_screen_center(pid, idx)).await
-            {
-                overlay_glide_to(sx, sy).await;
-                crate::overlay::send_command(cursor_overlay::OverlayCommand::ClickPulse {
-                    x: sx,
-                    y: sy,
-                });
-            }
         }
         // Foreground means the caller explicitly permits activation. Chromium
         // and WebKitGTK can acknowledge an accessibility write without
@@ -3634,6 +3662,7 @@ impl Tool for SetValueTool {
                 Err(error) => return ToolResult::error(format!("Task error: {error}")),
             }
         }
+        let cursor_id = resolve_cursor_key(&args);
         let value_for_task = value.clone();
         // Pulse the agent cursor onto the target element before writing, so a
         // value write gets the same visual feedback as a click — the viewer can
@@ -3644,13 +3673,12 @@ impl Tool for SetValueTool {
         {
             let window_id = exact_window_id.unwrap_or(0);
             if window_id != 0 {
-                crate::overlay::send_command(cursor_overlay::OverlayCommand::PinAbove(window_id));
+                crate::overlay::send_command_for(
+                    cursor_id.clone(),
+                    cursor_overlay::OverlayCommand::PinAbove(window_id),
+                );
             }
-            overlay_glide_to(sx, sy).await;
-            crate::overlay::send_command(cursor_overlay::OverlayCommand::ClickPulse {
-                x: sx,
-                y: sy,
-            });
+            overlay_glide_to_for(&cursor_id, sx, sy).await;
         }
         let result = cua_driver_core::blocking::spawn(move || {
             crate::atspi::set_value(pid, idx, &value_for_task)
@@ -4709,8 +4737,20 @@ impl Tool for DragTool {
                         steps,
                     )
                 }
-            })
-            .await;
+            });
+            let visual_drag = track_overlay_drag_for(
+                cursor_id.clone(),
+                (from_x, from_y),
+                (to_x, to_y),
+                duration_ms,
+                steps,
+            );
+            let (result, ()) = tokio::join!(result, visual_drag);
+            if matches!(&result, Ok(Ok(()))) {
+                self.state
+                    .cursor_registry
+                    .update_position(&cursor_id, to_x, to_y);
+            }
             return match result {
                 Ok(Ok(())) => ToolResult::text("Dragged on the desktop.").with_structured(
                     json!({"scope":"desktop","path":path,"effect":"unverifiable"}),
@@ -4831,38 +4871,44 @@ impl Tool for DragTool {
                 },
             );
         }
-        crate::overlay::send_command_for(
-            cursor_id.clone(),
-            cursor_overlay::OverlayCommand::SetPressed(true),
-        );
-
         // Native Wayland: emit press + interpolated motion + release as one
         // virtual-pointer (wlroots) or libei (GNOME/KDE) sequence, output-relative
         // coords. Returns early so we don't fall into the X11 XSendEvent loop below.
         if crate::wayland::wayland_input_enabled() {
             let steps_u32 = steps as u32;
-            let ((fxi, fyi), (txi, tyi)) = wayland_points.unwrap_or((
-                (from_x.round() as i32, from_y.round() as i32),
-                (to_x.round() as i32, to_y.round() as i32),
-            ));
+            let ((from_output_x, from_output_y), (to_output_x, to_output_y)) = wayland_points
+                .unwrap_or((
+                    (from_x.round() as i32, from_y.round() as i32),
+                    (to_x.round() as i32, to_y.round() as i32),
+                ));
             let drag_result = cua_driver_core::blocking::spawn(move || {
                 let target = crate::wayland::establish_exact_target(pid, xid)?;
                 crate::wayland::drag_with_outcome(
                     target,
-                    fxi,
-                    fyi,
-                    txi,
-                    tyi,
+                    from_output_x,
+                    from_output_y,
+                    to_output_x,
+                    to_output_y,
                     steps_u32,
                     duration_ms,
                     button,
                 )
-            })
-            .await;
-            crate::overlay::send_command_for(
+            });
+            let visual_drag = track_overlay_drag_for(
                 cursor_id.clone(),
-                cursor_overlay::OverlayCommand::SetPressed(false),
+                (f64::from(from_output_x), f64::from(from_output_y)),
+                (f64::from(to_output_x), f64::from(to_output_y)),
+                duration_ms,
+                steps,
             );
+            let (drag_result, ()) = tokio::join!(drag_result, visual_drag);
+            if matches!(&drag_result, Ok(Ok(_))) {
+                self.state.cursor_registry.update_position(
+                    &cursor_id,
+                    f64::from(to_output_x),
+                    f64::from(to_output_y),
+                );
+            }
             return match drag_result {
                 Ok(Ok(outcome)) => ToolResult::text(format!(
                     "✅ Posted drag ({button_str}) to pid {pid} \
@@ -4900,12 +4946,20 @@ impl Tool for DragTool {
                         steps,
                     )
                 })
-            })
-            .await;
-            crate::overlay::send_command_for(
+            });
+            let visual_drag = track_overlay_drag_for(
                 cursor_id.clone(),
-                cursor_overlay::OverlayCommand::SetPressed(false),
+                (screen_from_x, screen_from_y),
+                (screen_to_x, screen_to_y),
+                duration_ms,
+                steps,
             );
+            let (drag_result, ()) = tokio::join!(drag_result, visual_drag);
+            if matches!(&drag_result, Ok(Ok(()))) {
+                self.state
+                    .cursor_registry
+                    .update_position(&cursor_id, screen_to_x, screen_to_y);
+            }
             return match drag_result {
                 Ok(Ok(())) => ToolResult::text(format!(
                     "Dragged ({button_str}) to pid {pid} from ({from_x:.0}, {from_y:.0}) \
@@ -4922,6 +4976,10 @@ impl Tool for DragTool {
             };
         }
 
+        crate::overlay::send_command_for(
+            cursor_id.clone(),
+            cursor_overlay::OverlayCommand::SetPressed(true),
+        );
         let press_result = cua_driver_core::blocking::spawn(move || {
             crate::input::send_button_down(
                 xid,
@@ -4943,8 +5001,6 @@ impl Tool for DragTool {
             } else {
                 duration_ms
             };
-            let mut prev_x = from_x;
-            let mut prev_y = from_y;
             for i in 1..=steps {
                 let t = i as f64 / steps.max(1) as f64;
                 let ix = from_x + (to_x - from_x) * t;
@@ -4965,20 +5021,14 @@ impl Tool for DragTool {
                         })
                         .await
                         {
-                            let heading = if (ix - prev_x).abs() > f64::EPSILON
-                                || (iy - prev_y).abs() > f64::EPSILON
-                            {
-                                Some((iy - prev_y).atan2(ix - prev_x))
-                            } else {
-                                None
-                            };
                             self.state
                                 .cursor_registry
                                 .update_position(&cursor_id, sx, sy);
-                            overlay_move_to_for(&cursor_id, sx, sy, heading);
+                            crate::overlay::send_command_for(
+                                cursor_id.clone(),
+                                cursor_overlay::track_pointer_command(sx, sy),
+                            );
                         }
-                        prev_x = ix;
-                        prev_y = iy;
                         if step_delay_ms > 0 {
                             tokio::time::sleep(std::time::Duration::from_millis(step_delay_ms))
                                 .await;
@@ -5017,19 +5067,13 @@ impl Tool for DragTool {
                 cua_driver_core::blocking::spawn(move || window_local_to_screen(xid, to_x, to_y))
                     .await
             {
+                crate::overlay::send_command_for(
+                    cursor_id.clone(),
+                    cursor_overlay::track_pointer_command(sx_to, sy_to),
+                );
                 self.state
                     .cursor_registry
                     .update_position(&cursor_id, sx_to, sy_to);
-                overlay_snap_to_for(
-                    &cursor_id,
-                    sx_to,
-                    sy_to,
-                    Some((to_y - from_y).atan2(to_x - from_x)),
-                );
-                crate::overlay::send_command_for(
-                    cursor_id.clone(),
-                    cursor_overlay::OverlayCommand::ClickPulse { x: sx_to, y: sy_to },
-                );
             }
         }
 

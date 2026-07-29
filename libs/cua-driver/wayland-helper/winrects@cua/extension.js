@@ -22,7 +22,8 @@ import {
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
 
-const PROTOCOL_VERSION = 4;
+const HELPER_API_VERSION = 8;
+const EXACT_TARGET_PROTOCOL_VERSION = 4;
 const FOREGROUND_TIMEOUT_MS = 30_000;
 const CURSOR_IDLE_TIMEOUT_US = 5 * 60 * 1_000_000;
 
@@ -39,6 +40,12 @@ const IFACE = `<node><interface name="org.cua.WinRects">
 <method name="CommitForeground"><arg type="s" direction="in" name="transaction"/><arg type="s" direction="out" name="json"/></method>
 <method name="MoveCursorFor"><arg type="s" direction="in" name="owner"/><arg type="s" direction="in" name="target"/><arg type="i" direction="in" name="x"/><arg type="i" direction="in" name="y"/></method>
 <method name="ClickPulseFor"><arg type="s" direction="in" name="owner"/><arg type="s" direction="in" name="target"/><arg type="i" direction="in" name="x"/><arg type="i" direction="in" name="y"/></method>
+<method name="SetCursorColor"><arg type="s" direction="in" name="fill_color"/></method>
+<method name="SetCursorState"><arg type="s" direction="in" name="action"/><arg type="s" direction="in" name="delivery"/><arg type="s" direction="in" name="target"/><arg type="b" direction="in" name="active"/></method>
+<method name="SetSessionLabel"><arg type="s" direction="in" name="label"/></method>
+<method name="SetCursorColorFor"><arg type="s" direction="in" name="owner"/><arg type="s" direction="in" name="fill_color"/></method>
+<method name="SetCursorStateFor"><arg type="s" direction="in" name="owner"/><arg type="s" direction="in" name="action"/><arg type="s" direction="in" name="delivery"/><arg type="s" direction="in" name="target"/><arg type="b" direction="in" name="active"/></method>
+<method name="SetSessionLabelFor"><arg type="s" direction="in" name="owner"/><arg type="s" direction="in" name="label"/></method>
 <method name="HideCursorFor"><arg type="s" direction="in" name="owner"/></method>
 <method name="RemoveCursor"><arg type="s" direction="in" name="owner"/></method>
 <!-- v1 compatibility methods deliberately fail closed. An old driver must not
@@ -145,6 +152,7 @@ export default class WinRectsExtension extends Extension {
             reactive: false,
             can_focus: false,
         });
+        cursor._fillColor = '';
         cursor.connect('repaint', area => {
             const cr = area.get_context();
             const P = arrowPoints();
@@ -152,14 +160,24 @@ export default class WinRectsExtension extends Extension {
             for (let i = 1; i < P.length; i++) cr.lineTo(P[i][0], P[i][1]);
             cr.closePath();
             const tail = [(P[1][0] + P[3][0]) / 2, (P[1][1] + P[3][1]) / 2];
-            try {
-                const g = new Cairo.LinearGradient(P[0][0], P[0][1], tail[0], tail[1]);
-                g.addColorStopRGBA(0.00, 219 / 255, 238 / 255, 255 / 255, 0.97);
-                g.addColorStopRGBA(0.53, 94 / 255, 192 / 255, 232 / 255, 0.97);
-                g.addColorStopRGBA(1.00, 84 / 255, 205 / 255, 160 / 255, 0.97);
-                cr.setSource(g);
-            } catch (e) {
-                cr.setSourceRGBA(94 / 255, 192 / 255, 232 / 255, 0.97);
+            if (/^#[0-9a-fA-F]{6}$/.test(cursor._fillColor)) {
+                const value = Number.parseInt(cursor._fillColor.slice(1), 16);
+                cr.setSourceRGBA(
+                    ((value >> 16) & 0xff) / 255,
+                    ((value >> 8) & 0xff) / 255,
+                    (value & 0xff) / 255,
+                    0.97
+                );
+            } else {
+                try {
+                    const g = new Cairo.LinearGradient(P[0][0], P[0][1], tail[0], tail[1]);
+                    g.addColorStopRGBA(0.00, 219 / 255, 238 / 255, 255 / 255, 0.97);
+                    g.addColorStopRGBA(0.53, 94 / 255, 192 / 255, 232 / 255, 0.97);
+                    g.addColorStopRGBA(1.00, 84 / 255, 205 / 255, 160 / 255, 0.97);
+                    cr.setSource(g);
+                } catch (_error) {
+                    cr.setSourceRGBA(94 / 255, 192 / 255, 232 / 255, 0.97);
+                }
             }
             cr.fillPreserve();
             cr.setLineWidth(1.4); cr.setSourceRGBA(1, 1, 1, 0.95); cr.stroke();
@@ -168,6 +186,19 @@ export default class WinRectsExtension extends Extension {
         cursor.set_pivot_point(TIPX / 30, TIPY / 30);
         Main.layoutManager.addTopChrome(cursor);
         return cursor;
+    }
+
+    _createSessionBadge() {
+        const badge = new St.BoxLayout({
+            style_class: 'cua-session-badge',
+            vertical: false,
+            visible: false,
+            reactive: false,
+            can_focus: false,
+            style: 'spacing: 4px; padding: 4px 7px; border-radius: 9px; background-color: rgba(18,18,20,0.90); color: white;',
+        });
+        Main.layoutManager.addTopChrome(badge);
+        return badge;
     }
 
     _targetId(window) {
@@ -297,11 +328,11 @@ export default class WinRectsExtension extends Extension {
         return '';
     }
 
-    GetVersion() { return PROTOCOL_VERSION; }
+    GetVersion() { return HELPER_API_VERSION; }
 
     GetCapabilities() {
         return JSON.stringify({
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: EXACT_TARGET_PROTOCOL_VERSION,
             epoch: this._epoch,
             capabilities: [
                 'exact-target-v2',
@@ -363,7 +394,7 @@ export default class WinRectsExtension extends Extension {
                 id: w.get_stable_sequence(),
                 target_id: this._targetId(w),
                 helper_epoch: this._epoch,
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: EXACT_TARGET_PROTOCOL_VERSION,
                 pid: w.get_pid(),
                 app_id: this._windowAppId(w),
                 title: w.get_title() ?? '',
@@ -453,7 +484,7 @@ export default class WinRectsExtension extends Extension {
             stream.close(null);
             const encoded = GLib.base64_encode(stream.steal_as_bytes().get_data());
             invocation.return_value(new GLib.Variant('(s)', [JSON.stringify({
-                protocol_version: PROTOCOL_VERSION,
+                protocol_version: EXACT_TARGET_PROTOCOL_VERSION,
                 target: targetId,
                 rect: captureRect,
                 logical_size: {width, height},
@@ -767,12 +798,19 @@ export default class WinRectsExtension extends Extension {
         if (!record) {
             record = {
                 actor: this._createCursorActor(),
+                badge: this._createSessionBadge(),
                 connectionOwner: owner.connectionOwner,
                 targetId: null,
                 requestedVisible: false,
                 lastUsedAt: GLib.get_monotonic_time(),
                 targetSignals: [],
                 targetWindow: null,
+                fillColor: '',
+                action: '',
+                delivery: '',
+                target: '',
+                active: false,
+                sessionLabel: '',
             };
             this._cursors.set(owner.key, record);
         }
@@ -802,10 +840,13 @@ export default class WinRectsExtension extends Extension {
         const target = record.targetId ? this._resolveTarget(record.targetId) : null;
         this._bindCursorTarget(record, target);
         const visible = record.requestedVisible && target && this._isTargetVisible(target);
-        if (visible)
+        if (visible) {
             record.actor.show();
-        else
+            this._updateCursorBadge(record);
+        } else {
             record.actor.hide();
+            record.badge.hide();
+        }
     }
 
     _scheduleCursorVisibilityUpdate() {
@@ -832,6 +873,12 @@ export default class WinRectsExtension extends Extension {
                 duration: 480,
                 mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
             });
+            record.badge.ease({
+                x: x + 18,
+                y: y + 18,
+                duration: 480,
+                mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
+            });
             invocation.return_value(null);
         } catch (error) {
             invocation.return_dbus_error('org.cua.WinRects.CursorRejected', String(error));
@@ -844,6 +891,7 @@ export default class WinRectsExtension extends Extension {
             record.targetId = targetId;
             record.requestedVisible = true;
             record.actor.set_position(x - TIPX, y - TIPY);
+            record.badge.set_position(x + 18, y + 18);
             this._syncCursorVisibility(record);
             record.actor.ease({
                 scale_x: 1.5,
@@ -861,6 +909,77 @@ export default class WinRectsExtension extends Extension {
         }
     }
 
+    _semanticCursorFor(owner, invocation) {
+        return this._cursorFor(this._cursorOwner(owner, invocation));
+    }
+
+    _setCursorColor(owner, fillColor, invocation) {
+        const record = this._semanticCursorFor(owner, invocation);
+        const color = String(fillColor).slice(0, 32);
+        if (!/^#[0-9a-fA-F]{6}$/.test(color))
+            throw new Error('cursor_color_invalid: expected #RRGGBB');
+        record.fillColor = color;
+        record.actor._fillColor = color;
+        record.actor.queue_repaint();
+    }
+
+    _setCursorState(owner, action, delivery, target, active, invocation) {
+        const record = this._semanticCursorFor(owner, invocation);
+        record.action = String(action).slice(0, 32);
+        record.delivery = String(delivery).slice(0, 32);
+        record.target = String(target).slice(0, 32);
+        record.active = Boolean(active);
+        this._updateCursorBadge(record);
+    }
+
+    _setSessionLabel(owner, label, invocation) {
+        const record = this._semanticCursorFor(owner, invocation);
+        record.sessionLabel = String(label).slice(0, 24);
+        this._updateCursorBadge(record);
+    }
+
+    _updateCursorBadge(record) {
+        record.badge.destroy_all_children();
+        const chips = [record.sessionLabel];
+        if (record.active)
+            chips.push(record.action, record.delivery, record.target);
+        for (const text of chips.filter(Boolean)) {
+            record.badge.add_child(new St.Label({
+                text,
+                style: 'padding: 1px 4px; border-radius: 5px; background-color: rgba(255,255,255,0.13);',
+            }));
+        }
+        if (record.actor.visible && record.badge.get_n_children() > 0)
+            record.badge.show();
+        else
+            record.badge.hide();
+    }
+
+    SetCursorColorAsync([fillColor], invocation) {
+        try { this._setCursorColor('default', fillColor, invocation); invocation.return_value(null); }
+        catch (error) { invocation.return_dbus_error('org.cua.WinRects.CursorRejected', String(error)); }
+    }
+    SetCursorStateAsync([action, delivery, target, active], invocation) {
+        try { this._setCursorState('default', action, delivery, target, active, invocation); invocation.return_value(null); }
+        catch (error) { invocation.return_dbus_error('org.cua.WinRects.CursorRejected', String(error)); }
+    }
+    SetSessionLabelAsync([label], invocation) {
+        try { this._setSessionLabel('default', label, invocation); invocation.return_value(null); }
+        catch (error) { invocation.return_dbus_error('org.cua.WinRects.CursorRejected', String(error)); }
+    }
+    SetCursorColorForAsync([owner, fillColor], invocation) {
+        try { this._setCursorColor(owner, fillColor, invocation); invocation.return_value(null); }
+        catch (error) { invocation.return_dbus_error('org.cua.WinRects.CursorRejected', String(error)); }
+    }
+    SetCursorStateForAsync([owner, action, delivery, target, active], invocation) {
+        try { this._setCursorState(owner, action, delivery, target, active, invocation); invocation.return_value(null); }
+        catch (error) { invocation.return_dbus_error('org.cua.WinRects.CursorRejected', String(error)); }
+    }
+    SetSessionLabelForAsync([owner, label], invocation) {
+        try { this._setSessionLabel(owner, label, invocation); invocation.return_value(null); }
+        catch (error) { invocation.return_dbus_error('org.cua.WinRects.CursorRejected', String(error)); }
+    }
+
     HideCursorForAsync([owner], invocation) {
         try {
             const cursorOwner = this._cursorOwner(owner, invocation);
@@ -869,6 +988,7 @@ export default class WinRectsExtension extends Extension {
                 record.lastUsedAt = GLib.get_monotonic_time();
                 record.requestedVisible = false;
                 record.actor.hide();
+                record.badge.hide();
             }
             invocation.return_value(null);
         } catch (error) {
@@ -901,6 +1021,7 @@ export default class WinRectsExtension extends Extension {
             try { object.disconnect(id); } catch (_error) {}
         }
         record.actor.destroy();
+        record.badge.destroy();
         this._cursors.delete(owner);
     }
 

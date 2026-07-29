@@ -6,6 +6,7 @@
 //! - `CubicBezier` + `PathPlanner` — Bezier path math (ported 1:1 from C#)
 //! - `OverlayCommand` — messages sent from MCP tools to the overlay thread
 
+pub mod badge_glyphs;
 pub mod bezier;
 pub mod capture_utils;
 pub mod motion;
@@ -17,11 +18,20 @@ pub mod theme_artifact;
 pub mod util;
 pub mod z_order;
 
+pub use badge_glyphs::{BadgeChip, BadgeGlyph};
 pub use bezier::CubicBezier;
 pub use motion::{MotionConfig, Spring};
 pub use path_planner::{PathPlanner, PathState, PlannedPath};
-pub use render_state::{paint_cursor, render_frame, FocusRect, RenderStateCore};
-pub use session_badge::{paint_session_badge, sanitize_session_label};
+pub use render_state::{
+    paint_cursor, render_frame, FocusRect, RenderStateCore, SESSION_BADGE_FADE_SECS,
+    SESSION_BADGE_HOLD_SECS,
+};
+pub use session_badge::{
+    paint_session_badge, sanitize_session_label, session_badge_extents, session_badge_layout,
+    BadgeExtents, BadgeLabelLayout, SessionBadgeInput, SessionBadgeLayout, BADGE_CHIP_GAP,
+    BADGE_CHIP_GROUP_GAP, BADGE_CHIP_SIZE, BADGE_CURSOR_GAP, BADGE_HEIGHT, BADGE_MAX_WIDTH,
+    MAX_SESSION_LABEL_CHARS,
+};
 pub use theme::{
     session_fill_hex, session_fill_rgba, CursorAction, CursorVisualState, DeliveryModifier,
     PlaybackKind, ReducedMotion, TargetModifier, DEFAULT_CURSOR_FILL, DEFAULT_THEME_ID,
@@ -358,4 +368,39 @@ pub enum OverlayCommand {
     /// `[x, y, width, height]` in screen coordinates (top-left origin).
     /// `None` clears the highlight.
     ShowFocusRect(Option<[f64; 4]>),
+}
+
+/// Build the shared overlay command for one native pointer position.
+///
+/// Native drag implementations report the actual event coordinate while the
+/// cursor artwork is centred 16 points down-right so its tip lands on that
+/// coordinate. Keeping this transform here prevents platform-specific drag
+/// loops from drifting apart.
+pub fn track_pointer_command(x: f64, y: f64) -> OverlayCommand {
+    const CLICK_OFFSET: f64 = 16.0;
+    let heading = std::f64::consts::FRAC_PI_4;
+    OverlayCommand::SnapTo {
+        x: x + heading.cos() * CLICK_OFFSET,
+        y: y + heading.sin() * CLICK_OFFSET,
+        heading_radians: Some(heading),
+    }
+}
+
+#[cfg(test)]
+mod pointer_tracking_tests {
+    use super::*;
+
+    #[test]
+    fn tracked_artwork_keeps_its_tip_on_the_native_pointer() {
+        let OverlayCommand::SnapTo {
+            x,
+            y,
+            heading_radians: Some(heading),
+        } = track_pointer_command(120.0, 80.0)
+        else {
+            panic!("pointer tracking must produce an anchored snap");
+        };
+        assert!((x - (120.0 + heading.cos() * 16.0)).abs() < f64::EPSILON);
+        assert!((y - (80.0 + heading.sin() * 16.0)).abs() < f64::EPSILON);
+    }
 }
