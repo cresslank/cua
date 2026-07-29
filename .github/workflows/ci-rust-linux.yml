@@ -62,11 +62,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev \
+            at-spi2-core clang dbus-daemon pkg-config libdbus-1-dev \
+            libpipewire-0.3-dev libspa-0.2-dev \
             libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev
       - name: Run Linux Rust tests
         working-directory: libs/cua-driver/rust
-        run: cargo test -p cua-driver -p cua-driver-contract -p cua-driver-core -p cua-driver-testkit -p cursor-overlay -p cursor-theme-cli -p platform-linux --all-targets --locked
+        run: cargo test -p cua-driver -p cua-driver-contract -p cua-driver-core -p cua-driver-testkit -p cursor-overlay -p cursor-theme-cli -p platform-linux --all-targets --locked -- --skip direct_mcp_runtime_matches_the_released_protocol_contract --skip released_mcp_initialize_tools_list_and_error_fields_remain_compatible
+      - name: Run Linux MCP compatibility with session accessibility
+        working-directory: libs/cua-driver/rust
+        # The hardened Linux runtime requires an attested accessibility bus at
+        # startup. Exercise that boundary instead of bypassing it for CI.
+        run: dbus-run-session -- cargo test -p cua-driver --test compatibility_contract_test --locked
       - name: Compile portable GNOME/KDE portal input
         working-directory: libs/cua-driver/rust
         run: cargo check -p cua-driver --features portal-input --locked

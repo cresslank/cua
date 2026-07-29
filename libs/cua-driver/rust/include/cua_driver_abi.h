@@ -32,6 +32,20 @@
 #define PRIVATE_WORKER_PROTOCOL_VERSION 1
 
 /**
+ * Reserved identity used only when startup fails before initialization can
+ * produce a correlated response.
+ */
+#define PRIVATE_WORKER_STARTUP_ERROR_REQUEST_ID 0
+
+/**
+ * Correlated identity for the private-worker initialization exchange. Normal
+ * host request IDs start at two after initialization succeeds.
+ */
+#define PRIVATE_WORKER_INITIALIZATION_REQUEST_ID 1
+
+#define PRIVATE_WORKER_MAX_MESSAGE_BYTES ((64 * 1024) * 1024)
+
+/**
  * Stable status codes returned across the C ABI.
  */
 enum CuaDriverStatus

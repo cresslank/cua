@@ -728,6 +728,7 @@ impl Drop for LinuxReapPermit {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn linux_reap_registry() -> &'static LinuxReapRegistry {
     LINUX_REAP_REGISTRY.get_or_init(|| LinuxReapRegistry {
         pending: Mutex::new(Vec::with_capacity(LINUX_REAP_REGISTRY_CAPACITY)),

@@ -89,7 +89,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev \
+            at-spi2-core clang dbus-daemon pkg-config libdbus-1-dev \
+            libpipewire-0.3-dev libspa-0.2-dev \
             libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev
       - name: Prove portable contracts match the live registry
         if: runner.os != 'Windows' || steps.windows-session.outputs.session_id != '0'
@@ -97,9 +98,14 @@ jobs:
         run: cargo test --locked -p cua-driver --test schema_consistency_test portable_desktop_contracts_are_accepted_by_active_backend
 
       - name: Verify released CLI and MCP compatibility
-        if: runner.os != 'Windows' || steps.windows-session.outputs.session_id != '0'
+        if: runner.os != 'Linux' && (runner.os != 'Windows' || steps.windows-session.outputs.session_id != '0')
         working-directory: libs/cua-driver/rust
         run: cargo test --locked -p cua-driver --test compatibility_contract_test
+
+      - name: Verify released CLI and MCP compatibility with session accessibility
+        if: runner.os == 'Linux'
+        working-directory: libs/cua-driver/rust
+        run: dbus-run-session -- cargo test --locked -p cua-driver --test compatibility_contract_test
 
       - name: Compile the UniFFI SDK library
         working-directory: libs/cua-driver/rust
@@ -113,9 +119,14 @@ jobs:
         run: cargo run --manifest-path libs/cua-driver/compat-fixtures/apps/rust/Cargo.toml
 
       - name: Prove the embedded host serves SDK and MCP clients
-        if: runner.os != 'Windows' || steps.windows-session.outputs.session_id != '0'
+        if: runner.os != 'Linux' && (runner.os != 'Windows' || steps.windows-session.outputs.session_id != '0')
         working-directory: libs/cua-driver/rust
         run: cargo test --locked -p cua-driver --test embedded_host_sdk_mcp_test
+
+      - name: Prove the embedded host with session accessibility
+        if: runner.os == 'Linux'
+        working-directory: libs/cua-driver/rust
+        run: dbus-run-session -- cargo test --locked -p cua-driver --test embedded_host_sdk_mcp_test
 
       - name: Prove Windows Session 0 refusal and desktop-free metadata
         if: runner.os == 'Windows' && steps.windows-session.outputs.session_id == '0'
@@ -147,7 +158,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev \
+            at-spi2-core clang dbus-daemon pkg-config libdbus-1-dev \
+            libpipewire-0.3-dev libspa-0.2-dev \
             libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev
       - uses: actions/setup-python@v5
         with:
@@ -182,7 +194,7 @@ jobs:
 
       - name: Test UniFFI Rust implementation
         working-directory: libs/cua-driver/rust
-        run: cargo test --locked -p cua-driver-sdk
+        run: dbus-run-session -- cargo test --locked -p cua-driver-sdk
 
       - name: Test live contract parity
         working-directory: libs/cua-driver/rust
@@ -211,7 +223,7 @@ jobs:
             -L target/release -lcua_driver_sdk \
             -Wl,-rpath,'$ORIGIN/release' \
             -o target/cua-driver-abi-smoke
-          LD_LIBRARY_PATH=target/release target/cua-driver-abi-smoke
+          dbus-run-session -- env LD_LIBRARY_PATH=target/release target/cua-driver-abi-smoke
           nm -D --defined-only target/release/libcua_driver_sdk.so > /tmp/cua-driver-abi-symbols.txt
           for symbol in \
             cua_driver_abi_version_v1 \
@@ -232,14 +244,14 @@ jobs:
       - name: Test Python UniFFI loader
         working-directory: libs/cua-driver/python
         run: |
-          CUA_DRIVER_REQUIRE_UNIFFI=1 PYTHONPATH=src \
+          dbus-run-session -- env CUA_DRIVER_REQUIRE_UNIFFI=1 PYTHONPATH=src \
             python -m unittest tests/test_uniffi_loader.py -v
           CUA_DRIVER_REQUIRE_UNIFFI=1 PYTHONPATH=src python -c \
             "import cua_driver; missing = [name for name in cua_driver.__all__ if not hasattr(cua_driver, name)]; assert not missing, f'unresolved package exports: {missing}'"
 
       - name: Test TypeScript SDK
         working-directory: libs/cua-driver/typescript
-        run: npm run typecheck && CUA_DRIVER_REQUIRE_UNIFFI=1 npm test && npm audit --audit-level=high
+        run: npm run typecheck && dbus-run-session -- env CUA_DRIVER_REQUIRE_UNIFFI=1 npm test && npm audit --audit-level=high
 
       - name: Verify Python native package contents
         working-directory: libs/cua-driver
