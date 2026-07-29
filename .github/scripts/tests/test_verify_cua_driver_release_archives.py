@@ -348,6 +348,21 @@ def test_owner_inaccessible_required_tar_directory_fails_closed(
         _verify_tar(path, contract)
 
 
+def test_corrupt_gzip_trailer_fails_before_tar_contract_acceptance(
+    tmp_path: Path,
+) -> None:
+    contract = ArchiveContract("probe.tar.gz", ("safe/member",))
+    path = tmp_path / contract.filename
+    _write_tar(path, contract)
+    content = bytearray(path.read_bytes())
+    assert len(content) > 8
+    content[-8] ^= 0x01
+    path.write_bytes(content)
+
+    with pytest.raises(ContractError, match="failed gzip integrity verification"):
+        _verify_tar(path, contract)
+
+
 def test_other_execute_bit_does_not_satisfy_tar_executable_contract(
     tmp_path: Path,
 ) -> None:

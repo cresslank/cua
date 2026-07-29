@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import gzip
 from pathlib import Path
 import stat
 import tarfile
@@ -14,6 +15,9 @@ import zipfile
 
 class ContractError(RuntimeError):
     """Raised when a release archive is missing or malformed."""
+
+
+_MAX_UNCOMPRESSED_TAR_BYTES = 1 << 30
 
 
 @dataclass(frozen=True)
@@ -323,6 +327,23 @@ def _verify_helper_closure(
 
 
 def _verify_tar(path: Path, contract: ArchiveContract) -> None:
+    total = 0
+    try:
+        with gzip.open(path, "rb") as compressed:
+            while True:
+                chunk = compressed.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > _MAX_UNCOMPRESSED_TAR_BYTES:
+                    raise ContractError(
+                        f"{path.name} exceeds the bounded uncompressed TAR size"
+                    )
+    except ContractError:
+        raise
+    except (gzip.BadGzipFile, EOFError, OSError) as error:
+        raise ContractError(f"{path.name} failed gzip integrity verification") from error
+
     with tarfile.open(path, "r:gz") as archive:
         members: dict[str, tarfile.TarInfo] = {}
         directories: dict[str, tarfile.TarInfo] = {}

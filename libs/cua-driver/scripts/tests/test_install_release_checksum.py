@@ -21,10 +21,15 @@ def test_release_checksum_mismatch_fails_before_extraction(tmp_path: Path) -> No
         r'''
 out=""
 url=""
+write_status=0
 while [ "$#" -gt 0 ]; do
     case "$1" in
         -o)
             out="$2"
+            shift 2
+            ;;
+        -w)
+            write_status=1
             shift 2
             ;;
         -*)
@@ -46,6 +51,9 @@ case "$url" in
         printf 'tampered release payload\n' > "$out"
         ;;
 esac
+if [ "$write_status" -eq 1 ]; then
+    printf '200'
+fi
 ''',
     )
     _write_executable(
