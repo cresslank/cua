@@ -550,6 +550,12 @@ jobs:
           # that defined this workflow run.
           ref: ${{ github.workflow_sha }}
 
+      - name: Check out exact candidate source contract
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.publish && format('refs/tags/cua-driver-rs-v{0}', inputs.version) || github.ref }}
+          path: candidate-source
+
       - name: Determine version
         id: version
         run: |
@@ -569,7 +575,8 @@ jobs:
         run: |
           python3 .github/scripts/verify_cua_driver_release_archives.py \
             --artifacts artifacts \
-            --version "${{ steps.version.outputs.version }}"
+            --version "${{ steps.version.outputs.version }}" \
+            --wayland-helper-source candidate-source/libs/cua-driver/wayland-helper
 
   # ── Release ──────────────────────────────────────────────────────────────────
   # Tag pushes build immutable candidate artifacts only. Publishing is an

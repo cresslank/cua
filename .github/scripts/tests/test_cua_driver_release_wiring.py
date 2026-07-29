@@ -384,7 +384,12 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
             "github.event_name == 'workflow_dispatch' && inputs.publish && "
             "format('refs/tags/cua-driver-rs-v{0}', inputs.version) || github.ref"
         )
-        self.assertEqual(workflow.count(immutable_ref), 4)
+        self.assertEqual(workflow.count(immutable_ref), 5)
+        self.assertIn("path: candidate-source", workflow)
+        self.assertIn(
+            "--wayland-helper-source candidate-source/libs/cua-driver/wayland-helper",
+            workflow,
+        )
         self.assertIn(
             "name: Ensure Rust target is installed\n"
             "        working-directory: libs/cua-driver/rust",

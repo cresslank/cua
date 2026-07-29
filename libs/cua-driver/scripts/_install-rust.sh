@@ -841,9 +841,7 @@ else
 
         INSTALLED_WAYLAND_HELPER="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/winrects@cua"
         if [[ -d "$INSTALLED_WAYLAND_HELPER" ]]; then
-            cp "$SRC_WAYLAND_HELPER/winrects@cua/metadata.json" \
-                "$SRC_WAYLAND_HELPER/winrects@cua/extension.js" \
-                "$INSTALLED_WAYLAND_HELPER/"
+            /bin/bash "$SRC_WAYLAND_HELPER/install.sh"
             log "updated installed GNOME helper; reload the GNOME session to activate it"
         fi
     fi
