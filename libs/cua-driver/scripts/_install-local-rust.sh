@@ -257,13 +257,6 @@ fi
 
 OS="$("$UNAME_BIN" -s)"
 ARCH="$("$UNAME_BIN" -m)"
-if [ "${CUA_DRIVER_INSTALL_TRANSACTION_LOCK_TESTING:-}" = 1 ]; then
-    OS="${CUA_DRIVER_TEST_OS:-$OS}"
-    ARCH="${CUA_DRIVER_TEST_ARCH:-$ARCH}"
-elif [ -n "${CUA_DRIVER_TEST_OS:-}${CUA_DRIVER_TEST_ARCH:-}" ]; then
-    echo "error: test-only platform overrides require transaction-lock testing mode" >&2
-    exit 2
-fi
 case "$OS" in
     Darwin)
         echo "${RED}Error: hardened local promotion is temporarily unavailable on macOS until signed app publication is fully content-addressed and crash-atomic.${NORMAL}" >&2
@@ -859,6 +852,50 @@ print(digest.hexdigest())
 PY
 }
 
+fsync_directory() {
+    "$PYTHON_BIN" - "$1" <<'PY'
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+}
+
+fsync_tree_and_parent() {
+    "$PYTHON_BIN" - "$1" <<'PY'
+import os
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+if not root.is_dir() or root.is_symlink():
+    raise SystemExit(f"durability root is not a real directory: {root}")
+files = [path for path in root.rglob("*") if path.is_file() and not path.is_symlink()]
+directories = [root, *(path for path in root.rglob("*") if path.is_dir() and not path.is_symlink())]
+for path in files:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+for path in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+parent_fd = os.open(root.parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    os.fsync(parent_fd)
+finally:
+    os.close(parent_fd)
+PY
+}
+
 # Skill modes are part of provenance. Freeze the staged tree before hashing so
 # the digest describes the exact immutable modes later reused from the store.
 if [ -d "$VERSIONED_DIR/Skills" ]; then
@@ -981,7 +1018,18 @@ PY
     rm -rf "$VERSIONED_DIR"
 else
     chmod -R a-w "$VERSIONED_DIR"
+    fsync_tree_and_parent "$VERSIONED_DIR"
     mv "$VERSIONED_DIR" "$FINAL_VERSIONED_DIR"
+    # Persist the release-store directory entry before a selector can name it.
+    "$PYTHON_BIN" - "$RELEASES_DIR" <<'PY'
+import os
+import sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
 fi
 VERSIONED_DIR="$FINAL_VERSIONED_DIR"
 STAGING_VERSIONED_DIR=""
@@ -1149,6 +1197,7 @@ if [ "$OS" = "Linux" ]; then
 else
     mv -fh "$BIN_LINK_TMP" "$BIN_LINK"
 fi
+fsync_directory "$BIN_DIR"
 BIN_LINK_TMP=""
 echo "${GREEN}$BIN_DIR/cua-driver-local -> $BIN_TARGET${NORMAL}"
 echo ""
@@ -1171,6 +1220,7 @@ else
     # BSD mv follows symlink-to-directory destinations unless -h is supplied.
     mv -fh "$CURRENT_LINK_TMP" "$CURRENT_LINK"
 fi
+fsync_directory "$HOME_DIR/packages"
 CURRENT_LINK_TMP=""
 if [ "$APP_TRANSACTION_ACTIVE" = true ]; then
     APP_TRANSACTION_ACTIVE=false

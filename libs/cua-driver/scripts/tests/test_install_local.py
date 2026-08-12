@@ -33,6 +33,31 @@ def test_installer_keeps_content_addressed_atomic_promotion_without_global_kills
     assert "killall" not in installer
 
 
+def _copy_installer_fixture(
+    scripts_dir: Path, lock_path: Path, host_os: str | None = None
+) -> None:
+    installer = scripts_dir / INSTALL_LOCAL.name
+    lock_helper = scripts_dir / TRANSACTION_LOCK.name
+    shutil.copy2(INSTALL_LOCAL, installer)
+    shutil.copy2(TRANSACTION_LOCK, lock_helper)
+    shutil.copy2(LOCAL_SIGNING, scripts_dir / LOCAL_SIGNING.name)
+    shutil.copy2(DISPATCHER, scripts_dir / DISPATCHER.name)
+
+    lock_text = lock_helper.read_text(encoding="utf-8")
+    old_lock = 'DEFAULT_LOCK = f"/tmp/cua-driver-local-install-transaction-{os.geteuid()}.lock"'
+    lock_text = lock_text.replace(old_lock, f"DEFAULT_LOCK = {str(lock_path)!r}")
+    assert old_lock not in lock_text
+    lock_helper.write_text(lock_text, encoding="utf-8")
+
+    if host_os is not None:
+        installer_text = installer.read_text(encoding="utf-8")
+        old_platform = 'OS="$("$UNAME_BIN" -s)"\nARCH="$("$UNAME_BIN" -m)"'
+        new_platform = f"OS={host_os!r}\nARCH='x86_64'"
+        installer_text = installer_text.replace(old_platform, new_platform)
+        assert old_platform not in installer_text
+        installer.write_text(installer_text, encoding="utf-8")
+
+
 def _install_fake_rust_toolchain(fake_bin: Path, tmp_path: Path) -> None:
     toolchain_bin = tmp_path / "fake-toolchain/bin"
     toolchain_bin.mkdir(parents=True, exist_ok=True)
@@ -66,10 +91,7 @@ def test_installer_stages_binary_from_custom_cargo_target(
     rust_dir = fixture_root / "rust"
     scripts_dir.mkdir(parents=True)
     rust_dir.mkdir()
-    shutil.copy2(INSTALL_LOCAL, scripts_dir / INSTALL_LOCAL.name)
-    shutil.copy2(TRANSACTION_LOCK, scripts_dir / TRANSACTION_LOCK.name)
-    shutil.copy2(LOCAL_SIGNING, scripts_dir / LOCAL_SIGNING.name)
-    shutil.copy2(DISPATCHER, scripts_dir / DISPATCHER.name)
+    _copy_installer_fixture(scripts_dir, tmp_path / "install-transaction.lock")
 
     skill_file = rust_dir / "Skills/cua-driver/SKILL.md"
     skill_file.parent.mkdir(parents=True)
@@ -255,6 +277,7 @@ esac
 """,
     )
     _write_executable(fake_bin / "systemctl", "exit 0")
+    _write_executable(fake_bin / "pkill", "exit 0")
     sfw_body = "exit 0"
     if mutate_source_during_fetch:
         sfw_body = (
@@ -279,8 +302,6 @@ esac
             "CUA_DRIVER_REQUIRE_CLEAN_SOURCE": "1",
             "CUA_DRIVER_LOCAL_HOME": str(local_home),
             "CUA_DRIVER_LOCAL_INSTALL_DIR": str(tmp_path / "env-install-bin"),
-            "CUA_DRIVER_INSTALL_TRANSACTION_LOCK_TESTING": "1",
-            "CUA_DRIVER_INSTALL_TRANSACTION_LOCK_TEST_PATH": str(transaction_lock),
             "RUSTFLAGS": "--cfg cua_audit_injected",
             "CARGO_ENCODED_RUSTFLAGS": "--cfg\x1fcua_encoded_audit_injected",
             "RUSTC_WRAPPER": "/host/must-not-run-rustc-wrapper",
@@ -291,8 +312,8 @@ esac
         }
     )
 
-    # Cover both accepted --bin-dir spellings across this existing matrix and
-    # prove command-line precedence without replacing the hardened fixture.
+    # Cover both accepted --bin-dir spellings and prove CLI precedence over
+    # CUA_DRIVER_LOCAL_INSTALL_DIR without introducing a production test seam.
     bin_dir_args = (
         ["--bin-dir", str(install_bin)]
         if relative_target
@@ -517,15 +538,39 @@ def test_stage_only_rejects_autostart_combination() -> None:
     assert "--stage-only cannot be combined with --autostart" in text
 
 
+def test_publication_is_durable_and_has_no_environment_selected_lock_domain() -> None:
+    text = INSTALL_LOCAL.read_text(encoding="utf-8")
+    lock_text = TRANSACTION_LOCK.read_text(encoding="utf-8")
+
+    immutable_flush = text.index('fsync_tree_and_parent "$VERSIONED_DIR"')
+    release_publish = text.index('mv "$VERSIONED_DIR" "$FINAL_VERSIONED_DIR"')
+    release_parent_flush = text.index('fd = os.open(sys.argv[1]', release_publish)
+    visible_publish = text.index('mv -Tf "$BIN_LINK_TMP" "$BIN_LINK"')
+    visible_parent_flush = text.index('fsync_directory "$BIN_DIR"', visible_publish)
+    current_publish = text.index('mv -Tf "$CURRENT_LINK_TMP" "$CURRENT_LINK"')
+    current_parent_flush = text.index(
+        'fsync_directory "$HOME_DIR/packages"', current_publish
+    )
+
+    assert immutable_flush < release_publish < release_parent_flush < visible_publish
+    assert visible_publish < visible_parent_flush < current_publish < current_parent_flush
+    for name in (
+        "CUA_DRIVER_INSTALL_TRANSACTION_LOCK_TESTING",
+        "CUA_DRIVER_INSTALL_TRANSACTION_LOCK_TEST_PATH",
+        "CUA_DRIVER_TEST_OS",
+        "CUA_DRIVER_TEST_ARCH",
+    ):
+        assert name not in text
+        assert name not in lock_text
+
+
 def test_installer_refuses_dirty_source_before_build(tmp_path: Path) -> None:
     fixture_root = tmp_path / "repo"
     scripts_dir = fixture_root / "libs/cua-driver/scripts"
     rust_dir = fixture_root / "libs/cua-driver/rust"
     scripts_dir.mkdir(parents=True)
     rust_dir.mkdir()
-    shutil.copy2(INSTALL_LOCAL, scripts_dir / INSTALL_LOCAL.name)
-    shutil.copy2(TRANSACTION_LOCK, scripts_dir / TRANSACTION_LOCK.name)
-    shutil.copy2(LOCAL_SIGNING, scripts_dir / LOCAL_SIGNING.name)
+    _copy_installer_fixture(scripts_dir, tmp_path / "install-transaction.lock")
     (rust_dir / "Cargo.toml").write_text("[workspace]\nmembers = []\n")
 
     fake_bin = tmp_path / "fake-bin"
@@ -598,9 +643,9 @@ def test_clean_promotion_refuses_source_drift_during_build(
     rust_dir = fixture_root / "libs/cua-driver/rust"
     scripts_dir.mkdir(parents=True)
     rust_dir.mkdir()
-    shutil.copy2(INSTALL_LOCAL, scripts_dir / INSTALL_LOCAL.name)
-    shutil.copy2(TRANSACTION_LOCK, scripts_dir / TRANSACTION_LOCK.name)
-    shutil.copy2(LOCAL_SIGNING, scripts_dir / LOCAL_SIGNING.name)
+    _copy_installer_fixture(
+        scripts_dir, tmp_path / "install-transaction.lock", host_os=host_os
+    )
     cargo_toml = rust_dir / "Cargo.toml"
     cargo_toml.write_text("[workspace]\nmembers = []\n")
     (fixture_root / ".gitignore").write_text("target/\n")
@@ -663,12 +708,6 @@ esac
             "CUA_DRIVER_REQUIRE_CLEAN_SOURCE": "1",
             "CUA_DRIVER_LOCAL_HOME": str(tmp_path / "local-home"),
             "CUA_DRIVER_LOCAL_INSTALL_DIR": str(tmp_path / "install-bin"),
-            "CUA_DRIVER_INSTALL_TRANSACTION_LOCK_TESTING": "1",
-            "CUA_DRIVER_INSTALL_TRANSACTION_LOCK_TEST_PATH": str(
-                tmp_path / "install-transaction.lock"
-            ),
-            "CUA_DRIVER_TEST_OS": host_os,
-            "CUA_DRIVER_TEST_ARCH": "x86_64",
         }
     )
     result = subprocess.run(
@@ -697,8 +736,7 @@ def test_sha256_git_oid_is_refused(tmp_path: Path) -> None:
     scripts_dir = fixture_root / "scripts"
     (fixture_root / "rust").mkdir(parents=True)
     scripts_dir.mkdir()
-    shutil.copy2(INSTALL_LOCAL, scripts_dir / INSTALL_LOCAL.name)
-    shutil.copy2(TRANSACTION_LOCK, scripts_dir / TRANSACTION_LOCK.name)
+    _copy_installer_fixture(scripts_dir, tmp_path / "install-transaction.lock")
 
     non_git_env = os.environ.copy()
     non_git_env.pop("SUDO_USER", None)

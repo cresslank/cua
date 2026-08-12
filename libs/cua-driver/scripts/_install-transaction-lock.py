@@ -17,19 +17,6 @@ INO_ENV = "CUA_DRIVER_INSTALL_TRANSACTION_LOCK_INO"
 PROTOCOL_ENV = "CUA_DRIVER_INSTALL_TRANSACTION_LOCK_PROTOCOL"
 
 
-def lock_path() -> str:
-    # Production callers cannot split locking by overriding a package/home root.
-    # The fixed per-UID host path serializes every supported user-scoped Linux
-    # selector. Hardened macOS publication is refused before any global mutation.
-    if os.environ.get("CUA_DRIVER_INSTALL_TRANSACTION_LOCK_TESTING") == "1":
-        candidate = os.environ.get("CUA_DRIVER_INSTALL_TRANSACTION_LOCK_TEST_PATH")
-        if candidate:
-            if not os.path.isabs(candidate):
-                raise RuntimeError("test transaction lock path must be absolute")
-            return candidate
-    return DEFAULT_LOCK
-
-
 def checked_open(path: str) -> int:
     flags = os.O_RDWR | os.O_CREAT | os.O_NONBLOCK
     flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -124,7 +111,10 @@ def acquire_and_exec(path: str, command: list[str]) -> None:
 
 def main() -> int:
     try:
-        path = lock_path()
+        # One fixed per-UID host path serializes every supported local promotion.
+        # Tests that need isolation rewrite this literal in a disposable copy;
+        # shipped execution has no environment-selected lock domain.
+        path = DEFAULT_LOCK
         Path(path).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         if len(sys.argv) == 2 and sys.argv[1] == "--validate":
             validate_inherited(path)
