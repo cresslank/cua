@@ -11,6 +11,9 @@
 # Rust local installer (dev-only helper for libs/cua-driver/rust):
 #   --release    build the release configuration (default: debug)
 #                Linux builds include portal-input, matching release artifacts.
+#   --stage-only build and commit the immutable Linux release object, print its
+#                absolute path on stdout, and do not publish selectors or touch
+#                service integration. Ordinary build output is sent to stderr.
 #   --autostart  register an auto-start daemon (macOS: LaunchAgent;
 #                Linux: systemd user unit). Default off; the post-install
 #                message prints the registration command for the platform.
@@ -158,6 +161,7 @@ fi
 
 BUILD_CONFIG="debug"
 INSTALL_AUTOSTART=false
+STAGE_ONLY=false
 # Empty means "not passed" — the environment variable or default applies.
 BIN_DIR_OVERRIDE=""
 case "${CUA_DRIVER_REQUIRE_STABLE_SIGNING:-0}" in
@@ -177,6 +181,9 @@ while [ "$#" -gt 0 ]; do
             ;;
         --autostart)
             INSTALL_AUTOSTART=true
+            ;;
+        --stage-only)
+            STAGE_ONLY=true
             ;;
         --require-stable-signing)
             CUA_DRIVER_REQUIRE_STABLE_SIGNING=1
@@ -214,6 +221,8 @@ while [ "$#" -gt 0 ]; do
             echo "                Install the visible cua-driver-local symlink to <path>"
             echo "                instead of ~/.local/bin. Must be an absolute path; takes"
             echo "                precedence over CUA_DRIVER_LOCAL_INSTALL_DIR."
+            echo "  --stage-only  Commit only the immutable Linux release object and print"
+            echo "                its absolute path; do not publish selectors or services."
             echo "  --require-stable-signing"
             echo "                On macOS, stop before replacing the installed app unless"
             echo "                a certificate-backed identity is available. Recommended"
@@ -234,6 +243,17 @@ while [ "$#" -gt 0 ]; do
     esac
     shift
 done
+
+if [ "$STAGE_ONLY" = true ]; then
+    if [ "$INSTALL_AUTOSTART" = true ]; then
+        echo "${RED}Error: --stage-only cannot be combined with --autostart.${NORMAL}" >&2
+        exit 2
+    fi
+    # Reserve stdout as the machine-readable result channel. All existing
+    # installer/build output remains visible on stderr.
+    exec 3>&1
+    exec 1>&2
+fi
 
 OS="$("$UNAME_BIN" -s)"
 ARCH="$("$UNAME_BIN" -m)"
@@ -967,6 +987,18 @@ VERSIONED_DIR="$FINAL_VERSIONED_DIR"
 STAGING_VERSIONED_DIR=""
 STAGED_BINARY="$VERSIONED_DIR/cua-driver-local"
 assert_clean_source
+
+if [ "$STAGE_ONLY" = true ]; then
+    case "$VERSIONED_DIR" in
+        /*) ;;
+        *)
+            echo "${RED}Error: staged immutable release path is not absolute.${NORMAL}" >&2
+            exit 1
+            ;;
+    esac
+    printf '%s\n' "$VERSIONED_DIR" >&3
+    exit 0
+fi
 
 # --- macOS: stable local code-signing identity (so TCC grants survive rebuilds) ---
 #

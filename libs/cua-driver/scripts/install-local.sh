@@ -7,6 +7,8 @@
 #
 # Flags (forwarded verbatim to the Rust helper):
 #   --release              build the release configuration (default: debug)
+#   --stage-only           commit only the immutable Linux release object and
+#                          print its absolute path; publish no selectors/services
 #   --autostart            register an auto-start daemon (macOS: LaunchAgent;
 #                          Linux: systemd user unit). Default off.
 #   --require-stable-signing
@@ -23,7 +25,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 if [[ "${1:-}" == "--print-hardened-contract" ]]; then
-    printf '%s\n' 'cua-driver-local-installer-v3:clean-exact-git,bwrap-ro-source,bwrap-ro-dependencies,offline-build,provenance-v3,transaction-lock,no-global-worker-kill,linux-only'
+    printf '%s\n' 'cua-driver-local-installer-v4:clean-exact-git,bwrap-scoped-host-provenance,offline-build,provenance-v4,transaction-lock,stage-only,publish-last,no-global-worker-kill,linux-only'
     exit 0
 fi
 

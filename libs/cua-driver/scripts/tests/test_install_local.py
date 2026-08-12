@@ -498,6 +498,25 @@ esac
     assert "not a real directory" in malformed.stderr
 
 
+def test_stage_only_exits_before_selector_publication() -> None:
+    text = INSTALL_LOCAL.read_text(encoding="utf-8")
+    stage_guard = text.index(
+        'if [ "$STAGE_ONLY" = true ]; then',
+        text.index('STAGED_BINARY="$VERSIONED_DIR/cua-driver-local"'),
+    )
+    visible_publish = text.index('BIN_LINK_TMP="${BIN_LINK}.new.$$"')
+    current_publish = text.index('CURRENT_LINK_TMP="${CURRENT_LINK}.new.$$"')
+
+    assert stage_guard < visible_publish < current_publish
+    assert "printf '%s\\n' \"$VERSIONED_DIR\" >&3" in text
+    assert 'exec 3>&1\n    exec 1>&2' in text
+
+
+def test_stage_only_rejects_autostart_combination() -> None:
+    text = INSTALL_LOCAL.read_text(encoding="utf-8")
+    assert "--stage-only cannot be combined with --autostart" in text
+
+
 def test_installer_refuses_dirty_source_before_build(tmp_path: Path) -> None:
     fixture_root = tmp_path / "repo"
     scripts_dir = fixture_root / "libs/cua-driver/scripts"
