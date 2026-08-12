@@ -25,6 +25,7 @@ mod doctor;
 mod mcp_http;
 mod private_worker;
 mod proxy;
+mod release_channel;
 mod responsibility;
 mod sdk_adapter;
 mod serve;
@@ -48,8 +49,8 @@ fn configure_startup_permission_mode(
     permission_mode: Option<&str>,
     dangerously_bypass_approvals: bool,
     allow_legacy_existing_profile_approval: bool,
-    session_policy: Option<&str>,
-    approve_session_policy: bool,
+    capability_manifest: Option<&str>,
+    approve_capability_manifest: bool,
     grants: &[String],
 ) -> anyhow::Result<()> {
     if let Some(mode) = permission_mode {
@@ -75,15 +76,15 @@ fn configure_startup_permission_mode(
             "1",
         );
     }
-    if let Some(path) = session_policy {
+    if let Some(path) = capability_manifest {
         std::env::set_var(
-            cua_driver_core::session_manifest::SESSION_POLICY_FILE_ENV,
+            cua_driver_core::session_manifest::CAPABILITY_MANIFEST_FILE_ENV,
             path,
         );
     }
-    if approve_session_policy {
+    if approve_capability_manifest {
         std::env::set_var(
-            cua_driver_core::session_manifest::SESSION_POLICY_APPROVED_ENV,
+            cua_driver_core::session_manifest::CAPABILITY_MANIFEST_APPROVED_ENV,
             "1",
         );
     }
@@ -540,8 +541,8 @@ fn main() {
             permission_mode,
             dangerously_bypass_approvals,
             allow_legacy_existing_profile_approval,
-            session_policy,
-            approve_session_policy,
+            capability_manifest,
+            approve_capability_manifest,
             no_permissions_gate,
             claude_code_compat,
             grants,
@@ -550,8 +551,8 @@ fn main() {
                 permission_mode.as_deref(),
                 dangerously_bypass_approvals,
                 allow_legacy_existing_profile_approval,
-                session_policy.as_deref(),
-                approve_session_policy,
+                capability_manifest.as_deref(),
+                approve_capability_manifest,
                 &grants,
             ) {
                 eprintln!("cua-driver: authorization startup error: {error}");
@@ -732,6 +733,10 @@ fn main() {
             let pid_path = serve::default_pid_file_path();
             serve::run_status_cmd(&sp, &pid_path);
         }
+        cli::Command::Sessions { json, socket } => {
+            let sp = socket.unwrap_or_else(serve::default_socket_path);
+            serve::run_sessions_list_cmd(&sp, json);
+        }
         cli::Command::Recording {
             subcommand,
             args,
@@ -748,6 +753,13 @@ fn main() {
         }
         cli::Command::CheckUpdate { json, no_cache } => {
             cli::run_check_update_cmd(json, no_cache);
+        }
+        cli::Command::Channel {
+            subcommand,
+            value,
+            json,
+        } => {
+            cli::run_channel_cmd(&subcommand, value.as_deref(), json);
         }
         cli::Command::Doctor { json } => {
             // Long-running interactive entry point — kick off the
@@ -921,8 +933,8 @@ fn main() -> anyhow::Result<()> {
             permission_mode,
             dangerously_bypass_approvals,
             allow_legacy_existing_profile_approval,
-            session_policy,
-            approve_session_policy,
+            capability_manifest,
+            approve_capability_manifest,
             no_permissions_gate,
             claude_code_compat,
             grants,
@@ -931,8 +943,8 @@ fn main() -> anyhow::Result<()> {
                 permission_mode.as_deref(),
                 dangerously_bypass_approvals,
                 allow_legacy_existing_profile_approval,
-                session_policy.as_deref(),
-                approve_session_policy,
+                capability_manifest.as_deref(),
+                approve_capability_manifest,
                 &grants,
             )?;
             responsibility::reexec_disclaimed_if_needed();
@@ -986,6 +998,11 @@ fn main() -> anyhow::Result<()> {
             serve::run_status_cmd(&sp, &pid_path);
             return Ok(());
         }
+        cli::Command::Sessions { json, socket } => {
+            let sp = socket.unwrap_or_else(serve::default_socket_path);
+            serve::run_sessions_list_cmd(&sp, json);
+            return Ok(());
+        }
         cli::Command::Recording {
             subcommand,
             args,
@@ -1005,6 +1022,14 @@ fn main() -> anyhow::Result<()> {
         }
         cli::Command::CheckUpdate { json, no_cache } => {
             cli::run_check_update_cmd(json, no_cache);
+            return Ok(());
+        }
+        cli::Command::Channel {
+            subcommand,
+            value,
+            json,
+        } => {
+            cli::run_channel_cmd(&subcommand, value.as_deref(), json);
             return Ok(());
         }
         cli::Command::Doctor { json } => {

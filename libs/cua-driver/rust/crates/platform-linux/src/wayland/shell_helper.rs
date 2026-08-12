@@ -1000,23 +1000,17 @@ pub fn begin_foreground(window_id: u64) -> anyhow::Result<ForegroundTransaction>
         );
     };
     let payload = extract_json_object(&raw)
-        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-        .ok_or_else(|| anyhow::anyhow!("foreground_unavailable: invalid WinRects response"))?;
-    if payload
-        .get("activated")
-        .and_then(serde_json::Value::as_bool)
-        != Some(true)
-    {
-        let reason = payload
-            .get("reason")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("activation_not_confirmed");
+        .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
+    let activation = payload
+        .ok_or_else(|| anyhow::anyhow!("invalid WinRects response"))
+        .and_then(|payload| wait_for_foreground_activation(&token, &target.target_id, payload));
+    if let Err(error) = activation {
         let recovery = terminalize_foreground("AbortForeground", &token);
         if recovery.is_ok() {
             set_pending_foreground(None);
         }
         anyhow::bail!(
-            "foreground_unavailable: WinRects did not confirm exact window {window_id} activation ({reason}); reconciliation {}",
+            "foreground_unavailable: WinRects did not confirm exact window {window_id} activation ({error}); reconciliation {}",
             if recovery.is_ok() {
                 "reached a terminal state"
             } else {
@@ -1024,16 +1018,60 @@ pub fn begin_foreground(window_id: u64) -> anyhow::Result<ForegroundTransaction>
             }
         );
     }
-    let returned_token = payload
-        .get("transaction")
-        .and_then(serde_json::Value::as_str)
-        .filter(|token| !token.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("foreground_unavailable: missing WinRects transaction"))?;
-    if returned_token != token {
-        anyhow::bail!("foreground_unavailable: WinRects returned a mismatched transaction ID");
-    }
     set_pending_foreground(None);
     Ok(ForegroundTransaction { token })
+}
+
+fn wait_for_foreground_activation(
+    token: &str,
+    target_id: &str,
+    mut payload: serde_json::Value,
+) -> anyhow::Result<()> {
+    let deadline = Instant::now() + Duration::from_millis(500);
+    loop {
+        let returned_token = payload
+            .get("transaction")
+            .and_then(serde_json::Value::as_str)
+            .filter(|returned| !returned.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("missing WinRects transaction"))?;
+        if returned_token != token {
+            anyhow::bail!("WinRects returned a mismatched transaction ID");
+        }
+        if payload.get("target").and_then(serde_json::Value::as_str) != Some(target_id) {
+            anyhow::bail!("WinRects returned a mismatched exact target");
+        }
+        if payload
+            .get("activated")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Ok(());
+        }
+        let reason = payload
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("activation_not_confirmed");
+        if payload.get("terminal").and_then(serde_json::Value::as_bool) == Some(true) {
+            anyhow::bail!("foreground transaction became terminal ({reason})");
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("bounded focus confirmation timed out ({reason})");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("bounded focus confirmation timed out ({reason})");
+        }
+        let raw = gdbus_call_with_timeout(
+            "QueryForeground",
+            &[gvariant_string(token)],
+            remaining.min(Duration::from_millis(100)),
+        )
+        .ok_or_else(|| anyhow::anyhow!("QueryForeground timed out"))?;
+        payload = extract_json_object(&raw)
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .ok_or_else(|| anyhow::anyhow!("invalid QueryForeground response"))?;
+    }
 }
 
 fn new_foreground_token() -> String {

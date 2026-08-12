@@ -411,6 +411,33 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
         self.assertIn('"args": ["mcp"]', shared_hints)
         self.assertIn("MCP servers load at startup", shared_hints)
 
+    def test_post_install_hints_use_canonical_capability_manifest_flags(self) -> None:
+        shared_hints = self.read("libs/cua-driver/scripts/post-install-hints.txt")
+
+        self.assertIn("--capability-manifest", shared_hints)
+        self.assertIn("--approve-capability-manifest", shared_hints)
+        self.assertNotIn("--session-policy", shared_hints)
+        self.assertNotIn("--approve-session-policy", shared_hints)
+
+    def test_agent_sdk_examples_use_implicit_sessions_and_per_call_targets(self) -> None:
+        example_dir = REPO_ROOT / "libs/cua-driver/examples/agent-sdks"
+        examples = "\n".join(
+            path.read_text()
+            for path in example_dir.iterdir()
+            if path.suffix in {".py", ".ts", ".md"}
+        )
+
+        for forbidden in [
+            "CUA_CAPTURE_SCOPE",
+            "StartSessionInput",
+            "CaptureScope",
+            "capture_scope",
+        ]:
+            self.assertNotIn(forbidden, examples)
+        self.assertIn("implicit lifecycle session", examples)
+        self.assertIn("ActionTarget.DESKTOP", examples)
+        self.assertIn("new ActionTarget.Desktop", examples)
+
     def test_local_macos_signing_uses_an_unambiguous_identity_hash(self) -> None:
         signing = self.read("libs/cua-driver/scripts/_local-signing.sh")
 
@@ -464,8 +491,19 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
             "libs/cua-driver/rust/crates/cua-driver/src/skills.rs"
         )
         self.assertIn(
-            "releases/download/cua-driver-rs-v{version}/"
-            "cua-driver-rs-v{version}-skills.tar.gz",
+            'const STABLE_RELEASE_TAG_PREFIX: &str = "cua-driver-rs-v"',
+            skill_installer,
+        )
+        self.assertIn(
+            'const NIGHTLY_RELEASE_TAG_PREFIX: &str = "nightly-cua-driver-rs-v"',
+            skill_installer,
+        )
+        self.assertIn(
+            "releases/download/{tag_prefix}{version}/",
+            skill_installer,
+        )
+        self.assertIn(
+            "{STABLE_RELEASE_TAG_PREFIX}{version}-skills.tar.gz",
             skill_installer,
         )
         self.assertIn(
@@ -629,10 +667,10 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
         self.assertEqual(
             len(expected["baseTools"]), len(set(expected["baseTools"]))
         )
-        self.assertEqual(len(expected["baseTools"]), 54)
+        self.assertEqual(len(expected["baseTools"]), 56)
         self.assertEqual(
             expected["outputSchemaCountByPlatform"],
-            {"darwin": 30, "linux": 34, "win32": 30},
+            {"darwin": 32, "linux": 36, "win32": 32},
         )
         self.assertEqual(
             expected["platformTools"],

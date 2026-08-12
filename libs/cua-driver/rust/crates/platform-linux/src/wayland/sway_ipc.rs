@@ -193,6 +193,22 @@ fn focus_container_exact(id: u64, pid: u32) -> bool {
         .is_ok_and(|status| status.success())
 }
 
+fn wait_for_exact_container_focus(id: u64, pid: u32, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match window_for_id(id) {
+            Some(window) if window.pid != pid => return false,
+            Some(window) if window.focused => return true,
+            Some(_) => {}
+            None => return false,
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 /// Exact Sway focus transaction for a stateful press/move/release sequence.
 /// Its caller must hold the host raw-input lease for this value's lifetime.
 pub struct StatefulFocus {
@@ -219,13 +235,17 @@ impl StatefulFocus {
         if !focus_container_exact(id, pid) {
             anyhow::bail!("Sway refused to focus exact container {id}");
         }
-        std::thread::sleep(std::time::Duration::from_millis(80));
         let focus = Self {
             id,
             pid,
             prior,
             finished: false,
         };
+        if !wait_for_exact_container_focus(id, pid, std::time::Duration::from_millis(500)) {
+            anyhow::bail!(
+                "stale_target: exact Sway container {id} for pid {pid} did not acquire focus"
+            );
+        }
         focus.validate()?;
         Ok(focus)
     }
@@ -260,8 +280,8 @@ impl StatefulFocus {
         if !focus_container_exact(prior, prior_pid) {
             anyhow::bail!("Sway could not restore prior container {prior}");
         }
-        std::thread::sleep(std::time::Duration::from_millis(80));
-        if !window_for_id(prior).is_some_and(|window| window.focused) {
+        if !wait_for_exact_container_focus(prior, prior_pid, std::time::Duration::from_millis(500))
+        {
             anyhow::bail!("Sway did not confirm restored container {prior}");
         }
         Ok(())
@@ -281,7 +301,7 @@ fn with_focused_container_using<T>(
     id: u64,
     mut read_windows: impl FnMut() -> anyhow::Result<Vec<Window>>,
     mut focus: impl FnMut(u64) -> bool,
-    mut settle: impl FnMut(),
+    mut wait_for_focus: impl FnMut(u64, u32) -> bool,
     body: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     let prior = read_windows()?
@@ -291,11 +311,15 @@ fn with_focused_container_using<T>(
     if !focus(id) {
         anyhow::bail!("Sway refused to focus exact container {id}");
     }
-    settle();
 
     // Once focus succeeds, every later path restores the prior identity. Re-read
     // both id and PID before the action body to reject container-id replacement.
-    let result = match read_windows() {
+    let result = if !wait_for_focus(id, expected_pid) {
+        Err(anyhow::anyhow!(
+            "Sway did not confirm focus on exact container {id} for pid {expected_pid}"
+        ))
+    } else {
+        match read_windows() {
         Ok(windows) => match windows.into_iter().find(|window| window.id == id) {
             Some(window) if window.pid != expected_pid => Err(anyhow::anyhow!(
                 "stale_target: Sway container {id} changed from expected pid {expected_pid} to pid {} while acquiring focus",
@@ -312,6 +336,7 @@ fn with_focused_container_using<T>(
         Err(error) => Err(error.context(format!(
             "Sway could not confirm exact container {id} for pid {expected_pid} after focusing it"
         ))),
+        }
     };
     let restore = prior
         .filter(|(prior, _)| *prior != id)
@@ -325,7 +350,9 @@ fn with_focused_container_using<T>(
             if !focus(prior) {
                 anyhow::bail!("Sway could not restore prior container {prior}");
             }
-            settle();
+            if !wait_for_focus(prior, prior_pid) {
+                anyhow::bail!("Sway did not confirm restored container {prior}");
+            }
             if !read_windows()?
                 .into_iter()
                 .any(|window| window.id == prior && window.pid == prior_pid && window.focused)
@@ -358,7 +385,9 @@ pub fn with_focused_container<T>(
         id,
         || list_windows().ok_or_else(|| anyhow::anyhow!("Sway IPC tree is unavailable")),
         focus_container,
-        || std::thread::sleep(std::time::Duration::from_millis(80)),
+        |container, pid| {
+            wait_for_exact_container_focus(container, pid, std::time::Duration::from_millis(500))
+        },
         body,
     )
 }
@@ -420,7 +449,7 @@ mod tests {
                 focused.borrow_mut().push(id);
                 true
             },
-            || {},
+            |_, _| true,
             || {
                 body_ran.set(true);
                 Ok(())
@@ -440,10 +469,11 @@ mod tests {
         let reads = std::cell::RefCell::new(std::collections::VecDeque::from([
             Ok(vec![window(1, 10, true), window(2, 20, false)]),
             Ok(vec![window(1, 10, false), window(2, 20, false)]),
-            Ok(vec![window(1, 10, false), window(2, 20, false)]),
             Ok(vec![window(1, 10, true), window(2, 20, false)]),
         ]));
         let focused = std::cell::RefCell::new(Vec::new());
+        let confirmations =
+            std::cell::RefCell::new(std::collections::VecDeque::from([false, true]));
         let body_ran = std::cell::Cell::new(false);
 
         let error = with_focused_container_using(
@@ -454,7 +484,12 @@ mod tests {
                 focused.borrow_mut().push(id);
                 true
             },
-            || {},
+            |_, _| {
+                confirmations
+                    .borrow_mut()
+                    .pop_front()
+                    .expect("expected focus confirmation")
+            },
             || {
                 body_ran.set(true);
                 Ok(())
@@ -486,7 +521,7 @@ mod tests {
                 focused.borrow_mut().push(id);
                 true
             },
-            || {},
+            |_, _| true,
             || {
                 body_ran.set(true);
                 Ok(())

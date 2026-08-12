@@ -48,6 +48,10 @@ async fn before_snapshot_deadline<T>(
     tokio::time::timeout_at(deadline, work).await
 }
 
+fn push_action_name_slot(actions: &mut Vec<String>, name: Option<String>) {
+    actions.push(name.unwrap_or_default());
+}
+
 /// Drive an AT-SPI op `work` on the runtime, bounded by [`OP_TIMEOUT`].
 ///
 /// Individual interface calls are each bounded by [`call`], and `app_for_pid` /
@@ -846,9 +850,15 @@ async fn collect_visited_bounded<'a>(
                     if let Some(Ok(ap)) = call(proxies.action()).await {
                         let n = call(ap.n_actions()).await.and_then(|r| r.ok()).unwrap_or(0);
                         for i in 0..n {
-                            if let Some(Ok(an)) = call(ap.get_name(i)).await {
-                                actions.push(an);
-                            }
+                            // Preserve the AT-SPI action index even when an
+                            // individual name lookup fails. `do_action` takes
+                            // this original index, so compacting the vector
+                            // could otherwise actuate a different action than
+                            // the name we selected.
+                            push_action_name_slot(
+                                &mut actions,
+                                call(ap.get_name(i)).await.and_then(|result| result.ok()),
+                            );
                         }
                     }
                 }
@@ -2210,8 +2220,7 @@ pub fn scroll_element(pid: u32, idx: usize, direction: &str, amount: usize) -> R
 /// updates its renderer-owned focused control. Sending key events immediately
 /// after the acknowledgement can therefore split one string between the old
 /// and new controls. Wait for the target's Focused state to become observable;
-/// if a toolkit does not publish that state, retain the historical successful
-/// result after a bounded settling interval.
+/// an acknowledgement without read-back is not sufficient for global input.
 pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
     bounded(
         async {
@@ -2259,7 +2268,7 @@ pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
                     }
                 }
             }
-            Ok(true)
+            Ok(false)
         },
         || Err(anyhow!("focus_element timed out for pid {pid}")),
     )
@@ -3286,12 +3295,23 @@ mod coord_tests {
         before_snapshot_deadline, combine_wayland_content_offsets,
         ensure_element_descends_from_exact_window, exact_window_top_level_key, is_enabled_state,
         is_indexable_capabilities, is_passive_role, is_web_process_bus,
-        prefer_authoritative_wayland_origin, rebase_renderer_window_offset, screen_extent_rebase,
-        select_click_target, ApplicationSelection,
+        prefer_authoritative_wayland_origin, push_action_name_slot, rebase_renderer_window_offset,
+        screen_extent_rebase, select_click_target, ApplicationSelection,
     };
     use super::{element_key_for_object, RawObjectRef};
     use atspi::{State, StateSet};
     use std::time::Duration;
+
+    #[test]
+    fn failed_action_name_lookup_preserves_the_original_action_index() {
+        let mut actions = Vec::new();
+        push_action_name_slot(&mut actions, Some("first".to_owned()));
+        push_action_name_slot(&mut actions, None);
+        push_action_name_slot(&mut actions, Some("third".to_owned()));
+
+        assert_eq!(actions, ["first", "", "third"]);
+        assert_eq!(actions.iter().position(|action| action == "third"), Some(2));
+    }
 
     #[test]
     fn duplicate_pid_prefers_populated_application_after_empty_registration() {

@@ -1249,7 +1249,7 @@ fi
 
 # Agent skill pack symlinks: NOT auto-created. Run
 # `cua-driver skills install --local` to symlink agent dirs to the
-# staged copy at $VERSIONED_DIR/Skills/cua-driver-rs above.
+# staged copy at $VERSIONED_DIR/Skills/cua-driver above.
 echo ""
 
 # --- Autostart (optional) ----------------------------------------------
