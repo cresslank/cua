@@ -936,9 +936,7 @@ impl BrowserPlatform for WindowsBrowserPlatform {
             )
         })?;
         let window = cua_driver_core::blocking::spawn(move || {
-            crate::win32::list_windows(Some(pid_u32))
-                .into_iter()
-                .find(|window| window.hwnd == window_id)
+            crate::win32::find_window_by_pid_and_handle(pid_u32, window_id)
         })
         .await
         .ok()
@@ -980,7 +978,7 @@ impl BrowserPlatform for WindowsBrowserPlatform {
             )
         })?;
         let windows = cua_driver_core::blocking::spawn(move || {
-            crate::win32::list_windows(Some(pid_u32))
+            crate::win32::list_windows_via_win32(Some(pid_u32))
                 .into_iter()
                 .map(|window| window.hwnd)
                 .collect::<Vec<_>>()
@@ -1174,7 +1172,7 @@ impl BrowserPlatform for WindowsBrowserPlatform {
                             listener_pid: None,
                             detail: Some((*detail).to_owned()),
                         },
-                    })
+                    });
                 }
                 [] if std::time::Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1186,7 +1184,7 @@ impl BrowserPlatform for WindowsBrowserPlatform {
                             "{} did not expose a uniquely exact-pid-owned loopback endpoint after the exact setup action",
                             descriptor.product_name
                         ),
-                    ))
+                    ));
                 }
                 _ => {
                     break Err(refusal(
@@ -1195,7 +1193,7 @@ impl BrowserPlatform for WindowsBrowserPlatform {
                             "{} exposed multiple exact-pid-owned endpoint candidates after the exact setup action",
                             descriptor.product_name
                         ),
-                    ))
+                    ));
                 }
             }
         };

@@ -60,9 +60,11 @@ fn def() -> &'static ToolDef {
             the requested WindowServer bounds. `px_frame_mismatch` or \
             `px_capture_unavailable` omits an unprovable screenshot/pixel frame \
             instead of guessing a transform; the truthful AX payload remains available.\n\n\
-            Optional `query` filters the tree_markdown to matching lines plus their ancestor \
-            chain (case-insensitive substring). The element_index values are unchanged — \
-            filtering only trims the rendered Markdown.\n\n\
+            Optional `query` projects both tree_markdown and structured `elements` to \
+            matching lines plus their ancestor chain (case-insensitive substring). The \
+            element_index values are unchanged, the complete snapshot remains actionable, \
+            and `element_count` continues to report its total size; \
+            `filtered_element_count` reports the projected response size.\n\n\
             Optional `max_elements` / `max_depth` bound the AX walk to mitigate \
             context-window blow-up on Electron / Obsidian / large web apps that \
             produce 10k+ element trees. When applied, BOTH the markdown \
@@ -75,7 +77,7 @@ fn def() -> &'static ToolDef {
                 "session": { "type": "string", "description": "Optional session id: declares/uses the agent cursor and per-session state for this run. The same id works over MCP, the CLI, or the raw socket, and follows the run across apps/windows. Omit to run cursor-less." },
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "window_id": { "type": "integer", "description": "Target window ID from list_windows." },
-                "query": { "type": "string", "description": "Case-insensitive filter for tree_markdown." },
+                "query": { "type": "string", "description": "Case-insensitive filter for tree_markdown and structured elements. Returns matching actionable rows plus their actionable ancestors without renumbering element_index values." },
                 "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
                 "include_screenshot": {
                     "type": "boolean",
@@ -209,6 +211,13 @@ impl Tool for GetWindowStateTool {
         // still forces a capture (an explicit "write the frame to disk").
         let include_screenshot = args.get("include_screenshot").and_then(|v| v.as_bool());
         let should_capture = include_screenshot != Some(false) || screenshot_out_file.is_some();
+        // Internal direct-tool mode used by verify_state. Registry ingress
+        // strips underscore-prefixed arguments before public dispatch; only
+        // a trusted direct in-process invocation can enable this mode.
+        let observation_only = args
+            .get("_observation_only")
+            .and_then(|value| value.as_bool())
+            == Some(true);
         // Optional caps — when omitted, fall back to the defaults baked into
         // the AX walker (#22865). minimum:1 keyed in the schema, but defend
         // against 0 here as well so a misbehaving client can't disable the
@@ -275,11 +284,13 @@ impl Tool for GetWindowStateTool {
         // click(element_index=N) picked whatever the walk happened to return.
         // For an unresolved scope, replace any prior entry with an empty
         // snapshot so a stale index map cannot be clicked through either.
-        if let Some(ref r) = tree_result {
-            if scope_matched {
-                self.state.element_cache.update(pid, window_id, &r.nodes);
-            } else {
-                self.state.element_cache.update(pid, window_id, &[]);
+        if !observation_only {
+            if let Some(ref r) = tree_result {
+                if scope_matched {
+                    self.state.element_cache.update(pid, window_id, &r.nodes);
+                } else {
+                    self.state.element_cache.update(pid, window_id, &[]);
+                }
             }
         }
 
@@ -373,16 +384,18 @@ impl Tool for GetWindowStateTool {
                     // different ratios (only the large one downscales), and a
                     // pid-only key leaked one window's ratio into the other's
                     // pixel clicks.
-                    if let Some(ow) = orig_w {
-                        if w > 0 {
-                            self.state.resize_registry.set_ratio(
-                                pid,
-                                window_id,
-                                ow as f64 / w as f64,
-                            );
+                    if !observation_only {
+                        if let Some(ow) = orig_w {
+                            if w > 0 {
+                                self.state.resize_registry.set_ratio(
+                                    pid,
+                                    window_id,
+                                    ow as f64 / w as f64,
+                                );
+                            }
+                        } else {
+                            self.state.resize_registry.clear_ratio(pid, window_id);
                         }
-                    } else {
-                        self.state.resize_registry.clear_ratio(pid, window_id);
                     }
                     Some((b64, file_path, w, h, bounds, scale))
                 }
@@ -390,7 +403,9 @@ impl Tool for GetWindowStateTool {
                     tracing::warn!(
                         "Screenshot frame could not be verified for window {window_id}: {e:?}"
                     );
-                    self.state.resize_registry.clear_ratio(pid, window_id);
+                    if !observation_only {
+                        self.state.resize_registry.clear_ratio(pid, window_id);
+                    }
                     screenshot_frame_error = Some(e);
                     None
                 }
@@ -421,7 +436,10 @@ impl Tool for GetWindowStateTool {
             }
 
             // Summary text line (matching Swift reference format).
-            let element_count = self.state.element_cache.element_count(pid, window_id);
+            let element_count = tree_result
+                .as_ref()
+                .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
+                .unwrap_or(0);
             let summary = if let Some(ref r) = tree_result {
                 format!(
                     "window_id={window_id} pid={pid} size={}x{} elements={element_count}\n\n{}",
@@ -432,7 +450,7 @@ impl Tool for GetWindowStateTool {
             };
             content.push(Content::text(summary));
         } else if let Some(ref r) = tree_result {
-            let element_count = self.state.element_cache.element_count(pid, window_id);
+            let element_count = r.nodes.iter().filter(|n| n.element_index.is_some()).count();
             content.push(Content::text(format!(
                 "window_id={window_id} pid={pid} elements={element_count}\n\n{}",
                 r.tree_markdown
@@ -445,7 +463,10 @@ impl Tool for GetWindowStateTool {
             );
         }
 
-        let element_count = self.state.element_cache.element_count(pid, window_id);
+        let element_count = tree_result
+            .as_ref()
+            .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
+            .unwrap_or(0);
         let tree_md = tree_result
             .as_ref()
             .map(|r| r.tree_markdown.clone())
@@ -466,7 +487,7 @@ impl Tool for GetWindowStateTool {
             .as_ref()
             .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
             .unwrap_or(0);
-        let snapshot_id = if scope_matched {
+        let snapshot_id = if scope_matched && !observation_only {
             Some(cua_driver_core::element_token::global().register_snapshot(
                 pid,
                 window_id,
@@ -484,13 +505,28 @@ impl Tool for GetWindowStateTool {
         // preferred-for-back-compat-only via the `_note` field below.
         let elements_json: Vec<serde_json::Value> = match (snapshot_id, tree_result.as_ref()) {
             (Some(sid), Some(r)) => build_elements_array_with_token(&r.nodes, sid),
+            (None, Some(r)) if scope_matched => build_elements_array(&r.nodes),
             _ => Vec::new(),
         };
+        let elements_json = cua_driver_core::element_query::project_elements_for_query(
+            elements_json,
+            query.as_deref(),
+            &tree_md,
+        );
+        let filtered_element_count = elements_json.len();
+        // The structured array intentionally contains only actionable nodes,
+        // and AX child reads can fail independently of the element/depth caps.
+        // Until the walker exposes a proof over the projected search domain,
+        // absence must remain unknown rather than being claimed complete.
+        let elements_complete = false;
 
         let mut structured = serde_json::json!({
             "window_id": window_id,
             "pid": pid,
             "element_count": element_count,
+            "total_element_count": element_count,
+            "returned_element_count": filtered_element_count,
+            "elements_complete": elements_complete,
             "tree_markdown": tree_md,
             "elements": elements_json,
             "_note": "Prefer `elements` — `tree_markdown` will continue to work \
@@ -498,6 +534,9 @@ impl Tool for GetWindowStateTool {
                 Issue #22865: use `max_elements` / `max_depth` to bound the \
                 AX walk on apps with very large trees."
         });
+        if query.is_some() {
+            structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
+        }
         // Surface 6: an opaque snapshot identifier consumers can log
         // alongside the per-element tokens for debug correlation. Same value
         // embedded in every `element_token` emitted in `elements[]` above.
@@ -545,11 +584,33 @@ impl Tool for GetWindowStateTool {
                      action."
                 ));
                 structured["escalation"] = serde_json::json!({
-                    "recommended": "px",
-                    "reason": "act by pixel (x,y) off the screenshot in this response — \
-                               the frame IS the requested window even though its AX \
-                               surface is unresolved."
+                    "recommended": "foreground",
+                    "reason": "observation-only: the screenshot in this response IS the \
+                               requested window, but background input (including px) is \
+                               refused while its AX surface is unresolved — events could \
+                               reach a same-process sibling window. Re-snapshot after the \
+                               app settles, or act with delivery_mode:\"foreground\"."
                 });
+            }
+        }
+        // Additive read-only `background_input` capability section (macOS
+        // background input v1): the same fresh facts that gate every
+        // background mutation, reported per route so an agent can choose
+        // before acting. Every action still revalidates — this is advisory,
+        // not a promise. Old consumers ignore the extra field.
+        {
+            let capture_available = screenshot_dims.is_some();
+            let report = tokio::task::spawn_blocking(move || {
+                let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
+                cua_driver_core::background_input::background_input_capability_report(
+                    cua_driver_core::background_input::ExactWindowTarget { pid, window_id },
+                    &facts,
+                    Some(capture_available),
+                )
+            })
+            .await;
+            if let Ok(report) = report {
+                structured["background_input"] = report;
             }
         }
         if let Some((sw, sh)) = screenshot_dims {
@@ -582,12 +643,15 @@ impl Tool for GetWindowStateTool {
         }
         cua_driver_core::window_inspection::mark_browser_chrome_capture_coverage(
             &mut structured,
-            chromium_browser_window(pid),
+            chromium_browser_window(pid).then_some(
+                cua_driver_core::window_inspection::BrowserChromeCaptureCoverage::MayBeIncomplete,
+            ),
         );
         ToolResult {
             content,
             is_error: None,
             structured_content: Some(structured),
+            action_record: None,
         }
     }
 }
@@ -771,8 +835,23 @@ pub(crate) fn build_elements_array_with_token(
             if let Some(enabled) = node.enabled {
                 entry["enabled"] = serde_json::Value::Bool(enabled);
             }
-            if let Some(selected) = node.selected {
+            let selected = node.selected.or_else(|| {
+                let role = node.role.to_ascii_lowercase();
+                if role.contains("checkbox") || role.contains("radiobutton") {
+                    node.value_state.as_deref().and_then(|value| match value {
+                        "1" | "true" | "on" => Some(true),
+                        "0" | "false" | "off" => Some(false),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            });
+            if let Some(selected) = selected {
                 entry["selected"] = serde_json::Value::Bool(selected);
+            }
+            if node.in_web_content {
+                entry["in_web_content"] = serde_json::Value::Bool(true);
             }
             if let Some(frame) = frame {
                 entry["frame"] = frame;
@@ -805,6 +884,13 @@ pub(crate) fn build_elements_array(nodes: &[crate::ax::tree::AXNode]) -> Vec<ser
     out
 }
 
+/// Keep the structured response aligned with a query-filtered markdown tree.
+///
+/// The AX walker deliberately keeps the complete node/cache snapshot so the
+/// original element indices remain valid. The rendered markdown already holds
+/// the exact matching rows and ancestor chain, so use its indices as the
+/// projection source of truth instead of duplicating query matching over the
+/// structured fields.
 #[cfg(test)]
 mod window_scope_contract_tests {
     use super::*;
@@ -926,6 +1012,7 @@ mod window_scope_contract_tests {
 mod tests {
     use super::*;
     use crate::ax::tree::AXNode;
+    use cua_driver_core::element_query::project_elements_for_query;
 
     fn node(
         idx: Option<usize>,
@@ -954,6 +1041,7 @@ mod tests {
             max_value: None,
             enabled: None,
             selected: None,
+            in_web_content: false,
         }
     }
 
@@ -1002,6 +1090,62 @@ mod tests {
             vec![0, 1, 2],
             "ordering must match DFS / element_index assignment"
         );
+    }
+
+    #[test]
+    fn query_projection_keeps_only_rendered_actionable_rows() {
+        let nodes = vec![
+            node(Some(0), "AXWindow", Some("Document"), 0, None, None),
+            node(Some(1), "AXMenuItem", Some("Window"), 1, Some(0), None),
+            node(
+                Some(2),
+                "AXMenuItem",
+                Some("Move & Resize"),
+                2,
+                Some(1),
+                None,
+            ),
+            node(Some(3), "AXMenuItem", Some("Left"), 3, Some(2), None),
+            node(Some(4), "AXButton", Some("Unrelated"), 1, Some(0), None),
+        ];
+        let elements = build_elements_array(&nodes);
+        let filtered_markdown = concat!(
+            "- [0] AXWindow \"Document\"\n",
+            "  - [1] AXMenuItem \"Window\"\n",
+            "    - [2] AXMenuItem \"Move & Resize\"\n",
+            "      - [3] AXMenuItem \"Left\"\n",
+        );
+
+        let projected = project_elements_for_query(elements, Some("Left"), filtered_markdown);
+        let indices: Vec<u64> = projected
+            .iter()
+            .map(|entry| entry["element_index"].as_u64().unwrap())
+            .collect();
+
+        assert_eq!(indices, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn query_projection_returns_no_elements_when_markdown_has_no_match() {
+        let nodes = vec![node(Some(0), "AXButton", Some("Unrelated"), 0, None, None)];
+        let elements = build_elements_array(&nodes);
+
+        let projected = project_elements_for_query(elements, Some("zoomLeft"), "");
+
+        assert!(projected.is_empty());
+    }
+
+    #[test]
+    fn unfiltered_projection_preserves_every_element() {
+        let nodes = vec![
+            node(Some(0), "AXButton", Some("One"), 0, None, None),
+            node(Some(1), "AXButton", Some("Two"), 0, None, None),
+        ];
+        let elements = build_elements_array(&nodes);
+
+        let projected = project_elements_for_query(elements, None, "");
+
+        assert_eq!(projected.len(), 2);
     }
 
     #[test]
@@ -1077,6 +1221,29 @@ mod tests {
         assert_eq!(entry["min"], 2.0);
         assert_eq!(entry["max"], 8.0);
         assert_eq!(entry["enabled"], true);
+        assert_eq!(entry["selected"], false);
+    }
+
+    #[test]
+    fn elements_surface_inherited_web_content_trust_marker() {
+        let mut nodes = vec![node(
+            Some(0),
+            "AXButton",
+            Some("Renderer button"),
+            2,
+            None,
+            None,
+        )];
+        nodes[0].in_web_content = true;
+        let entry = &build_elements_array(&nodes)[0];
+        assert_eq!(entry["in_web_content"], true);
+    }
+
+    #[test]
+    fn checkbox_value_state_normalizes_to_selected() {
+        let mut nodes = vec![node(Some(0), "AXCheckBox", Some("I agree"), 0, None, None)];
+        nodes[0].value_state = Some("0".into());
+        let entry = &build_elements_array(&nodes)[0];
         assert_eq!(entry["selected"], false);
     }
 
@@ -1159,9 +1326,8 @@ mod tests {
         assert_eq!(elements[2]["label"], "from-id");
     }
 
-    /// Surface 6: every element entry must carry a non-empty
-    /// `element_token` alongside its integer `element_index`. The
-    /// integer field stays unchanged — the token is purely additive.
+    /// Every element entry carries a non-empty snapshot-bound
+    /// `element_token` alongside its numeric `element_index`.
     #[test]
     fn build_elements_array_with_token_emits_element_token_per_row() {
         let reg = cua_driver_core::element_token::global();

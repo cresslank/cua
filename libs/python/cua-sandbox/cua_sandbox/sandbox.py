@@ -30,6 +30,7 @@ from __future__ import annotations
 import logging
 import random
 import time
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import (
@@ -56,7 +57,7 @@ except ImportError:
         pass
 
 
-from cua_sandbox._config import get_client_id, get_client_secret
+from cua_sandbox._config import has_fleet_auth
 from cua_sandbox.image import Image
 from cua_sandbox.interfaces import (
     Apps,
@@ -66,6 +67,7 @@ from cua_sandbox.interfaces import (
     Mobile,
     Mouse,
     Screen,
+    Services,
     Shell,
     Terminal,
     Tunnel,
@@ -268,6 +270,7 @@ class Sandbox:
         self.terminal = Terminal(transport)
         self.mobile = Mobile(transport)
         self.tunnel = Tunnel(transport)
+        self.services = Services(transport)
         _os = _runtime_info.environment if _runtime_info and _runtime_info.environment else "linux"
         self.apps = Apps(transport, os_type=_os)
 
@@ -399,9 +402,10 @@ class Sandbox:
     @classmethod
     async def create(
         cls,
-        image: Image,
+        image: Optional[Image] = None,
         *,
         name: Optional[str] = None,
+        pool: Optional[str] = None,
         api_key: Optional[str] = None,
         local: bool = False,
         runtime: Optional["Runtime"] = None,
@@ -411,6 +415,7 @@ class Sandbox:
         region: str = "us-east-1",
         time_to_start: Optional[float] = None,
         request_timeout: Optional[float] = None,
+        server_port: int = 8000,
         telemetry_enabled: bool = True,
     ) -> "Sandbox":
         """Provision a new persistent sandbox and return it connected.
@@ -421,7 +426,8 @@ class Sandbox:
 
         Args:
             image: Image to run (e.g. ``Image.desktop("ubuntu")``).
-            name: Optional name to assign to the sandbox.
+            name: Optional name to assign to the sandbox. Required with ``pool``.
+            pool: Pre-created Fleet pool to claim instead of creating from an image.
             api_key: Legacy CUA API key. Providing one uses the legacy VM API;
                 Fleet cloud sandboxes use OAuth client credentials instead.
             local: Use a local runtime instead of cloud.
@@ -436,6 +442,10 @@ class Sandbox:
                 commands sent to the computer-server (default 30, cloud only).
                 Individual commands with a server-side timeout automatically
                 extend the client timeout to match.
+            server_port: Guest computer-server TCP port for Fleet cloud sandboxes.
+                Defaults to 8000. Set this when the guest image runs the CUA
+                computer-server ``/cmd`` API on a non-default port, for example
+                5000.
             telemetry_enabled: Set to False to disable telemetry for this instance.
 
         Example::
@@ -445,9 +455,13 @@ class Sandbox:
             print(sb.name)  # save to reconnect later
             await sb.disconnect()
         """
+        if (image is None) == (pool is None):
+            raise ValueError("Specify exactly one of image or pool")
+
         return await cls._create(
             image=image,
             name=name,
+            pool=pool,
             ephemeral=False,
             api_key=api_key,
             local=local,
@@ -458,6 +472,7 @@ class Sandbox:
             region=region,
             time_to_start=time_to_start,
             request_timeout=request_timeout,
+            server_port=server_port,
             telemetry_enabled=telemetry_enabled,
         )
 
@@ -536,6 +551,7 @@ class Sandbox:
         region: str = "us-east-1",
         time_to_start: Optional[float] = None,
         request_timeout: Optional[float] = None,
+        server_port: int = 8000,
         telemetry_enabled: bool = True,
     ) -> AsyncIterator["Sandbox"]:
         """Create an ephemeral sandbox that is automatically destroyed on exit.
@@ -557,6 +573,10 @@ class Sandbox:
                 commands sent to the computer-server (default 30, cloud only).
                 Individual commands with a server-side timeout automatically
                 extend the client timeout to match.
+            server_port: Guest computer-server TCP port for Fleet cloud sandboxes.
+                Defaults to 8000. Set this when the guest image runs the CUA
+                computer-server ``/cmd`` API on a non-default port, for example
+                5000.
 
         Example::
 
@@ -577,6 +597,7 @@ class Sandbox:
             region=region,
             time_to_start=time_to_start,
             request_timeout=request_timeout,
+            server_port=server_port,
             telemetry_enabled=telemetry_enabled,
         )
         try:
@@ -697,7 +718,7 @@ class Sandbox:
     @staticmethod
     def _uses_fleet(api_key: Optional[str]) -> bool:
         """Choose Fleet only for OAuth-configured calls without an explicit API key."""
-        return api_key is None and bool(get_client_id() and get_client_secret())
+        return api_key is None and has_fleet_auth()
 
     @classmethod
     async def _list_cloud(cls, *, api_key: Optional[str] = None) -> "list[SandboxInfo]":
@@ -720,18 +741,29 @@ class Sandbox:
         return [cls._fleet_sandbox_info(pool) for pool in pools]
 
     @staticmethod
-    def _fleet_sandbox_info(pool: dict[str, Any]) -> SandboxInfo:
-        metadata = pool.get("metadata") or {}
-        spec = pool.get("spec") or {}
-        status = pool.get("status") or {}
-        replicas = spec.get("replicas", 1)
-        available = status.get("availableCount", 0)
-        state = "suspended" if replicas == 0 else "running" if available else "provisioning"
+    def _fleet_sandbox_info(pool: Any) -> SandboxInfo:
+        if isinstance(pool, Mapping):
+            metadata = pool.get("metadata") or {}
+            spec = pool.get("spec") or {}
+            status = pool.get("status") or {}
+            name = metadata.get("name", "")
+            replicas = spec.get("replicas", 1)
+            ready = status.get("readyReplicas", 0)
+            created_at = metadata.get("creationTimestamp")
+        else:
+            metadata = pool.metadata
+            spec = pool.spec
+            status = pool.status
+            name = metadata.name
+            replicas = spec.replicas
+            ready = status.ready_replicas if status else 0
+            created_at = metadata.creation_timestamp
+        state = "suspended" if replicas == 0 else "running" if ready else "provisioning"
         return SandboxInfo(
-            name=metadata.get("name", ""),
+            name=name,
             status=state,
             source="fleet",
-            created_at=metadata.get("creationTimestamp"),
+            created_at=created_at,
         )
 
     @classmethod
@@ -976,7 +1008,13 @@ class Sandbox:
 
             await cloud_vm_action(name, "delete", api_key=api_key)
             return
-        await FleetCloudTransport.delete_sandbox(name)
+        from cua_sandbox import sandbox_state
+
+        state = sandbox_state.load(name)
+        pool_name = state.get("pool_name") if state else None
+        await FleetCloudTransport.delete_sandbox(name, pool_name=pool_name)
+        if pool_name:
+            sandbox_state.delete(name)
 
     @classmethod
     async def _delete_local(cls, name: str) -> None:
@@ -1018,6 +1056,7 @@ class Sandbox:
         image: Optional[Image] = None,
         runtime: Optional["Runtime"] = None,
         name: Optional[str] = None,
+        pool: Optional[str] = None,
         ephemeral: Optional[bool] = None,
         cpu: Optional[int] = None,
         memory_mb: Optional[int] = None,
@@ -1025,9 +1064,25 @@ class Sandbox:
         region: str = "us-east-1",
         time_to_start: Optional[float] = None,
         request_timeout: Optional[float] = None,
+        server_port: int = 8000,
         telemetry_enabled: bool = True,
     ) -> "Sandbox":
-        """Internal workhorse — all public factories delegate here."""
+        """Internal factory that validates server_port before selecting a transport."""
+        if (
+            isinstance(server_port, bool)
+            or not isinstance(server_port, int)
+            or server_port < 1
+            or server_port > 65535
+        ):
+            raise ValueError("server_port must be an integer between 1 and 65535")
+
+        if image is not None and pool is not None:
+            raise ValueError("Specify exactly one of image or pool")
+        if pool and not name:
+            raise ValueError("Pool-backed sandboxes require a name")
+        if pool and local:
+            raise ValueError("Pool-backed sandboxes are cloud-only")
+
         _t_start = time.monotonic()
         if ephemeral is None:
             ephemeral = bool(image)
@@ -1076,12 +1131,31 @@ class Sandbox:
             _record_sandbox_create(sb, image=None, local=local, ephemeral=False, t_start=_t_start)
             return sb
 
+        if pool:
+            transport = FleetCloudTransport(
+                image=None,
+                name=name,
+                pool_name=pool,
+                create_claim=True,
+                region=region,
+                time_to_start=time_to_start,
+                request_timeout=request_timeout,
+                server_port=server_port,
+            )
+            sb = cls(transport, name=name, _ephemeral=False, _telemetry_enabled=telemetry_enabled)
+            await sb._connect()
+            from cua_sandbox import sandbox_state
+
+            sandbox_state.save_fleet_claim(name, pool)
+            _record_sandbox_create(sb, image=None, local=False, ephemeral=False, t_start=_t_start)
+            return sb
+
         if image and not runtime and local:
             # local=True with no runtime → auto-select based on image type
             runtime = _auto_runtime(image)
         if image and not runtime and not local:
             # image without runtime and not local → cloud creation
-            if not any([ws_url, http_url]) and not api_key:
+            if not any([ws_url, http_url]) and cls._uses_fleet(api_key):
                 transport = FleetCloudTransport(
                     image=image,
                     name=name or _random_name(),
@@ -1091,6 +1165,7 @@ class Sandbox:
                     region=region,
                     time_to_start=time_to_start,
                     request_timeout=request_timeout,
+                    server_port=server_port,
                 )
                 sb = cls(
                     transport, name=name, _ephemeral=ephemeral, _telemetry_enabled=telemetry_enabled
@@ -1116,7 +1191,7 @@ class Sandbox:
                     sb, image=image, local=False, ephemeral=bool(ephemeral), t_start=_t_start
                 )
                 return sb
-            if api_key and not any([ws_url, http_url]):
+            if not any([ws_url, http_url]):
                 transport = _make_transport(
                     api_key=api_key,
                     name=name,
@@ -1207,9 +1282,14 @@ class Sandbox:
                 )
         else:
             if name and cls._uses_fleet(api_key) and not ws_url and not http_url:
+                from cua_sandbox import sandbox_state
+
+                state = sandbox_state.load(name)
+                pool_name = state.get("pool_name") if state else None
                 transport = FleetCloudTransport(
                     image=None,
                     name=name,
+                    pool_name=pool_name,
                     cpu=cpu,
                     memory_mb=memory_mb,
                     disk_gb=disk_gb,

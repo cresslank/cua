@@ -14,12 +14,23 @@ import pytest
 INSTALL_LOCAL = Path(__file__).resolve().parents[1] / "_install-local-rust.sh"
 LOCAL_SIGNING = INSTALL_LOCAL.with_name("_local-signing.sh")
 TRANSACTION_LOCK = INSTALL_LOCAL.with_name("_install-transaction-lock.py")
+DISPATCHER = INSTALL_LOCAL.with_name("install-local.sh")
 
 
 def _write_executable(path: Path, body: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"#!/bin/sh\n{body}", encoding="utf-8")
     path.chmod(0o755)
+
+
+def test_installer_keeps_content_addressed_atomic_promotion_without_global_kills() -> None:
+    installer = INSTALL_LOCAL.read_text(encoding="utf-8")
+
+    assert 'FINAL_VERSIONED_DIR="$RELEASES_DIR/$VERSION_TAG-v4-' in installer
+    assert 'mv "$VERSIONED_DIR" "$FINAL_VERSIONED_DIR"' in installer
+    assert 'mv -f "$STAGED_BINARY_TMP" "$STAGED_BINARY"' in installer
+    assert "pkill" not in installer
+    assert "killall" not in installer
 
 
 def _install_fake_rust_toolchain(fake_bin: Path, tmp_path: Path) -> None:
@@ -58,6 +69,7 @@ def test_installer_stages_binary_from_custom_cargo_target(
     shutil.copy2(INSTALL_LOCAL, scripts_dir / INSTALL_LOCAL.name)
     shutil.copy2(TRANSACTION_LOCK, scripts_dir / TRANSACTION_LOCK.name)
     shutil.copy2(LOCAL_SIGNING, scripts_dir / LOCAL_SIGNING.name)
+    shutil.copy2(DISPATCHER, scripts_dir / DISPATCHER.name)
 
     skill_file = rust_dir / "Skills/cua-driver/SKILL.md"
     skill_file.parent.mkdir(parents=True)
@@ -243,7 +255,6 @@ esac
 """,
     )
     _write_executable(fake_bin / "systemctl", "exit 0")
-    _write_executable(fake_bin / "pkill", "exit 0")
     sfw_body = "exit 0"
     if mutate_source_during_fetch:
         sfw_body = (
@@ -267,7 +278,7 @@ esac
             "CUA_DRIVER_SOURCE_SHA": source_oid,
             "CUA_DRIVER_REQUIRE_CLEAN_SOURCE": "1",
             "CUA_DRIVER_LOCAL_HOME": str(local_home),
-            "CUA_DRIVER_LOCAL_INSTALL_DIR": str(install_bin),
+            "CUA_DRIVER_LOCAL_INSTALL_DIR": str(tmp_path / "env-install-bin"),
             "CUA_DRIVER_INSTALL_TRANSACTION_LOCK_TESTING": "1",
             "CUA_DRIVER_INSTALL_TRANSACTION_LOCK_TEST_PATH": str(transaction_lock),
             "RUSTFLAGS": "--cfg cua_audit_injected",
@@ -280,10 +291,40 @@ esac
         }
     )
 
+    # Cover both accepted --bin-dir spellings across this existing matrix and
+    # prove command-line precedence without replacing the hardened fixture.
+    bin_dir_args = (
+        ["--bin-dir", str(install_bin)]
+        if relative_target
+        else [f"--bin-dir={install_bin}"]
+    )
+    for missing_args in (["--bin-dir"], ["--bin-dir="], ["--bin-dir", "--release"]):
+        missing_bin_dir = subprocess.run(
+            ["/bin/bash", str(scripts_dir / DISPATCHER.name), *missing_args],
+            cwd=fixture_root,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert missing_bin_dir.returncode == 2
+        assert "--bin-dir requires a value" in missing_bin_dir.stderr
+    for relative_args in (["--bin-dir", "relative/bin"], ["--bin-dir=relative/bin"]):
+        relative_bin_dir = subprocess.run(
+            ["/bin/bash", str(scripts_dir / DISPATCHER.name), *relative_args],
+            cwd=fixture_root,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert relative_bin_dir.returncode == 2
+        assert "absolute path" in relative_bin_dir.stderr
+
     opt_out_env = env.copy()
     opt_out_env["CUA_DRIVER_REQUIRE_CLEAN_SOURCE"] = "0"
     opted_out = subprocess.run(
-        ["/bin/bash", str(scripts_dir / INSTALL_LOCAL.name), "--release"],
+        ["/bin/bash", str(scripts_dir / DISPATCHER.name), "--release", *bin_dir_args],
         cwd=fixture_root,
         env=opt_out_env,
         text=True,
@@ -300,7 +341,7 @@ esac
     unrelated.write_text("must not be opened or changed\n")
     transaction_lock.symlink_to(unrelated)
     unsafe_lock = subprocess.run(
-        ["/bin/bash", str(scripts_dir / INSTALL_LOCAL.name), "--release"],
+        ["/bin/bash", str(scripts_dir / DISPATCHER.name), "--release", *bin_dir_args],
         cwd=fixture_root,
         env=env,
         text=True,
@@ -315,7 +356,7 @@ esac
     with transaction_lock.open("w") as held_lock:
         fcntl.flock(held_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         blocked = subprocess.run(
-            ["/bin/bash", str(scripts_dir / INSTALL_LOCAL.name), "--release"],
+            ["/bin/bash", str(scripts_dir / DISPATCHER.name), "--release", *bin_dir_args],
             cwd=fixture_root,
             env=env,
             text=True,
@@ -327,7 +368,7 @@ esac
     assert not (install_bin / "cua-driver-local").exists()
 
     result = subprocess.run(
-        ["/bin/bash", str(scripts_dir / INSTALL_LOCAL.name), "--release"],
+        ["/bin/bash", str(scripts_dir / DISPATCHER.name), "--release", *bin_dir_args],
         cwd=fixture_root,
         env=env,
         text=True,
@@ -352,6 +393,7 @@ esac
         return
 
     assert result.returncode == 0, result.stdout + result.stderr
+    assert not (tmp_path / "env-install-bin").exists()
     assert not any(custom_target.glob(".cua-immutable-*"))
     installed = install_bin / "cua-driver-local"
     assert "fresh custom target" in installed.read_text()
@@ -426,7 +468,7 @@ esac
 
     # Reusing an identical immutable release is accepted.
     repeated = subprocess.run(
-        ["/bin/bash", str(scripts_dir / INSTALL_LOCAL.name), "--release"],
+        ["/bin/bash", str(scripts_dir / DISPATCHER.name), "--release", *bin_dir_args],
         cwd=fixture_root,
         env=env,
         text=True,
@@ -445,7 +487,7 @@ esac
     shutil.rmtree(changed_release)
     changed_release.symlink_to(tmp_path, target_is_directory=True)
     malformed = subprocess.run(
-        ["/bin/bash", str(scripts_dir / INSTALL_LOCAL.name), "--release"],
+        ["/bin/bash", str(scripts_dir / DISPATCHER.name), "--release", *bin_dir_args],
         cwd=fixture_root,
         env=env,
         text=True,

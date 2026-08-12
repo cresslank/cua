@@ -42,7 +42,7 @@ const INTROSPECT_IFACE: &str = "org.gnome.Shell.Introspect";
 /// Public helper API carried by `GetVersion`; follows the upstream cursor and
 /// session-badge contract and is intentionally independent from the exact-
 /// target capability protocol advertised by `GetCapabilities`.
-const REQUIRED_HELPER_API_VERSION: u32 = 8;
+const REQUIRED_HELPER_API_VERSION: u32 = 13;
 const REQUIRED_EXACT_TARGET_PROTOCOL: u64 = 4;
 static OVERLAY_DISPATCH_TX: OnceLock<Option<std::sync::mpsc::SyncSender<OverlayDispatchRequest>>> =
     OnceLock::new();
@@ -141,8 +141,8 @@ fn dispatch_overlay_request(
     {
         // The exact-target protocol is intentionally independent from the
         // semantic-cursor API.  A protocol-v4 helper already loaded by GNOME
-        // remains usable until the next login, but it must not receive v8-only
-        // cursor badge methods.
+        // remains usable until the next login, but it must not receive current
+        // helper-API-only cursor badge methods.
         return;
     }
     match request {
@@ -481,7 +481,7 @@ impl Drop for ForegroundTransaction {
 }
 
 pub fn available() -> bool {
-    // GetCapabilities is the exact-target contract. Do not require the v8
+    // GetCapabilities is the exact-target contract. Do not require the current
     // semantic-cursor GetVersion here: GNOME cannot safely reload extensions
     // in place, so a still-loaded protocol-v4 helper must remain usable until
     // the next login after updated files are staged.
@@ -992,7 +992,11 @@ pub fn begin_foreground(window_id: u64) -> anyhow::Result<ForegroundTransaction>
         }
         anyhow::bail!(
             "foreground_unavailable: GNOME BeginForeground timed out for exact window {window_id}; reconciliation {}",
-            if recovery.is_ok() { "reached a terminal state" } else { "remains required" }
+            if recovery.is_ok() {
+                "reached a terminal state"
+            } else {
+                "remains required"
+            }
         );
     };
     let payload = extract_json_object(&raw)
@@ -1013,7 +1017,11 @@ pub fn begin_foreground(window_id: u64) -> anyhow::Result<ForegroundTransaction>
         }
         anyhow::bail!(
             "foreground_unavailable: WinRects did not confirm exact window {window_id} activation ({reason}); reconciliation {}",
-            if recovery.is_ok() { "reached a terminal state" } else { "remains required" }
+            if recovery.is_ok() {
+                "reached a terminal state"
+            } else {
+                "remains required"
+            }
         );
     }
     let returned_token = payload
@@ -1351,6 +1359,11 @@ pub fn remove_cursor(owner: &str) {
 mod tests {
     use super::*;
 
+    const EXTENSION_SOURCE: &str =
+        include_str!("../../../../../wayland-helper/winrects@cua/extension.js");
+    const EXTENSION_METADATA: &str =
+        include_str!("../../../../../wayland-helper/winrects@cua/metadata.json");
+
     #[test]
     fn parses_dbus_owner_and_numeric_identity() {
         assert_eq!(
@@ -1668,5 +1681,51 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not terminal"));
+    }
+
+    #[test]
+    fn bundled_helper_v13_uses_host_owned_modifier_badge_chips() {
+        assert!(EXTENSION_SOURCE.contains("GetVersion()"));
+        assert!(EXTENSION_SOURCE.contains("const HELPER_API_VERSION = 13;"));
+        assert!(EXTENSION_SOURCE.contains("return HELPER_API_VERSION;"));
+        assert!(EXTENSION_SOURCE.contains("SetCursorState"));
+        assert!(EXTENSION_SOURCE.contains("SetCursorColor"));
+        assert!(EXTENSION_SOURCE.contains("SetSessionLabel"));
+        assert!(EXTENSION_SOURCE.contains("const DISPLAY_SIZE = 42;"));
+        assert!(EXTENSION_SOURCE.contains("const GLOW_PADDING = 24;"));
+        assert!(EXTENSION_SOURCE.contains("function drawCursorGlowShape"));
+        assert!(EXTENSION_SOURCE.contains("function glowPath"));
+        assert!(EXTENSION_SOURCE.contains("strokePath(cr, width, alpha, fillColor)"));
+        assert!(EXTENSION_SOURCE.contains("width + 1.5"));
+        assert!(EXTENSION_SOURCE.contains("width - 1"));
+        assert!(EXTENSION_SOURCE.contains("createGlowSurface(record.fillColor)"));
+        assert!(EXTENSION_SOURCE.contains("cr.translate(-GLOW_PADDING, -GLOW_PADDING);"));
+        assert!(EXTENSION_SOURCE.contains("function drawBadgeChip"));
+        assert!(EXTENSION_SOURCE.contains("function badgeStyle(fillColor)"));
+        assert!(EXTENSION_SOURCE.contains("record.badge.add_child(record.badgeLabel)"));
+        assert!(EXTENSION_SOURCE.contains("record.deliveryChip"));
+        assert!(EXTENSION_SOURCE.contains("record.targetChip"));
+        assert!(EXTENSION_SOURCE
+            .contains("if (targetVisible && (labelAlpha > 0.001 || chipAlpha > 0.001))"));
+        assert!(EXTENSION_SOURCE.contains("record.badgeLabel.hide()"));
+        assert!(!EXTENSION_SOURCE.contains("this._badgeIdentity"));
+        assert!(!EXTENSION_SOURCE.contains("this._badgeDot"));
+        assert!(!EXTENSION_SOURCE.contains("function drawModifiers"));
+        let metadata: serde_json::Value =
+            serde_json::from_str(EXTENSION_METADATA).expect("valid bundled helper metadata");
+        assert_eq!(metadata["version"], 13);
+
+        for action in [
+            "idle", "observe", "click", "drag", "scroll", "text", "key", "navigate", "app",
+            "transfer", "record", "system",
+        ] {
+            assert!(
+                EXTENSION_SOURCE.contains(&format!("'{action}'")),
+                "missing semantic cursor state {action}"
+            );
+        }
+
+        assert!(!EXTENSION_SOURCE.contains("const VERTS"));
+        assert!(!EXTENSION_SOURCE.contains("setSourceRGBA(0.10, 0.75, 1.00"));
     }
 }

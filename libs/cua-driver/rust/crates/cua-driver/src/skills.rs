@@ -43,6 +43,7 @@
 //!
 //! - Claude Code: `~/.claude/skills/`
 //! - Codex:       `~/.agents/skills/`
+//! - Prime Agent: `~/.prime/agent/skills/`
 //! - OpenClaw:    `~/.openclaw/skills/`
 //! - OpenCode: `~/.config/opencode/skills/` (macOS / Linux),
 //!   `%APPDATA%\opencode\skills\` (Windows)
@@ -201,6 +202,10 @@ const AGENTS: &[Agent] = &[
         parent: AgentParent::Home(".agents/skills"),
     },
     Agent {
+        label: "Prime Agent",
+        parent: AgentParent::Home(".prime/agent/skills"),
+    },
+    Agent {
         label: "OpenClaw",
         parent: AgentParent::Home(".openclaw/skills"),
     },
@@ -331,7 +336,7 @@ fn install(flags: &[String], force: bool) -> Result<()> {
         }
     }
     if !linked_any {
-        println!("(No agent skills dirs present yet — install Claude Code / Codex / OpenClaw / OpenCode / Antigravity / Hermes then re-run.)");
+        println!("(No agent skills dirs present yet — install Claude Code / Codex / Prime Agent / OpenClaw / OpenCode / Antigravity / Hermes then re-run.)");
     }
     Ok(())
 }
@@ -776,9 +781,22 @@ fn print_path() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_tar_gz, SKILL_FILES};
+    use super::{extract_tar_gz, AgentParent, AGENTS, SKILL_FILES};
     use std::path::PathBuf;
     use tempfile::tempdir;
+
+    #[test]
+    fn prime_agent_target_matches_its_native_global_skill_directory() {
+        let target = AGENTS
+            .iter()
+            .find(|agent| agent.label == "Prime Agent")
+            .expect("Prime Agent must remain a supported skill target");
+
+        assert!(matches!(
+            target.parent,
+            AgentParent::Home(".prime/agent/skills")
+        ));
+    }
 
     /// Build a gzipped tarball with the entries given as
     /// `(path, contents)` pairs. Returns the raw `.tar.gz` bytes.
@@ -837,6 +855,58 @@ mod tests {
             assert!(
                 macos.contains(required),
                 "macOS skill lost required permission guidance: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_skill_keeps_filesystem_outcome_ladder_and_gui_proof_boundaries() {
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let skill = std::fs::read_to_string(crate_dir.join("../../Skills/cua-driver/SKILL.md"))
+            .expect("canonical skill must be readable");
+
+        for required in [
+            "headless filesystem or command capability",
+            "perform one batch-safe operation",
+            "filesystem rename committed",
+            "issue that modified click with",
+            "every intended item is selected",
+            "source reflects copy-versus-move semantics",
+        ] {
+            assert!(
+                skill.contains(required),
+                "skill lost required filesystem outcome guidance: {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn bundled_skill_keeps_semantic_clipboard_outcome_ladder() {
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let skill = std::fs::read_to_string(crate_dir.join("../../Skills/cua-driver/SKILL.md"))
+            .expect("canonical skill must be readable");
+        let browser = std::fs::read_to_string(crate_dir.join("../../Skills/cua-driver/BROWSER.md"))
+            .expect("canonical browser skill must be readable");
+
+        for required in [
+            "exact value on the system clipboard",
+            "`clipboard_write`",
+            "`clipboard_read`",
+            "passive page-text ref",
+        ] {
+            assert!(
+                skill.contains(required),
+                "skill lost required clipboard outcome guidance: {required}"
+            );
+        }
+        for required in [
+            "exact page content on the system clipboard",
+            "passive headings and text nodes are evidence sources",
+            "foreground escalation rules in `SKILL.md`",
+        ] {
+            assert!(
+                browser.contains(required),
+                "browser skill lost required clipboard outcome guidance: {required}"
             );
         }
     }

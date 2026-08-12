@@ -10,8 +10,8 @@ binding.
 
 <VideoDemo
   className="my-8"
-  src="https://trycua.github.io/assets/videos/cua-driver/macos-background-chrome.mp4"
-  poster="https://trycua.github.io/assets/posters/cua-driver/macos-background-chrome.jpg"
+  src="https://github.com/user-attachments/assets/46f4be37-92c2-4360-bc20-bde35401bc71"
+  poster="https://github.com/user-attachments/assets/bcbe275a-9b37-4432-9f76-124d88574f6a"
   title="Chrome remains behind the agent terminal"
   sourceUrl="https://x.com/trycua/status/2047383209244287350"
 >
@@ -97,7 +97,7 @@ resources:
     - bundle_id: com.google.Chrome
       launch: false
       windows: all
-      terminate: never
+      terminate: deny
   browser:
     profiles:
       - kind: existing_profile
@@ -315,7 +315,11 @@ browser_click({
 ```
 
 Use this only when the page's DOM click semantics are acceptable. The driver
-never silently falls back from trusted input to a DOM event.
+never silently falls back from trusted input to a DOM event. A successful
+`dom_event` dispatch returns `effect: "unverifiable"`: it does not mean the
+control activated, and trust-gated controls may ignore it. Take a fresh page
+snapshot and verify the expected state before continuing. Cua Driver does not
+automatically foreground the browser when that verification fails.
 
 Snapshot again, then type into the fresh input ref:
 

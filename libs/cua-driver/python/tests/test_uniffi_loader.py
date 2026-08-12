@@ -58,7 +58,7 @@ while True:
             if request["method"] == "metadata":
                 result = {
                     "driver_version": "0.10.0",
-                    "contract_version": "0.2.0",
+                    "contract_version": "0.6.0",
                     "tools_list_schema_version": "1",
                     "capability_version": "1",
                     "mcp_protocol_version": "2025-06-18",
@@ -104,10 +104,18 @@ except FileNotFoundError:
     def test_generated_python_sdk_calls_the_rust_daemon_interface(self) -> None:
         import cua_driver
         from cua_driver import (
+            ActionEffect,
+            ActionRoute,
+            ClickButton,
+            ClickInput,
             CuaDriver,
+            DesktopScope,
             EffectiveScope,
-            GetDesktopStateInput,
+            StatePredicate,
             StartSessionOutput,
+            VerificationStatus,
+            VerifyStateInput,
+            WindowPredicate,
         )
 
         self.assertIsNotNone(EffectiveScope)
@@ -122,11 +130,11 @@ except FileNotFoundError:
             socket_path = str(Path(directory) / "driver.sock")
             listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             listener.bind(socket_path)
-            listener.listen(2)
+            listener.listen(4)
             captured: list[dict[str, object]] = []
 
             def serve() -> None:
-                for _ in range(2):
+                while len(captured) < 2:
                     connection, _ = listener.accept()
                     with connection:
                         line = connection.makefile("r", encoding="utf-8").readline()
@@ -134,7 +142,7 @@ except FileNotFoundError:
                         if request["method"] == "metadata":
                             result = {
                                 "driver_version": "0.12.6",
-                                "contract_version": "0.2.0",
+                                "contract_version": "0.6.0",
                                 "tools_list_schema_version": "1",
                                 "capability_version": "1",
                                 "mcp_protocol_version": "2025-06-18",
@@ -143,6 +151,20 @@ except FileNotFoundError:
                             }
                         else:
                             captured.append(request)
+                            if request["name"] == "verify_state":
+                                structured = {
+                                    "status": "satisfied",
+                                    "stable": True,
+                                    "elapsed_ms": 12,
+                                    "samples": 2,
+                                    "predicates": [],
+                                }
+                            else:
+                                structured = {
+                                    "effect": "unverifiable",
+                                    "route": "global_input",
+                                    "delivery": {"mode": "not_applicable"},
+                                }
                             result = {
                                 "content": [
                                     {"type": "text", "text": "python ffi"},
@@ -152,7 +174,7 @@ except FileNotFoundError:
                                         "data": "cG5n",
                                     },
                                 ],
-                                "structuredContent": {"verified": True},
+                                "structuredContent": structured,
                                 "isError": False,
                             }
                         response = {"ok": True, "result": result}
@@ -176,24 +198,78 @@ except FileNotFoundError:
                 "type_text",
                 "press_key",
                 "hotkey",
+                "verify_state",
             }
             self.assertTrue(all(hasattr(driver, name) for name in expected_methods))
-            result = asyncio.run(
-                driver.get_desktop_state(
-                    GetDesktopStateInput(
-                        session="python-run", screenshot_out_file=None
+            verification_result = asyncio.run(
+                driver.verify_state(
+                    VerifyStateInput(
+                        pid=123,
+                        window_id=456,
+                        expect=[
+                            StatePredicate(
+                                window=WindowPredicate(exists=True, bounds=None),
+                                element=None,
+                            )
+                        ],
+                        session="python-run",
+                        timeout_ms=0,
+                        stable_samples=1,
+                        include_screenshot=True,
+                    )
+                )
+            )
+            action_result = asyncio.run(
+                driver.click(
+                    ClickInput(
+                        x=12.0,
+                        y=34.0,
+                        scope=DesktopScope.DESKTOP,
+                        session="python-run",
+                        button=ClickButton.LEFT,
+                        count=1,
                     )
                 )
             )
             server.join(timeout=5)
             listener.close()
 
-        self.assertEqual(result.text, "python ffi")
-        self.assertEqual(result.images[0].mime_type, "image/png")
-        self.assertTrue(result.verified)
-        self.assertEqual(captured[0]["name"], "get_desktop_state")
-        self.assertEqual(captured[0]["args"], {"session": "python-run"})
+        self.assertEqual(verification_result.text, "python ffi")
+        self.assertEqual(verification_result.images[0].mime_type, "image/png")
+        self.assertIsNone(verification_result.action)
+        self.assertEqual(
+            verification_result.verification.status, VerificationStatus.SATISFIED
+        )
+        self.assertIsNone(action_result.verification)
+        self.assertEqual(action_result.action.effect, ActionEffect.UNVERIFIABLE)
+        self.assertEqual(action_result.action.route, ActionRoute.GLOBAL_INPUT)
+        self.assertFalse(hasattr(action_result, "verified"))
+        self.assertEqual(captured[0]["name"], "verify_state")
+        self.assertEqual(
+            captured[0]["args"],
+            {
+                "pid": 123,
+                "window_id": 456,
+                "expect": [{"window": {"exists": True}}],
+                "session": "python-run",
+                "timeout_ms": 0,
+                "stable_samples": 1,
+                "include_screenshot": True,
+            },
+        )
         self.assertEqual(captured[0]["client_kind"], "python_sdk")
+        self.assertEqual(captured[1]["name"], "click")
+        self.assertEqual(
+            captured[1]["args"],
+            {
+                "x": 12.0,
+                "y": 34.0,
+                "scope": "desktop",
+                "session": "python-run",
+                "button": "left",
+                "count": 1,
+            },
+        )
 
     def test_generated_python_sdk_can_own_the_runtime_in_process(self) -> None:
         from cua_driver import CuaDriver, DriverExecutionMode

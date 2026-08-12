@@ -22,7 +22,7 @@ import {
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
 
-const HELPER_API_VERSION = 8;
+const HELPER_API_VERSION = 13;
 const EXACT_TARGET_PROTOCOL_VERSION = 4;
 const FOREGROUND_TIMEOUT_MS = 30_000;
 const CURSOR_IDLE_TIMEOUT_US = 5 * 60 * 1_000_000;
@@ -57,18 +57,660 @@ const IFACE = `<node><interface name="org.cua.WinRects">
 <method name="HideCursor"></method>
 </interface></node>`;
 
-// The same agent cursor cua-driver renders on every other platform: the
-// procedural gradient arrow from cursor-overlay (verts tip-at-+x, `default_blue`
-// palette). Rotated to point up-left and translated so the tip sits at the
-// actor's (TIPX, TIPY); MoveCursor/ClickPulse place that tip on the target.
-const VERTS = [[14, 0], [-8, -9], [-3, 0], [-8, 9]];
-const ANGLE = Math.PI * 1.25;           // tip points up-left
-const TIPX = 2, TIPY = 2;
-function arrowPoints() {
-    const ca = Math.cos(ANGLE), sa = Math.sin(ANGLE);
-    const rot = VERTS.map(([x, y]) => [ca * x - sa * y, sa * x + ca * y]);
-    const tx = TIPX - rot[0][0], ty = TIPY - rot[0][1];
-    return rot.map(([x, y]) => [x + tx, y + ty]);
+// GNOME cannot host the Rust renderer directly, so this Shell actor mirrors
+// the embedded cua.default vector theme and semantic state vocabulary.
+const CANVAS_SIZE = 128;
+const DISPLAY_SIZE = 42;
+const ACTOR_SIZE = 112;
+const ACTOR_CENTER = ACTOR_SIZE / 2;
+const SCALE = DISPLAY_SIZE / CANVAS_SIZE;
+const FLOAT_DURATION = 4.0;
+const GLOW_SURFACE_SCALE = 3;
+const GLOW_PADDING = 24;
+const BADGE_Y_OFFSET = 29;
+const BADGE_HOLD_SECONDS = 2.0;
+const BADGE_FADE_SECONDS = 0.4;
+const BADGE_CHIP_SIZE = 18;
+const ACTIONS = new Set([
+  'idle',
+  'observe',
+  'click',
+  'drag',
+  'scroll',
+  'text',
+  'key',
+  'navigate',
+  'app',
+  'transfer',
+  'record',
+  'system',
+]);
+const ONE_SHOT_ACTIONS = new Set(['click', 'key', 'navigate', 'app', 'system']);
+const ACTION_DURATIONS = {
+  idle: 4.0,
+  click: 0.67,
+  observe: 1.6,
+  drag: 1.6,
+  scroll: 1.6,
+  text: 1.6,
+  key: 1.6,
+  navigate: 1.6,
+  app: 1.6,
+  transfer: 1.6,
+  record: 1.6,
+  system: 1.6,
+};
+
+function nowSeconds() {
+  return GLib.get_monotonic_time() / 1_000_000;
+}
+
+function mixChannel(base, accent, weight) {
+  return Math.round(base * (1 - weight) + accent * weight);
+}
+
+function badgeStyle(fillColor) {
+  const start = fillColor.map((channel, index) => mixChannel([94, 151, 178][index], channel, 0.66));
+  const end = fillColor.map((channel, index) => mixChannel([13, 27, 38][index], channel, 0.26));
+  // The rim carries session identity now that the orb is gone, matching
+  // paint_session_badge in the Rust renderer.
+  const rim = fillColor.map((channel) => mixChannel(255, channel, 0.55));
+  return [
+    'spacing: 7px',
+    'padding: 6px 10px',
+    `background-gradient-start: rgba(${start[0]}, ${start[1]}, ${start[2]}, 0.93)`,
+    `background-gradient-end: rgba(${end[0]}, ${end[1]}, ${end[2]}, 0.96)`,
+    'background-gradient-direction: horizontal',
+    `border: 1px solid rgba(${rim[0]}, ${rim[1]}, ${rim[2]}, 0.75)`,
+    'border-radius: 14px',
+    'box-shadow: 0 2px 9px rgba(0, 0, 0, 0.30)',
+  ].join(';');
+}
+
+function easeInOut(value) {
+  const t = Math.max(0, Math.min(1, value));
+  return t * t * (3 - 2 * t);
+}
+
+function triangleWave(value) {
+  const t = ((value % 1) + 1) % 1;
+  return t < 0.5 ? t * 2 : (1 - t) * 2;
+}
+
+function setInk(cr, alpha = 1) {
+  cr.setSourceRGBA(1, 1, 1, alpha);
+}
+
+function setPaper(cr, alpha = 1) {
+  cr.setSourceRGBA(1, 1, 1, alpha);
+}
+
+function setFill(cr, color, alpha = 1) {
+  cr.setSourceRGBA(color[0] / 255, color[1] / 255, color[2] / 255, alpha);
+}
+
+function glowPath(cr, width, alpha, glowColor) {
+  if (!glowColor) return;
+  const layers = 12;
+  const outerExpansion = 13;
+  const innerExpansion = 2.5;
+  const maxOpacity = 0.17;
+  let accumulatedOpacity = 0;
+  for (let layer = 0; layer < layers; layer++) {
+    const progress = (layer + 1) / layers;
+    const expansion = outerExpansion + (innerExpansion - outerExpansion) * progress;
+    const targetOpacity = maxOpacity * Math.max(0, Math.min(1, alpha)) * Math.pow(progress, 1.6);
+    const layerOpacity =
+      (targetOpacity - accumulatedOpacity) / Math.max(0.001, 1 - accumulatedOpacity);
+    accumulatedOpacity = targetOpacity;
+    cr.setLineWidth(width + expansion);
+    cr.setLineCap(Cairo.LineCap.ROUND);
+    cr.setLineJoin(Cairo.LineJoin.ROUND);
+    setFill(cr, glowColor, layerOpacity);
+    cr.strokePreserve();
+  }
+}
+
+function strokePath(cr, width, alpha = 1, glowColor = null) {
+  glowPath(cr, width, alpha, glowColor);
+  cr.setLineWidth(glowColor ? width + 1.5 : width);
+  cr.setLineCap(Cairo.LineCap.ROUND);
+  cr.setLineJoin(Cairo.LineJoin.ROUND);
+  setInk(cr, alpha);
+  if (!glowColor) {
+    cr.stroke();
+    return;
+  }
+  cr.strokePreserve();
+  cr.setLineWidth(Math.max(1.5, width - 1));
+  setFill(cr, glowColor, alpha);
+  cr.stroke();
+}
+
+function fillPath(cr, glowWidth, alpha = 1, glowColor = null) {
+  glowPath(cr, glowWidth, alpha, glowColor);
+  cr.setLineWidth(3);
+  cr.setLineCap(Cairo.LineCap.ROUND);
+  cr.setLineJoin(Cairo.LineJoin.ROUND);
+  setInk(cr, alpha);
+  cr.strokePreserve();
+  setFill(cr, glowColor, alpha);
+  cr.fill();
+}
+
+function linePath(cr, points, width = 4, alpha = 1, glowColor = null) {
+  if (points.length === 0) return;
+  cr.moveTo(points[0][0], points[0][1]);
+  for (let i = 1; i < points.length; i++) cr.lineTo(points[i][0], points[i][1]);
+  strokePath(cr, width, alpha, glowColor);
+}
+
+function roundedRect(cr, x, y, width, height, radius) {
+  const r = Math.max(0, Math.min(radius, width / 2, height / 2));
+  const k = 0.5522848;
+  cr.moveTo(x + r, y);
+  cr.lineTo(x + width - r, y);
+  cr.curveTo(x + width - r + r * k, y, x + width, y + r - r * k, x + width, y + r);
+  cr.lineTo(x + width, y + height - r);
+  cr.curveTo(
+    x + width,
+    y + height - r + r * k,
+    x + width - r + r * k,
+    y + height,
+    x + width - r,
+    y + height
+  );
+  cr.lineTo(x + r, y + height);
+  cr.curveTo(x + r - r * k, y + height, x, y + height - r + r * k, x, y + height - r);
+  cr.lineTo(x, y + r);
+  cr.curveTo(x, y + r - r * k, x + r - r * k, y, x + r, y);
+  cr.closePath();
+}
+
+function traceCursorBody(cr) {
+  cr.moveTo(55, 30);
+  cr.curveTo(48, 28, 42, 33, 43, 41);
+  cr.lineTo(64, 98);
+  cr.curveTo(67, 106, 73, 106, 77, 99);
+  cr.lineTo(86, 79);
+  cr.curveTo(88, 75, 91, 72, 95, 70);
+  cr.lineTo(108, 63);
+  cr.curveTo(115, 59, 114, 53, 107, 50);
+  cr.closePath();
+}
+
+function drawCursorGlowShape(cr, fillColor) {
+  const layers = 36;
+  const outerWidth = 44;
+  const innerWidth = 7;
+  const maxOpacity = 0.34;
+  let accumulatedOpacity = 0;
+
+  for (let layer = 0; layer < layers; layer++) {
+    const progress = (layer + 1) / layers;
+    const width = outerWidth + (innerWidth - outerWidth) * progress;
+    const targetOpacity = maxOpacity * Math.pow(progress, 1.65);
+    const layerOpacity =
+      (targetOpacity - accumulatedOpacity) / Math.max(0.001, 1 - accumulatedOpacity);
+    accumulatedOpacity = targetOpacity;
+    if (layerOpacity <= 0) continue;
+
+    traceCursorBody(cr);
+    cr.setLineWidth(width);
+    cr.setLineCap(Cairo.LineCap.ROUND);
+    cr.setLineJoin(Cairo.LineJoin.ROUND);
+    setFill(cr, fillColor, layerOpacity);
+    cr.stroke();
+  }
+}
+
+function createGlowSurface(fillColor) {
+  const surface = new Cairo.ImageSurface(
+    Cairo.Format.ARGB32,
+    (CANVAS_SIZE + GLOW_PADDING * 2) * GLOW_SURFACE_SCALE,
+    (CANVAS_SIZE + GLOW_PADDING * 2) * GLOW_SURFACE_SCALE
+  );
+  const cr = new Cairo.Context(surface);
+  cr.scale(GLOW_SURFACE_SCALE, GLOW_SURFACE_SCALE);
+  cr.translate(GLOW_PADDING, GLOW_PADDING);
+  drawCursorGlowShape(cr, fillColor);
+  cr.$dispose();
+  return surface;
+}
+
+function sharedFloatMotion(progress) {
+  const angle = progress * Math.PI * 2;
+  return {
+    dx: Math.sin(angle) * 5,
+    dy: Math.cos(angle) * 6 - 5,
+    rotation: Math.cos(angle) * ((2.5 * Math.PI) / 180),
+    scale: 1,
+  };
+}
+
+function cursorBodyMotion(progress, action) {
+  let dx = 0;
+  let dy = 0;
+  let rotation = 0;
+  let scale = 1;
+
+  if (action === 'click') {
+    if (progress < 0.35) scale = 1 - easeInOut(progress / 0.35) * 0.07;
+    else if (progress < 0.6) scale = 0.93 + easeInOut((progress - 0.35) / 0.25) * 0.1;
+    else scale = 1.03 - easeInOut((progress - 0.6) / 0.4) * 0.03;
+  } else if (action === 'drag') {
+    const held = easeInOut(triangleWave(progress));
+    dx = held * 7;
+    dy = held * 3;
+  }
+
+  return { dx, dy, rotation, scale };
+}
+
+function applyCursorBodyMotion(cr, motion) {
+  cr.translate(64 + motion.dx, 64 + motion.dy);
+  cr.rotate(motion.rotation);
+  cr.scale(motion.scale, motion.scale);
+  cr.translate(-64, -64);
+}
+
+function drawCursorGlow(cr, progress, action, glowSurface) {
+  const motion = cursorBodyMotion(progress, action);
+  cr.save();
+  applyCursorBodyMotion(cr, motion);
+  cr.translate(-GLOW_PADDING, -GLOW_PADDING);
+  cr.scale(1 / GLOW_SURFACE_SCALE, 1 / GLOW_SURFACE_SCALE);
+  cr.setSourceSurface(glowSurface, 0, 0);
+  cr.paint();
+  cr.restore();
+}
+
+function drawCursorBody(cr, progress, action, fillColor) {
+  const motion = cursorBodyMotion(progress, action);
+  cr.save();
+  applyCursorBodyMotion(cr, motion);
+  traceCursorBody(cr);
+  setFill(cr, fillColor);
+  cr.fillPreserve();
+  cr.setLineWidth(5);
+  cr.setLineCap(Cairo.LineCap.ROUND);
+  cr.setLineJoin(Cairo.LineJoin.ROUND);
+  setPaper(cr);
+  cr.stroke();
+  cr.restore();
+}
+
+function drawActionCue(cr, action, progress, fillColor) {
+  const wave = triangleWave(progress);
+  const strokeCue = (width, alpha = 1) => strokePath(cr, width, alpha, fillColor);
+  const lineCue = (points, width = 4, alpha = 1) => linePath(cr, points, width, alpha, fillColor);
+  cr.save();
+  switch (action) {
+    case 'observe': {
+      const opacity = Math.min(1, progress * 7);
+      cr.translate(8, -10);
+      cr.moveTo(38, 28);
+      cr.curveTo(27, 29, 20, 38, 20, 49);
+      strokeCue(4, opacity);
+      cr.moveTo(42, 19);
+      cr.curveTo(23, 19, 11, 33, 11, 51);
+      strokeCue(4, opacity);
+      break;
+    }
+    case 'click': {
+      const cueProgress = Math.max(0, Math.min(1, progress / 0.65));
+      const opacity = Math.max(
+        0,
+        Math.min(1, Math.min(1 - Math.pow(cueProgress, 1.35), cueProgress * 5))
+      );
+      const cueScale = 1.1 + easeInOut(cueProgress) * 0.4;
+      cr.translate(35, 28);
+      cr.scale(cueScale, cueScale);
+      cr.translate(-25, -25);
+      lineCue(
+        [
+          [35, 20],
+          [34, 11],
+        ],
+        4,
+        opacity
+      );
+      lineCue(
+        [
+          [27, 25],
+          [19, 19],
+        ],
+        4,
+        opacity
+      );
+      lineCue(
+        [
+          [25, 34],
+          [15, 34],
+        ],
+        4,
+        opacity
+      );
+      break;
+    }
+    case 'drag': {
+      const offset = easeInOut(wave) * 7;
+      cr.translate(offset, offset * 0.43);
+      lineCue(
+        [
+          [28, 38],
+          [16, 35],
+        ],
+        4,
+        0.2 + wave * 0.8
+      );
+      lineCue(
+        [
+          [26, 48],
+          [12, 45],
+        ],
+        4,
+        0.2 + wave * 0.8
+      );
+      break;
+    }
+    case 'scroll': {
+      cr.translate(-5, 4 - wave * 8);
+      lineCue(
+        [
+          [23, 31],
+          [31, 22],
+          [39, 31],
+        ],
+        4,
+        0.42 + wave * 0.58
+      );
+      lineCue(
+        [
+          [23, 49],
+          [31, 58],
+          [39, 49],
+        ],
+        4,
+        0.42 + wave * 0.58
+      );
+      break;
+    }
+    case 'text': {
+      const opacity = progress < 0.34 || progress > 0.64 ? 1 : 0.18;
+      cr.translate(-4, 0);
+      lineCue(
+        [
+          [31, 22],
+          [31, 58],
+        ],
+        4,
+        opacity
+      );
+      lineCue(
+        [
+          [24, 22],
+          [38, 22],
+        ],
+        4,
+        opacity
+      );
+      lineCue(
+        [
+          [24, 58],
+          [38, 58],
+        ],
+        4,
+        opacity
+      );
+      break;
+    }
+    case 'key': {
+      const bounce = Math.sin(progress * Math.PI * 2) * (1 - progress) * 3;
+      cr.translate(-9, bounce);
+      roundedRect(cr, 14, 25, 28, 28, 6);
+      strokeCue(3.5);
+      lineCue(
+        [
+          [23, 32],
+          [23, 46],
+          [23, 39],
+          [33, 32],
+          [24, 39],
+          [34, 46],
+        ],
+        3.5
+      );
+      break;
+    }
+    case 'navigate': {
+      cr.translate(-10 + easeInOut(progress) * 9, 0);
+      lineCue(
+        [
+          [15, 29],
+          [25, 40],
+          [15, 51],
+        ],
+        4,
+        0.2 + wave * 0.8
+      );
+      lineCue(
+        [
+          [29, 29],
+          [39, 40],
+          [29, 51],
+        ],
+        4,
+        0.2 + wave * 0.8
+      );
+      break;
+    }
+    case 'app': {
+      const s = 0.2 + easeInOut(Math.min(1, progress * 2)) * 0.8;
+      cr.translate(21, 39);
+      cr.scale(s, s);
+      cr.translate(-26, -39);
+      for (const [x, y] of [
+        [13, 26],
+        [29, 26],
+        [13, 42],
+        [29, 42],
+      ]) {
+        roundedRect(cr, x, y, 10, 10, 2);
+        strokeCue(3.5);
+      }
+      break;
+    }
+    case 'transfer':
+      cr.translate(-9, 6 - wave * 12);
+      lineCue(
+        [
+          [22, 50],
+          [22, 20],
+          [14, 28],
+          [22, 20],
+          [30, 28],
+        ],
+        4,
+        0.38 + wave * 0.62
+      );
+      lineCue(
+        [
+          [37, 28],
+          [37, 58],
+          [29, 50],
+          [37, 58],
+          [45, 50],
+        ],
+        4,
+        0.38 + wave * 0.62
+      );
+      break;
+    case 'record':
+      cr.translate(-12, 0);
+      cr.arc(29, 39, 17, 0, Math.PI * 2);
+      strokeCue(4);
+      cr.arc(29, 39, 3.6 + wave * 2.1, 0, Math.PI * 2);
+      fillPath(cr, (3.6 + wave * 2.1) * 1.25, 0.42 + wave * 0.58, fillColor);
+      break;
+    case 'system': {
+      cr.translate(15, 39);
+      cr.rotate(((easeInOut(progress) * 68 - 18) * Math.PI) / 180);
+      cr.translate(-29, -39);
+      for (const radius of [12, 4]) {
+        cr.arc(29, 39, radius, 0, Math.PI * 2);
+        strokeCue(3.5);
+      }
+      for (const points of [
+        [
+          [29, 20],
+          [29, 25],
+        ],
+        [
+          [29, 53],
+          [29, 58],
+        ],
+        [
+          [10, 39],
+          [15, 39],
+        ],
+        [
+          [43, 39],
+          [48, 39],
+        ],
+        [
+          [16, 26],
+          [20, 30],
+        ],
+        [
+          [38, 48],
+          [42, 52],
+        ],
+        [
+          [16, 52],
+          [20, 48],
+        ],
+        [
+          [38, 30],
+          [42, 26],
+        ],
+      ])
+        lineCue(points, 3.5);
+      break;
+    }
+    default:
+      break;
+  }
+  cr.restore();
+}
+
+function drawBadgeChip(cr, glyph, filled, fillColor) {
+  roundedRect(cr, 0.5, 0.5, 17, 17, 5);
+  if (filled) {
+    cr.setSourceRGBA(fillColor[0] / 255, fillColor[1] / 255, fillColor[2] / 255, 0.86);
+    cr.fillPreserve();
+  } else {
+    cr.setSourceRGBA(1, 1, 1, 0.09);
+    cr.fillPreserve();
+  }
+  cr.setSourceRGBA(1, 1, 1, filled ? 0.72 : 0.42);
+  cr.setLineWidth(1);
+  cr.stroke();
+  cr.setSourceRGBA(1, 1, 1, 0.95);
+  cr.setLineWidth(1.35);
+  cr.setLineCap(Cairo.LineCap.ROUND);
+  cr.setLineJoin(Cairo.LineJoin.ROUND);
+
+  const stroke = () => cr.stroke();
+  const line = (points) => {
+    cr.moveTo(points[0][0], points[0][1]);
+    for (const [x, y] of points.slice(1)) cr.lineTo(x, y);
+    stroke();
+  };
+  switch (glyph) {
+    case 'background':
+      roundedRect(cr, 4, 4, 7, 7, 1.8);
+      stroke();
+      roundedRect(cr, 6.4, 6.4, 7, 7, 1.8);
+      stroke();
+      break;
+    case 'foreground':
+      roundedRect(cr, 4, 5, 10, 9, 1.8);
+      stroke();
+      line([
+        [5, 7.6],
+        [13, 7.6],
+      ]);
+      break;
+    case 'ax':
+      line([
+        [9, 5],
+        [9, 9],
+        [5, 13],
+      ]);
+      line([
+        [9, 9],
+        [13, 13],
+      ]);
+      for (const [x, y] of [
+        [9, 5],
+        [5, 13],
+        [13, 13],
+      ]) {
+        cr.arc(x, y, 1.35, 0, Math.PI * 2);
+        cr.fill();
+      }
+      break;
+    case 'pixel':
+      line([
+        [4, 7],
+        [4, 4],
+        [7, 4],
+      ]);
+      line([
+        [11, 4],
+        [14, 4],
+        [14, 7],
+      ]);
+      line([
+        [14, 11],
+        [14, 14],
+        [11, 14],
+      ]);
+      line([
+        [7, 14],
+        [4, 14],
+        [4, 11],
+      ]);
+      break;
+    case 'browser':
+      cr.arc(9, 9, 5, 0, Math.PI * 2);
+      stroke();
+      line([
+        [4, 9],
+        [14, 9],
+      ]);
+      line([
+        [9, 4],
+        [7, 9],
+        [9, 14],
+        [11, 9],
+        [9, 4],
+      ]);
+      break;
+    case 'desktop':
+      roundedRect(cr, 4, 4, 10, 7.6, 1.3);
+      stroke();
+      line([
+        [9, 11.6],
+        [9, 14],
+        [6, 14],
+        [12, 14],
+      ]);
+      break;
+    default:
+      break;
+  }
 }
 
 export default class WinRectsExtension extends Extension {
@@ -144,61 +786,141 @@ export default class WinRectsExtension extends Extension {
         }
     }
 
-    _createCursorActor() {
-        const cursor = new St.DrawingArea({
-            width: 30,
-            height: 30,
-            visible: false,
-            reactive: false,
-            can_focus: false,
+    _createCursorRecord(owner) {
+        const record = {
+            connectionOwner: owner.connectionOwner,
+            targetId: null,
+            requestedVisible: false,
+            lastUsedAt: GLib.get_monotonic_time(),
+            targetSignals: [],
+            targetWindow: null,
+            fillColor: [94, 192, 232],
+            fillColorCss: '#5ec0e8',
+            action: 'idle',
+            delivery: '',
+            target: '',
+            active: false,
+            sessionLabel: '',
+            actionStarted: nowSeconds(),
+            endingAt: null,
+            cursorX: null,
+            cursorY: null,
+            badgeRevealedAt: null,
+            modifierFadeAt: null,
+            frameId: 0,
+            glowSurface: null,
+        };
+        record.glowSurface = createGlowSurface(record.fillColor);
+        record.actor = new St.DrawingArea({
+            width: ACTOR_SIZE, height: ACTOR_SIZE, visible: false,
+            reactive: false, can_focus: false,
         });
-        cursor._fillColor = '';
-        cursor.connect('repaint', area => {
+        record.actor.connect('repaint', area => {
             const cr = area.get_context();
-            const P = arrowPoints();
-            cr.moveTo(P[0][0], P[0][1]);
-            for (let i = 1; i < P.length; i++) cr.lineTo(P[i][0], P[i][1]);
-            cr.closePath();
-            const tail = [(P[1][0] + P[3][0]) / 2, (P[1][1] + P[3][1]) / 2];
-            if (/^#[0-9a-fA-F]{6}$/.test(cursor._fillColor)) {
-                const value = Number.parseInt(cursor._fillColor.slice(1), 16);
-                cr.setSourceRGBA(
-                    ((value >> 16) & 0xff) / 255,
-                    ((value >> 8) & 0xff) / 255,
-                    (value & 0xff) / 255,
-                    0.97
-                );
-            } else {
-                try {
-                    const g = new Cairo.LinearGradient(P[0][0], P[0][1], tail[0], tail[1]);
-                    g.addColorStopRGBA(0.00, 219 / 255, 238 / 255, 255 / 255, 0.97);
-                    g.addColorStopRGBA(0.53, 94 / 255, 192 / 255, 232 / 255, 0.97);
-                    g.addColorStopRGBA(1.00, 84 / 255, 205 / 255, 160 / 255, 0.97);
-                    cr.setSource(g);
-                } catch (_error) {
-                    cr.setSourceRGBA(94 / 255, 192 / 255, 232 / 255, 0.97);
-                }
-            }
-            cr.fillPreserve();
-            cr.setLineWidth(1.4); cr.setSourceRGBA(1, 1, 1, 0.95); cr.stroke();
+            const duration = ACTION_DURATIONS[record.action] ?? 1.6;
+            const elapsed = nowSeconds() - record.actionStarted;
+            const progress = (elapsed % duration) / duration;
+            const floatProgress = (elapsed % FLOAT_DURATION) / FLOAT_DURATION;
+            cr.save();
+            cr.translate(ACTOR_CENTER, ACTOR_CENTER);
+            cr.scale(SCALE, SCALE);
+            cr.translate(-CANVAS_SIZE / 2, -CANVAS_SIZE / 2);
+            applyCursorBodyMotion(cr, sharedFloatMotion(floatProgress));
+            drawCursorGlow(cr, progress, record.action, record.glowSurface);
+            drawActionCue(cr, record.action, progress, record.fillColor);
+            drawCursorBody(cr, progress, record.action, record.fillColor);
+            cr.restore();
             cr.$dispose();
         });
-        cursor.set_pivot_point(TIPX / 30, TIPY / 30);
-        Main.layoutManager.addTopChrome(cursor);
-        return cursor;
+        record.actor.set_pivot_point(0.5, 0.5);
+        Main.layoutManager.addTopChrome(record.actor);
+        record.badgeLabel = new St.Label({
+            text: '', visible: false, y_align: Clutter.ActorAlign.CENTER,
+            style: 'font-size: 11px; font-weight: 600; color: white;',
+        });
+        record.deliveryChip = new St.DrawingArea({width: BADGE_CHIP_SIZE, height: BADGE_CHIP_SIZE, visible: false});
+        record.deliveryChip.connect('repaint', area => {
+            const cr = area.get_context(); drawBadgeChip(cr, record.delivery, true, record.fillColor); cr.$dispose();
+        });
+        record.targetChip = new St.DrawingArea({width: BADGE_CHIP_SIZE, height: BADGE_CHIP_SIZE, visible: false});
+        record.targetChip.connect('repaint', area => {
+            const cr = area.get_context(); drawBadgeChip(cr, record.target, false, record.fillColor); cr.$dispose();
+        });
+        record.badge = new St.BoxLayout({
+            visible: false, reactive: false, can_focus: false, style: badgeStyle(record.fillColor),
+        });
+        record.badge.add_child(record.badgeLabel);
+        record.badge.add_child(record.deliveryChip);
+        record.badge.add_child(record.targetChip);
+        Main.layoutManager.addTopChrome(record.badge);
+        record.frameId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 33, () => {
+            if (!record.actor) return GLib.SOURCE_REMOVE;
+            const now = nowSeconds();
+            if (record.endingAt !== null && now >= record.endingAt)
+                this._setRecordCursorState(record, 'idle', '', '');
+            if (ONE_SHOT_ACTIONS.has(record.action) && now - record.actionStarted >= ACTION_DURATIONS[record.action])
+                this._setRecordCursorState(record, 'idle', '', '');
+            if (record.actor.visible) record.actor.queue_repaint();
+            let labelAlpha = record.badgeRevealedAt === null ? 0 : 1;
+            if (record.badgeRevealedAt !== null) {
+                const elapsed = now - record.badgeRevealedAt;
+                if (elapsed > BADGE_HOLD_SECONDS && elapsed < BADGE_HOLD_SECONDS + BADGE_FADE_SECONDS)
+                    labelAlpha = 1 - easeInOut((elapsed - BADGE_HOLD_SECONDS) / BADGE_FADE_SECONDS);
+                else if (elapsed >= BADGE_HOLD_SECONDS + BADGE_FADE_SECONDS) {
+                    labelAlpha = 0; record.badgeRevealedAt = null;
+                }
+            }
+            let chipAlpha = record.delivery || record.target ? 1 : 0;
+            if (record.modifierFadeAt !== null) {
+                const fade = (now - record.modifierFadeAt) / BADGE_FADE_SECONDS;
+                chipAlpha = 1 - easeInOut(fade);
+                if (fade >= 1) {
+                    chipAlpha = 0; record.modifierFadeAt = null; record.delivery = ''; record.target = '';
+                    this._updateModifierChips(record);
+                }
+            }
+            record.badgeLabel.opacity = Math.round(255 * labelAlpha);
+            if (labelAlpha <= 0.001) record.badgeLabel.hide();
+            record.deliveryChip.opacity = Math.round(255 * chipAlpha);
+            record.targetChip.opacity = Math.round(255 * chipAlpha);
+            // Exact-target gating is load-bearing: animation may never reveal a global cursor.
+            const target = record.targetId ? this._resolveTarget(record.targetId) : null;
+            const targetVisible = Boolean(record.requestedVisible && target && this._isTargetVisible(target));
+            if (targetVisible && (labelAlpha > 0.001 || chipAlpha > 0.001)) record.badge.show();
+            else record.badge.hide();
+            return GLib.SOURCE_CONTINUE;
+        });
+        return record;
     }
 
-    _createSessionBadge() {
-        const badge = new St.BoxLayout({
-            style_class: 'cua-session-badge',
-            vertical: false,
-            visible: false,
-            reactive: false,
-            can_focus: false,
-            style: 'spacing: 4px; padding: 4px 7px; border-radius: 9px; background-color: rgba(18,18,20,0.90); color: white;',
-        });
-        Main.layoutManager.addTopChrome(badge);
-        return badge;
+    _positionBadge(record, x, y, duration) {
+        const [, naturalWidth] = record.badge.get_preferred_width(-1);
+        const badgeX = Math.round(x - naturalWidth / 2);
+        const badgeY = Math.round(y + BADGE_Y_OFFSET);
+        if (duration > 0)
+            record.badge.ease({x: badgeX, y: badgeY, duration, mode: Clutter.AnimationMode.EASE_OUT_CUBIC});
+        else record.badge.set_position(badgeX, badgeY);
+    }
+
+    _updateModifierChips(record) {
+        record.deliveryChip.visible = record.delivery.length > 0;
+        record.targetChip.visible = record.target.length > 0;
+        record.deliveryChip.queue_repaint();
+        record.targetChip.queue_repaint();
+    }
+
+    _setRecordCursorState(record, action, delivery, target) {
+        record.action = ACTIONS.has(action) ? action : 'idle';
+        const nextDelivery = delivery ?? '';
+        const nextTarget = target ?? '';
+        if (nextDelivery || nextTarget) {
+            record.delivery = nextDelivery; record.target = nextTarget; record.modifierFadeAt = null;
+        } else if ((record.delivery || record.target) && record.modifierFadeAt === null) {
+            record.modifierFadeAt = nowSeconds();
+        }
+        this._updateModifierChips(record);
+        record.actionStarted = nowSeconds(); record.endingAt = null;
+        record.actor.queue_repaint();
     }
 
     _targetId(window) {
@@ -796,22 +1518,7 @@ export default class WinRectsExtension extends Extension {
     _cursorFor(owner) {
         let record = this._cursors.get(owner.key);
         if (!record) {
-            record = {
-                actor: this._createCursorActor(),
-                badge: this._createSessionBadge(),
-                connectionOwner: owner.connectionOwner,
-                targetId: null,
-                requestedVisible: false,
-                lastUsedAt: GLib.get_monotonic_time(),
-                targetSignals: [],
-                targetWindow: null,
-                fillColor: '',
-                action: '',
-                delivery: '',
-                target: '',
-                active: false,
-                sessionLabel: '',
-            };
+            record = this._createCursorRecord(owner);
             this._cursors.set(owner.key, record);
         }
         record.lastUsedAt = GLib.get_monotonic_time();
@@ -866,19 +1573,15 @@ export default class WinRectsExtension extends Extension {
             const record = this._cursorFor(this._cursorOwner(owner, invocation));
             record.targetId = targetId;
             record.requestedVisible = true;
+            record.cursorX = x; record.cursorY = y;
             this._syncCursorVisibility(record);
             record.actor.ease({
-                x: x - TIPX,
-                y: y - TIPY,
+                x: x - ACTOR_CENTER,
+                y: y - ACTOR_CENTER,
                 duration: 480,
                 mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
             });
-            record.badge.ease({
-                x: x + 18,
-                y: y + 18,
-                duration: 480,
-                mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
-            });
+            this._positionBadge(record, x, y, 480);
             invocation.return_value(null);
         } catch (error) {
             invocation.return_dbus_error('org.cua.WinRects.CursorRejected', String(error));
@@ -890,8 +1593,11 @@ export default class WinRectsExtension extends Extension {
             const record = this._cursorFor(this._cursorOwner(owner, invocation));
             record.targetId = targetId;
             record.requestedVisible = true;
-            record.actor.set_position(x - TIPX, y - TIPY);
-            record.badge.set_position(x + 18, y + 18);
+            record.actor.set_position(x - ACTOR_CENTER, y - ACTOR_CENTER);
+            record.cursorX = x; record.cursorY = y;
+            this._positionBadge(record, x, y, 0);
+            if (['idle', 'navigate', 'click'].includes(record.action))
+                this._setRecordCursorState(record, 'click', record.delivery, record.target);
             this._syncCursorVisibility(record);
             record.actor.ease({
                 scale_x: 1.5,
@@ -915,44 +1621,37 @@ export default class WinRectsExtension extends Extension {
 
     _setCursorColor(owner, fillColor, invocation) {
         const record = this._semanticCursorFor(owner, invocation);
-        const color = String(fillColor).slice(0, 32);
-        if (!/^#[0-9a-fA-F]{6}$/.test(color))
-            throw new Error('cursor_color_invalid: expected #RRGGBB');
-        record.fillColor = color;
-        record.actor._fillColor = color;
-        record.actor.queue_repaint();
+        const match = /^#([0-9a-fA-F]{6})$/.exec(String(fillColor));
+        if (!match) throw new Error('cursor_color_invalid: expected #RRGGBB');
+        const rgb = Number.parseInt(match[1], 16);
+        record.fillColor = [(rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff];
+        record.fillColorCss = `#${match[1].toLowerCase()}`;
+        record.badge.set_style(badgeStyle(record.fillColor));
+        if (record.glowSurface) record.glowSurface.finish();
+        record.glowSurface = createGlowSurface(record.fillColor);
+        record.deliveryChip.queue_repaint(); record.targetChip.queue_repaint(); record.actor.queue_repaint();
     }
 
     _setCursorState(owner, action, delivery, target, active, invocation) {
         const record = this._semanticCursorFor(owner, invocation);
-        record.action = String(action).slice(0, 32);
-        record.delivery = String(delivery).slice(0, 32);
-        record.target = String(target).slice(0, 32);
-        record.active = Boolean(active);
-        this._updateCursorBadge(record);
+        if (!ACTIONS.has(action)) throw new Error('cursor_action_invalid');
+        if (active) this._setRecordCursorState(record, action, delivery, target);
+        else if (record.action === action && !ONE_SHOT_ACTIONS.has(action))
+            record.endingAt = nowSeconds() + 0.4;
     }
 
     _setSessionLabel(owner, label, invocation) {
         const record = this._semanticCursorFor(owner, invocation);
         record.sessionLabel = String(label).slice(0, 24);
-        this._updateCursorBadge(record);
-    }
-
-    _updateCursorBadge(record) {
-        record.badge.destroy_all_children();
-        const chips = [record.sessionLabel];
-        if (record.active)
-            chips.push(record.action, record.delivery, record.target);
-        for (const text of chips.filter(Boolean)) {
-            record.badge.add_child(new St.Label({
-                text,
-                style: 'padding: 1px 4px; border-radius: 5px; background-color: rgba(255,255,255,0.13);',
-            }));
+        record.badgeLabel.set_text(record.sessionLabel);
+        if (!record.sessionLabel || !record.actor.visible) {
+            record.badgeLabel.hide(); record.badgeRevealedAt = null;
+            return;
         }
-        if (record.actor.visible && record.badge.get_n_children() > 0)
-            record.badge.show();
-        else
-            record.badge.hide();
+        record.badgeLabel.show();
+        record.badgeRevealedAt = nowSeconds();
+        if (record.cursorX !== null && record.cursorY !== null)
+            this._positionBadge(record, record.cursorX, record.cursorY, 0);
     }
 
     SetCursorColorAsync([fillColor], invocation) {
@@ -989,6 +1688,8 @@ export default class WinRectsExtension extends Extension {
                 record.requestedVisible = false;
                 record.actor.hide();
                 record.badge.hide();
+                record.badgeRevealedAt = null;
+                record.modifierFadeAt = null;
             }
             invocation.return_value(null);
         } catch (error) {
@@ -1020,6 +1721,8 @@ export default class WinRectsExtension extends Extension {
         for (const [object, id] of record.targetSignals) {
             try { object.disconnect(id); } catch (_error) {}
         }
+        if (record.frameId) GLib.source_remove(record.frameId);
+        if (record.glowSurface) record.glowSurface.finish();
         record.actor.destroy();
         record.badge.destroy();
         this._cursors.delete(owner);

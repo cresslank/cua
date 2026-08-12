@@ -225,27 +225,24 @@ for prefix in ("check_lower", "read", "write"):
     if unbridged:
         raise AssertionError(f"Ruby facade does not bridge schema methods: {unbridged}")
 
-kotlin_sdk = (bindings / "kotlin/ai/cua/cyclops/sdk/cyclops_sdk.kt").read_text(encoding="utf-8")
+kotlin_sdk = (bindings / "kotlin/ai/cua/cyclops/sdk/fleet_sdk.kt").read_text(encoding="utf-8")
 kotlin_schema = (bindings / "kotlin/ai/cua/cyclops/sdk/schema/cyclops_sdk_schema.kt").read_text(encoding="utf-8")
 if "package ai.cua.cyclops.sdk" not in kotlin_sdk or "package ai.cua.cyclops.sdk.schema" not in kotlin_schema:
     raise AssertionError("Kotlin components are not generated into distinct configured packages")
-if "var `spec`: PoolSpec" not in kotlin_sdk or "data class PoolSpec" not in kotlin_schema:
-    raise AssertionError("Kotlin PoolSpec external type is not linked through the schema package")
+if "var `spec`: OsGymSandboxWarmPoolSpec" not in kotlin_sdk or "data class OsGymSandboxWarmPoolSpec" not in kotlin_schema:
+    raise AssertionError("Kotlin OsGymSandboxWarmPoolSpec external type is not linked through the schema package")
 
 swift_sdk = (bindings / "swift/CyclopsSdk.swift").read_text(encoding="utf-8")
 swift_schema = (bindings / "swift/CyclopsSdkSchema.swift").read_text(encoding="utf-8")
-if "public var spec: PoolSpec" not in swift_sdk or "public struct PoolSpec" not in swift_schema:
-    raise AssertionError("Swift PoolSpec external type is not available for one-module compilation")
-pool_spec = re.search(
-    r"public struct PoolSpec: Equatable, Hashable \{(?P<body>.*?)\n\}\n\n#if compiler",
-    swift_schema,
-    re.DOTALL,
-)
-if pool_spec is None:
-    raise AssertionError("Swift PoolSpec is missing explicit Equatable and Hashable conformances")
-for method in ("public static func ==", "public func hash(into hasher: inout Hasher)"):
-    if method not in pool_spec.group("body"):
-        raise AssertionError(f"Swift PoolSpec is missing Rust-backed conformance method: {method}")
+if "public var spec: OsGymSandboxWarmPoolSpec" not in swift_sdk or "public struct OsGymSandboxWarmPoolSpec" not in swift_schema:
+    raise AssertionError("Swift OsGymSandboxWarmPoolSpec external type is not available for one-module compilation")
+if "public struct OsGymSandboxWarmPoolSpec: Equatable, Hashable {" not in swift_schema:
+    raise AssertionError("Swift OsGymSandboxWarmPoolSpec is missing Equatable and Hashable conformances")
+# The legacy PoolSpec carried Rust-backed ==/hash methods (it embedded a
+# PreservedJson object); no surviving schema record does, so records that
+# embed objects must instead NOT claim the conformances they cannot satisfy.
+if "public struct VmTemplate: Equatable" in swift_schema:
+    raise AssertionError("Swift VmTemplate (object-bearing record) must not claim Equatable")
 LANGUAGE_AUDIT
 }
 run_language_linkage_audits
@@ -266,27 +263,27 @@ assert_tree_unchanged "$initial_hash" "handwritten fixture cleanup"
 
 runtime_library="$(find_cyclops_sdk_library)" || fail "could not read a cyclops-sdk cdylib from Cargo compiler-artifact output"
 [ -f "$runtime_library" ] || fail "Cargo reported a missing cyclops-sdk cdylib: $runtime_library"
-runtime_copy="$bindings_dir/python/cyclops_sdk/$(basename "$runtime_library")"
+runtime_copy="$bindings_dir/python/fleet_sdk/$(basename "$runtime_library")"
 cp "$runtime_library" "$runtime_copy"
-PYTHONPATH="$bindings_dir/python" python3 - "$bindings_dir/python/cyclops_sdk/_sdk.py" <<'PYTHON_SMOKE'
+PYTHONPATH="$bindings_dir/python" python3 - "$bindings_dir/python/fleet_sdk/_sdk.py" <<'PYTHON_SMOKE'
 import asyncio
 import json
 import re
 import sys
 
-import cyclops_sdk
+import fleet_sdk
 
 sdk_source = open(sys.argv[1], encoding="utf-8").read()
 required_private_exports = set(re.findall(r"\bcyclops_sdk\.(_[A-Za-z_][A-Za-z0-9_]*)", sdk_source))
-missing = sorted(required_private_exports.difference(vars(cyclops_sdk)))
+missing = sorted(required_private_exports.difference(vars(fleet_sdk)))
 if missing:
     raise AssertionError(f"missing schema-private SDK dependencies: {missing}")
-public_exports = set(cyclops_sdk.__all__)
+public_exports = set(fleet_sdk.__all__)
 leaked = sorted(required_private_exports.intersection(public_exports))
 if leaked:
     raise AssertionError(f"schema-private dependencies leaked into __all__: {leaked}")
 
-class CallbackHttpClient(cyclops_sdk.HttpClient):
+class CallbackHttpClient(fleet_sdk.HttpClient):
     def __init__(self):
         self.requests = []
 
@@ -296,27 +293,27 @@ class CallbackHttpClient(cyclops_sdk.HttpClient):
             body = {"access_token": "offline-token", "expires_in": 3600}
         elif request.url.endswith("/api/namespaces"):
             body = {"metadata": {"name": "default"}}
-        elif request.url.endswith("/api/k8s/apis/cua.ai/v1/namespaces/default/osgymworkspacepools"):
+        elif request.url.endswith("/api/k8s/apis/osgym.cua.ai/v1alpha1/namespaces/default/osgymsandboxwarmpools"):
             body = {
-                "apiVersion": "cua.ai/v1",
-                "kind": "OSGymWorkspacePool",
+                "apiVersion": "osgym.cua.ai/v1alpha1",
+                "kind": "OSGymSandboxWarmPool",
                 "metadata": {"namespace": "default", "name": "offline-pool"},
                 "spec": {
                     "replicas": 1,
-                    "template": {"containerDiskImage": "registry.example/desktop:offline"},
+                    "sandboxTemplateRef": {"name": "default"},
                 },
             }
         else:
             raise AssertionError(f"unexpected callback request: {request.method} {request.url}")
-        return cyclops_sdk.HttpResponse(status=201, headers=[], body=json.dumps(body).encode())
+        return fleet_sdk.HttpResponse(status=201, headers=[], body=json.dumps(body).encode())
 
 async def smoke_create_pool():
     transport = CallbackHttpClient()
-    client = cyclops_sdk.CyclopsClient.connect(
-        cyclops_sdk.CyclopsConfiguration(
+    client = fleet_sdk.CyclopsClient.connect(
+        fleet_sdk.CyclopsConfiguration(
             base_url="https://cyclops.invalid",
             token_url="https://keycloak.invalid/realms/offline/protocol/openid-connect/token",
-            credentials=cyclops_sdk.CyclopsCredentials("client-id", "client-secret"),
+            credentials=fleet_sdk.CyclopsCredentials("client-id", "client-secret"),
             pool_poll_interval_ms=1,
             pool_poll_limit=1,
             claim_poll_interval_ms=1,
@@ -324,35 +321,78 @@ async def smoke_create_pool():
         ),
         transport,
     )
-    spec = cyclops_sdk.PoolSpec(
-        replicas=1,
-        template=cyclops_sdk.PoolTemplate(
-            runtime=None,
-            runtime_class_name=None,
-            node_selector=None,
-            tolerations=None,
-            command=None,
-            container_disk_image="registry.example/desktop:offline",
-            image_pull_secret=None,
-            cpu_cores=None,
-            memory=None,
-            firmware=None,
-            probes=None,
-            oidc=None,
-        ),
-        autoscaling=None,
-        services=None,
-    )
-    pool = await client.create_pool(cyclops_sdk.CreatePoolRequest(namespace="default", spec=spec))
+    spec = fleet_sdk.OsGymSandboxWarmPoolSpecBuilder().replicas(1).sandbox_template_ref(
+        fleet_sdk.SandboxTemplateRefBuilder().name("default").build()
+    ).build()
+    request = fleet_sdk.CreatePoolRequestBuilder().namespace("default").spec(spec).build()
+    assert type(spec) is fleet_sdk.OsGymSandboxWarmPoolSpec
+    assert type(request) is fleet_sdk.CreatePoolRequest
+    assert spec.autoscaling is None
+    pool = await client.create_pool(request)
     assert pool.metadata.name == "offline-pool"
-    assert any(request.url.endswith("/osgymworkspacepools") for request in transport.requests)
+    assert any(request.url.endswith("/osgymsandboxwarmpools") for request in transport.requests)
 
 asyncio.run(smoke_create_pool())
 PYTHON_SMOKE
 rm "$runtime_copy"
 runtime_copy=""
 "$generator" --check
+python_sdk_source="$bindings_dir/python/fleet_sdk/_sdk.py"
+python_schema_source="$bindings_dir/python/fleet_sdk/_schema.py"
+kotlin_sdk_source="$bindings_dir/kotlin/ai/cua/cyclops/sdk/fleet_sdk.kt"
+kotlin_schema_source="$bindings_dir/kotlin/ai/cua/cyclops/sdk/schema/cyclops_sdk_schema.kt"
+swift_sdk_source="$bindings_dir/swift/CyclopsSdk.swift"
+swift_schema_source="$bindings_dir/swift/CyclopsSdkSchema.swift"
 ruby_sdk_source="$bindings_dir/ruby/cyclops_sdk/sdk.rb"
+ruby_schema_source="$bindings_dir/ruby/cyclops_sdk/schema.rb"
+node_sdk_source="$bindings_dir/ts-uniffi/fleet_sdk.ts"
+browser_sdk_source="$bindings_dir/ts-uniffi-browser/ts/fleet_sdk.ts"
+go_sdk_source="$bindings_dir/go-uniffi/fleet_sdk/fleet_sdk.go"
+
+for separate_binding in "$node_sdk_source" "$browser_sdk_source" "$go_sdk_source"; do
+  if grep -Fq -- "VmTemplateBuilder" "$separate_binding" || grep -Fq -- "CreatePoolRequestBuilder" "$separate_binding"; then
+    fail "separately generated Go/TypeScript binding unexpectedly contains authoritative builders: $separate_binding"
+  fi
+done
+
+grep -Fq -- "class VmTemplateBuilder" "$python_schema_source" || fail "Python bindings omit VmTemplateBuilder"
+grep -Fq -- "class CreatePoolRequestBuilder" "$python_sdk_source" || fail "Python bindings omit CreatePoolRequestBuilder"
+grep -Fq -- "open class VmTemplateBuilder" "$kotlin_schema_source" || fail "Kotlin bindings omit VmTemplateBuilder"
+grep -Fq -- "open class CreatePoolRequestBuilder" "$kotlin_sdk_source" || fail "Kotlin bindings omit CreatePoolRequestBuilder"
+grep -Fq -- "open class VmTemplateBuilder" "$swift_schema_source" || fail "Swift bindings omit VmTemplateBuilder"
+grep -Fq -- "open class CreatePoolRequestBuilder" "$swift_sdk_source" || fail "Swift bindings omit CreatePoolRequestBuilder"
+grep -Fq -- "class VmTemplateBuilder" "$ruby_schema_source" || fail "Ruby bindings omit VmTemplateBuilder"
+grep -Fq -- "class CreatePoolRequestBuilder" "$ruby_sdk_source" || fail "Ruby bindings omit CreatePoolRequestBuilder"
+grep -Fq -- "alloc_from_TypeOSGymSandboxTemplateSpec" "$bindings_dir/ruby/cyclops_sdk.rb" || \
+  fail "Ruby facade omits cross-component record allocation adapter"
+if grep -Fq -- "execute_authenticated" "$python_sdk_source"; then fail "Python bindings export execute_authenticated"; fi
+if grep -Fq -- "executeAuthenticated" "$kotlin_sdk_source"; then fail "Kotlin bindings export executeAuthenticated"; fi
+if grep -Fq -- "executeAuthenticated" "$swift_sdk_source"; then fail "Swift bindings export executeAuthenticated"; fi
+if grep -Fq -- "execute_authenticated" "$ruby_sdk_source"; then fail "Ruby bindings export execute_authenticated"; fi
+if grep -Fq -- "executeAuthenticated" "$node_sdk_source"; then fail "Node bindings export executeAuthenticated"; fi
+if grep -Fq -- "ExecuteAuthenticated" "$go_sdk_source"; then fail "Go bindings export ExecuteAuthenticated"; fi
+for method in list_namespaces list_user_api_keys create_user_api_key delete_user_api_key; do
+  grep -Fq -- "async def $method" "$python_sdk_source" || fail "Python bindings omit $method"
+done
+for method in listNamespaces listUserApiKeys createUserApiKey deleteUserApiKey; do
+  grep -Fq -- "suspend fun \`$method\`" "$kotlin_sdk_source" || fail "Kotlin bindings omit $method"
+  grep -Fq -- "func $method" "$swift_sdk_source" || fail "Swift bindings omit $method"
+done
+for method in list_namespaces list_user_api_keys create_user_api_key delete_user_api_key; do
+  grep -Fq -- "def $method" "$ruby_sdk_source" || fail "Ruby bindings omit $method"
+done
+for method in listNamespaces listUserApiKeys createUserApiKey deleteUserApiKey; do
+  grep -Fq -- "$method(" "$node_sdk_source" || fail "Node bindings omit $method"
+done
+for method in ListNamespaces ListUserApiKeys CreateUserApiKey DeleteUserApiKey; do
+  grep -Fq -- "$method(" "$go_sdk_source" || fail "Go bindings omit $method"
+done
+grep -Fq -- "creation_timestamp:typing.Optional[str]" "$python_sdk_source" || fail "Python bindings omit creation_timestamp"
+grep -Fq -- "var \`creationTimestamp\`: kotlin.String?" "$kotlin_sdk_source" || fail "Kotlin bindings omit creationTimestamp"
+grep -Fq -- "public var creationTimestamp: String?" "$swift_sdk_source" || fail "Swift bindings omit creationTimestamp"
+grep -Fq -- "attr_reader :namespace, :name, :labels, :creation_timestamp" "$ruby_sdk_source" || fail "Ruby bindings omit creation_timestamp"
+grep -Fq -- "creationTimestamp?: string" "$node_sdk_source" || fail "Node bindings omit creationTimestamp"
+grep -Fq -- "CreationTimestamp *string" "$go_sdk_source" || fail "Go bindings omit CreationTimestamp"
 grep -Fq -- "@uniffi_handle_map = UniffiHandleMap.new" "$ruby_sdk_source" || fail "Ruby callback bindings do not retain native callback objects"
 grep -Fq -- "module UniffiCallbackInterfaceHttpClient" "$ruby_sdk_source" || fail "Ruby callback bindings do not register an HTTP callback vtable"
 grep -Fq -- "[VTableCallbackInterfaceHttpClient.by_ref]" "$ruby_sdk_source" || fail "Ruby callback vtable initializer has the wrong FFI signature"
@@ -362,15 +402,16 @@ grep -Fq -- "def self.uniffi_lower_http_error" "$ruby_sdk_source" || fail "Ruby 
 grep -Fq -- "builder.write_U32(1)" "$ruby_sdk_source" || fail "Ruby callback bindings encode HttpError variant tags"
 grep -Fq -- "reason = reason.fetch(:reason)" "$ruby_sdk_source" || fail "Ruby callback bindings normalize HttpError keyword payloads"
 grep -Fq -- "def self.uniffi_is_error_type?" "$ruby_sdk_source" || fail "Ruby callback bindings do not classify callback errors"
-grep -Fq -- "CyclopsSdk.uniffi_rust_future_rust_buffer" "$ruby_sdk_source" || fail "Ruby async methods do not resolve Rust-buffer futures"
+grep -Fq -- "FleetSdk.uniffi_rust_future_rust_buffer" "$ruby_sdk_source" || fail "Ruby async methods do not resolve Rust-buffer futures"
 grep -Fq -- "def self.uniffi_rust_future_void" "$ruby_sdk_source" || fail "Ruby bindings do not resolve void futures"
-grep -Fq -- "CyclopsSdk.uniffi_rust_future_void" "$ruby_sdk_source" || fail "Ruby async void methods do not resolve Rust futures"
+grep -Fq -- "FleetSdk.uniffi_rust_future_void" "$ruby_sdk_source" || fail "Ruby async void methods do not resolve Rust futures"
+if grep -Fq -- ",,RustCallStatus.new" "$ruby_sdk_source"; then fail "Ruby zero-argument async methods emit a duplicate status separator"; fi
 grep -Fq -- "UniFFILib.uniffi_cyclops_sdk_fn_method_cyclopsclient_create_pool(uniffi_clone_handle(),RustBuffer.alloc_from_TypeCreatePoolRequest(request),RustCallStatus.new)" "$ruby_sdk_source" || fail "Ruby async factories do not pass the generated status placeholder"
-grep -Fq -- "    readTypePoolSpec" "$bindings_dir/ruby/cyclops_sdk.rb" || fail "Ruby facade does not delegate schema record readers"
+grep -Fq -- "    readTypeOSGymSandboxWarmPoolSpec" "$bindings_dir/ruby/cyclops_sdk.rb" || fail "Ruby facade does not delegate schema record readers"
 if grep -Fq -- "OsGym" "$ruby_sdk_source"; then
   fail "Ruby SDK retains cross-crate OsGym helper names"
 fi
-grep -Fq -- "    readTypeOSGymWorkspacePoolStatus" "$bindings_dir/ruby/cyclops_sdk.rb" || fail "Ruby facade does not delegate schema optional readers"
+grep -Fq -- "    readTypeOSGymSandboxWarmPoolStatus" "$bindings_dir/ruby/cyclops_sdk.rb" || fail "Ruby facade does not delegate schema status readers"
 if grep -Fq -- "return 0 if @handle.nil?" "$ruby_sdk_source"; then
   fail "Ruby callback bindings lower native callbacks to an invalid zero handle"
 fi
@@ -379,16 +420,16 @@ baseline_hash="$(tree_hash "$bindings_dir")"
 assert_no_harness_artifacts
 
 stale_manifest="$bindings_dir/python/.cyclops-sdk-generated-files"
-stale_obsolete_root="$bindings_dir/python/cyclops_sdk/obsolete"
+stale_obsolete_root="$bindings_dir/python/fleet_sdk/obsolete"
 stale_nested_root="$stale_obsolete_root/nested directory"
-stale_handwritten_root="$bindings_dir/python/cyclops_sdk/handwritten sibling"
+stale_handwritten_root="$bindings_dir/python/fleet_sdk/handwritten sibling"
 mkdir -p "$stale_nested_root" "$stale_handwritten_root"
 printf 'stale generated file\n' > "$stale_nested_root/stale generated.py"
 printf 'handwritten sibling\n' > "$stale_handwritten_root/keep.txt"
 cat >> "$stale_manifest" <<'EOF_MANIFEST'
-d cyclops_sdk/obsolete
-d cyclops_sdk/obsolete/nested directory
-f cyclops_sdk/obsolete/nested directory/stale generated.py
+d fleet_sdk/obsolete
+d fleet_sdk/obsolete/nested directory
+f fleet_sdk/obsolete/nested directory/stale generated.py
 EOF_MANIFEST
 expect_check_failure stale-manifest
 "$generator"
@@ -401,7 +442,7 @@ rm "$stale_handwritten_root/keep.txt"
 rmdir "$stale_handwritten_root"
 assert_tree_unchanged "$baseline_hash" "stale manifest cleanup"
 
-content_file="$bindings_dir/python/cyclops_sdk/__init__.py"
+content_file="$bindings_dir/python/fleet_sdk/__init__.py"
 content_file_mode="$(mode_for "$content_file")"
 cp "$content_file" "$temporary_directory/content-file"
 printf '\n# task10 content drift\n' >> "$content_file"
@@ -417,7 +458,7 @@ expect_check_failure file-mode
 chmod "$mode_file_mode" "$mode_file"
 "$generator" --check
 
-type_file="$bindings_dir/python/cyclops_sdk/_schema.py"
+type_file="$bindings_dir/python/fleet_sdk/_schema.py"
 mv "$type_file" "$temporary_directory/type-file"
 mkdir "$type_file"
 expect_check_failure file-type
@@ -425,7 +466,7 @@ rmdir "$type_file"
 mv "$temporary_directory/type-file" "$type_file"
 "$generator" --check
 
-file_link="$bindings_dir/python/cyclops_sdk/_sdk.py"
+file_link="$bindings_dir/python/fleet_sdk/_sdk.py"
 mv "$file_link" "$temporary_directory/file-link-target"
 ln -s "$temporary_directory/file-link-target" "$file_link"
 expect_check_failure file-symlink

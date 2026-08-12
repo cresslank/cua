@@ -1,13 +1,15 @@
 use crate::{Sandbox, SdkError};
 use url::Url;
 
-const POOL_COLLECTION_PREFIX: &str = "api/k8s/apis/cua.ai/v1/namespaces/";
+const POOL_COLLECTION_PREFIX: &str = "api/k8s/apis/osgym.cua.ai/v1alpha1/namespaces/";
 const CLAIM_COLLECTION_PREFIX: &str = "api/k8s/apis/osgym.cua.ai/v1alpha1/namespaces/";
 const CLAIM_COLLECTION_SUFFIX: &str = "/osgymsandboxclaims";
-const POOL_COLLECTION_SUFFIX: &str = "/osgymworkspacepools";
+const POOL_COLLECTION_SUFFIX: &str = "/osgymsandboxwarmpools";
+const TEMPLATE_COLLECTION_SUFFIX: &str = "/osgymsandboxtemplates";
 const NAMESPACE_COLLECTION: &str = "api/namespaces";
 const NAMESPACE_PREFIX: &str = "api/namespaces/";
 const SERVICE_COLLECTION_PREFIX: &str = "api/svc/";
+const USER_KEY_COLLECTION: &str = "api/user-keys";
 
 pub fn pool_collection(base: &Url, namespace: &str) -> Result<Url, SdkError> {
     validate_dns_label_for("namespace", namespace)?;
@@ -26,6 +28,31 @@ pub fn pool_item(base: &Url, namespace: &str, name: &str) -> Result<Url, SdkErro
     )
 }
 
+pub fn named_pool_item(base: &Url, name: &str) -> Result<Url, SdkError> {
+    validate_dns_label_for("name", name)?;
+    route(
+        base,
+        format!("{POOL_COLLECTION_PREFIX}{name}{POOL_COLLECTION_SUFFIX}/{name}"),
+    )
+}
+
+pub fn template_collection(base: &Url, namespace: &str) -> Result<Url, SdkError> {
+    validate_dns_label_for("namespace", namespace)?;
+    route(
+        base,
+        format!("{POOL_COLLECTION_PREFIX}{namespace}{TEMPLATE_COLLECTION_SUFFIX}"),
+    )
+}
+
+pub fn template_item(base: &Url, namespace: &str, name: &str) -> Result<Url, SdkError> {
+    validate_dns_label_for("namespace", namespace)?;
+    validate_dns_label_for("name", name)?;
+    route(
+        base,
+        format!("{POOL_COLLECTION_PREFIX}{namespace}{TEMPLATE_COLLECTION_SUFFIX}/{name}"),
+    )
+}
+
 pub fn namespace_collection(base: &Url) -> Result<Url, SdkError> {
     route(base, NAMESPACE_COLLECTION.into())
 }
@@ -33,6 +60,20 @@ pub fn namespace_collection(base: &Url) -> Result<Url, SdkError> {
 pub fn namespace_item(base: &Url, namespace: &str) -> Result<Url, SdkError> {
     validate_dns_label_for("namespace", namespace)?;
     route(base, format!("{NAMESPACE_PREFIX}{namespace}"))
+}
+
+pub fn user_key_collection(base: &Url) -> Result<Url, SdkError> {
+    route(base, USER_KEY_COLLECTION.into())
+}
+
+pub fn user_key_item(base: &Url, id: &str) -> Result<Url, SdkError> {
+    let mut url = user_key_collection(base)?;
+    url.path_segments_mut()
+        .map_err(|_| SdkError::Configuration {
+            reason: "base_url cannot be used for user API key routes".into(),
+        })?
+        .push(id);
+    Ok(url)
 }
 
 pub fn validate_dns_label(value: &str) -> Result<(), SdkError> {
@@ -215,7 +256,7 @@ fn hex_value(byte: u8) -> Option<u8> {
 mod tests {
     use super::{
         claim_collection, claim_item, namespace_collection, namespace_item, pool_collection,
-        pool_item,
+        pool_item, template_collection, template_item,
     };
     use url::Url;
 
@@ -225,13 +266,13 @@ mod tests {
 
         assert_eq!(
             pool_collection(&base, "example-pool").unwrap().as_str(),
-            "https://cyclops.example:8443/api/k8s/apis/cua.ai/v1/namespaces/example-pool/osgymworkspacepools"
+            "https://cyclops.example:8443/api/k8s/apis/osgym.cua.ai/v1alpha1/namespaces/example-pool/osgymsandboxwarmpools"
         );
         assert_eq!(
             pool_item(&base, "example-pool", "example-pool")
                 .unwrap()
                 .as_str(),
-            "https://cyclops.example:8443/api/k8s/apis/cua.ai/v1/namespaces/example-pool/osgymworkspacepools/example-pool"
+            "https://cyclops.example:8443/api/k8s/apis/osgym.cua.ai/v1alpha1/namespaces/example-pool/osgymsandboxwarmpools/example-pool"
         );
         assert_eq!(
             namespace_collection(&base).unwrap().as_str(),
@@ -251,6 +292,16 @@ mod tests {
                 .as_str(),
             "https://cyclops.example:8443/api/k8s/apis/osgym.cua.ai/v1alpha1/namespaces/example-pool/osgymsandboxclaims/example-claim"
         );
+        assert_eq!(
+            template_collection(&base, "example-pool").unwrap().as_str(),
+            "https://cyclops.example:8443/api/k8s/apis/osgym.cua.ai/v1alpha1/namespaces/example-pool/osgymsandboxtemplates"
+        );
+        assert_eq!(
+            template_item(&base, "example-pool", "example-template")
+                .unwrap()
+                .as_str(),
+            "https://cyclops.example:8443/api/k8s/apis/osgym.cua.ai/v1alpha1/namespaces/example-pool/osgymsandboxtemplates/example-template"
+        );
     }
 
     #[test]
@@ -259,13 +310,13 @@ mod tests {
 
         assert_eq!(
             pool_collection(&base, "example-pool").unwrap().as_str(),
-            "https://gateway.example/cyclops/api/k8s/apis/cua.ai/v1/namespaces/example-pool/osgymworkspacepools"
+            "https://gateway.example/cyclops/api/k8s/apis/osgym.cua.ai/v1alpha1/namespaces/example-pool/osgymsandboxwarmpools"
         );
         assert_eq!(
             pool_item(&base, "example-pool", "example-pool")
                 .unwrap()
                 .as_str(),
-            "https://gateway.example/cyclops/api/k8s/apis/cua.ai/v1/namespaces/example-pool/osgymworkspacepools/example-pool"
+            "https://gateway.example/cyclops/api/k8s/apis/osgym.cua.ai/v1alpha1/namespaces/example-pool/osgymsandboxwarmpools/example-pool"
         );
         assert_eq!(
             namespace_collection(&base).unwrap().as_str(),

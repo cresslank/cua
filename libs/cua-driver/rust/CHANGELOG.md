@@ -1,5 +1,154 @@
 # Changelog
 
+## [0.19.3](https://github.com/trycua/cua/compare/cua-driver-rs-v0.19.2...cua-driver-rs-v0.19.3) (2026-08-10)
+
+
+### Bug Fixes
+
+* **cua-driver:** remove Windows npm VC runtime prerequisite ([#3038](https://github.com/trycua/cua/issues/3038)) ([c167125](https://github.com/trycua/cua/commit/c167125e1bb0c4fe515beddc0d480f573f3c6077))
+
+## [0.19.2](https://github.com/trycua/cua/compare/cua-driver-rs-v0.19.1...cua-driver-rs-v0.19.2) (2026-08-07)
+
+
+### Bug Fixes
+
+* **cua-driver:** constrain incompatible zune-core resolution ([#2984](https://github.com/trycua/cua/issues/2984)) ([1979ab7](https://github.com/trycua/cua/commit/1979ab73fdcdba130a54467ca7072c447011f7ab))
+* **cua-driver:** make MCP output schemas object-rooted ([96d87ad](https://github.com/trycua/cua/commit/96d87adb248d746aed2a5427b1a256dbd3f1ae1a))
+* **cua-driver:** reap Linux launch_app children instead of leaking zombies ([#2974](https://github.com/trycua/cua/issues/2974)) ([f91d78e](https://github.com/trycua/cua/commit/f91d78e49a74fd7a690100957886e93e185655e2))
+
+## [0.19.1](https://github.com/trycua/cua/compare/cua-driver-rs-v0.19.0...cua-driver-rs-v0.19.1) (2026-08-07)
+
+
+### Bug Fixes
+
+* **cua-driver:** advertise refusals in the MCP outputSchema ([#2968](https://github.com/trycua/cua/issues/2968)) ([dc6f32c](https://github.com/trycua/cua/commit/dc6f32cd4d32bb0a60e18674086f443f9d9d8288))
+* **cua-driver:** record launch provenance for sessionless launch_app so kill_app can reprove it ([#2966](https://github.com/trycua/cua/issues/2966)) ([b065550](https://github.com/trycua/cua/commit/b06555075fc0ccc14df7e17d33b7eb27d97c9c53)), closes [#2965](https://github.com/trycua/cua/issues/2965)
+* **cua-driver:** resolve Linux launch_app names via .desktop entries and surface xdg-open failures ([#2954](https://github.com/trycua/cua/issues/2954)) ([fb4b492](https://github.com/trycua/cua/commit/fb4b492cd997dd3e8659298adfd98825974ebb7e))
+* **cua-driver:** survive z-order BadMatch under reparenting WMs so the Linux agent cursor can paint ([#2957](https://github.com/trycua/cua/issues/2957)) ([9522358](https://github.com/trycua/cua/commit/9522358294f34aba138221e87d3dbb79486b199a)), closes [#2955](https://github.com/trycua/cua/issues/2955)
+
+## [0.19.0](https://github.com/trycua/cua/compare/cua-driver-rs-v0.18.0...cua-driver-rs-v0.19.0) (2026-08-06)
+
+
+### Features
+
+* **cua-driver:** support Prime Agent skill onboarding ([#2944](https://github.com/trycua/cua/issues/2944)) ([0f796d0](https://github.com/trycua/cua/commit/0f796d0659877bee3404d11eef566cfbcbf8edf1))
+
+
+### Bug Fixes
+
+* **cua-driver:** Linux cursor overlay compositing, xrdp-family servers, and resting float ([#2940](https://github.com/trycua/cua/issues/2940)) ([997d6d8](https://github.com/trycua/cua/commit/997d6d86433254ccf12e5dbf1edcb46bf05eb5ac))
+* **cua-driver:** resolve SDK release from run artifacts ([#2926](https://github.com/trycua/cua/issues/2926)) ([3cd9de9](https://github.com/trycua/cua/commit/3cd9de9a32bf6b4a98a2186c1535054bd740bb21))
+
+## [0.18.0](https://github.com/trycua/cua/compare/cua-driver-rs-v0.17.0...cua-driver-rs-v0.18.0) (2026-08-05)
+
+
+### Features
+
+* **cua-driver:** add macOS Spaces awareness to list_windows ([#2850](https://github.com/trycua/cua/issues/2850)) ([f7404b4](https://github.com/trycua/cua/commit/f7404b40287c128b15afa30b6c6f9024cbf081b8))
+* **cua-driver:** drop the session orb from the cursor badge ([#2842](https://github.com/trycua/cua/issues/2842)) ([59f280e](https://github.com/trycua/cua/commit/59f280e485be4f58811bda6a9e2dbe7632b9b63c))
+* **cua-driver:** exact-target macOS background input v1 ([#2837](https://github.com/trycua/cua/issues/2837)) ([1b2cb5a](https://github.com/trycua/cua/commit/1b2cb5a706c3e5d636b683ab15336dbf35e579e0))
+
+
+### Bug Fixes
+
+* **cua-driver:** avoid accessibility advertise on Cinnamon ([#2784](https://github.com/trycua/cua/issues/2784)) ([b3ba121](https://github.com/trycua/cua/commit/b3ba12126188e1540b93d7c51d55926299fd36ab))
+* **cua-driver:** avoid retrying deferred text writes ([7e0d6bc](https://github.com/trycua/cua/commit/7e0d6bcb5d7ca55d9da1ff3e8acc1bdddf6fa422))
+* **cua-driver:** bound large macOS text synthesis ([#2863](https://github.com/trycua/cua/issues/2863)) ([a6b87e0](https://github.com/trycua/cua/commit/a6b87e01af9c3f291a40a9d7f4e6301418b2a8ab))
+* **cua-driver:** bound Linux AT-SPI listener startup ([#2827](https://github.com/trycua/cua/issues/2827)) ([ed3c365](https://github.com/trycua/cua/commit/ed3c365c954446c774c422e8018541e56155dd6a))
+* **cua-driver:** bound Linux snapshots after app exit ([#2822](https://github.com/trycua/cua/issues/2822)) ([d1c5a7a](https://github.com/trycua/cua/commit/d1c5a7a90b23a37a18838d9c2122d003d00e7ecf))
+* **cua-driver:** bound Windows app-name lookup ([#2858](https://github.com/trycua/cua/issues/2858)) ([2be7aab](https://github.com/trycua/cua/commit/2be7aab3de35bdffa9d8ad767471c0699d36d6e5))
+* **cua-driver:** bound Windows installed-app discovery ([#2855](https://github.com/trycua/cua/issues/2855)) ([ea971ef](https://github.com/trycua/cua/commit/ea971ef06d4ebeda16c6947cb2bca2dd875d2ddc))
+* **cua-driver:** clarify synthetic browser click outcomes ([#2866](https://github.com/trycua/cua/issues/2866)) ([197c518](https://github.com/trycua/cua/commit/197c518c9c364bd30da8bc076748ea82ed093e27))
+* **cua-driver:** explain permanent scope recovery ([#2857](https://github.com/trycua/cua/issues/2857)) ([9110d9f](https://github.com/trycua/cua/commit/9110d9fd69c7fda41caab3aaac9df80c87bdab2f))
+* **cua-driver:** fail closed on X11 overlay shape errors ([#1818](https://github.com/trycua/cua/issues/1818)) ([0462954](https://github.com/trycua/cua/commit/0462954cfb9843ca0cc43f49262acf0e69e3517d))
+* **cua-driver:** hard-bound Windows UIA provider calls ([#2117](https://github.com/trycua/cua/issues/2117)) ([c9c6607](https://github.com/trycua/cua/commit/c9c660770a26c2f0024b9be1079fac0d4c9effff))
+* **cua-driver:** harden Windows discovery and foreground input ([#2812](https://github.com/trycua/cua/issues/2812)) ([441cae0](https://github.com/trycua/cua/commit/441cae0d4d4048524ce2f7eeabfb63a6c9a422d3))
+* **cua-driver:** ignore macOS compositor sibling surfaces ([#2908](https://github.com/trycua/cua/issues/2908)) ([df57e61](https://github.com/trycua/cua/commit/df57e610d3f2e9c07aac59d4896d48656490e1cc))
+* **cua-driver:** keep Windows autostart on the junction path ([#2809](https://github.com/trycua/cua/issues/2809)) ([06f0c04](https://github.com/trycua/cua/commit/06f0c048fb11b1780e61252eb41a2b968865a8a7))
+* **cua-driver:** keep Windows cursor visible without focus theft ([#2864](https://github.com/trycua/cua/issues/2864)) ([2e7a412](https://github.com/trycua/cua/commit/2e7a41215ec9e3594567029aad07450c3d731721))
+* **cua-driver:** keep remote debugging enabled when a restart is needed ([#2911](https://github.com/trycua/cua/issues/2911)) ([f5b15cc](https://github.com/trycua/cua/commit/f5b15cccf6a9f0424dd2d83f730b523c4be21df0))
+* **cua-driver:** launch desktop AppsFolder apps on Windows ([#2862](https://github.com/trycua/cua/issues/2862)) ([fb2a6f6](https://github.com/trycua/cua/commit/fb2a6f60522ebf132270a3377c9a0496d2c0ba98))
+* **cua-driver:** prevent Linux uinput pointer panics ([#2736](https://github.com/trycua/cua/issues/2736)) ([9fde53e](https://github.com/trycua/cua/commit/9fde53e1fb190834054eb36e7574bc0b523831e2))
+* **cua-driver:** quiesce idle Wayland overlay ([#2828](https://github.com/trycua/cua/issues/2828)) ([35b71a0](https://github.com/trycua/cua/commit/35b71a0ebd081c333bf53af6b386ef4798dd05b1))
+* **cua-driver:** refuse minimized Windows element actions ([8a9b7ba](https://github.com/trycua/cua/commit/8a9b7baa32bb5b7ea48a1ee6ffc1d87a433405e4))
+* **cua-driver:** repair X11 overlay after display changes ([#2354](https://github.com/trycua/cua/issues/2354)) ([81019b5](https://github.com/trycua/cua/commit/81019b54b89d577ccb5d7758eba0fd33861fc9d9))
+* **cua-driver:** report honest macOS browser chrome coverage ([#2919](https://github.com/trycua/cua/issues/2919)) ([7c52b84](https://github.com/trycua/cua/commit/7c52b8449fab36cdda9fe4310e6afd3be202c955))
+* **cua-driver:** report macOS key delivery truthfully ([#2830](https://github.com/trycua/cua/issues/2830)) ([3dc0fc0](https://github.com/trycua/cua/commit/3dc0fc0e345f6d8107899a18c74245615e294c03))
+* **cua-driver:** report PostMessage pixel fallback truthfully ([4dc537e](https://github.com/trycua/cua/commit/4dc537ef34e715c099ab30c7d45618e791da2ad1))
+* **cua-driver:** scope the Linux AT-SPI walk to the requested window ([#2895](https://github.com/trycua/cua/issues/2895)) ([8c515ca](https://github.com/trycua/cua/commit/8c515ca74d7f9dad2b3ae9d74b59294511824fa1))
+* **cua-driver:** select the correct Linux AT-SPI application tree ([#2740](https://github.com/trycua/cua/issues/2740)) ([d86e49b](https://github.com/trycua/cua/commit/d86e49ba4bf1c456fd16eca220184a38600ed927))
+* **cua-driver:** stage local installs over a running driver ([#2889](https://github.com/trycua/cua/issues/2889)) ([157816e](https://github.com/trycua/cua/commit/157816e6144a79162253762b79d0abdfffa8e486))
+* **cua-driver:** stop Windows update --apply from killing itself ([#2805](https://github.com/trycua/cua/issues/2805)) ([aebd996](https://github.com/trycua/cua/commit/aebd9962d2686e75ff9e17e0a3735e303ff96981))
+* **cua-driver:** verify exact macOS window activation ([#2829](https://github.com/trycua/cua/issues/2829)) ([cd5c6f3](https://github.com/trycua/cua/commit/cd5c6f3ec5c2f71a8fbc64563d42933d381008ba))
+
+
+### Performance Improvements
+
+* **cua-driver:** accelerate Linux X11 capture with MIT-SHM ([#2796](https://github.com/trycua/cua/issues/2796)) ([5448c44](https://github.com/trycua/cua/commit/5448c449c81c81a7e48a418f8276d257f0e4c563))
+* **cua-driver:** accelerate macOS window capture with ScreenCaptureKit ([#2795](https://github.com/trycua/cua/issues/2795)) ([bc90373](https://github.com/trycua/cua/commit/bc90373362cb7c521b1ff03f94457d5de618095c))
+
+## [0.17.0](https://github.com/trycua/cua/compare/cua-driver-rs-v0.16.0...cua-driver-rs-v0.17.0) (2026-08-02)
+
+
+### ⚠ BREAKING CHANGES
+
+* **cua-driver:** make native desktop actions snapshot-safe ([#2783](https://github.com/trycua/cua/issues/2783))
+
+### Features
+
+* **cua-driver:** make native desktop actions snapshot-safe ([#2783](https://github.com/trycua/cua/issues/2783)) ([d8ae6df](https://github.com/trycua/cua/commit/d8ae6df643df5049505a327b88abc2644a25b209))
+* **cua-driver:** make native selection and editing foreground-safe ([#2789](https://github.com/trycua/cua/issues/2789)) ([815013a](https://github.com/trycua/cua/commit/815013a88c02d2c8c3e40f98d41fac84f037f91d))
+
+
+### Bug Fixes
+
+* **cua-driver:** focus exact target for native menus ([#2788](https://github.com/trycua/cua/issues/2788)) ([2269fa3](https://github.com/trycua/cua/commit/2269fa352a801bcf1505ac3af8b125db742a4b82))
+
+## [0.16.0](https://github.com/trycua/cua/compare/cua-driver-rs-v0.15.0...cua-driver-rs-v0.16.0) (2026-08-01)
+
+
+### Features
+
+* **cua-driver:** add verified semantic window framing ([#2772](https://github.com/trycua/cua/issues/2772)) ([fb39144](https://github.com/trycua/cua/commit/fb3914475b9cba97376a6b9b739077cc0994d15f))
+
+
+### Bug Fixes
+
+* **cua-driver:** prefer semantic routes before GUI fallback ([6f2faf9](https://github.com/trycua/cua/commit/6f2faf9f9c0ea2db3d0b731d45c6d80a9de23db5))
+
+## [0.15.0](https://github.com/trycua/cua/compare/cua-driver-rs-v0.14.2...cua-driver-rs-v0.15.0) (2026-08-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **cua-driver:** standardize action results ([#2713](https://github.com/trycua/cua/issues/2713))
+
+### Features
+
+* **cua-driver:** add checked state verification ([#2705](https://github.com/trycua/cua/issues/2705)) ([84440dd](https://github.com/trycua/cua/commit/84440ddc6d42accb629f2289012241ed512e1aea))
+* **cua-driver:** add clipboard read and write primitives ([#2764](https://github.com/trycua/cua/issues/2764)) ([b8fb6d1](https://github.com/trycua/cua/commit/b8fb6d1218d84ea1806ebce2dec5f22edda29c21))
+* **cua-driver:** standardize action results ([#2713](https://github.com/trycua/cua/issues/2713)) ([8e0a92e](https://github.com/trycua/cua/commit/8e0a92e3dbf20134be9922f9e0dc847addcc92fa))
+
+
+### Bug Fixes
+
+* **cua-driver:** bound macOS capture permission probe ([#2761](https://github.com/trycua/cua/issues/2761)) ([14b790f](https://github.com/trycua/cua/commit/14b790f766fe177aa047c88975e301a49a17cc4c))
+* **cua-driver:** define list_windows z-index contract ([#2768](https://github.com/trycua/cua/issues/2768)) ([5fe669f](https://github.com/trycua/cua/commit/5fe669ff43897f305aacb2442d8c5084607daf66))
+* **cua-driver:** index writable native value controls ([46fc5cb](https://github.com/trycua/cua/commit/46fc5cb7c2b477ba3194a792580dab4a595a5ec5))
+* **cua-driver:** open Finder folder URLs reliably ([13057dc](https://github.com/trycua/cua/commit/13057dc6c8c08da71b8e06a63831ccb5b6870bc5))
+* **cua-driver:** preserve verified selection readbacks ([dc0af9b](https://github.com/trycua/cua/commit/dc0af9b23ca8d866540b9ed2b4e4ad7b8b0c4ffb))
+* **cua-driver:** reject ambiguous PID-only targets ([#2763](https://github.com/trycua/cua/issues/2763)) ([5b95f2a](https://github.com/trycua/cua/commit/5b95f2a888b84f1e892635b20484b69d27122630))
+* **cua-driver:** reject concurrent text input per process ([#2762](https://github.com/trycua/cua/issues/2762)) ([07d1242](https://github.com/trycua/cua/commit/07d124258d83c2a53b0739463a925eaa3477066b))
+* **cua-driver:** select macOS collection items reliably ([4be90ea](https://github.com/trycua/cua/commit/4be90ea11345535decb1baacde14c0313338f1c6))
+
+## [0.14.2](https://github.com/trycua/cua/compare/cua-driver-rs-v0.14.1...cua-driver-rs-v0.14.2) (2026-07-31)
+
+
+### Bug Fixes
+
+* **cua-driver:** preserve Screen Sharing keyboard input ([#2698](https://github.com/trycua/cua/issues/2698)) ([61b1a84](https://github.com/trycua/cua/commit/61b1a84c9ede937fcc3f0c8a78aa78ac79d1421e))
+* **cua-driver:** reconcile macOS launch readiness ([#2697](https://github.com/trycua/cua/issues/2697)) ([771e016](https://github.com/trycua/cua/commit/771e0165e7ecd2566cbb17b793a863755a8d651f))
+
 ## [0.14.1](https://github.com/trycua/cua/compare/cua-driver-rs-v0.14.0...cua-driver-rs-v0.14.1) (2026-07-29)
 
 

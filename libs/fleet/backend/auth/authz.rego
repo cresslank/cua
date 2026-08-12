@@ -75,6 +75,15 @@ allow {
     is_interactive_client
 }
 
+# Stripe-hosted billing browser endpoints. The backend derives the customer
+# identity from input.user.sub and never accepts Stripe ownership identifiers.
+allow {
+    startswith(input.route, "/api/billing/")
+    input.route != "/api/billing/webhook"
+    input.user.sub != ""
+    input.user.azp == "cyclops-cs-spa"
+}
+
 # /api/namespaces — namespace management (list, create, delete).
 # Exact interactive clients may manage their own namespaces.
 # Capsule enforces per-user scoping at the K8s API level via
@@ -127,6 +136,10 @@ allow {
 #   apis/osgym.cua.ai/v1alpha1/osgymsandboxclaims
 #                                            — cluster-wide claim listing
 #                                              (namespaced claims stay open)
+#   apis/osgym.cua.ai/v1alpha1/{osgymsandboxwarmpools,osgymsandboxtemplates,osgymsandboxes}
+#                                            — cluster-wide listings of the
+#                                              native fleet CRDs (namespaced
+#                                              access stays open)
 #   apis/capsule.clastix.io/<version>/tenants
 #                                            — cluster-wide Tenant ownership
 #                                              and provisioning API, across
@@ -143,6 +156,9 @@ is_infra_k8s_path(path) { startswith(path, "apis/batch/v1") }
 is_infra_k8s_path(path) { startswith(path, "api/v1/namespaces/cyclops-cs/configmaps") }
 is_infra_k8s_path(path) { path == "apis/cua.ai/v1/osgymworkspacepools" }
 is_infra_k8s_path(path) { path == "apis/osgym.cua.ai/v1alpha1/osgymsandboxclaims" }
+is_infra_k8s_path(path) { path == "apis/osgym.cua.ai/v1alpha1/osgymsandboxwarmpools" }
+is_infra_k8s_path(path) { path == "apis/osgym.cua.ai/v1alpha1/osgymsandboxtemplates" }
+is_infra_k8s_path(path) { path == "apis/osgym.cua.ai/v1alpha1/osgymsandboxes" }
 is_infra_k8s_path(path) {
     parts := split(path, "/")
     count(parts) >= 4
