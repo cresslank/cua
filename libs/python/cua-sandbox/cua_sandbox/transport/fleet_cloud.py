@@ -19,7 +19,7 @@ from cua_sandbox._config import (
     get_fleet_token,
     get_token_url,
 )
-from cua_sandbox.image import Image
+from cua_sandbox.image import Image, cloud_registry_image
 from cua_sandbox.transport.cyclops_http_client import CyclopsHttpClient
 from cua_sandbox.transport.fleet import FleetTransport
 from fleet_sdk import (
@@ -34,6 +34,7 @@ from fleet_sdk import (
     CyclopsConfiguration,
     CyclopsCredentials,
     CyclopsTokenProviderConfiguration,
+    Firmware,
     HttpRequest,
     OsGymSandboxTemplateSpecBuilder,
     OsGymSandboxWarmPoolSpecBuilder,
@@ -565,7 +566,7 @@ class FleetCloudTransport(FleetTransport):
         ]
         vm_template_builder = (
             VmTemplateBuilder()
-            .container_disk_image(self._image._registry)
+            .container_disk_image(cloud_registry_image(self._image))
             .image_pull_secret("ecr-credentials")
             .probes(
                 PreservedJson.from_json(
@@ -574,6 +575,12 @@ class FleetCloudTransport(FleetTransport):
             )
             .services(services)
         )
+        # Windows guest disks are built UEFI-only (see registry/qemu_builder.py), and the
+        # Fleet schema defaults firmware to BIOS, so a Windows image left at the default
+        # boots SeaBIOS against a GPT/ESP disk and never reaches the readiness probe.
+        # The local QEMU runtime keys off the same os_type check.
+        if self._image.os_type == "windows":
+            vm_template_builder = vm_template_builder.firmware(Firmware.EFI)
         if self._cpu is not None:
             vm_template_builder = vm_template_builder.cpu_cores(self._cpu)
         if self._memory_mb is not None:
@@ -606,8 +613,10 @@ class FleetCloudTransport(FleetTransport):
 
     @staticmethod
     def _validate_image(image: Image) -> None:
-        if not image._registry:
-            raise NotImplementedError("Fleet cloud sandboxes require Image.from_registry(...)")
+        if not cloud_registry_image(image):
+            raise NotImplementedError(
+                "Fleet cloud sandboxes require a supported built-in image or Image.from_registry(...)"
+            )
         if (
             image._layers
             or image._env
