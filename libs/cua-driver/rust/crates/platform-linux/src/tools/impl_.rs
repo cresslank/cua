@@ -2369,6 +2369,8 @@ fn inject_terminal_input(pid: u32, xid: u64, text: &str) -> anyhow::Result<bool>
 }
 
 // ── click ─────────────────────────────────────────────────────────────────────
+// Desktop-raw. Core dispatch waits for portal/libei, then takes the resource
+// lease before this tool injects. Do not start a second seat-wide lease here.
 
 fn bounded_click_count_arg(args: &Value) -> Result<u32, ToolResult> {
     let count = match args.opt_u32("count") {
@@ -8668,6 +8670,15 @@ mod click_button_schema_tests {
         assert!(!chromium_background_must_refuse(false, true, true));
         assert!(!chromium_background_must_refuse(true, false, true));
         assert!(!chromium_background_must_refuse(false, false, false));
+    }
+
+    #[test]
+    fn host_writes_are_classified_before_platform_injection() {
+        use cua_driver_core::action_lease::{classify_tool, ActionClass};
+
+        assert_eq!(classify_tool("click"), ActionClass::DesktopRaw);
+        assert_eq!(classify_tool("set_value"), ActionClass::WindowSemantic);
+        assert_eq!(classify_tool("get_window_state"), ActionClass::Observation);
     }
 
     #[test]

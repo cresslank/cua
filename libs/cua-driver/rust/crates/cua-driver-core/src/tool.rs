@@ -1,8 +1,8 @@
 //! Tool trait and registry.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -71,54 +71,49 @@ pub fn with_runtime_scope<T>(scope: String, action: impl FnOnce() -> T) -> T {
     action()
 }
 
-fn desktop_action_coordinator() -> &'static tokio::sync::Mutex<()> {
-    static COORDINATOR: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    COORDINATOR.get_or_init(|| tokio::sync::Mutex::new(()))
+const ACTION_LEASE_WAIT: Duration = Duration::from_secs(2);
+
+fn lease_refusal(error: crate::action_lease::LeaseError) -> ToolResult {
+    protected_refusal(error.code(), error.message())
 }
 
-fn active_text_input_pids() -> &'static Mutex<HashSet<i64>> {
-    static ACTIVE: OnceLock<Mutex<HashSet<i64>>> = OnceLock::new();
-    ACTIVE.get_or_init(|| Mutex::new(HashSet::new()))
-}
-
-#[derive(Debug)]
-struct TextInputAdmission {
-    pid: i64,
-}
-
-impl Drop for TextInputAdmission {
-    fn drop(&mut self) {
-        active_text_input_pids()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&self.pid);
-    }
-}
-
-fn try_admit_text_input(
+/// Take resource-scoped write leases that do not require portal/libei.
+/// Desktop-raw stays with the platform path so a consent dialog cannot hold
+/// the seat.
+async fn admit_action_lease(
     tool_name: &str,
     args: &Value,
-) -> Result<Option<TextInputAdmission>, ToolResult> {
-    if tool_name != "type_text" {
+) -> Result<Option<crate::action_lease::ActionLease>, ToolResult> {
+    let class = crate::action_lease::classify_tool(tool_name);
+    if class == crate::action_lease::ActionClass::Observation {
         return Ok(None);
     }
-    let Some(pid) = args
-        .get("pid")
-        .and_then(Value::as_i64)
-        .filter(|pid| *pid > 0)
-    else {
-        // Desktop-scoped input has no stable process identity. It continues to
-        // use the process-wide physical action coordinator below.
-        return Ok(None);
-    };
-    let mut active = active_text_input_pids()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if !active.insert(pid) {
-        let message = format!("text input is already active for pid {pid}");
-        return Err(protected_refusal("input_busy", &message));
+    if class == crate::action_lease::ActionClass::DesktopRaw {
+        let tool = tool_name.to_owned();
+        match crate::blocking::spawn(move || crate::action_lease::ensure_raw_input_ready(&tool))
+            .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(message)) => {
+                return Err(protected_refusal("input_unavailable", &message));
+            }
+            Err(error) => {
+                return Err(protected_refusal(
+                    "input_unavailable",
+                    &format!("raw input readiness failed: {error}"),
+                ));
+            }
+        }
     }
-    Ok(Some(TextInputAdmission { pid }))
+    let request = crate::action_lease::lease_request_for(tool_name, args, ACTION_LEASE_WAIT);
+    if crate::action_lease::ActionLeaseTable::resources_for(&request).is_empty() {
+        return Ok(None);
+    }
+    crate::action_lease::global()
+        .acquire(request)
+        .await
+        .map(Some)
+        .map_err(lease_refusal)
 }
 
 pub use cua_driver_contract::{CAPABILITY_VERSION, TOOLS_LIST_SCHEMA_VERSION};
@@ -1075,20 +1070,6 @@ impl ToolRegistry {
             return result;
         }
 
-        // A queued text mutation can become stale while another agent is
-        // typing into the same process. Refuse that overlap before consent,
-        // cursor, recording, or platform focus behavior can begin. The guard
-        // is process-global so independent registries cannot interleave text
-        // through separate platform workers, and RAII releases it on task
-        // cancellation as well as normal completion.
-        let _text_input_admission = match try_admit_text_input(resolved_name, &public_args) {
-            Ok(admission) => admission,
-            Err(mut refusal) => {
-                restore_public_runtime_result(&mut refusal, &runtime_prefix);
-                return refusal;
-            }
-        };
-
         let active_adapters =
             crate::authorization::enforcement_adapters_for_call(resolved_name, &public_args);
         let has_adapter = |id: &str| active_adapters.iter().any(|adapter| adapter.id == id);
@@ -1425,19 +1406,15 @@ impl ToolRegistry {
                 "start_recording" | "stop_recording" | "get_recording_state" | "replay_trajectory"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
-        let _desktop_action = if is_physical_desktop_action(resolved_name) {
-            let coordinator = desktop_action_coordinator();
-            // Avoid yielding the dispatch task when the process-wide input
-            // lane is uncontended. On Windows, that yield creates a window in
-            // which the foreground target can lose keyboard eligibility
-            // between the fixture's focus proof and SendInput. Contended
-            // runtimes still wait and serialize through the same mutex.
-            Some(match coordinator.try_lock() {
-                Ok(guard) => guard,
-                Err(_) => coordinator.lock().await,
-            })
-        } else {
-            None
+        // Resource-scoped writes are admitted after authorization so a
+        // consent dialog cannot hold desktop-raw. Portal/libei readiness
+        // runs first; the lease is taken only when the injector can start.
+        let _action_lease = match admit_action_lease(resolved_name, &args).await {
+            Ok(lease) => lease,
+            Err(mut refusal) => {
+                restore_public_runtime_result(&mut refusal, &runtime_prefix);
+                return refusal;
+            }
         };
         let pending_turn = should_record
             .then(|| {
@@ -1453,10 +1430,7 @@ impl ToolRegistry {
 
         let mut result = tool.invoke(args.clone()).await;
         drop(lifecycle_dispatch);
-        // The platform worker has exited, so another text operation for this
-        // pid may now start even while result projection and evidence capture
-        // finish for the completed call.
-        drop(_text_input_admission);
+        drop(_action_lease);
         if result.action_record.is_none() {
             if let Some(structured) = result.structured_content.as_ref() {
                 result.action_record = crate::action_record::ActionExecutionRecord::from_legacy(
@@ -1493,11 +1467,6 @@ impl ToolRegistry {
             }
         }
         crate::cursor_events::end_tool(cursor_event);
-        // Coordinate the physical action itself, not post-action evidence
-        // capture or result shaping. Keeping the global desktop lock through
-        // recording/PiP screenshots would unnecessarily block an unrelated
-        // runtime after the input side effect has already completed.
-        drop(_desktop_action);
         restore_public_runtime_result(&mut result, &runtime_prefix);
         // Preserve the producer's private summary for recording/replay before
         // the public ActionResult projection deliberately replaces legacy
@@ -2401,28 +2370,6 @@ fn canonical_proposed_path(raw: &str) -> Result<String, ToolResult> {
     Ok(canonical.to_string_lossy().into_owned())
 }
 
-fn is_physical_desktop_action(tool: &str) -> bool {
-    matches!(
-        tool,
-        "click"
-            | "double_click"
-            | "right_click"
-            | "scroll"
-            | "drag"
-            | "mouse_drag"
-            | "parallel_mouse_drag"
-            | "move_cursor"
-            | "mouse_button_down"
-            | "mouse_button_up"
-            | "type_text"
-            | "press_key"
-            | "hotkey"
-            | "set_value"
-            | "bring_to_front"
-            | "set_window_frame"
-    )
-}
-
 /// Bucket that owns the processes a call is allowed to terminate.
 ///
 /// A call that declares a session keys its launches to that session, so
@@ -2617,9 +2564,8 @@ fn restore_public_runtime_value(value: &mut Value, runtime_prefix: &str) -> bool
 #[cfg(test)]
 mod runtime_isolation_tests {
     use super::{
-        canonical_proposed_path, desktop_action_coordinator, namespace_runtime_args,
-        publish_action_result, restore_public_runtime_result, try_admit_text_input,
-        TrustedInvocationEvidence, DISPATCH_RUNTIME_SCOPE,
+        canonical_proposed_path, namespace_runtime_args, publish_action_result,
+        restore_public_runtime_result, TrustedInvocationEvidence, DISPATCH_RUNTIME_SCOPE,
     };
     use crate::{
         authorization::PermissionMode,
@@ -4231,15 +4177,23 @@ resources:
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn physical_desktop_actions_are_admitted_one_at_a_time() {
+    async fn resource_scoped_writes_are_admitted_one_at_a_time() {
+        let table = crate::action_lease::ActionLeaseTable::new();
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let mut tasks = Vec::new();
         for _ in 0..8 {
+            let table = table.clone();
             let active = active.clone();
             let max_active = max_active.clone();
             tasks.push(tokio::spawn(async move {
-                let _admission = desktop_action_coordinator().lock().await;
+                let _admission = table
+                    .acquire(crate::action_lease::LeaseRequest::desktop_raw(
+                        None,
+                        Duration::from_secs(2),
+                    ))
+                    .await
+                    .unwrap();
                 let now = active.fetch_add(1, Ordering::SeqCst) + 1;
                 max_active.fetch_max(now, Ordering::SeqCst);
                 tokio::task::yield_now().await;
@@ -4253,35 +4207,39 @@ resources:
     }
 
     #[test]
-    fn overlapping_text_input_for_one_pid_fails_fast_and_releases_after_completion() {
-        let pid = 8_675_410;
-        let first = try_admit_text_input("type_text", &serde_json::json!({"pid": pid}))
-            .expect("first text operation should be admitted")
-            .expect("pid-scoped text operation should receive a guard");
+    fn overlapping_desktop_raw_fails_fast_and_releases_after_completion() {
+        let table = crate::action_lease::ActionLeaseTable::new();
+        let first = table
+            .acquire_blocking(crate::action_lease::LeaseRequest::desktop_raw(
+                Some(crate::action_lease::ExactWindow {
+                    pid: 8_675_410,
+                    window_id: 3,
+                }),
+                Duration::ZERO,
+            ))
+            .expect("first raw transaction should be admitted");
 
-        let refusal = try_admit_text_input("type_text", &serde_json::json!({"pid": pid}))
-            .expect_err("overlapping text operation should fail fast");
-        assert_eq!(refusal.is_error, Some(true));
-        assert_eq!(
-            refusal
-                .structured_content
-                .as_ref()
-                .and_then(|value| value.pointer("/refusal/code"))
-                .and_then(serde_json::Value::as_str),
-            Some("input_busy")
-        );
+        let refusal = table
+            .acquire_blocking(crate::action_lease::LeaseRequest::desktop_raw(
+                Some(crate::action_lease::ExactWindow {
+                    pid: 8_675_410,
+                    window_id: 3,
+                }),
+                Duration::ZERO,
+            ))
+            .expect_err("overlapping raw transaction should fail fast");
+        assert_eq!(refusal.code(), "input_busy");
 
-        let other_pid = try_admit_text_input("type_text", &serde_json::json!({"pid": pid + 1}))
-            .expect("a different pid should have an independent input lane")
-            .expect("pid-scoped text operation should receive a guard");
-        drop(other_pid);
         drop(first);
-
-        assert!(
-            try_admit_text_input("type_text", &serde_json::json!({"pid": pid}))
-                .expect("completed text operation should release its pid")
-                .is_some()
-        );
+        assert!(table
+            .acquire_blocking(crate::action_lease::LeaseRequest::desktop_raw(
+                Some(crate::action_lease::ExactWindow {
+                    pid: 8_675_410,
+                    window_id: 3,
+                }),
+                Duration::ZERO,
+            ))
+            .is_ok());
     }
 
     #[test]

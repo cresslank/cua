@@ -110,6 +110,20 @@ pub fn is_gnome_wayland_session() -> bool {
             || shell_helper::present())
 }
 
+/// Wait for portal/libei without holding the desktop-raw lease. Core dispatch
+/// calls this before acquiring the table entry.
+pub fn ensure_raw_input_ready_for_tool(tool: &str) -> Result<(), String> {
+    if !is_gnome_wayland_session() {
+        return Ok(());
+    }
+    let result = match tool {
+        "scroll" => require_gnome_scroll_transport_ready(),
+        "type_text" | "press_key" | "hotkey" => require_gnome_keyboard_transport_ready(),
+        _ => require_gnome_pointer_transport_ready(),
+    };
+    result.map_err(|error| error.to_string())
+}
+
 fn desktop_name_is_gnome(desktop: &str) -> bool {
     desktop
         .split(':')
@@ -4342,6 +4356,34 @@ mod tests {
         drop(first);
         acquire_host_raw_input_lease_with_timeout(std::time::Duration::ZERO)
             .expect("lease must recover after owner drop");
+    }
+
+    #[test]
+    fn desktop_raw_table_lease_is_exclusive_and_does_not_flush_on_drop() {
+        use cua_driver_core::action_lease::{ActionLeaseTable, LeaseRequest};
+        use std::time::Duration;
+
+        let table = ActionLeaseTable::new();
+        let first = table
+            .acquire_blocking(LeaseRequest::desktop_raw(None, Duration::ZERO))
+            .expect("first table lease");
+        let blocked = table
+            .acquire_blocking(LeaseRequest::desktop_raw(None, Duration::ZERO))
+            .expect_err("second desktop-raw grant must fail closed");
+        assert_eq!(blocked.code(), "input_busy");
+        drop(first);
+        table
+            .acquire_blocking(LeaseRequest::desktop_raw(None, Duration::ZERO))
+            .expect("drop must release without flushing queued input");
+    }
+
+    #[test]
+    fn raw_input_ready_hook_is_a_noop_off_gnome() {
+        if is_gnome_wayland_session() {
+            return;
+        }
+        assert_eq!(ensure_raw_input_ready_for_tool("click"), Ok(()));
+        assert_eq!(ensure_raw_input_ready_for_tool("type_text"), Ok(()));
     }
 
     #[test]
