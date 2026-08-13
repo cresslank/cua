@@ -147,6 +147,8 @@ impl ServiceSessionClient {
     }
 
     pub(crate) fn close(&self) {
+        // trusted_session_end plus daemon EOF reaps any action leases this
+        // connection still holds. Do not send leftover input to the next owner.
         if let Err(error) = self.close_until(Instant::now() + SERVICE_CLOSE_DEADLINE) {
             tracing::warn!(error = %error, "trusted service session cleanup did not complete before its deadline");
         }

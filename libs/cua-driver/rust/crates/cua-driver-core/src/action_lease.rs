@@ -73,6 +73,7 @@ pub struct LeaseRequest {
     pub window: Option<ExactWindow>,
     pub browser_profile: Option<String>,
     pub wait: Duration,
+    pub owner: Option<String>,
 }
 
 impl LeaseRequest {
@@ -82,6 +83,7 @@ impl LeaseRequest {
             window: None,
             browser_profile: None,
             wait: Duration::ZERO,
+            owner: None,
         }
     }
 
@@ -91,6 +93,7 @@ impl LeaseRequest {
             window: Some(window),
             browser_profile: None,
             wait,
+            owner: None,
         }
     }
 
@@ -100,6 +103,7 @@ impl LeaseRequest {
             window: Some(window),
             browser_profile: None,
             wait,
+            owner: None,
         }
     }
 
@@ -109,6 +113,7 @@ impl LeaseRequest {
             window,
             browser_profile: None,
             wait,
+            owner: None,
         }
     }
 
@@ -118,7 +123,16 @@ impl LeaseRequest {
             window: None,
             browser_profile: Some(key.into()),
             wait,
+            owner: None,
         }
+    }
+
+    pub fn with_owner(mut self, owner: impl Into<String>) -> Self {
+        let owner = owner.into();
+        if !owner.is_empty() {
+            self.owner = Some(owner);
+        }
+        self
     }
 }
 
@@ -182,7 +196,7 @@ fn browser_profile_key(args: &Value) -> Option<String> {
 /// Build the grant set for one tool call. Desktop-raw still names the window
 /// so a targeted raw transaction also covers that app and window.
 pub fn lease_request_for(tool: &str, args: &Value, wait: Duration) -> LeaseRequest {
-    match classify_tool(tool) {
+    let request = match classify_tool(tool) {
         ActionClass::Observation => LeaseRequest::observation(),
         ActionClass::WindowSemantic => match window_from_args(args) {
             Some(window) => LeaseRequest::window_semantic(window, wait),
@@ -213,7 +227,25 @@ pub fn lease_request_for(tool: &str, args: &Value, wait: Duration) -> LeaseReque
             .map(|key| LeaseRequest::browser_profile(key, wait))
             .unwrap_or_else(LeaseRequest::observation),
         ActionClass::DesktopRaw => LeaseRequest::desktop_raw(window_from_args(args), wait),
+    };
+    if let Some(owner) = lease_owner_from_args(args) {
+        request.with_owner(owner)
+    } else {
+        request
     }
+}
+
+pub fn lease_owner_from_args(args: &Value) -> Option<String> {
+    args.get("_transport_session_id")
+        .and_then(Value::as_str)
+        .filter(|owner| !owner.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            args.get("_session_id")
+                .and_then(Value::as_str)
+                .filter(|owner| !owner.is_empty())
+                .map(str::to_owned)
+        })
 }
 
 /// Process-wide table. Tests that need isolation should construct their own.
@@ -245,6 +277,8 @@ pub fn ensure_raw_input_ready(tool: &str) -> Result<(), String> {
 pub enum LeaseError {
     InputBusy { message: String },
     TargetBusy { message: String },
+    InputStale { message: String },
+    TargetStale { message: String },
 }
 
 impl LeaseError {
@@ -252,12 +286,17 @@ impl LeaseError {
         match self {
             Self::InputBusy { .. } => "input_busy",
             Self::TargetBusy { .. } => "target_busy",
+            Self::InputStale { .. } => "input_stale",
+            Self::TargetStale { .. } => "target_stale",
         }
     }
 
     pub fn message(&self) -> &str {
         match self {
-            Self::InputBusy { message } | Self::TargetBusy { message } => message,
+            Self::InputBusy { message }
+            | Self::TargetBusy { message }
+            | Self::InputStale { message }
+            | Self::TargetStale { message } => message,
         }
     }
 }
@@ -266,11 +305,27 @@ impl LeaseError {
 pub struct ActionLease {
     table: Arc<ActionLeaseTable>,
     id: u64,
+    released: bool,
+}
+
+impl ActionLease {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    /// Keep the grant after this handle is forgotten. The owner reap path or
+    /// an explicit `release_id` must still drop it.
+    pub fn detach(mut self) -> u64 {
+        self.released = true;
+        self.id
+    }
 }
 
 impl Drop for ActionLease {
     fn drop(&mut self) {
-        self.table.release(self.id);
+        if !self.released {
+            self.table.release(self.id);
+        }
     }
 }
 
@@ -280,9 +335,16 @@ impl std::fmt::Debug for ActionLease {
     }
 }
 
+struct HeldLease {
+    id: u64,
+    resources: Vec<LeaseResource>,
+    owner: Option<String>,
+}
+
 #[derive(Default)]
 struct TableInner {
-    held: Vec<(u64, Vec<LeaseResource>)>,
+    held: Vec<HeldLease>,
+    reap_epoch: u64,
 }
 
 /// In-process resource table. Task 3 will share one instance via the daemon.
@@ -348,12 +410,15 @@ impl ActionLeaseTable {
     ) -> Result<ActionLease, LeaseError> {
         let needed = Self::resources_for(&request);
         if needed.is_empty() {
-            return Ok(self.issue(Vec::new()));
+            return Ok(self.issue(Vec::new(), request.owner));
         }
         let deadline = Instant::now() + request.wait;
+        let epoch = self.reap_epoch();
         loop {
-            if let Some(lease) = self.try_grant(&needed) {
-                return Ok(lease);
+            match self.try_grant(&needed, request.owner.as_deref(), epoch) {
+                Ok(Some(lease)) => return Ok(lease),
+                Ok(None) => {}
+                Err(error) => return Err(error),
             }
             let now = Instant::now();
             if now >= deadline {
@@ -361,8 +426,10 @@ impl ActionLeaseTable {
             }
             let remaining = deadline.saturating_duration_since(now);
             let notified = self.notify.notified();
-            if let Some(lease) = self.try_grant(&needed) {
-                return Ok(lease);
+            match self.try_grant(&needed, request.owner.as_deref(), epoch) {
+                Ok(Some(lease)) => return Ok(lease),
+                Ok(None) => {}
+                Err(error) => return Err(error),
             }
             tokio::select! {
                 _ = notified => {}
@@ -378,21 +445,25 @@ impl ActionLeaseTable {
     ) -> Result<ActionLease, LeaseError> {
         let needed = Self::resources_for(&request);
         if needed.is_empty() {
-            return Ok(self.issue(Vec::new()));
+            return Ok(self.issue(Vec::new(), request.owner));
         }
         let deadline = Instant::now() + request.wait;
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut epoch = inner.reap_epoch;
         loop {
+            if inner.reap_epoch != epoch {
+                return Err(stale_error(&needed));
+            }
             let held: Vec<LeaseResource> = inner
                 .held
                 .iter()
-                .flat_map(|(_, resources)| resources.iter().cloned())
+                .flat_map(|held| held.resources.iter().cloned())
                 .collect();
             if !set_conflicts(&needed, &held) {
-                return Ok(self.issue_locked(&mut inner, needed));
+                return Ok(self.issue_locked(&mut inner, needed, request.owner.clone()));
             }
             let now = Instant::now();
             if now >= deadline {
@@ -404,48 +475,107 @@ impl ActionLeaseTable {
                 .wait_timeout(inner, remaining)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             inner = guard;
+            if inner.reap_epoch != epoch {
+                return Err(stale_error(&needed));
+            }
+            epoch = inner.reap_epoch;
             if wait.timed_out() && Instant::now() >= deadline {
                 return Err(busy_error(&needed));
             }
         }
     }
 
-    fn try_grant(self: &Arc<Self>, needed: &[LeaseResource]) -> Option<ActionLease> {
+    pub fn release_all_for_owner(&self, owner: &str) -> usize {
+        if owner.is_empty() {
+            return 0;
+        }
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = inner.held.len();
+        inner
+            .held
+            .retain(|held| held.owner.as_deref() != Some(owner));
+        let released = before - inner.held.len();
+        if released > 0 {
+            inner.reap_epoch = inner.reap_epoch.wrapping_add(1);
+            drop(inner);
+            self.condvar.notify_all();
+            self.notify.notify_waiters();
+        }
+        released
+    }
+
+    pub fn release_id(&self, id: u64) {
+        self.release(id);
+    }
+
+    fn reap_epoch(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reap_epoch
+    }
+
+    fn try_grant(
+        self: &Arc<Self>,
+        needed: &[LeaseResource],
+        owner: Option<&str>,
+        epoch: u64,
+    ) -> Result<Option<ActionLease>, LeaseError> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if inner.reap_epoch != epoch {
+            return Err(stale_error(needed));
+        }
         let held: Vec<LeaseResource> = inner
             .held
             .iter()
-            .flat_map(|(_, resources)| resources.iter().cloned())
+            .flat_map(|held| held.resources.iter().cloned())
             .collect();
         if set_conflicts(needed, &held) {
-            return None;
+            return Ok(None);
         }
-        Some(self.issue_locked(&mut inner, needed.to_vec()))
+        Ok(Some(self.issue_locked(
+            &mut inner,
+            needed.to_vec(),
+            owner.map(str::to_owned),
+        )))
     }
 
-    fn issue(self: &Arc<Self>, resources: Vec<LeaseResource>) -> ActionLease {
+    fn issue(
+        self: &Arc<Self>,
+        resources: Vec<LeaseResource>,
+        owner: Option<String>,
+    ) -> ActionLease {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.issue_locked(&mut inner, resources)
+        self.issue_locked(&mut inner, resources, owner)
     }
 
     fn issue_locked(
         self: &Arc<Self>,
         inner: &mut TableInner,
         resources: Vec<LeaseResource>,
+        owner: Option<String>,
     ) -> ActionLease {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if !resources.is_empty() {
-            inner.held.push((id, resources));
+            inner.held.push(HeldLease {
+                id,
+                resources,
+                owner,
+            });
         }
         ActionLease {
             table: Arc::clone(self),
             id,
+            released: false,
         }
     }
 
@@ -455,7 +585,7 @@ impl ActionLeaseTable {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = inner.held.len();
-        inner.held.retain(|(held_id, _)| *held_id != id);
+        inner.held.retain(|held| held.id != id);
         if inner.held.len() != before {
             drop(inner);
             self.condvar.notify_all();
@@ -507,6 +637,21 @@ fn busy_error(needed: &[LeaseResource]) -> LeaseError {
     } else {
         LeaseError::TargetBusy {
             message: "another writer holds the requested target".into(),
+        }
+    }
+}
+
+fn stale_error(needed: &[LeaseResource]) -> LeaseError {
+    if needed
+        .iter()
+        .any(|resource| matches!(resource, LeaseResource::DesktopRaw))
+    {
+        LeaseError::InputStale {
+            message: "the previous writer disconnected before this action ran".into(),
+        }
+    } else {
+        LeaseError::TargetStale {
+            message: "the previous writer disconnected before this action ran".into(),
         }
     }
 }
@@ -850,5 +995,59 @@ mod tests {
         assert!(!ran);
         ran = true;
         assert!(ran);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn killing_the_holder_fails_the_waiter_without_running() {
+        let table = ActionLeaseTable::new();
+        let holder = table
+            .acquire(LeaseRequest::desktop_raw(None, Duration::from_secs(1)).with_owner("client-a"))
+            .await
+            .unwrap();
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiter = {
+            let table = std::sync::Arc::clone(&table);
+            let ran = std::sync::Arc::clone(&ran);
+            tokio::spawn(async move {
+                let result = table
+                    .acquire(
+                        LeaseRequest::desktop_raw(None, Duration::from_secs(1))
+                            .with_owner("client-b"),
+                    )
+                    .await;
+                if result.is_ok() {
+                    ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                result
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(table.release_all_for_owner("client-a"), 1);
+        let error = waiter
+            .await
+            .unwrap()
+            .expect_err("queued waiter must not inherit a dead client's seat");
+        assert_eq!(error.code(), "input_stale");
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+        drop(holder);
+        table
+            .acquire(LeaseRequest::desktop_raw(None, Duration::ZERO))
+            .await
+            .expect("a later caller can take the seat after reap");
+    }
+
+    #[test]
+    fn lease_request_binds_transport_owner() {
+        let request = lease_request_for(
+            "click",
+            &serde_json::json!({
+                "pid": 9,
+                "window_id": 4,
+                "_transport_session_id": "runtime/proxy-1",
+                "_session_id": "runtime/public",
+            }),
+            Duration::ZERO,
+        );
+        assert_eq!(request.owner.as_deref(), Some("runtime/proxy-1"));
     }
 }

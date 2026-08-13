@@ -104,6 +104,8 @@ async fn detach_trusted_connection(
     connection: TrustedConnectionSession,
 ) {
     connection.session.close();
+    cua_driver_core::action_lease::global()
+        .release_all_for_owner(&connection.options.public_session);
     let now = std::time::Instant::now();
     let mut records = registry.lock().await;
     records.retain(|_, candidate| candidate.expires_at > now);
@@ -206,6 +208,78 @@ fn apply_session_identity(args: &mut serde_json::Value, minted: &Option<String>)
 /// would be wrongly rejected if the guard gated them on an already-ended id.
 fn is_session_lifecycle_tool(tool_name: &str) -> bool {
     matches!(tool_name, "start_session" | "end_session")
+}
+
+fn handle_action_lease_method(req: &DaemonRequest) -> Option<DaemonResponse> {
+    match req.method.as_str() {
+        "lease_acquire" => {
+            let mut args = req.args.clone().unwrap_or_else(|| serde_json::json!({}));
+            if let Some(session_id) = req.session_id.as_deref() {
+                if let Some(object) = args.as_object_mut() {
+                    object
+                        .entry("_transport_session_id")
+                        .or_insert_with(|| serde_json::Value::String(session_id.to_owned()));
+                }
+            }
+            let tool = req.name.as_deref().unwrap_or("click");
+            let wait_ms = args
+                .get("wait_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let request = cua_driver_core::action_lease::lease_request_for(
+                tool,
+                &args,
+                std::time::Duration::from_millis(wait_ms),
+            );
+            match cua_driver_core::action_lease::global().acquire_blocking(request) {
+                Ok(lease) => {
+                    let id = lease.detach();
+                    Some(DaemonResponse::ok(serde_json::json!({"lease_id": id})))
+                }
+                Err(error) => Some(DaemonResponse::err(
+                    format!("{}: {}", error.code(), error.message()),
+                    1,
+                )),
+            }
+        }
+        "lease_release" => {
+            let id = req
+                .args
+                .as_ref()
+                .and_then(|args| args.get("lease_id"))
+                .and_then(serde_json::Value::as_u64);
+            match id {
+                Some(id) => {
+                    cua_driver_core::action_lease::global().release_id(id);
+                    Some(DaemonResponse::ok(serde_json::json!({"released": true})))
+                }
+                None => Some(DaemonResponse::err("lease_release requires lease_id", 1)),
+            }
+        }
+        "lease_release_owner" => {
+            let owner = req
+                .args
+                .as_ref()
+                .and_then(|args| args.get("owner"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| req.session_id.clone());
+            match owner {
+                Some(owner) if !owner.is_empty() => {
+                    let released =
+                        cua_driver_core::action_lease::global().release_all_for_owner(&owner);
+                    Some(DaemonResponse::ok(
+                        serde_json::json!({ "released": released }),
+                    ))
+                }
+                _ => Some(DaemonResponse::err(
+                    "lease_release_owner requires owner or session_id",
+                    1,
+                )),
+            }
+        }
+        _ => None,
+    }
 }
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
@@ -972,9 +1046,11 @@ pub async fn run_serve(
                                 ).await;
                             }
                             other => {
-                                let resp = DaemonResponse::err(
-                                    format!("Unknown method: {other}"), 65
-                                );
+                                let resp = handle_action_lease_method(&req).unwrap_or_else(|| {
+                                    DaemonResponse::err(
+                                        format!("Unknown method: {other}"), 65
+                                    )
+                                });
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -1661,7 +1737,9 @@ pub async fn run_serve(
                                 ).await;
                             }
                             other => {
-                                let resp = DaemonResponse::err(format!("Unknown method: {other}"), 65);
+                                let resp = handle_action_lease_method(&req).unwrap_or_else(|| {
+                                    DaemonResponse::err(format!("Unknown method: {other}"), 65)
+                                });
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -2490,7 +2568,10 @@ mod service_authorization_status_tests {
 
 #[cfg(test)]
 mod session_boundary_tests {
-    use super::{active_proxy_sessions, apply_session_identity, inject_browser_approvals};
+    use super::{
+        active_proxy_sessions, apply_session_identity, handle_action_lease_method,
+        inject_browser_approvals,
+    };
     use cua_driver_core::browser::approval::MCP_HOST_APPROVAL_ARG;
     use cua_driver_core::browser::download::MCP_HOST_DOWNLOAD_APPROVAL_ARG;
     use serde_json::json;
@@ -2580,5 +2661,50 @@ mod session_boundary_tests {
         inject_browser_approvals("browser_download", &mut proxy_download, Some(session));
         active_proxy_sessions().lock().unwrap().remove(session);
         assert_eq!(proxy_download[MCP_HOST_DOWNLOAD_APPROVAL_ARG], true);
+    }
+
+    #[test]
+    fn daemon_lease_methods_serialize_and_reap_by_owner() {
+        use cua_driver_core::daemon::DaemonRequest;
+
+        let first = handle_action_lease_method(&DaemonRequest {
+            method: "lease_acquire".into(),
+            name: Some("click".into()),
+            args: Some(json!({"wait_ms": 0})),
+            session_id: Some("owner-a".into()),
+            observation_origin: None,
+            client_kind: None,
+        })
+        .expect("lease_acquire is a daemon method");
+        assert!(first.ok, "{first:?}");
+
+        let blocked = handle_action_lease_method(&DaemonRequest {
+            method: "lease_acquire".into(),
+            name: Some("click".into()),
+            args: Some(json!({"wait_ms": 0})),
+            session_id: Some("owner-b".into()),
+            observation_origin: None,
+            client_kind: None,
+        })
+        .expect("second acquire is a daemon method");
+        assert!(!blocked.ok);
+        assert!(
+            blocked
+                .error
+                .as_deref()
+                .is_some_and(|error| error.starts_with("input_busy:")),
+            "{blocked:?}"
+        );
+
+        let reaped = handle_action_lease_method(&DaemonRequest {
+            method: "lease_release_owner".into(),
+            name: None,
+            args: None,
+            session_id: Some("owner-a".into()),
+            observation_origin: None,
+            client_kind: None,
+        })
+        .expect("lease_release_owner is a daemon method");
+        assert!(reaped.ok, "{reaped:?}");
     }
 }

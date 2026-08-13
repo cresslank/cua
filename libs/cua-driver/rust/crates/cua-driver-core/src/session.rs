@@ -790,6 +790,7 @@ pub fn end_sessions_for_owner(owner_transport: &str, reason: SessionEndReason) -
     for id in &ids {
         end_session_with_reason(id, reason);
     }
+    crate::action_lease::global().release_all_for_owner(owner_transport);
     ids.len()
 }
 
