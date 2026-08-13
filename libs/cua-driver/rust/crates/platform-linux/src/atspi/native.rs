@@ -52,6 +52,64 @@ fn push_action_name_slot(actions: &mut Vec<String>, name: Option<String>) {
     actions.push(name.unwrap_or_default());
 }
 
+async fn live_action_names(action: &atspi::proxy::action::ActionProxy<'_>) -> Result<Vec<String>> {
+    let count = call(action.n_actions())
+        .await
+        .and_then(|result| result.ok())
+        .ok_or_else(|| anyhow!("AT-SPI action count lookup timed out"))?;
+    let mut names = Vec::with_capacity(count as usize);
+    for index in 0..count {
+        let name = call(action.get_name(index))
+            .await
+            .and_then(|result| result.ok())
+            .unwrap_or_default();
+        names.push(name);
+    }
+    Ok(names)
+}
+
+async fn invoke_live_activation(
+    action: &atspi::proxy::action::ActionProxy<'_>,
+    role: &str,
+    context: &str,
+) -> Result<String> {
+    // Native action indexes are not stable authority. Re-read the complete
+    // vector on the retained proxy at the mutation boundary, select by live
+    // semantics, and require an affirmative native acknowledgement.
+    let names = live_action_names(action).await?;
+    let chosen = activation_index(role, &names)
+        .ok_or_else(|| anyhow!("{context} has no live safe activation action"))?;
+    let selected = names[chosen].clone();
+    let accepted = action
+        .do_action(chosen as i32)
+        .await
+        .map_err(|error| anyhow!("doAction failed: {error}"))?;
+    if !accepted {
+        anyhow::bail!("{context} rejected live action {selected:?}");
+    }
+    Ok(selected)
+}
+
+fn normalized_action_name(name: &str) -> String {
+    name.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+async fn live_named_action_index(
+    action: &atspi::proxy::action::ActionProxy<'_>,
+    wanted: &[&str],
+) -> Result<Option<(i32, String)>> {
+    let names = live_action_names(action).await?;
+    Ok(names.into_iter().enumerate().find_map(|(index, name)| {
+        wanted
+            .iter()
+            .any(|candidate| *candidate == normalized_action_name(&name))
+            .then_some((index as i32, name))
+    }))
+}
+
 /// Drive an AT-SPI op `work` on the runtime, bounded by [`OP_TIMEOUT`].
 ///
 /// Individual interface calls are each bounded by [`call`], and `app_for_pid` /
@@ -116,9 +174,9 @@ async fn shared_connection() -> Result<&'static AccessibilityConnection> {
             let conn = AccessibilityConnection::from_address(address)
                 .await
                 .map_err(|error| anyhow!("AT-SPI connect failed: {error}"))?;
-            if let Err(error) = conn.add_registry_event::<atspi::ObjectEvents>().await {
-                dlog!("AT-SPI object-event registration failed: {error}");
-            }
+            conn.add_registry_event::<atspi::ObjectEvents>()
+                .await
+                .map_err(|error| anyhow!("AT-SPI object-event registration failed: {error}"))?;
             Ok(conn)
         })
         .await
@@ -146,13 +204,10 @@ fn wait_for_listener_startup(
         .map_err(|error| anyhow!("could not spawn AT-SPI listener initialization: {error}"))?;
     match completed_rx.recv_timeout(timeout) {
         Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            dlog!(
-                "AT-SPI listener initialization did not complete within {} ms; continuing in the background",
-                timeout.as_millis()
-            );
-            Ok(())
-        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(anyhow!(
+            "AT-SPI listener initialization did not complete within {} ms",
+            timeout.as_millis()
+        )),
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             Err(anyhow!("AT-SPI listener initialization thread panicked"))
         }
@@ -190,21 +245,28 @@ mod listener_startup_tests {
             .contains("synthetic AT-SPI connection failure"));
     }
     #[test]
-    fn stalled_listener_is_bounded_and_keeps_initializing_in_background() {
+    fn stalled_listener_is_bounded_and_refuses_readiness() {
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let wg = gate.clone();
         let done = Arc::new(AtomicBool::new(false));
         let wd = done.clone();
         let started = Instant::now();
-        wait_for_listener_startup(Duration::from_millis(50), move || {
+        let error = wait_for_listener_startup(Duration::from_millis(50), move || {
             let (l, c) = &*wg;
             let g = l.lock().unwrap();
             drop(c.wait_while(g, |v| !*v).unwrap());
             wd.store(true, Ordering::SeqCst);
             Ok(())
         })
-        .expect("stalled startup should continue in the background");
+        .expect_err("stalled startup must refuse readiness");
         assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error
+            .to_string()
+            .contains("listener initialization did not complete"));
+        assert!(
+            !done.load(Ordering::SeqCst),
+            "timed-out worker should still own its in-flight initialization"
+        );
         let (l, c) = &*gate;
         *l.lock().unwrap() = true;
         c.notify_one();
@@ -1871,9 +1933,6 @@ pub fn invoke_menu_path(
                 if target.enabled == Some(false) {
                     anyhow::bail!("menu path segment {depth} is disabled");
                 }
-                let chosen = activation_index(&target.role, &target.actions).ok_or_else(|| {
-                    anyhow!("menu path segment {depth} has no safe activation action")
-                })?;
                 let proxies = target
                     .acc
                     .proxies()
@@ -1883,13 +1942,12 @@ pub fn invoke_menu_path(
                     .action()
                     .await
                     .map_err(|error| anyhow!("Action unavailable: {error}"))?;
-                let accepted = action
-                    .do_action(chosen as i32)
-                    .await
-                    .map_err(|error| anyhow!("doAction failed: {error}"))?;
-                if !accepted {
-                    anyhow::bail!("menu path segment {depth} rejected its native action");
-                }
+                invoke_live_activation(
+                    &action,
+                    &target.role,
+                    &format!("menu path segment {depth}"),
+                )
+                .await?;
                 if depth + 1 != path.len() {
                     tokio::time::sleep(Duration::from_millis(80)).await;
                 }
@@ -1912,14 +1970,7 @@ pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
                 anyhow!("element {idx} not found (total: {})", action_nodes.len())
             })?;
 
-            // Suspected no-op: actuating `do_action(0)` on a passive display role
-            // (a `label`/`static`/`image` indexed only for its Value interface) or a
-            // node that advertises no action at all is the AT-SPI analogue of macOS'
-            // "element does not advertise this action" — the call returns success but
-            // likely changes nothing. Reuses the same passive-role detector
-            // `select_click_target` leans on for the coordinate paths. The caller
-            // turns this into `effect: "suspected_noop"` + an escalation hint.
-            let suspected_noop = target.actions.is_empty() || is_passive_role(&target.role);
+            let suspected_noop = is_passive_role(&target.role);
 
             let ap = target
                 .acc
@@ -1929,10 +1980,8 @@ pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
                 .action()
                 .await
                 .map_err(|e| anyhow!("Action unavailable: {e}"))?;
-            let action = target.actions.first().cloned().unwrap_or_default();
-            ap.do_action(0)
-                .await
-                .map_err(|e| anyhow!("doAction failed: {e}"))?;
+            let action =
+                invoke_live_activation(&ap, &target.role, &format!("element {idx}")).await?;
             // AT-SPI's doAction acknowledgement can precede the renderer's
             // queued DOM mutation. Give WebKit/Chromium one short event-loop
             // turn before returning success so a caller's immediate external
@@ -2054,17 +2103,7 @@ pub fn perform_verified_action_by_key(
                     "AT-SPI element key {element_key:#x} changed semantic identity before action"
                 );
             }
-            let action_index = target
-                .actions
-                .iter()
-                .position(|action| action.eq_ignore_ascii_case(expected_action))
-                .ok_or_else(|| {
-                    anyhow!(
-                        "AT-SPI element key {element_key:#x} no longer exposes exact action {expected_action:?}"
-                    )
-                })?;
             let suspected_noop = is_passive_role(&target.role);
-            let action = target.actions[action_index].clone();
             let proxy = target
                 .acc
                 .proxies()
@@ -2079,13 +2118,27 @@ pub fn perform_verified_action_by_key(
             // never reconstruct authority from the PID or object key.
             // Revalidate on a blocking worker so a Wayland AT-SPI fallback
             // cannot recursively block this module's private Tokio runtime.
-            // No fallible await remains between this proof check and doAction.
             let proof_for_action = target_proof.clone();
             cua_driver_core::blocking::spawn(move || {
                 crate::wayland::validate_single_exact_target(&proof_for_action)
             })
             .await
             .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
+            let live_actions = live_action_names(&proxy).await?;
+            if live_actions != expected_actions {
+                anyhow::bail!(
+                    "AT-SPI element key {element_key:#x} changed its live action vector before action"
+                );
+            }
+            let action_index = live_actions
+                .iter()
+                .position(|action| action.eq_ignore_ascii_case(expected_action))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "AT-SPI element key {element_key:#x} no longer exposes exact action {expected_action:?}"
+                    )
+                })?;
+            let action = live_actions[action_index].clone();
             let accepted = proxy
                 .do_action(action_index as i32)
                 .await
@@ -2134,34 +2187,25 @@ pub fn scroll_element(pid: u32, idx: usize, direction: &str, amount: usize) -> R
                 "right" => ["scrollright", "scrollforward"],
                 _ => ["scrolldown", "scrollforward"],
             };
-            let mut selected = None;
             let mut action_proxy = None;
             if let Ok(action) = proxies.action().await {
-                let count = call(action.n_actions())
-                    .await
-                    .and_then(|result| result.ok())
-                    .unwrap_or(0);
-                for action_index in 0..count {
-                    if let Some(Ok(name)) = call(action.get_name(action_index)).await {
-                        let normalized: String = name
-                            .chars()
-                            .filter(|ch| ch.is_ascii_alphanumeric())
-                            .flat_map(|ch| ch.to_lowercase())
-                            .collect();
-                        if wanted.iter().any(|candidate| *candidate == normalized) {
-                            selected = Some(action_index);
-                            break;
-                        }
-                    }
+                if live_named_action_index(&action, &wanted).await?.is_some() {
+                    action_proxy = Some(action);
                 }
-                action_proxy = Some(action);
             }
 
-            if let (Some(action), Some(action_index)) = (action_proxy, selected) {
+            if let Some(action) = action_proxy {
                 for _ in 0..amount.max(1) {
+                    let (action_index, action_name) = live_named_action_index(&action, &wanted)
+                        .await?
+                        .ok_or_else(|| {
+                            anyhow!("directional scroll action disappeared before mutation")
+                        })?;
                     match call(action.do_action(action_index)).await {
                         Some(Ok(true)) => {}
-                        Some(Ok(false)) => return Err(anyhow!("scroll action returned false")),
+                        Some(Ok(false)) => {
+                            return Err(anyhow!("scroll action {action_name:?} returned false"))
+                        }
                         Some(Err(e)) => return Err(anyhow!("scroll action failed: {e}")),
                         None => return Err(anyhow!("scroll action timed out")),
                     }
@@ -2353,10 +2397,8 @@ pub fn perform_action_at_point(pid: u32, win_x: i32, win_y: i32) -> Result<Optio
                 .action()
                 .await
                 .map_err(|e| anyhow!("Action unavailable: {e}"))?;
-            ap.do_action(0)
-                .await
-                .map_err(|e| anyhow!("doAction failed: {e}"))?;
-            Ok(Some(target.actions.first().cloned().unwrap_or_default()))
+            let action = invoke_live_activation(&ap, &target.role, "point target").await?;
+            Ok(Some(action))
         },
         || Ok(None),
     )
@@ -2462,10 +2504,8 @@ pub fn perform_action_at_screen_point(
                 .action()
                 .await
                 .map_err(|e| anyhow!("Action unavailable: {e}"))?;
-            ap.do_action(0)
-                .await
-                .map_err(|e| anyhow!("doAction failed: {e}"))?;
-            Ok(Some(target.actions.first().cloned().unwrap_or_default()))
+            let action = invoke_live_activation(&ap, &target.role, "screen-point target").await?;
+            Ok(Some(action))
         },
         || Ok(None),
     )
@@ -3292,7 +3332,7 @@ mod frame_correlation_tests {
 mod coord_tests {
     use super::parse_gtk_frame_extents;
     use super::{
-        before_snapshot_deadline, combine_wayland_content_offsets,
+        activation_index, before_snapshot_deadline, combine_wayland_content_offsets,
         ensure_element_descends_from_exact_window, exact_window_top_level_key, is_enabled_state,
         is_indexable_capabilities, is_passive_role, is_web_process_bus,
         prefer_authoritative_wayland_origin, push_action_name_slot, rebase_renderer_window_offset,
@@ -3311,6 +3351,21 @@ mod coord_tests {
 
         assert_eq!(actions, ["first", "", "third"]);
         assert_eq!(actions.iter().position(|action| action == "third"), Some(2));
+    }
+
+    #[test]
+    fn activation_selection_never_falls_back_to_a_destructive_first_action() {
+        let actions = vec![
+            "buffer.delete-line".to_owned(),
+            "clipboard.copy".to_owned(),
+            "activate".to_owned(),
+        ];
+
+        assert_eq!(activation_index("text", &actions), Some(2));
+        assert_eq!(
+            activation_index("text", &["buffer.delete-line".to_owned()]),
+            None
+        );
     }
 
     #[test]

@@ -33,6 +33,8 @@ pub mod tools;
 pub mod virtualdesk;
 
 #[cfg(any(target_os = "windows", test))]
+mod input_identity;
+#[cfg(any(target_os = "windows", test))]
 mod keycodes;
 
 // Cross-platform: pure math for packing `(x, y)` into the `LPARAM` payload

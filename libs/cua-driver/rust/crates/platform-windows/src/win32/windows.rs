@@ -21,11 +21,15 @@
 
 use std::collections::HashSet;
 use std::sync::Mutex;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT, TRUE};
+use std::thread::sleep;
+use std::time::{Duration, Instant};
+use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, EnumWindows, GetClassNameW, GetWindow, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, GW_OWNER,
+    EnumChildWindows, EnumWindows, GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow,
+    GetWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+    IsIconic, IsWindow, IsWindowVisible, SetCursorPos, SetForegroundWindow, WindowFromPoint,
+    GA_ROOT, GW_OWNER,
 };
 
 #[derive(Debug, Clone)]
@@ -160,9 +164,146 @@ pub(crate) struct ForegroundTarget {
     owner: Option<u64>,
 }
 
+impl ForegroundTarget {
+    pub(crate) const fn hwnd(self) -> u64 {
+        self.hwnd
+    }
+
+    pub(crate) const fn pid(self) -> u32 {
+        self.pid
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PointTarget {
+    root: u64,
+    pid: u32,
+}
+
+impl PointTarget {
+    pub(crate) const fn root(self) -> u64 {
+        self.root
+    }
+
+    pub(crate) const fn pid(self) -> u32 {
+        self.pid
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CursorTarget {
+    point: POINT,
+    root: u64,
+    pid: u32,
+}
+
+/// Capture the exact root/PID recipient at a screen point with a stable
+/// point/root/owner read. The token can be retained across async work; input
+/// primitives must still re-prove it immediately before each mutation.
+pub(crate) fn capture_point_target(x: i32, y: i32) -> Option<PointTarget> {
+    let point = POINT { x, y };
+    let before = unsafe { WindowFromPoint(point) };
+    if before.0.is_null() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(before, GA_ROOT) };
+    if root.0.is_null() {
+        return None;
+    }
+    let root = root.0 as usize as u64;
+    let pid = window_owner_pid(root)?;
+    let after = unsafe { WindowFromPoint(point) };
+    if after.0.is_null() {
+        return None;
+    }
+    let after_root = unsafe { GetAncestor(after, GA_ROOT) };
+    (!after_root.0.is_null()
+        && after_root.0 as usize as u64 == root
+        && window_owner_pid(root) == Some(pid))
+    .then_some(PointTarget { root, pid })
+}
+
+/// Capture a stable cursor destination identity. A raw coordinate is not
+/// restoration authority: retain the top-level recipient and owning PID so
+/// cleanup can refuse if the point later belongs to another process.
+pub(crate) fn capture_current_cursor_target() -> Option<CursorTarget> {
+    let mut before = POINT::default();
+    unsafe { GetCursorPos(&mut before) }.ok()?;
+    let window = unsafe { WindowFromPoint(before) };
+    if window.0.is_null() {
+        return None;
+    }
+    let root = unsafe { GetAncestor(window, GA_ROOT) };
+    if root.0.is_null() {
+        return None;
+    }
+    let root = root.0 as usize as u64;
+    let pid = window_owner_pid(root)?;
+    let mut after = POINT::default();
+    unsafe { GetCursorPos(&mut after) }.ok()?;
+    (before.x == after.x && before.y == after.y).then_some(CursorTarget {
+        point: before,
+        root,
+        pid,
+    })
+}
+
+fn cursor_target_still_live(target: CursorTarget) -> bool {
+    if window_owner_pid(target.root) != Some(target.pid) {
+        return false;
+    }
+    let window = unsafe { WindowFromPoint(target.point) };
+    if window.0.is_null() {
+        return false;
+    }
+    let root = unsafe { GetAncestor(window, GA_ROOT) };
+    !root.0.is_null()
+        && crate::input_identity::recipient_identity_matches(
+            target.root,
+            target.pid,
+            root.0 as usize as u64,
+            window_owner_pid(target.root),
+        )
+}
+
+/// Restore the cursor only while its snapshotted point still belongs to the
+/// same exact root/PID, then confirm that Windows accepted the position.
+pub(crate) fn restore_cursor_target(target: CursorTarget) -> bool {
+    if !cursor_target_still_live(target) {
+        return false;
+    }
+    if unsafe { SetCursorPos(target.point.x, target.point.y) }.is_err() {
+        return false;
+    }
+    let mut actual = POINT::default();
+    unsafe { GetCursorPos(&mut actual) }.is_ok()
+        && actual.x == target.point.x
+        && actual.y == target.point.y
+        && cursor_target_still_live(target)
+}
+
+/// Capture the current foreground identity with a stable
+/// foreground/owner/foreground read. A foreground switch or recycled HWND
+/// during the snapshot is a refusal rather than a mixed identity token.
+pub(crate) fn capture_current_foreground_target() -> Option<ForegroundTarget> {
+    let before = unsafe { GetForegroundWindow() }.0 as usize as u64;
+    if before == 0 {
+        return None;
+    }
+    let target = capture_foreground_target(before, None)?;
+    let after = unsafe { GetForegroundWindow() }.0 as usize as u64;
+    (before == after).then_some(target)
+}
+
 /// Snapshot the exact target identity and owner before global input is sent.
-pub(crate) fn capture_foreground_target(target: u64) -> Option<ForegroundTarget> {
+pub(crate) fn capture_foreground_target(
+    target: u64,
+    expected_pid: Option<u32>,
+) -> Option<ForegroundTarget> {
     let pid = window_owner_pid(target)?;
+    if expected_pid.is_some_and(|expected| expected != pid) {
+        return None;
+    }
     let owner = unsafe { GetWindow(HWND(target as *mut _), GW_OWNER) }
         .ok()
         .filter(|owner| !owner.0.is_null())
@@ -172,6 +313,61 @@ pub(crate) fn capture_foreground_target(target: u64) -> Option<ForegroundTarget>
         pid,
         owner,
     })
+}
+
+pub(crate) fn restore_foreground_target(target: ForegroundTarget, timeout: Duration) -> bool {
+    if window_owner_pid(target.hwnd) != Some(target.pid) {
+        return false;
+    }
+    let hwnd = HWND(target.hwnd as *mut _);
+    if !unsafe { SetForegroundWindow(hwnd) }.as_bool() {
+        return false;
+    }
+    let deadline = Instant::now() + timeout;
+    loop {
+        if unsafe { GetForegroundWindow() } == hwnd
+            && window_owner_pid(target.hwnd) == Some(target.pid)
+        {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(10));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ForegroundRestoreOutcome {
+    Restored,
+    Superseded,
+    Failed,
+}
+
+/// Restore `previous` only while foreground is still the exact window displaced
+/// by this transaction (or one of its verified owned popups). A user Alt-Tab or
+/// any unrelated foreground change supersedes restoration instead of being
+/// overwritten.
+pub(crate) fn restore_foreground_target_if_still_displaced(
+    previous: ForegroundTarget,
+    displaced: ForegroundTarget,
+    timeout: Duration,
+) -> ForegroundRestoreOutcome {
+    let actual = unsafe { GetForegroundWindow() }.0 as usize as u64;
+    let previous_is_current =
+        actual == previous.hwnd && window_owner_pid(previous.hwnd) == Some(previous.pid);
+    let displaced_is_current = foreground_matches_target_or_owned_window(displaced, actual);
+    if !crate::input_identity::restoration_is_permitted(previous_is_current, displaced_is_current) {
+        return ForegroundRestoreOutcome::Superseded;
+    }
+    if previous_is_current {
+        return ForegroundRestoreOutcome::Restored;
+    }
+    if restore_foreground_target(previous, timeout) {
+        ForegroundRestoreOutcome::Restored
+    } else {
+        ForegroundRestoreOutcome::Failed
+    }
 }
 
 /// Verify the foreground before or after an exact-target global input action.
@@ -341,6 +537,7 @@ mod exact_window_tests {
         exact_window_from_probe, owner_chain_reaches_target, post_action_foreground_allowed,
         PostActionForegroundRelation, WindowInfo,
     };
+    use crate::input_identity::restoration_is_permitted;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn window(pid: u32, hwnd: u64) -> WindowInfo {
@@ -420,6 +617,13 @@ mod exact_window_tests {
         assert!(!owner_chain_reaches_target(10, 30, |hwnd| {
             (hwnd == 30).then_some(40)
         }));
+    }
+
+    #[test]
+    fn restoration_never_overwrites_an_unrelated_user_foreground_change() {
+        assert!(restoration_is_permitted(true, false));
+        assert!(restoration_is_permitted(false, true));
+        assert!(!restoration_is_permitted(false, false));
     }
 
     #[test]

@@ -24,12 +24,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
     VIRTUAL_KEY,
 };
+use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, GetClassNameW, GetGUIThreadInfo, GetParent, GetWindowThreadProcessId,
     IsChild, PostMessageW, GUITHREADINFO, WM_CHAR, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
     WM_SYSKEYUP,
 };
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
 
 // ── XAML / UWP host detection ────────────────────────────────────────────────
 //
@@ -236,6 +236,22 @@ pub fn post_char(hwnd: u64, ch: char) -> Result<()> {
     Ok(())
 }
 
+fn prove_posted_text_recipient(
+    root_hwnd: u64,
+    target: HWND,
+    expected_pid: Option<u32>,
+    boundary: &str,
+) -> Result<()> {
+    if let Some(pid) = expected_pid {
+        if crate::win32::capture_foreground_target(root_hwnd, Some(pid)).is_none()
+            || crate::win32::window_owner_pid(target.0 as usize as u64) != Some(pid)
+        {
+            anyhow::bail!("{boundary}: exact root or retained text recipient changed ownership");
+        }
+    }
+    Ok(())
+}
+
 /// Post `\n` (or `\r`, or `\r\n`) as a real Enter keystroke pair —
 /// WM_KEYDOWN/WM_KEYUP(VK_RETURN) — to the focused child `h`.
 ///
@@ -249,11 +265,12 @@ pub fn post_char(hwnd: u64, ch: char) -> Result<()> {
 /// The previous `WM_CHAR(0x0A)`-as-newline path silently joined every
 /// line of multi-line `type_text` input into a single run (visible in the
 /// LibreOffice Writer ode-to-a-background-cursor screenshot).
-unsafe fn post_enter_keystroke(h: HWND) -> Result<()> {
+unsafe fn post_enter_keystroke(root_hwnd: u64, h: HWND, expected_pid: Option<u32>) -> Result<()> {
     let vk = windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
     let scan = MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC);
     let lp_down = 1u32 | (scan << 16);
     let lp_up = lp_down | (1u32 << 30) | (1u32 << 31);
+    prove_posted_text_recipient(root_hwnd, h, expected_pid, "posted Enter key-down")?;
     PostMessageW(
         h,
         WM_KEYDOWN,
@@ -268,7 +285,15 @@ unsafe fn post_enter_keystroke(h: HWND) -> Result<()> {
     // next character — visible in the "ABC\nDEF\nGHI" repro as "ABC / DEF /
     // (gap) / HI".
     sleep(Duration::from_millis(KEY_DELAY_MS));
-    PostMessageW(h, WM_KEYUP, WPARAM(vk.0 as usize), LPARAM(lp_up as isize))?;
+    if let Err(error) =
+        prove_posted_text_recipient(root_hwnd, h, expected_pid, "posted Enter release cleanup")
+    {
+        anyhow::bail!(
+            "posted Enter key-down was delivered, but release cleanup was not routed because recipient ownership changed: {error}"
+        );
+    }
+    PostMessageW(h, WM_KEYUP, WPARAM(vk.0 as usize), LPARAM(lp_up as isize))
+        .map_err(|error| anyhow::anyhow!("posted Enter release cleanup failed: {error}"))?;
     Ok(())
 }
 
@@ -278,7 +303,11 @@ unsafe fn post_enter_keystroke(h: HWND) -> Result<()> {
 /// (see [`post_enter_keystroke`]) instead of literal `WM_CHAR(0x0A/0x0D)`,
 /// which most rich-text Win32 controls drop.
 pub fn post_type_text(hwnd: u64, text: &str) -> Result<()> {
-    post_type_text_with_delay(hwnd, text, 0)
+    post_type_text_inner(hwnd, None, text, 0)
+}
+
+pub fn post_type_text_for_pid(hwnd: u64, expected_pid: u32, text: &str) -> Result<()> {
+    post_type_text_inner(hwnd, Some(expected_pid), text, 0)
 }
 
 /// Post all characters in `text` as WM_CHAR messages with a configurable
@@ -288,6 +317,24 @@ pub fn post_type_text(hwnd: u64, text: &str) -> Result<()> {
 /// (see [`post_enter_keystroke`]) — see the LibreOffice screenshot in
 /// the PR description for the bug this fixes.
 pub fn post_type_text_with_delay(hwnd: u64, text: &str, inter_char_ms: u64) -> Result<()> {
+    post_type_text_inner(hwnd, None, text, inter_char_ms)
+}
+
+pub fn post_type_text_with_delay_for_pid(
+    hwnd: u64,
+    expected_pid: u32,
+    text: &str,
+    inter_char_ms: u64,
+) -> Result<()> {
+    post_type_text_inner(hwnd, Some(expected_pid), text, inter_char_ms)
+}
+
+fn post_type_text_inner(
+    hwnd: u64,
+    expected_pid: Option<u32>,
+    text: &str,
+    inter_char_ms: u64,
+) -> Result<()> {
     if let Some(msg) = crate::input::post_message_blocked_by_uipi(hwnd) {
         anyhow::bail!(msg);
     }
@@ -306,7 +353,7 @@ pub fn post_type_text_with_delay(hwnd: u64, text: &str, inter_char_ms: u64) -> R
             }
             '\n' | '\r' => {
                 unsafe {
-                    post_enter_keystroke(h)?;
+                    post_enter_keystroke(hwnd, h, expected_pid)?;
                 }
                 prev_was_cr = ch == '\r';
                 // Extra settle after Enter — paragraph creation in rich
@@ -320,6 +367,7 @@ pub fn post_type_text_with_delay(hwnd: u64, text: &str, inter_char_ms: u64) -> R
             _ => {
                 prev_was_cr = false;
                 let code = ch as u32 as usize;
+                prove_posted_text_recipient(hwnd, h, expected_pid, "posted character")?;
                 unsafe {
                     PostMessageW(h, WM_CHAR, WPARAM(code), LPARAM(1))?;
                 }
@@ -332,15 +380,39 @@ pub fn post_type_text_with_delay(hwnd: u64, text: &str, inter_char_ms: u64) -> R
 
 /// Press a named key (and optional modifiers) via WM_KEYDOWN/WM_KEYUP.
 pub fn post_key(hwnd: u64, key: &str, modifiers: &[&str]) -> Result<()> {
+    post_key_inner(hwnd, None, key, modifiers)
+}
+
+pub fn post_key_for_pid(hwnd: u64, expected_pid: u32, key: &str, modifiers: &[&str]) -> Result<()> {
+    post_key_inner(hwnd, Some(expected_pid), key, modifiers)
+}
+
+fn post_key_inner(
+    hwnd: u64,
+    expected_pid: Option<u32>,
+    key: &str,
+    modifiers: &[&str],
+) -> Result<()> {
     if let Some(msg) = crate::input::post_message_blocked_by_uipi(hwnd) {
         anyhow::bail!(msg);
     }
     let hwnd_win = HWND(hwnd as *mut _);
+    let prove = |target: HWND| -> Result<()> {
+        if let Some(pid) = expected_pid {
+            if crate::win32::capture_foreground_target(hwnd, Some(pid)).is_none()
+                || crate::win32::window_owner_pid(target.0 as usize as u64) != Some(pid)
+            {
+                anyhow::bail!("exact target or posted-key recipient changed ownership");
+            }
+        }
+        Ok(())
+    };
     // WebView2/Tauri keeps the editable renderer in a focused child HWND.
     // Posting only to the top-level frame reports success but never reaches
     // the renderer; mirror the WM_CHAR path and retarget to that child when
     // the target thread exposes one.
     let target = focused_descendant(hwnd_win).unwrap_or(hwnd_win);
+    prove(target)?;
     let vk = key_name_to_vk(key)?;
     let has_alt = modifiers.iter().any(|m| *m == "alt" || *m == "menu");
 
@@ -365,44 +437,104 @@ pub fn post_key(hwnd: u64, key: &str, modifiers: &[&str]) -> Result<()> {
 
     let mod_vks: Vec<VIRTUAL_KEY> = modifiers.iter().filter_map(|m| modifier_vk(m)).collect();
 
+    let mut pressed_modifiers = Vec::new();
+    let mut key_down_sent = false;
+    let mut primary_error: Option<String> = None;
     unsafe {
-        // Press modifiers.
         for mvk in &mod_vks {
+            if let Err(error) = prove(target) {
+                primary_error = Some(error.to_string());
+                break;
+            }
             let ms = MapVirtualKeyW(mvk.0 as u32, MAPVK_VK_TO_VSC);
-            PostMessageW(
+            match PostMessageW(
                 target,
                 down_msg,
                 WPARAM(mvk.0 as usize),
                 repeat_lp(ms, false, false),
-            )?;
+            ) {
+                Ok(()) => pressed_modifiers.push(*mvk),
+                Err(error) => {
+                    primary_error = Some(format!("posted modifier down failed: {error}"));
+                    break;
+                }
+            }
         }
-        // Press key.
-        PostMessageW(
-            target,
-            down_msg,
-            WPARAM(vk.0 as usize),
-            repeat_lp(scan, is_extended(vk), false),
-        )?;
-        sleep(Duration::from_millis(KEY_DELAY_MS));
-        // Release key.
-        PostMessageW(
-            target,
-            up_msg,
-            WPARAM(vk.0 as usize),
-            repeat_lp(scan, is_extended(vk), true),
-        )?;
-        // Release modifiers (reverse order).
-        for mvk in mod_vks.iter().rev() {
-            let ms = MapVirtualKeyW(mvk.0 as u32, MAPVK_VK_TO_VSC);
-            PostMessageW(
-                target,
-                up_msg,
-                WPARAM(mvk.0 as usize),
-                repeat_lp(ms, false, true),
-            )?;
+        if primary_error.is_none() {
+            if let Err(error) = prove(target) {
+                primary_error = Some(error.to_string());
+            } else {
+                match PostMessageW(
+                    target,
+                    down_msg,
+                    WPARAM(vk.0 as usize),
+                    repeat_lp(scan, is_extended(vk), false),
+                ) {
+                    Ok(()) => {
+                        key_down_sent = true;
+                        sleep(Duration::from_millis(KEY_DELAY_MS));
+                    }
+                    Err(error) => {
+                        primary_error = Some(format!("posted key down failed: {error}"));
+                    }
+                }
+            }
+        }
+
+        let mut cleanup_failures = Vec::new();
+        if key_down_sent {
+            match prove(target) {
+                Ok(()) => {
+                    if let Err(error) = PostMessageW(
+                        target,
+                        up_msg,
+                        WPARAM(vk.0 as usize),
+                        repeat_lp(scan, is_extended(vk), true),
+                    ) {
+                        cleanup_failures.push(format!("posted key up failed: {error}"));
+                    }
+                }
+                Err(error) => cleanup_failures.push(format!(
+                    "posted key up was not routed because recipient ownership changed: {error}"
+                )),
+            }
+        }
+        for mvk in pressed_modifiers.iter().rev() {
+            match prove(target) {
+                Ok(()) => {
+                    let ms = MapVirtualKeyW(mvk.0 as u32, MAPVK_VK_TO_VSC);
+                    if let Err(error) = PostMessageW(
+                        target,
+                        up_msg,
+                        WPARAM(mvk.0 as usize),
+                        repeat_lp(ms, false, true),
+                    ) {
+                        cleanup_failures.push(format!(
+                            "posted modifier 0x{:x} up failed: {error}",
+                            mvk.0
+                        ));
+                    }
+                }
+                Err(error) => cleanup_failures.push(format!(
+                    "posted modifier 0x{:x} up was not routed because recipient ownership changed: {error}",
+                    mvk.0
+                )),
+            }
+        }
+
+        match (primary_error, cleanup_failures.is_empty()) {
+            (None, true) => Ok(()),
+            (Some(primary), true) => Err(anyhow::anyhow!(primary)),
+            (None, false) => Err(anyhow::anyhow!(
+                "posted key cleanup failed: {}",
+                cleanup_failures.join("; ")
+            )),
+            (Some(primary), false) => Err(anyhow::anyhow!(
+                "{primary}; cleanup evidence: {}",
+                cleanup_failures.join("; ")
+            )),
         }
     }
-    Ok(())
 }
 
 /// Press `key` (with optional `modifiers`) via `SendInput` against the system
@@ -427,7 +559,7 @@ pub fn post_key(hwnd: u64, key: &str, modifiers: &[&str]) -> Result<()> {
 /// worker, the foreground swap may silently fail and SendInput land on the
 /// wrong window. Callers should funnel hotkey calls through the uia worker.
 pub fn send_key_synthesized(hwnd: u64, key: &str, modifiers: &[&str]) -> Result<()> {
-    send_key_synthesized_after_focus(hwnd, key, modifiers, || Ok(()))
+    send_key_synthesized_after_focus_for_pid(hwnd, None, key, modifiers, || Ok(()))
 }
 
 /// Foreground key delivery with a target-specific focus step performed only
@@ -439,6 +571,16 @@ pub fn send_key_synthesized(hwnd: u64, key: &str, modifiers: &[&str]) -> Result<
 /// input is inserted when either foreground or child-focus confirmation fails.
 pub fn send_key_synthesized_after_focus(
     hwnd: u64,
+    key: &str,
+    modifiers: &[&str],
+    focus: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    send_key_synthesized_after_focus_for_pid(hwnd, None, key, modifiers, focus)
+}
+
+pub fn send_key_synthesized_after_focus_for_pid(
+    hwnd: u64,
+    expected_pid: Option<u32>,
     key: &str,
     modifiers: &[&str],
     focus: impl FnOnce() -> Result<()>,
@@ -471,19 +613,41 @@ pub fn send_key_synthesized_after_focus(
         events.push(key_input(*mvk, true));
     }
 
-    with_confirmed_foreground(target, "key delivery", focus, || unsafe {
-        let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
-        if sent as usize != events.len() {
-            bail!(
-                "SendInput inserted only {sent} of {} events. Likely cause: \
+    with_confirmed_foreground(
+        target,
+        expected_pid,
+        "key delivery",
+        focus,
+        |approved| unsafe {
+            let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
+            if sent as usize != events.len() {
+                let cleanup = release_events_for_inserted_prefix(&events, sent as usize);
+                let actual = GetForegroundWindow().0 as usize as u64;
+                let cleanup_authorized =
+                    crate::win32::foreground_matches_target_or_owned_window(approved, actual);
+                let cleanup_sent = if cleanup_authorized {
+                    SendInput(&cleanup, std::mem::size_of::<INPUT>() as i32)
+                } else {
+                    0
+                };
+                bail!(
+                    "SendInput inserted only {sent} of {} events. Likely cause: \
                  the daemon is not at UIAccess integrity, so SetForegroundWindow \
                  was rejected and the events landed on the wrong window. Run \
-                 hotkey through the cua-driver-uia worker.",
-                events.len()
-            );
-        }
-        Ok(())
-    })
+                 hotkey through the cua-driver-uia worker. Release-only cleanup \
+                 was {} and inserted {cleanup_sent}/{} events.",
+                    events.len(),
+                    if cleanup_authorized {
+                        "authorized"
+                    } else {
+                        "withheld because foreground authority was lost"
+                    },
+                    cleanup.len()
+                );
+            }
+            Ok(())
+        },
+    )
 }
 
 /// Foreground-delivery text entry: the `delivery_mode:"foreground"` rung for
@@ -498,13 +662,22 @@ pub fn send_key_synthesized_after_focus(
 /// of a false success. Required for VCL/LibreOffice document grids and other
 /// targets where PostMessage WM_CHAR is silently dropped.
 pub fn send_text_synthesized(hwnd: u64, text: &str) -> Result<()> {
-    send_text_synthesized_after_focus(hwnd, text, || Ok(()))
+    send_text_synthesized_after_focus_for_pid(hwnd, None, text, || Ok(()))
 }
 
 /// Foreground Unicode delivery with child focus established after exact
 /// top-level activation and before `SendInput`.
 pub fn send_text_synthesized_after_focus(
     hwnd: u64,
+    text: &str,
+    focus: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    send_text_synthesized_after_focus_for_pid(hwnd, None, text, focus)
+}
+
+pub fn send_text_synthesized_after_focus_for_pid(
+    hwnd: u64,
+    expected_pid: Option<u32>,
     text: &str,
     focus: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
@@ -548,18 +721,40 @@ pub fn send_text_synthesized_after_focus(
         return Ok(());
     }
 
-    with_confirmed_foreground(target, "text delivery", focus, || unsafe {
-        let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
-        if sent as usize != events.len() {
-            bail!(
-                "SendInput inserted only {sent} of {} key events. Likely cause: \
+    with_confirmed_foreground(
+        target,
+        expected_pid,
+        "text delivery",
+        focus,
+        |approved| unsafe {
+            let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
+            if sent as usize != events.len() {
+                let cleanup = release_events_for_inserted_prefix(&events, sent as usize);
+                let actual = GetForegroundWindow().0 as usize as u64;
+                let cleanup_authorized =
+                    crate::win32::foreground_matches_target_or_owned_window(approved, actual);
+                let cleanup_sent = if cleanup_authorized {
+                    SendInput(&cleanup, std::mem::size_of::<INPUT>() as i32)
+                } else {
+                    0
+                };
+                bail!(
+                    "SendInput inserted only {sent} of {} key events. Likely cause: \
                  the daemon is not at UIAccess integrity, so SetForegroundWindow \
-                 was rejected and the events landed on the wrong window.",
-                events.len()
-            );
-        }
-        Ok(())
-    })
+                 was rejected and the events landed on the wrong window. Release-only \
+                 cleanup was {} and inserted {cleanup_sent}/{} events.",
+                    events.len(),
+                    if cleanup_authorized {
+                        "authorized"
+                    } else {
+                        "withheld because foreground authority was lost"
+                    },
+                    cleanup.len()
+                );
+            }
+            Ok(())
+        },
+    )
 }
 
 fn wait_for_exact_foreground(target: HWND, timeout: Duration) -> bool {
@@ -583,35 +778,76 @@ fn wait_for_exact_foreground(target: HWND, timeout: Duration) -> bool {
 /// result after activation succeeds.
 fn with_confirmed_foreground<T>(
     target: HWND,
+    expected_pid: Option<u32>,
     operation: &str,
     focus: impl FnOnce() -> Result<()>,
-    body: impl FnOnce() -> Result<T>,
+    body: impl FnOnce(crate::win32::ForegroundTarget) -> Result<T>,
 ) -> Result<T> {
-    let previous = unsafe { GetForegroundWindow() };
-    let _ = unsafe { crate::input::force_foreground_assisted(target) };
+    let previous_target = match crate::win32::capture_current_foreground_target() {
+        Some(previous) if previous.hwnd() != target.0 as usize as u64 => Some(previous),
+        Some(_) => None,
+        None => {
+            bail!(
+                "foreground_restore_unavailable: a stable prior foreground identity could not be captured; no input was sent"
+            )
+        }
+    };
+    let target_before =
+        crate::win32::capture_foreground_target(target.0 as usize as u64, expected_pid)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "foreground_unavailable: exact target HWND {:?} changed ownership before {operation}; no window or input mutation was attempted",
+                    target.0
+                )
+            })?;
+    let _ = unsafe {
+        match expected_pid {
+            Some(pid) => crate::input::force_foreground_assisted_for_pid(target, pid),
+            None => crate::input::force_foreground_assisted(target),
+        }
+    };
     if !wait_for_exact_foreground(target, Duration::from_millis(500)) {
         let actual = unsafe { GetForegroundWindow() };
-        if !previous.0.is_null() && previous != target {
-            let _ = unsafe { SetForegroundWindow(previous) };
-        }
+        let restore_failed = previous_target.is_some_and(|previous_target| {
+            crate::win32::restore_foreground_target_if_still_displaced(
+                previous_target,
+                target_before,
+                Duration::from_millis(500),
+            ) == crate::win32::ForegroundRestoreOutcome::Failed
+        });
         bail!(
             "foreground_unavailable: Windows did not confirm exact target HWND {:?} for {operation} \
              within 500 ms (actual foreground HWND {:?}). Route the request through the \
-             UIAccess-manifested cua-driver-uia worker; no input was sent.",
+             UIAccess-manifested cua-driver-uia worker; no input was sent.{}",
             target.0,
-            actual.0
+            actual.0,
+            if restore_failed {
+                " Cleanup failure: foreground restoration was not confirmed."
+            } else {
+                ""
+            }
         );
     }
 
-    let Some(foreground_target) = crate::win32::capture_foreground_target(target.0 as usize as u64)
+    let Some(foreground_target) =
+        crate::win32::capture_foreground_target(target.0 as usize as u64, expected_pid)
     else {
-        if !previous.0.is_null() && previous != target {
-            let _ = unsafe { SetForegroundWindow(previous) };
-        }
+        let restore_failed = previous_target.is_some_and(|previous_target| {
+            crate::win32::restore_foreground_target_if_still_displaced(
+                previous_target,
+                target_before,
+                Duration::from_millis(500),
+            ) == crate::win32::ForegroundRestoreOutcome::Failed
+        });
         bail!(
-            "foreground_unavailable: exact target HWND {:?} disappeared before {operation}; \
-             no input was sent",
-            target.0
+            "foreground_unavailable: exact target HWND {:?} disappeared or changed ownership \
+             before {operation}; no input was sent{}",
+            target.0,
+            if restore_failed {
+                "; cleanup failure: foreground restoration was not confirmed"
+            } else {
+                ""
+            }
         );
     };
 
@@ -643,7 +879,7 @@ fn with_confirmed_foreground<T>(
                 actual.0
             );
         }
-        body()
+        body(foreground_target)
     })();
 
     // Give the target message loop a bounded opportunity to consume the
@@ -651,8 +887,23 @@ fn with_confirmed_foreground<T>(
     if result.is_ok() {
         sleep(Duration::from_millis(40));
     }
-    if !previous.0.is_null() && previous != target {
-        let _ = unsafe { SetForegroundWindow(previous) };
+    let mut result = result;
+    if let Some(previous_target) = previous_target {
+        let restored = crate::win32::restore_foreground_target_if_still_displaced(
+            previous_target,
+            foreground_target,
+            Duration::from_millis(500),
+        );
+        if restored == crate::win32::ForegroundRestoreOutcome::Failed {
+            let restore_error = anyhow::anyhow!(
+                "foreground_restore_failed: Windows did not confirm restoration of the prior foreground HWND {:?} after {operation}",
+                previous_target.hwnd()
+            );
+            result = Err(match result {
+                Ok(_) => restore_error,
+                Err(error) => anyhow::anyhow!("{error}; cleanup failure: {restore_error}"),
+            });
+        }
     }
     result
 }
@@ -677,6 +928,37 @@ fn unicode_key_input(unit: u16, up: bool) -> INPUT {
             },
         },
     }
+}
+
+fn release_events_for_inserted_prefix(events: &[INPUT], inserted: usize) -> Vec<INPUT> {
+    let mut held: Vec<KEYBDINPUT> = Vec::new();
+    for event in events.iter().take(inserted.min(events.len())) {
+        if event.r#type != INPUT_KEYBOARD {
+            continue;
+        }
+        let key = unsafe { event.Anonymous.ki };
+        if key.dwFlags.contains(KEYEVENTF_KEYUP) {
+            if let Some(index) = held.iter().rposition(|held_key| {
+                held_key.wVk == key.wVk
+                    && held_key.wScan == key.wScan
+                    && held_key.dwFlags == KEYBD_EVENT_FLAGS(key.dwFlags.0 & !KEYEVENTF_KEYUP.0)
+            }) {
+                held.remove(index);
+            }
+        } else {
+            held.push(key);
+        }
+    }
+    held.into_iter()
+        .rev()
+        .map(|mut key| {
+            key.dwFlags |= KEYEVENTF_KEYUP;
+            INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 { ki: key },
+            }
+        })
+        .collect()
 }
 
 /// Build a single keyboard INPUT struct for `vk`, either down (`up = false`)
@@ -816,4 +1098,46 @@ fn key_name_to_vk(key: &str) -> Result<VIRTUAL_KEY> {
         }
     };
     Ok(vk)
+}
+
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_RETURN};
+
+    fn is_up(event: &INPUT) -> bool {
+        unsafe { event.Anonymous.ki.dwFlags.contains(KEYEVENTF_KEYUP) }
+    }
+
+    #[test]
+    fn partial_hotkey_prefix_releases_only_still_held_keys_in_reverse_order() {
+        let events = [
+            key_input(VK_CONTROL, false),
+            key_input(VK_RETURN, false),
+            key_input(VK_RETURN, true),
+            key_input(VK_CONTROL, true),
+        ];
+        let cleanup = release_events_for_inserted_prefix(&events, 2);
+        assert_eq!(cleanup.len(), 2);
+        assert!(cleanup.iter().all(is_up));
+        assert_eq!(unsafe { cleanup[0].Anonymous.ki.wScan }, unsafe {
+            events[1].Anonymous.ki.wScan
+        });
+        assert_eq!(unsafe { cleanup[1].Anonymous.ki.wScan }, unsafe {
+            events[0].Anonymous.ki.wScan
+        });
+        assert!(release_events_for_inserted_prefix(&events, events.len()).is_empty());
+    }
+
+    #[test]
+    fn partial_unicode_prefix_releases_the_inserted_code_unit() {
+        let events = [
+            unicode_key_input('x' as u16, false),
+            unicode_key_input('x' as u16, true),
+        ];
+        let cleanup = release_events_for_inserted_prefix(&events, 1);
+        assert_eq!(cleanup.len(), 1);
+        assert!(is_up(&cleanup[0]));
+        assert_eq!(unsafe { cleanup[0].Anonymous.ki.wScan }, 'x' as u16);
+    }
 }

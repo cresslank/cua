@@ -24,6 +24,9 @@ uniffi = { workspace = true, features = ["tokio"] }
 uuid = { workspace = true }
 cursor-overlay = { path = "../cursor-overlay" }
 
+[target.'cfg(unix)'.dependencies]
+socket2 = "0.6"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 platform-macos = { path = "../platform-macos" }
 core-foundation = "0.10"
@@ -36,6 +39,7 @@ windows = { version = "0.58", features = [
     "Win32_Security",
     "Win32_System_Pipes",
     "Win32_System_JobObjects",
+    "Win32_System_IO",
     "Win32_System_Threading",
 ] }
 

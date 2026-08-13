@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -127,6 +129,37 @@ class GitHubApi:
         content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         return self.request("POST", url, raw_body=path.read_bytes(), content_type=content_type)
 
+    def download(self, path: str) -> bytes:
+        url = path if path.startswith("http") else f"{self.api_url}/{path.lstrip('/')}"
+        headers = {
+            "Accept": "application/octet-stream",
+            "Authorization": f"Bearer {self.token}",
+            "User-Agent": "trycua-release-finalizer",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        request = Request(url, headers=headers, method="GET")
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                with urlopen(request, timeout=120) as response:
+                    return response.read()
+            except HTTPError as error:
+                retryable = error.code in self.RETRYABLE_STATUS_CODES
+                if retryable and attempt < self.max_attempts:
+                    time.sleep(self._retry_delay(error, attempt))
+                    continue
+                detail = error.read().decode("utf-8", errors="replace")
+                raise ReleaseError(
+                    f"GitHub API GET {path} failed: {error.code} {detail}"
+                ) from error
+            except (URLError, TimeoutError) as error:
+                if attempt < self.max_attempts:
+                    time.sleep(self._retry_delay(None, attempt))
+                    continue
+                raise ReleaseError(
+                    f"GitHub API GET {path} failed after {self.max_attempts} attempts: {error}"
+                ) from error
+        raise AssertionError("GitHub asset download retry loop exited unexpectedly")
+
 
 def releases_by_tag(api: GitHubApi, repository: str, tag: str) -> list[dict[str, Any]]:
     matches: list[dict[str, Any]] = []
@@ -242,6 +275,25 @@ def release_assets(api: GitHubApi, repository: str, release_id: int) -> list[dic
     return assets
 
 
+def asset_matches_local_file(
+    api: GitHubApi,
+    repository: str,
+    asset: Mapping[str, Any],
+    path: Path,
+) -> bool:
+    if asset.get("state") != "uploaded" or int(asset.get("size", -1)) != path.stat().st_size:
+        return False
+    local_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    provider_digest = str(asset.get("digest") or "")
+    if provider_digest:
+        algorithm, separator, digest = provider_digest.partition(":")
+        if algorithm != "sha256" or not separator or len(digest) != 64:
+            return False
+        return hmac.compare_digest(digest.lower(), local_digest)
+    remote = api.download(f"repos/{repository}/releases/assets/{asset['id']}")
+    return hmac.compare_digest(hashlib.sha256(remote).hexdigest(), local_digest)
+
+
 def upload_assets(
     api: GitHubApi,
     repository: str,
@@ -260,14 +312,9 @@ def upload_assets(
         raise ReleaseError(f"asset directory {asset_dir} is empty")
     for path in files:
         matches = by_name.get(path.name, [])
-        complete = [
-            asset
-            for asset in matches
-            if asset.get("state") == "uploaded"
-            and int(asset.get("size", -1)) == path.stat().st_size
-        ]
+        complete = [asset for asset in matches if asset_matches_local_file(api, repository, asset, path)]
         if len(complete) == 1 and len(matches) == 1:
-            print(f"asset already uploaded with matching size: {path.name}")
+            print(f"asset already uploaded with matching SHA-256: {path.name}")
             continue
         for asset in matches:
             api.delete(f"repos/{repository}/releases/assets/{asset['id']}")
@@ -297,7 +344,7 @@ def verify_published_assets(
                 f"published release asset {path.name} has {len(matches)} matching uploads"
             )
         asset = matches[0]
-        if asset.get("state") != "uploaded" or int(asset.get("size", -1)) != path.stat().st_size:
+        if not asset_matches_local_file(api, repository, asset, path):
             raise ReleaseError(f"published release asset {path.name} does not match the local file")
 
 

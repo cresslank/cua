@@ -256,6 +256,7 @@ impl ElementCache {
         let ptr = retained.as_ptr();
         let element: IUIAutomationElement =
             unsafe { IUIAutomationElement::from_raw(ptr as *mut _) };
+        crate::uia::prove_element_mutation_target(&element, hwnd, pid)?;
         let result = unsafe { element.SetFocus() };
         // `retained` owns the AddRef; `from_raw` borrows that same pointer.
         std::mem::forget(element);

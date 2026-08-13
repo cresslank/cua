@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import hashlib
 import json
 from pathlib import Path
 from urllib.error import HTTPError
@@ -25,6 +26,7 @@ class FakeApi:
         self.uploaded: list[tuple[str, str]] = []
         self.patches: list[tuple[str, dict]] = []
         self.posts: list[tuple[str, dict]] = []
+        self.asset_bodies: dict[int, bytes] = {}
         self.assets = [{"id": 21, "name": "old.zip", "state": "starter", "size": 0}]
         self.release = {
             "id": 7,
@@ -58,6 +60,9 @@ class FakeApi:
 
     def upload(self, url: str, path: Path):
         self.uploaded.append((url, path.name))
+
+    def download(self, path: str) -> bytes:
+        return self.asset_bodies[int(path.rsplit("/", 1)[1])]
 
     def patch(self, path: str, body: dict):
         self.patches.append((path, body))
@@ -136,6 +141,7 @@ def test_published_release_is_verified_without_mutation(tmp_path: Path):
             "name": "lume.tar.gz",
             "state": "uploaded",
             "size": artifact.stat().st_size,
+            "digest": f"sha256:{hashlib.sha256(artifact.read_bytes()).hexdigest()}",
         }
     ]
 
@@ -153,6 +159,54 @@ def test_published_release_is_verified_without_mutation(tmp_path: Path):
     assert api.uploaded == []
     assert api.deleted == []
     assert api.patches == []
+
+
+def test_draft_retry_replaces_same_size_asset_with_different_bytes(tmp_path: Path):
+    artifact = tmp_path / "lume.tar.gz"
+    artifact.write_bytes(b"correct")
+    api = FakeApi("abc123")
+    api.assets = [
+        {
+            "id": 23,
+            "name": artifact.name,
+            "state": "uploaded",
+            "size": artifact.stat().st_size,
+        }
+    ]
+    api.asset_bodies[23] = b"corrupt"
+
+    github_release.upload_assets(api, "trycua/cua", api.release, tmp_path)
+
+    assert api.deleted == ["repos/trycua/cua/releases/assets/23"]
+    assert [name for _, name in api.uploaded] == [artifact.name]
+
+
+def test_published_release_rejects_same_size_asset_with_different_bytes(tmp_path: Path):
+    artifact = tmp_path / "lume.tar.gz"
+    artifact.write_bytes(b"correct")
+    api = FakeApi("abc123")
+    api.release.update({"draft": False, "body": "final body"})
+    api.assets = [
+        {
+            "id": 24,
+            "name": artifact.name,
+            "state": "uploaded",
+            "size": artifact.stat().st_size,
+        }
+    ]
+    api.asset_bodies[24] = b"corrupt"
+
+    with pytest.raises(ReleaseError, match="does not match the local file"):
+        finalize_release(
+            api=api,
+            repository="trycua/cua",
+            tag="lume-v0.4.0",
+            expected_sha="abc123",
+            body="final body",
+            asset_dir=tmp_path,
+            prerelease=False,
+            make_latest=True,
+        )
 
 
 def test_github_api_retries_transient_server_error(monkeypatch: pytest.MonkeyPatch):

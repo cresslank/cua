@@ -44,14 +44,130 @@ fn pid_window_target_candidates(pid: i64) -> Vec<WindowTargetCandidate> {
     window_target_candidates_for_pid(crate::wayland::list_windows_dispatch(Some(pid)), pid)
 }
 
+struct ExactPidWindowTargetGuard {
+    inner: Box<dyn Tool>,
+}
+
+fn guarded_pid(args: &Value) -> Result<u32, ToolResult> {
+    let raw = args.get("pid").and_then(Value::as_u64);
+    match raw
+        .and_then(|pid| u32::try_from(pid).ok())
+        .filter(|pid| *pid != 0)
+    {
+        Some(pid) => Ok(pid),
+        None => Err(ToolResult::error(
+            "pid must be a positive integer in the Linux process-id range.",
+        )
+        .with_structured(json!({
+            "code": "window_target_mismatch",
+            "effect": "refused",
+            "pid": args.get("pid").cloned().unwrap_or(Value::Null),
+        }))),
+    }
+}
+
+fn explicit_window_belongs_to_pid(pid: u32, window_id: u64) -> bool {
+    if crate::wayland::is_wayland() {
+        crate::wayland::list_windows_dispatch(Some(pid))
+            .iter()
+            .any(|window| window.xid == window_id && window.pid == Some(pid))
+    } else {
+        crate::x11::window_belongs_to_pid(window_id, pid)
+    }
+}
+
+#[async_trait]
+impl Tool for ExactPidWindowTargetGuard {
+    fn def(&self) -> &ToolDef {
+        self.inner.def()
+    }
+
+    async fn protected_resource_ownership(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> cua_driver_core::tool::ProtectedResourceOwnership {
+        self.inner
+            .protected_resource_ownership(adapter_id, args)
+            .await
+    }
+
+    async fn protected_resource_scope(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, String> {
+        self.inner.protected_resource_scope(adapter_id, args).await
+    }
+
+    async fn validate_protected_resource_scope(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+        approved_scope: &Value,
+    ) -> Result<(), String> {
+        self.inner
+            .validate_protected_resource_scope(adapter_id, args, approved_scope)
+            .await
+    }
+
+    async fn invoke(&self, args: Value) -> ToolResult {
+        let windowless_desktop = args.get("scope").and_then(Value::as_str) == Some("desktop")
+            && args.get("pid").is_none()
+            && args.get("window_id").is_none();
+        if !windowless_desktop {
+            let pid = match guarded_pid(&args) {
+                Ok(pid) => pid,
+                Err(result) => return result,
+            };
+            if let Some(window_id) = args.get("window_id").and_then(Value::as_u64) {
+                let owned = cua_driver_core::blocking::spawn(move || {
+                    explicit_window_belongs_to_pid(pid, window_id)
+                })
+                .await
+                .unwrap_or(false);
+                if !owned {
+                    return ToolResult::error(format!(
+                        "window_id {window_id} is stale or does not belong to pid {pid}."
+                    ))
+                    .with_structured(json!({
+                        "code": "window_target_mismatch",
+                        "effect": "refused",
+                        "pid": pid,
+                        "window_id": window_id,
+                    }));
+                }
+            }
+        }
+        self.inner.invoke(args).await
+    }
+}
+
 fn pid_window_guarded<T: Tool + 'static>(
     tool: T,
     candidates: &WindowTargetCandidates,
 ) -> Box<dyn Tool> {
-    Box::new(PidOnlyWindowTargetGuard::new(
-        Box::new(tool),
-        candidates.clone(),
-    ))
+    Box::new(ExactPidWindowTargetGuard {
+        inner: Box::new(PidOnlyWindowTargetGuard::new(
+            Box::new(tool),
+            candidates.clone(),
+        )),
+    })
+}
+
+#[cfg(test)]
+mod exact_pid_window_guard_tests {
+    use super::guarded_pid;
+    use serde_json::json;
+
+    #[test]
+    fn guarded_pid_rejects_negative_zero_and_out_of_range_values() {
+        for value in [json!(-1), json!(0), json!(u64::from(u32::MAX) + 1)] {
+            let result = guarded_pid(&json!({"pid": value})).unwrap_err();
+            assert_eq!(result.is_error, Some(true));
+        }
+        assert_eq!(guarded_pid(&json!({"pid": 42})).unwrap(), 42);
+    }
 }
 
 // ── DriverConfig + ResizeRegistry + ZoomRegistry ─────────────────────────────
@@ -3660,6 +3776,25 @@ impl Tool for PressKeyTool {
                 }
             }
         };
+        // Revalidate the exact PID/window pair at the mutation boundary. The
+        // outer wrapper prevents malformed requests and stale explicit targets,
+        // but ownership can change while element resolution or candidate lookup
+        // runs. Never emit X11 or Wayland input from an earlier observation.
+        let action_target_owned =
+            cua_driver_core::blocking::spawn(move || explicit_window_belongs_to_pid(pid, xid))
+                .await
+                .unwrap_or(false);
+        if !action_target_owned {
+            return ToolResult::error(format!(
+                "window_id {xid} is stale or no longer belongs to pid {pid}."
+            ))
+            .with_structured(json!({
+                "code": "window_target_mismatch",
+                "effect": "refused",
+                "pid": pid,
+                "window_id": xid,
+            }));
+        }
 
         // ── px form: pixel-click to focus, then the key goes to the focused element ──
         // Reuses click's translation + delivery_mode; after it, deliver via the plain

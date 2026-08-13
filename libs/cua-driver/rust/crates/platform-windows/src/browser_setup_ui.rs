@@ -105,12 +105,19 @@ fn exact_setup_checkbox(
     unique_actionable(nodes, "CheckBox", descriptor.checkbox_label, "toggle")
 }
 
-unsafe fn invoke(element_ptr: usize) -> Result<(), BrowserRefusal> {
+unsafe fn invoke(
+    element_ptr: usize,
+    root_hwnd: u64,
+    expected_pid: u32,
+) -> Result<(), BrowserRefusal> {
     let element = IUIAutomationElement::from_raw(element_ptr as *mut _);
-    let result = element
-        .GetCurrentPattern(UIA_InvokePatternId)
-        .and_then(|pattern| pattern.cast::<IUIAutomationInvokePattern>())
-        .and_then(|pattern| pattern.Invoke());
+    let result = (|| -> anyhow::Result<()> {
+        let pattern = element.GetCurrentPattern(UIA_InvokePatternId)?;
+        let pattern = pattern.cast::<IUIAutomationInvokePattern>()?;
+        crate::uia::prove_element_mutation_target(&element, root_hwnd, expected_pid)?;
+        pattern.Invoke()?;
+        Ok(())
+    })();
     std::mem::forget(element);
     result.map_err(|error| {
         refusal(
@@ -120,12 +127,32 @@ unsafe fn invoke(element_ptr: usize) -> Result<(), BrowserRefusal> {
     })
 }
 
-unsafe fn set_value(element_ptr: usize, value: &str) -> Result<(), BrowserRefusal> {
+fn prove_window_owner(hwnd: u64, expected_pid: u32, operation: &str) -> Result<(), BrowserRefusal> {
+    if crate::win32::window_owner_pid(hwnd) != Some(expected_pid) {
+        return Err(refusal(
+            BrowserRefusalCode::BrowserBindingStale,
+            format!(
+                "the approved browser window changed ownership immediately before {operation}; no UIA mutation was attempted"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+unsafe fn set_value(
+    element_ptr: usize,
+    root_hwnd: u64,
+    expected_pid: u32,
+    value: &str,
+) -> Result<(), BrowserRefusal> {
     let element = IUIAutomationElement::from_raw(element_ptr as *mut _);
-    let result = element
-        .GetCurrentPattern(UIA_ValuePatternId)
-        .and_then(|pattern| pattern.cast::<IUIAutomationValuePattern>())
-        .and_then(|pattern| pattern.SetValue(&BSTR::from(value)));
+    let result = (|| -> anyhow::Result<()> {
+        let pattern = element.GetCurrentPattern(UIA_ValuePatternId)?;
+        let pattern = pattern.cast::<IUIAutomationValuePattern>()?;
+        crate::uia::prove_element_mutation_target(&element, root_hwnd, expected_pid)?;
+        pattern.SetValue(&BSTR::from(value))?;
+        Ok(())
+    })();
     std::mem::forget(element);
     result.map_err(|error| {
         refusal(
@@ -135,24 +162,42 @@ unsafe fn set_value(element_ptr: usize, value: &str) -> Result<(), BrowserRefusa
     })
 }
 
-fn force_setup_foreground(target: windows::Win32::Foundation::HWND) -> (bool, bool) {
-    unsafe { crate::input::force_foreground_assisted(target) }
+fn force_setup_foreground(
+    target: windows::Win32::Foundation::HWND,
+    expected_pid: u32,
+) -> (bool, bool) {
+    unsafe { crate::input::force_foreground_assisted_for_pid(target, expected_pid) }
 }
 
 fn confirm_setup_navigation(
     hwnd: u64,
+    expected_pid: u32,
     element_ptr: usize,
     foregrounded_window: &mut bool,
     injected_global_input: &mut bool,
     focused_setup_address_field: &mut bool,
 ) -> Result<(), BrowserRefusal> {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
-
     let target = HWND(hwnd as *mut _);
-    let prior = unsafe { GetForegroundWindow() };
+    let displaced_target = crate::win32::capture_foreground_target(hwnd, Some(expected_pid))
+        .ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserWrongTargetRefused,
+                "the approved browser HWND changed ownership before setup navigation; no window or input mutation was attempted",
+            )
+        })?;
+    let prior_target = match crate::win32::capture_current_foreground_target() {
+        Some(prior) if prior.hwnd() != hwnd => Some(prior),
+        Some(_) => None,
+        None => {
+            return Err(refusal(
+                BrowserRefusalCode::BrowserWrongTargetRefused,
+                "a stable prior foreground identity could not be captured before setup navigation",
+            ));
+        }
+    };
     let navigation = (|| {
-        let (fronted, injected) = force_setup_foreground(target);
+        let (fronted, injected) = force_setup_foreground(target, expected_pid);
         *injected_global_input |= injected;
         if !fronted {
             return Err(refusal(
@@ -164,9 +209,20 @@ fn confirm_setup_navigation(
 
         let element = unsafe { IUIAutomationElement::from_raw(element_ptr as *mut _) };
         let focused = unsafe {
-            element
-                .SetFocus()
-                .and_then(|_| element.CurrentHasKeyboardFocus())
+            match crate::uia::prove_element_mutation_target(&element, hwnd, expected_pid) {
+                Ok(()) => element
+                    .SetFocus()
+                    .and_then(|_| element.CurrentHasKeyboardFocus()),
+                Err(error) => {
+                    std::mem::forget(element);
+                    return Err(refusal(
+                        BrowserRefusalCode::BrowserWrongTargetRefused,
+                        format!(
+                            "could not revalidate the exact address field before focus: {error}"
+                        ),
+                    ));
+                }
+            }
         };
         std::mem::forget(element);
         match focused {
@@ -186,7 +242,14 @@ fn confirm_setup_navigation(
         }
 
         *injected_global_input = true;
-        crate::input::keyboard::send_key_synthesized(hwnd, "enter", &[]).map_err(|error| {
+        crate::input::keyboard::send_key_synthesized_after_focus_for_pid(
+            hwnd,
+            Some(expected_pid),
+            "enter",
+            &[],
+            || Ok(()),
+        )
+        .map_err(|error| {
             refusal(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!("could not confirm the bounded setup navigation: {error}"),
@@ -194,14 +257,14 @@ fn confirm_setup_navigation(
         })
     })();
 
-    let restored = if prior.0.is_null() || prior == target {
-        true
-    } else {
-        let (restored, injected) = force_setup_foreground(prior);
-        *injected_global_input |= injected;
-        restored
-    };
-    if !restored {
+    let restoration_failed = prior_target.is_some_and(|prior_target| {
+        crate::win32::restore_foreground_target_if_still_displaced(
+            prior_target,
+            displaced_target,
+            Duration::from_millis(500),
+        ) == crate::win32::ForegroundRestoreOutcome::Failed
+    });
+    if restoration_failed {
         return Err(refusal(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             "the setup navigation completed, but Windows refused to restore the prior foreground window",
@@ -237,12 +300,19 @@ unsafe fn checkbox_state(element_ptr: usize) -> Result<CheckboxState, BrowserRef
     }
 }
 
-unsafe fn toggle(element_ptr: usize) -> Result<(), BrowserRefusal> {
+unsafe fn toggle(
+    element_ptr: usize,
+    root_hwnd: u64,
+    expected_pid: u32,
+) -> Result<(), BrowserRefusal> {
     let element = IUIAutomationElement::from_raw(element_ptr as *mut _);
-    let result = element
-        .GetCurrentPattern(UIA_TogglePatternId)
-        .and_then(|pattern| pattern.cast::<IUIAutomationTogglePattern>())
-        .and_then(|pattern| pattern.Toggle());
+    let result = (|| -> anyhow::Result<()> {
+        let pattern = element.GetCurrentPattern(UIA_TogglePatternId)?;
+        let pattern = pattern.cast::<IUIAutomationTogglePattern>()?;
+        crate::uia::prove_element_mutation_target(&element, root_hwnd, expected_pid)?;
+        pattern.Toggle()?;
+        Ok(())
+    })();
     std::mem::forget(element);
     result.map_err(|error| {
         refusal(
@@ -417,6 +487,7 @@ pub fn ensure_profile_discoverable(
 
 pub struct SetupUiHandle {
     hwnd: u64,
+    expected_pid: u32,
     descriptor: &'static BrowserSetupDescriptor,
     pub opened_setup_page: bool,
     pub enabled_remote_debugging: bool,
@@ -440,7 +511,13 @@ impl SetupUiHandle {
             Ok(Some(element)) => unsafe {
                 match checkbox_state(element) {
                     Ok(CheckboxState::Off) => true,
-                    Ok(CheckboxState::On) => toggle(element).is_ok(),
+                    Ok(CheckboxState::On) => prove_window_owner(
+                        self.hwnd,
+                        self.expected_pid,
+                        "remote-debugging rollback",
+                    )
+                    .and_then(|()| toggle(element, self.hwnd, self.expected_pid))
+                    .is_ok(),
                     Err(_) => false,
                 }
             },
@@ -513,8 +590,13 @@ impl SetupUiHandle {
             );
             return Err(self.abort(error));
         }
-        if let Err(error) = crate::input::keyboard::send_key_synthesized(self.hwnd, "w", &["ctrl"])
-        {
+        if let Err(error) = crate::input::keyboard::send_key_synthesized_after_focus_for_pid(
+            self.hwnd,
+            Some(self.expected_pid),
+            "w",
+            &["ctrl"],
+            || Ok(()),
+        ) {
             let error = refusal(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!("could not close the exact temporary setup tab: {error}"),
@@ -536,7 +618,14 @@ impl SetupUiHandle {
         release_nodes(&tree.nodes);
         Some(
             proven
-                && crate::input::keyboard::send_key_synthesized(self.hwnd, "w", &["ctrl"]).is_ok(),
+                && crate::input::keyboard::send_key_synthesized_after_focus_for_pid(
+                    self.hwnd,
+                    Some(self.expected_pid),
+                    "w",
+                    &["ctrl"],
+                    || Ok(()),
+                )
+                .is_ok(),
         )
     }
 }
@@ -601,6 +690,7 @@ pub fn abort_pending(hwnd: u64, error: BrowserRefusal) -> BrowserRefusal {
 
 pub fn enable(
     hwnd: u64,
+    expected_pid: u32,
     descriptor: &'static BrowserSetupDescriptor,
 ) -> Result<SetupUiHandle, BrowserRefusal> {
     // Reserve the stable profile resource before the first tree read/mutation.
@@ -611,6 +701,7 @@ pub fn enable(
     let mut handle = match initial_checkbox {
         Ok(Some(_)) => SetupUiHandle {
             hwnd,
+            expected_pid,
             descriptor,
             opened_setup_page: false,
             enabled_remote_debugging: false,
@@ -651,12 +742,14 @@ pub fn enable(
                 .as_mut()
                 .expect("setup reservation available")
                 .retain_fail_closed();
-            let invoked = unsafe { invoke(new_tab) };
+            let invoked = prove_window_owner(hwnd, expected_pid, "New Tab invocation")
+                .and_then(|()| unsafe { invoke(new_tab, hwnd, expected_pid) });
             release_nodes(&initial.nodes);
             invoked?;
 
             let mut handle = SetupUiHandle {
                 hwnd,
+                expected_pid,
                 descriptor,
                 opened_setup_page: true,
                 enabled_remote_debugging: false,
@@ -714,11 +807,13 @@ pub fn enable(
                     return Err(handle.abort(error));
                 }
             };
-            if let Err(error) = unsafe { set_value(omnibox, descriptor.setup_url) } {
-                release_nodes(&created.nodes);
+            let updated = prove_window_owner(hwnd, expected_pid, "address-field update").and_then(
+                |()| unsafe { set_value(omnibox, hwnd, expected_pid, descriptor.setup_url) },
+            );
+            release_nodes(&created.nodes);
+            if let Err(error) = updated {
                 return Err(handle.abort(error));
             }
-            release_nodes(&created.nodes);
             created = crate::uia::walk_tree(hwnd, None);
             let refreshed_omnibox = created
                 .nodes
@@ -740,6 +835,7 @@ pub fn enable(
             };
             if let Err(error) = confirm_setup_navigation(
                 hwnd,
+                expected_pid,
                 refreshed_omnibox,
                 &mut handle.foregrounded_window,
                 &mut handle.injected_global_input,
@@ -780,7 +876,9 @@ pub fn enable(
                         handle.enable_attempted = true;
                         handle.remote_debugging_mutation_possible = true;
                         handle.reservation.retain_fail_closed();
-                        unsafe { toggle(element).map(|_| false) }
+                        prove_window_owner(hwnd, expected_pid, "remote-debugging enable").and_then(
+                            |()| unsafe { toggle(element, hwnd, expected_pid).map(|_| false) },
+                        )
                     }
                     Ok(CheckboxState::Off) => Ok(false),
                     Err(error) => Err(error),

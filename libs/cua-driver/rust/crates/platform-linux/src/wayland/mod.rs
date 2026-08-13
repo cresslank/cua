@@ -1822,6 +1822,13 @@ pub fn with_target_foreground<T>(
     window_id: u64,
     body: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    // Sway/GNOME focus, global input, and restoration form one host-global
+    // transaction. Serialize across both this process and the desktop session,
+    // then re-establish the exact PID/window identity after waiting for the
+    // lease so a stale pre-wait observation cannot authorize input.
+    let _lease = acquire_host_raw_input_lease()?;
+    let target = establish_exact_target(pid, window_id)?;
+    validate_exact_target(&target)?;
     if let Some(window) = sway_ipc::window_for_id(window_id) {
         if window.pid != pid {
             anyhow::bail!(

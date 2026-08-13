@@ -80,6 +80,7 @@ pub unsafe fn element_is_offscreen(element_ptr: usize) -> Option<bool> {
 /// refcount (the constructed handle is `forget`-ten before return).
 pub unsafe fn scroll_into_view_and_recenter(
     host_hwnd: u64,
+    expected_pid: u32,
     element_ptr: usize,
 ) -> Option<(i32, i32)> {
     if element_ptr == 0 {
@@ -111,9 +112,11 @@ pub unsafe fn scroll_into_view_and_recenter(
         }
     };
 
-    let result = scroll_item_into_view(host_hwnd, &elem)
+    let result = scroll_item_into_view(host_hwnd, expected_pid, &elem)
         .and_then(actionable)
-        .or_else(|| scroll_ancestors_into_view(host_hwnd, &elem).and_then(actionable));
+        .or_else(|| {
+            scroll_ancestors_into_view(host_hwnd, expected_pid, &elem).and_then(actionable)
+        });
 
     // Don't Release the cache's ref - the RetainedElement guard owns it.
     std::mem::forget(elem);
@@ -127,6 +130,8 @@ pub unsafe fn scroll_into_view_and_recenter(
 /// makes indexed background scrolls reach that container without activating
 /// the host window.
 pub unsafe fn scroll_element(
+    host_hwnd: u64,
+    expected_pid: u32,
     element_ptr: usize,
     direction: &str,
     amount: u32,
@@ -151,11 +156,19 @@ pub unsafe fn scroll_element(
     };
     let horizontal = matches!(direction, "left" | "right");
     for _ in 0..amount.max(1) {
-        let result = if horizontal {
-            scroll.Scroll(vertical, ScrollAmount_NoAmount)
-        } else {
-            scroll.Scroll(ScrollAmount_NoAmount, vertical)
-        };
+        let result = crate::uia::fg_bypass::run_with_uwp_bypass_for_pid(
+            host_hwnd as isize,
+            expected_pid,
+            || {
+                crate::uia::prove_element_mutation_target(&elem, host_hwnd, expected_pid)?;
+                if horizontal {
+                    scroll.Scroll(vertical, ScrollAmount_NoAmount)
+                } else {
+                    scroll.Scroll(ScrollAmount_NoAmount, vertical)
+                }
+                .map_err(anyhow::Error::from)
+            },
+        );
         result.map_err(|e| anyhow::anyhow!("UIA scroll failed: {e}"))?;
     }
     std::mem::forget(elem);
@@ -163,13 +176,20 @@ pub unsafe fn scroll_element(
 }
 
 /// Strategy 1: `ScrollItemPattern::ScrollIntoView` on the element itself.
-unsafe fn scroll_item_into_view(host_hwnd: u64, elem: &IUIAutomationElement) -> Option<(i32, i32)> {
+unsafe fn scroll_item_into_view(
+    host_hwnd: u64,
+    expected_pid: u32,
+    elem: &IUIAutomationElement,
+) -> Option<(i32, i32)> {
     let pattern = elem.GetCurrentPattern(UIA_ScrollItemPatternId).ok()?;
     let scroll_item = pattern.cast::<IUIAutomationScrollItemPattern>().ok()?;
     // Drive the scroll inside the UWP foreground-steal bypass (no-op for
     // non-XAML hosts) so a XAML host can't self-raise on the layout change.
-    crate::uia::fg_bypass::run_with_uwp_bypass(host_hwnd as isize, || scroll_item.ScrollIntoView())
-        .ok()?;
+    crate::uia::fg_bypass::run_with_uwp_bypass_for_pid(host_hwnd as isize, expected_pid, || {
+        crate::uia::prove_element_mutation_target(elem, host_hwnd, expected_pid)?;
+        scroll_item.ScrollIntoView().map_err(anyhow::Error::from)
+    })
+    .ok()?;
     let rect = elem.CurrentBoundingRectangle().ok()?;
     Some(((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2))
 }
@@ -179,6 +199,7 @@ unsafe fn scroll_item_into_view(host_hwnd: u64, elem: &IUIAutomationElement) -> 
 /// viewport.
 unsafe fn scroll_ancestors_into_view(
     host_hwnd: u64,
+    expected_pid: u32,
     elem: &IUIAutomationElement,
 ) -> Option<(i32, i32)> {
     // COM is already initialized by `scroll_into_view_and_recenter` (this fn's
@@ -231,9 +252,15 @@ unsafe fn scroll_ancestors_into_view(
                 (_, false) => ScrollAmount_LargeIncrement,
                 (_, true) => ScrollAmount_SmallIncrement,
             };
-            let scrolled = crate::uia::fg_bypass::run_with_uwp_bypass(host_hwnd as isize, || {
-                sp.Scroll(ScrollAmount_NoAmount, amount)
-            });
+            let scrolled = crate::uia::fg_bypass::run_with_uwp_bypass_for_pid(
+                host_hwnd as isize,
+                expected_pid,
+                || {
+                    crate::uia::prove_element_mutation_target(&container, host_hwnd, expected_pid)?;
+                    sp.Scroll(ScrollAmount_NoAmount, amount)
+                        .map_err(anyhow::Error::from)
+                },
+            );
             if scrolled.is_err() {
                 break;
             }

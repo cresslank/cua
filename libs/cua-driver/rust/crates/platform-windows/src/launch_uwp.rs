@@ -38,7 +38,6 @@ use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, GUID, HSTRING, PCWSTR, PWSTR};
-use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, IBindCtx, CLSCTX_LOCAL_SERVER,
     COINIT_APARTMENTTHREADED,
@@ -48,7 +47,6 @@ use windows::Win32::UI::Shell::{
     ApplicationActivationManager, BHID_EnumItems, IApplicationActivationManager, IEnumShellItems,
     IShellItem, IShellItem2, SHCreateItemFromParsingName, AO_NONE, SIGDN_NORMALDISPLAY,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 /// `PKEY_AppUserModel_ID` (System.AppUserModel.ID) — the property key whose
 /// string value on each `shell:AppsFolder` entry is the AUMID we need to
@@ -90,106 +88,56 @@ const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
 ///   packaged dependency unresolved (rare)
 /// - Any COM-init failure on a thread that has previously been
 ///   initialized with a conflicting apartment model
-pub fn launch_uwp(aumid: &str, args: &str) -> windows::core::Result<u32> {
-    // Session-0 short-circuit: `IApplicationActivationManager::ActivateApplication`
-    // relies on the per-user AppX runtime that doesn't exist in services /
-    // SSH-launched contexts. Calling it in Session 0 hangs indefinitely
-    // (no CPU, no progress, no error). Fail fast with a clear message so
-    // tools / tests don't time out silently.
+pub(crate) fn launch_uwp(
+    aumid: &str,
+    args: &str,
+    prior_foreground: crate::win32::ForegroundTarget,
+) -> windows::core::Result<u32> {
     if matches!(crate::diagnostics::current_session_id(), Some(0)) {
         return Err(windows::core::Error::new(
-            windows::core::HRESULT(0x80004005u32 as i32), // E_FAIL
+            windows::core::HRESULT(0x80004005u32 as i32),
             format!("UWP activation of {aumid:?} requires an interactive session — current process is in Session 0 (services). Re-run from an interactive logon (RDP, console, or scheduled task in the user's session)."),
         ));
     }
-
-    // Apartment model: AAM is a local-server COM object that historically
-    // requires STA on the calling thread. `CoInitializeEx` is idempotent
-    // per-thread; its HRESULT is intentionally discarded — if the thread
-    // was previously initialized with a different model, the subsequent
-    // CoCreateInstance call will surface a clear error.
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-
     let manager: IApplicationActivationManager =
         unsafe { CoCreateInstance(&ApplicationActivationManager, None, CLSCTX_LOCAL_SERVER)? };
-
     let aumid_h = HSTRING::from(aumid);
     let args_h = HSTRING::from(args);
-
-    // Snapshot prior foreground BEFORE activation — that's our restore
-    // target. Captured even if null; the restore step is a no-op then.
-    let prior_foreground = unsafe { GetForegroundWindow() };
-
     let pid = unsafe {
         manager.ActivateApplication(PCWSTR(aumid_h.as_ptr()), PCWSTR(args_h.as_ptr()), AO_NONE)?
     };
-
-    // Restore the prior foreground window. AppX activation has already
-    // run by this point and may have stolen focus; flip it back so the
-    // human's typing context is preserved. The restore is best-effort —
-    // failures (null prior, target window destroyed, target hung) are
-    // logged at debug level and otherwise swallowed because the launch
-    // itself succeeded and we don't want to fail the tool call on a
-    // focus-restore corner case.
-    restore_foreground_best_effort(prior_foreground);
-
-    Ok(pid)
-}
-
-/// Best-effort restore of the foreground window. Run in a tight retry
-/// loop because UWP activations sometimes push their own window to
-/// foreground a few milliseconds AFTER `ActivateApplication` returns —
-/// a single immediate SetForegroundWindow call would race the AppX
-/// runtime and lose. Three attempts spaced 50ms apart covers the window.
-///
-/// **Foreground-lock workaround:** Windows restricts SetForegroundWindow
-/// to processes that meet specific conditions (foreground process,
-/// owner of last input, etc.). The daemon usually meets none of these
-/// when launch_app is called from MCP. We inject a single VK_NONAME
-/// synthetic keypress via `keybd_event` to claim "owner of last input"
-/// status long enough for SetForegroundWindow to succeed. VK_NONAME
-/// (0xFC) is the reserved no-name virtual-key code — it does not map
-/// to any UI action and is safe to inject without side effects.
-fn restore_foreground_best_effort(prior: HWND) {
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-    };
-    use windows::Win32::UI::WindowsAndMessaging::{IsWindow, SetForegroundWindow};
-
-    if prior.0.is_null() {
-        tracing::debug!(target: "launch_uwp", "no prior foreground to restore");
-        return;
-    }
-
-    // Claim "owner of last input" so the next SetForegroundWindow call
-    // isn't silently dropped by the foreground lock. VK_NONAME (0xFC)
-    // doesn't trigger any application's key handler.
-    const VK_NONAME: u8 = 0xFC;
-    unsafe {
-        keybd_event(VK_NONAME, 0, KEYBD_EVENT_FLAGS(0), 0);
-        keybd_event(VK_NONAME, 0, KEYEVENTF_KEYUP, 0);
-    }
-
-    for attempt in 0..3 {
-        if attempt > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        unsafe {
-            if !IsWindow(prior).as_bool() {
-                tracing::debug!(target: "launch_uwp", "prior foreground HWND no longer valid");
-                return;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let Some(current) = crate::win32::capture_current_foreground_target() else {
+            if Instant::now() >= deadline {
+                return Ok(pid);
             }
-            let ok = SetForegroundWindow(prior).as_bool();
-            tracing::debug!(
-                target: "launch_uwp",
-                "SetForegroundWindow attempt {} -> {}",
-                attempt + 1,
-                ok,
-            );
-            if ok {
-                return;
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        };
+        if current.hwnd() == prior_foreground.hwnd() && current.pid() == prior_foreground.pid() {
+            if Instant::now() >= deadline {
+                return Ok(pid);
             }
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
         }
+        if current.pid() != pid {
+            return Ok(pid);
+        }
+        return match crate::win32::restore_foreground_target_if_still_displaced(
+            prior_foreground,
+            current,
+            Duration::from_millis(500),
+        ) {
+            crate::win32::ForegroundRestoreOutcome::Restored
+            | crate::win32::ForegroundRestoreOutcome::Superseded => Ok(pid),
+            crate::win32::ForegroundRestoreOutcome::Failed => Err(windows::core::Error::new(
+                windows::core::HRESULT(0x80004005u32 as i32),
+                "UWP activation completed, but exact prior foreground restoration was not confirmed",
+            )),
+        };
     }
 }
 

@@ -33,6 +33,29 @@ pub mod windows_enum;
 pub use cache::ElementCache;
 pub use windows_enum::enumerate_top_level_windows;
 
+pub(crate) fn prove_element_mutation_target(
+    element: &IUIAutomationElement,
+    root_hwnd: u64,
+    expected_pid: u32,
+) -> anyhow::Result<()> {
+    if crate::win32::capture_foreground_target(root_hwnd, Some(expected_pid)).is_none() {
+        anyhow::bail!("approved root HWND changed ownership before retained UIA mutation");
+    }
+    let element_pid = unsafe { element.CurrentProcessId() }
+        .map_err(|error| anyhow::anyhow!("could not revalidate retained UIA process: {error}"))?;
+    if u32::try_from(element_pid).ok() != Some(expected_pid) {
+        anyhow::bail!("retained UIA element no longer belongs to the approved process");
+    }
+    let native = unsafe { element.CurrentNativeWindowHandle() }
+        .ok()
+        .map(|handle| handle.0 as usize as u64)
+        .unwrap_or(0);
+    if native != 0 && crate::win32::window_owner_pid(native) != Some(expected_pid) {
+        anyhow::bail!("retained UIA element native HWND changed ownership");
+    }
+    Ok(())
+}
+
 /// Default cap; callers can override via [`walk_tree_bounded`].
 pub const DEFAULT_MAX_DEPTH: usize = 25;
 /// Default cap; callers can override via [`walk_tree_bounded`].
@@ -160,12 +183,19 @@ unsafe fn release_walk_nodes(nodes: Vec<UiaNode>) {
     }
 }
 
-unsafe fn invoke_menu_element(element_ptr: usize, final_segment: bool) -> Result<(), String> {
+unsafe fn invoke_menu_element(
+    element_ptr: usize,
+    hwnd: u64,
+    expected_pid: u32,
+    final_segment: bool,
+) -> Result<(), String> {
     let element =
         std::mem::ManuallyDrop::new(IUIAutomationElement::from_raw(element_ptr as *mut _));
     if !final_segment {
         if let Ok(pattern) = element.GetCurrentPattern(UIA_ExpandCollapsePatternId) {
             if let Ok(expand) = pattern.cast::<IUIAutomationExpandCollapsePattern>() {
+                prove_element_mutation_target(&element, hwnd, expected_pid)
+                    .map_err(|error| error.to_string())?;
                 return expand
                     .Expand()
                     .map_err(|error| format!("ExpandCollapse.Expand failed: {error}"));
@@ -174,6 +204,8 @@ unsafe fn invoke_menu_element(element_ptr: usize, final_segment: bool) -> Result
     }
     if let Ok(pattern) = element.GetCurrentPattern(UIA_InvokePatternId) {
         if let Ok(invoke) = pattern.cast::<IUIAutomationInvokePattern>() {
+            prove_element_mutation_target(&element, hwnd, expected_pid)
+                .map_err(|error| error.to_string())?;
             return invoke
                 .Invoke()
                 .map_err(|error| format!("InvokePattern.Invoke failed: {error}"));
@@ -182,6 +214,8 @@ unsafe fn invoke_menu_element(element_ptr: usize, final_segment: bool) -> Result
     if final_segment {
         if let Ok(pattern) = element.GetCurrentPattern(UIA_SelectionItemPatternId) {
             if let Ok(selection) = pattern.cast::<IUIAutomationSelectionItemPattern>() {
+                prove_element_mutation_target(&element, hwnd, expected_pid)
+                    .map_err(|error| error.to_string())?;
                 return selection
                     .Select()
                     .map_err(|error| format!("SelectionItem.Select failed: {error}"));
@@ -193,7 +227,7 @@ unsafe fn invoke_menu_element(element_ptr: usize, final_segment: bool) -> Result
 
 /// Resolve and invoke an exact application menu path from fresh UIA state at
 /// every hop. No cached element index survives a menu mutation.
-pub fn invoke_menu_path(hwnd: u64, path: &[String]) -> Result<(), String> {
+pub fn invoke_menu_path(hwnd: u64, expected_pid: u32, path: &[String]) -> Result<(), String> {
     for depth in 0..path.len() {
         let result = walk_tree(hwnd, None);
         let matches = exact_menu_path_matches(&result.nodes, &path[..=depth]);
@@ -215,8 +249,20 @@ pub fn invoke_menu_path(hwnd: u64, path: &[String]) -> Result<(), String> {
             Some(format!(
                 "menu path segment {depth} is exposed only through MSAA, not UI Automation"
             ))
+        } else if crate::win32::window_owner_pid(hwnd) != Some(expected_pid) {
+            Some(format!(
+                "menu path segment {depth} refused because the approved HWND changed ownership before mutation"
+            ))
         } else {
-            unsafe { invoke_menu_element(target.element_ptr, depth + 1 == path.len()) }.err()
+            unsafe {
+                invoke_menu_element(
+                    target.element_ptr,
+                    hwnd,
+                    expected_pid,
+                    depth + 1 == path.len(),
+                )
+            }
+            .err()
         };
         unsafe { release_walk_nodes(result.nodes) };
         if let Some(error) = error {

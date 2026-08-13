@@ -1105,7 +1105,7 @@ impl BrowserPlatform for WindowsBrowserPlatform {
         // listener appear newly created after the approved setup action.
         let listeners_before = unfiltered_loopback_ports_for_exact_pid(pid_u32).await?;
         let handle = cua_driver_core::blocking::spawn(move || {
-            crate::browser_setup_ui::enable(hwnd, descriptor)
+            crate::browser_setup_ui::enable(hwnd, pid_u32, descriptor)
         })
         .await
         .map_err(|error| {

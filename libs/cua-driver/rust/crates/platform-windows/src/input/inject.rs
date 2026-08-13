@@ -18,8 +18,8 @@
 //! per-process injection-enable, NOT on the target being foreground. The one
 //! residual is that a tap on an *inactive* top-level window can still trigger
 //! click-activation; we contain that with `NoActivateGuard` (WS_EX_NOACTIVATE)
-//! plus a `force_foreground_attached(prev_fg)` re-assertion of the USER's
-//! foreground afterward. Per the macOS-aligned contract a background actuation
+//! plus conditional exact-identity restoration of the USER's foreground
+//! afterward. Per the macOS-aligned contract a background actuation
 //! never raises/restacks the target: when coordinate-routed input can't reach
 //! it (occluded at the point), the caller returns `background_unavailable`
 //! rather than raising it (see `target_visible_at_point`).
@@ -39,18 +39,14 @@ use windows::Win32::UI::Controls::{
     CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
     POINTER_FEEDBACK_DEFAULT, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-};
 use windows::Win32::UI::Input::Pointer::{
     InjectSyntheticPointerInput, POINTER_FLAG_DOWN, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE,
     POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO, POINTER_TOUCH_INFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
-    IsWindow, LockSetForegroundWindow, SetCursorPos, SetForegroundWindow, SetWindowLongPtrW,
-    WindowFromPoint, GA_ROOT, GWL_EXSTYLE, LSFW_LOCK, LSFW_UNLOCK, PT_PEN, PT_TOUCH,
-    WS_EX_NOACTIVATE,
+    GetAncestor, GetForegroundWindow, GetWindowLongPtrW, GetWindowThreadProcessId,
+    LockSetForegroundWindow, SetForegroundWindow, SetWindowLongPtrW, WindowFromPoint, GA_ROOT,
+    GWL_EXSTYLE, LSFW_LOCK, LSFW_UNLOCK, PT_PEN, PT_TOUCH, WS_EX_NOACTIVATE,
 };
 
 #[derive(Default)]
@@ -132,26 +128,58 @@ pub(crate) unsafe fn force_foreground_attached(target: HWND) -> bool {
     GetForegroundWindow() == target
 }
 
-/// Retry an explicit visible foreground transition after a reserved no-name
-/// key grants this process the most-recent-input token. The key has no
-/// application meaning; the retry count keeps the transition bounded.
-pub(crate) unsafe fn force_foreground_assisted(target: HWND) -> (bool, bool) {
-    if unsafe { force_foreground_attached(target) } {
-        return (true, false);
+unsafe fn force_foreground_attached_for_pid(target: HWND, expected_pid: u32) -> bool {
+    let target_addr = target.0 as usize as u64;
+    if crate::win32::capture_foreground_target(target_addr, Some(expected_pid)).is_none() {
+        return false;
     }
+    let cur = GetForegroundWindow();
+    if cur == target {
+        return true;
+    }
+    let my_tid = GetCurrentThreadId();
+    let mut foreground_pid = 0u32;
+    let cur_tid = GetWindowThreadProcessId(cur, Some(&mut foreground_pid));
+    let attached = cur_tid != 0 && cur_tid != my_tid;
+    if attached {
+        let _ = AttachThreadInput(my_tid, cur_tid, true);
+    }
+    let still_owned =
+        crate::win32::capture_foreground_target(target_addr, Some(expected_pid)).is_some();
+    let requested = still_owned && SetForegroundWindow(target).as_bool();
+    if attached {
+        let _ = AttachThreadInput(my_tid, cur_tid, false);
+    }
+    requested
+        && crate::win32::capture_foreground_target(target_addr, Some(expected_pid)).is_some()
+        && GetForegroundWindow() == target
+}
 
-    const VK_NONAME: u8 = 0xFC;
-    unsafe {
-        keybd_event(VK_NONAME, 0, KEYBD_EVENT_FLAGS(0), 0);
-        keybd_event(VK_NONAME, 0, KEYEVENTF_KEYUP, 0);
-    }
+/// Attempt one bounded foreground transition without emitting any synthetic
+/// input. Foreground-lock denial is a fail-closed refusal.
+pub(crate) unsafe fn force_foreground_assisted(target: HWND) -> (bool, bool) {
+    (unsafe { force_foreground_attached(target) }, false)
+}
+
+/// PID-bound foreground transition for exact-window transactions. Ownership is
+/// re-proved before every activation retry. Unlike the desktop-scoped helper,
+/// this variant never emits a reserved global key while another application is
+/// foreground; foreground-lock denial is a refusal.
+pub(crate) unsafe fn force_foreground_assisted_for_pid(
+    target: HWND,
+    expected_pid: u32,
+) -> (bool, bool) {
+    let target_addr = target.0 as usize as u64;
     for _ in 0..3 {
-        if unsafe { force_foreground_attached(target) } {
-            return (true, true);
+        if crate::win32::capture_foreground_target(target_addr, Some(expected_pid)).is_none() {
+            return (false, false);
+        }
+        if unsafe { force_foreground_attached_for_pid(target, expected_pid) } {
+            return (true, false);
         }
         sleep(Duration::from_millis(25));
     }
-    (false, true)
+    (false, false)
 }
 
 /// RAII guard that makes a specific target window **unable to become the
@@ -170,12 +198,22 @@ pub struct NoActivateGuard {
     // Store the handle as an integer so the guard is `Send` and can be held
     // across `.await` in the async tools.
     root_addr: isize,
+    expected_pid: Option<u32>,
     applied: bool,
 }
 
 impl NoActivateGuard {
     /// Arm on the top-level (GA_ROOT) ancestor of `hwnd`.
     pub fn arm(hwnd: HWND) -> Self {
+        Self::arm_inner(hwnd, None)
+            .expect("PID-less NoActivateGuard arming cannot reject ownership")
+    }
+
+    pub fn arm_for_pid(hwnd: HWND, expected_pid: u32) -> Result<Self> {
+        Self::arm_inner(hwnd, Some(expected_pid))
+    }
+
+    fn arm_inner(hwnd: HWND, expected_pid: Option<u32>) -> Result<Self> {
         unsafe {
             let root = {
                 let r = GetAncestor(hwnd, GA_ROOT);
@@ -185,43 +223,108 @@ impl NoActivateGuard {
                     r
                 }
             };
+            if expected_pid.is_some_and(|pid| {
+                crate::win32::window_owner_pid(root.0 as usize as u64) != Some(pid)
+            }) {
+                bail!("exact target HWND changed ownership before NoActivateGuard mutation");
+            }
             let prev = GetWindowLongPtrW(root, GWL_EXSTYLE);
             let want = WS_EX_NOACTIVATE.0 as isize;
             // Apply WS_EX_NOACTIVATE if not already set (prev can be 0, so don't
             // gate on it — we just need to check the bit and set it if absent).
-            let applied = (prev & want) == 0 && {
+            let was_present = (prev & want) != 0;
+            if !was_present
+                && expected_pid.is_some_and(|pid| {
+                    crate::win32::window_owner_pid(root.0 as usize as u64) != Some(pid)
+                })
+            {
+                bail!("exact target HWND changed ownership at NoActivateGuard mutation");
+            }
+            let applied = !was_present && {
                 SetWindowLongPtrW(root, GWL_EXSTYLE, prev | want);
                 // Confirm it took (cross-process SetWindowLongPtr can be denied
                 // by UIPI on higher-integrity targets).
                 (GetWindowLongPtrW(root, GWL_EXSTYLE) & want) != 0
             };
-            Self {
-                root_addr: root.0 as isize,
-                applied,
+            if !was_present
+                && expected_pid.is_some_and(|pid| {
+                    crate::win32::window_owner_pid(root.0 as usize as u64) != Some(pid)
+                })
+            {
+                bail!(
+                    "exact target HWND changed ownership after NoActivateGuard mutation; restoration withheld"
+                );
             }
+            if expected_pid.is_some() && !was_present && !applied {
+                bail!("NoActivateGuard mutation did not read back");
+            }
+            Ok(Self {
+                root_addr: root.0 as isize,
+                expected_pid,
+                applied,
+            })
         }
+    }
+
+    pub fn finish(&mut self) -> Result<()> {
+        if !self.applied {
+            return Ok(());
+        }
+        unsafe {
+            let root = HWND(self.root_addr as *mut _);
+            if self.expected_pid.is_some_and(|pid| {
+                crate::win32::window_owner_pid(root.0 as usize as u64) != Some(pid)
+            }) {
+                bail!("exact target HWND changed ownership; NoActivateGuard restoration refused");
+            }
+            let current = GetWindowLongPtrW(root, GWL_EXSTYLE);
+            let noactivate = WS_EX_NOACTIVATE.0 as isize;
+            SetWindowLongPtrW(root, GWL_EXSTYLE, current & !noactivate);
+            if GetWindowLongPtrW(root, GWL_EXSTYLE) & noactivate != 0 {
+                bail!("NoActivateGuard restoration did not read back");
+            }
+            self.applied = false;
+        }
+        Ok(())
     }
 }
 
 impl Drop for NoActivateGuard {
     fn drop(&mut self) {
         if self.applied {
-            unsafe {
-                let root = HWND(self.root_addr as *mut _);
-                let current = GetWindowLongPtrW(root, GWL_EXSTYLE);
-                let noactivate = WS_EX_NOACTIVATE.0 as isize;
-                // Clear only the bit this guard added. Restoring the full
-                // captured value can clobber unrelated style changes the app
-                // made while the background action was in flight.
-                SetWindowLongPtrW(root, GWL_EXSTYLE, current & !noactivate);
-            }
+            let _ = self.finish();
         }
+    }
+}
+
+pub fn run_with_noactivate_for_pid<T, E>(
+    hwnd: HWND,
+    expected_pid: u32,
+    action: impl FnOnce() -> std::result::Result<T, E>,
+) -> Result<T>
+where
+    E: std::fmt::Display,
+{
+    let mut guard = NoActivateGuard::arm_for_pid(hwnd, expected_pid)?;
+    let action_result = action().map_err(|error| anyhow::anyhow!(error.to_string()));
+    let restore_result = guard.finish();
+    match (action_result, restore_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(action), Ok(())) => Err(action),
+        (Ok(_), Err(restoration)) => Err(restoration),
+        (Err(action), Err(restoration)) => Err(anyhow::anyhow!(
+            "{action}; no-activate cleanup: {restoration}"
+        )),
     }
 }
 
 /// PEN_FLAG_BARREL (winuser.h) — pen barrel button held == secondary (right)
 /// button. `penFlags` is a raw u32 in the bindings, so use the literal.
-const PEN_FLAG_BARREL: u32 = 0x00000001;
+const PEN_FLAG_BARREL: u32 = 0x0000_0001;
+
+fn cleanup_release_is_authorized(down_may_have_landed: bool, recipient_authorized: bool) -> bool {
+    down_may_have_landed && recipient_authorized
+}
 
 // (Removed ZorderGuard.) The macOS-aligned contract forbids a `background`
 // actuation from raising/restacking the target: coordinate-routed pen/touch
@@ -234,7 +337,14 @@ const PEN_FLAG_BARREL: u32 = 0x00000001;
 /// (right) click — both for `WM_POINTER`-aware apps (Chromium/WPF/UWP) and via
 /// pen→mouse promotion for legacy Win32. A fresh synthetic pen device is
 /// created and destroyed per tap (right/middle clicks are rare).
-fn pen_taps(sx: i32, sy: i32, barrel: bool, count: usize) -> Result<()> {
+fn pen_taps(
+    target: HWND,
+    expected_pid: u32,
+    sx: i32,
+    sy: i32,
+    barrel: bool,
+    count: usize,
+) -> Result<()> {
     unsafe {
         let dev = CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT)
             .map_err(|e| anyhow::anyhow!("CreateSyntheticPointerDevice(PEN): {e}"))?;
@@ -271,11 +381,40 @@ fn pen_taps(sx: i32, sy: i32, barrel: bool, count: usize) -> Result<()> {
         let mut result: Result<()> = Ok(());
         let n = count.max(1);
         for i in 0..n {
-            let r1 = InjectSyntheticPointerInput(dev, &[down]);
+            if !exact_target_visible_at_point(target, expected_pid, sx, sy) {
+                result = Err(anyhow::anyhow!(
+                    "exact target ownership or recipient changed before synthetic pen down"
+                ));
+                break;
+            }
+            let down_result = InjectSyntheticPointerInput(dev, &[down]);
             sleep(Duration::from_millis(25));
-            let r2 = InjectSyntheticPointerInput(dev, &[up]);
-            if let Err(e) = r1.and(r2) {
-                result = Err(anyhow::anyhow!("InjectSyntheticPointerInput(pen): {e}"));
+            let still_authorized = exact_target_visible_at_point(target, expected_pid, sx, sy);
+            let cleanup_result = cleanup_release_is_authorized(true, still_authorized)
+                .then(|| InjectSyntheticPointerInput(dev, &[up]));
+            result = match (down_result, cleanup_result, still_authorized) {
+                (Ok(()), Some(Ok(())), true) => Ok(()),
+                (Ok(()), None, false) => Err(anyhow::anyhow!(
+                    "exact target ownership or recipient changed after synthetic pen down; up cleanup was withheld and the transient device will be destroyed"
+                )),
+                (Ok(()), Some(Err(cleanup)), _) => Err(anyhow::anyhow!(
+                    "synthetic pen down may have landed; mandatory up cleanup failed: {cleanup}"
+                )),
+                (Err(primary), Some(Ok(())), _) => Err(anyhow::anyhow!(
+                    "synthetic pen down failed: {primary}; mandatory up cleanup succeeded"
+                )),
+                (Err(primary), Some(Err(cleanup)), _) => Err(anyhow::anyhow!(
+                    "synthetic pen down failed: {primary}; mandatory up cleanup also failed: {cleanup}"
+                )),
+                (Err(primary), None, false) => Err(anyhow::anyhow!(
+                    "synthetic pen down failed: {primary}; up cleanup was withheld because recipient authority was lost"
+                )),
+                (_, Some(_), false) => {
+                    unreachable!("unauthorized pen cleanup is never injected")
+                }
+                (_, None, true) => unreachable!("authorized cleanup always produces a result"),
+            };
+            if result.is_err() {
                 break;
             }
             if i + 1 < n {
@@ -306,6 +445,7 @@ fn pen_taps(sx: i32, sy: i32, barrel: bool, count: usize) -> Result<()> {
 /// reliably and routes by coordinate with no foreground dependency.
 pub fn inject_click_screen(
     target: u64,
+    expected_pid: u32,
     sx: i32,
     sy: i32,
     count: usize,
@@ -315,10 +455,8 @@ pub fn inject_click_screen(
         bail!("inject_click_screen: null target window");
     }
     let target_h = HWND(target as *mut _);
-    unsafe {
-        if !IsWindow(target_h).as_bool() {
-            bail!("inject_click_screen: invalid or stale target HWND");
-        }
+    if crate::win32::capture_foreground_target(target, Some(expected_pid)).is_none() {
+        bail!("inject_click_screen: target HWND changed ownership");
     }
     if let Some(msg) = crate::input::post_message_blocked_by_uipi(target) {
         // Higher-integrity target: injection into its queue is blocked too.
@@ -338,32 +476,54 @@ pub fn inject_click_screen(
     // NOT raise to win the hit-test (that's the foreground rung's job, which the
     // agent opts into). Instead bail — the caller surfaces `background_unavailable`
     // and the agent escalates to `delivery_mode:"foreground"`.
-    if unsafe { !target_visible_at_point(target_h, sx, sy) } {
+    if !exact_target_visible_at_point(target_h, expected_pid, sx, sy) {
         bail!(
             "background coordinate injection cannot reach this target at ({sx},{sy}) \
              — it is occluded by another window (raising it would break the \
              no-foreground contract). Escalate to delivery_mode:\"foreground\"."
         );
     }
-    // Remember who the user had in front so we can re-assert it below.
-    let prev_fg = unsafe { GetForegroundWindow() };
+    // Remember who the user had in front with a stable foreground/owner/
+    // foreground snapshot so restoration can never target a mixed identity.
+    let prev_fg_target = match crate::win32::capture_current_foreground_target() {
+        Some(previous) if previous.hwnd() != target => Some(previous),
+        Some(_) => None,
+        None => {
+            bail!(
+                "foreground_restore_unavailable: a stable prior foreground identity could not be captured; no background click mutation was attempted"
+            )
+        }
+    };
+    let displaced = crate::win32::capture_foreground_target(target, Some(expected_pid))
+        .ok_or_else(|| anyhow::anyhow!("inject_click_screen: target ownership changed"))?;
     // Make the target non-activatable for the click so click-activation can't
     // steal foreground. No z-order raise.
-    let result = {
-        let _noact = NoActivateGuard::arm(target_h);
-        // One synthetic device does all `count` taps (single/double/triple click).
-        pen_taps(sx, sy, barrel, count)
-    };
+    let mut noact = NoActivateGuard::arm_for_pid(target_h, expected_pid)?;
+    // One synthetic device does all `count` taps (single/double/triple click).
+    let mut result = pen_taps(target_h, expected_pid, sx, sy, barrel, count);
+    if let Err(restoration) = noact.finish() {
+        result = Err(match result {
+            Ok(()) => restoration,
+            Err(primary) => anyhow::anyhow!("{primary}; cleanup failure: {restoration}"),
+        });
+    }
     // `WS_EX_NOACTIVATE` is NOT categorical against a Chromium/Electron content
     // window that calls `SetForegroundWindow(self)` from its (async) click
     // handler. Re-assert the USER's foreground (this restores focus where the
     // user left it — it never raises the target). Short settle + repeat to win
     // the race against the async self-activation.
-    unsafe {
-        if result.is_ok() && !prev_fg.0.is_null() && prev_fg != target_h {
-            force_foreground_attached(prev_fg);
-            sleep(Duration::from_millis(12));
-            force_foreground_attached(prev_fg);
+    if let Some(previous) = prev_fg_target {
+        let restored = crate::win32::restore_foreground_target_if_still_displaced(
+            previous,
+            displaced,
+            Duration::from_millis(500),
+        );
+        if restored == crate::win32::ForegroundRestoreOutcome::Failed {
+            let restore_error = anyhow::anyhow!("foreground_restore_failed after background click");
+            result = Err(match result {
+                Ok(_) => restore_error,
+                Err(error) => anyhow::anyhow!("{error}; cleanup failure: {restore_error}"),
+            });
         }
     }
     result
@@ -382,6 +542,11 @@ unsafe fn target_visible_at_point(target: HWND, sx: i32, sy: i32) -> bool {
     let top_root = GetAncestor(top, GA_ROOT);
     let target_root = GetAncestor(target, GA_ROOT);
     !top_root.0.is_null() && top_root == target_root
+}
+
+fn exact_target_visible_at_point(target: HWND, expected_pid: u32, sx: i32, sy: i32) -> bool {
+    crate::win32::capture_foreground_target(target.0 as usize as u64, Some(expected_pid)).is_some()
+        && unsafe { target_visible_at_point(target, sx, sy) }
 }
 
 /// True when screen point `(x, y)` lies within `hwnd`'s window rectangle.
@@ -524,11 +689,33 @@ mod iconic_sentinel_tests {
     }
 }
 
+#[cfg(test)]
+mod cleanup_authorization_tests {
+    use super::cleanup_release_is_authorized;
+
+    #[test]
+    fn release_requires_possible_down_and_current_recipient_authority() {
+        assert!(!cleanup_release_is_authorized(false, false));
+        assert!(!cleanup_release_is_authorized(false, true));
+        assert!(!cleanup_release_is_authorized(true, false));
+        assert!(cleanup_release_is_authorized(true, true));
+    }
+}
+
 /// One pen press-drag-release from screen `(sx0,sy0)` to `(sx1,sy1)`, with
 /// `steps` interpolated in-contact UPDATE points between the down and the up.
 /// A single synthetic pen device is created for the whole stroke. The barrel
 /// button is held when `barrel` is set (secondary-button drag).
-fn pen_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize, barrel: bool) -> Result<()> {
+fn pen_drag(
+    target: HWND,
+    expected_pid: u32,
+    sx0: i32,
+    sy0: i32,
+    sx1: i32,
+    sy1: i32,
+    steps: usize,
+    barrel: bool,
+) -> Result<()> {
     unsafe {
         let dev = CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT)
             .map_err(|e| anyhow::anyhow!("CreateSyntheticPointerDevice(PEN): {e}"))?;
@@ -555,34 +742,88 @@ fn pen_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize, barrel: bool) 
                 },
             },
         };
-        // Press at the start.
+        if !exact_target_visible_at_point(target, expected_pid, sx0, sy0) {
+            let _ = DestroySyntheticPointerDevice(dev);
+            bail!("exact target ownership or recipient changed before synthetic pen drag down");
+        }
         let down = mk(
             POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,
             sx0,
             sy0,
         );
-        let mut res = InjectSyntheticPointerInput(dev, &[down]);
-        // Interpolated in-contact moves so frameworks that gate drag-tracking on
-        // motion (rather than a single down→up) see a continuous stroke.
+        let mut result = InjectSyntheticPointerInput(dev, &[down]);
+        let down_may_have_landed = true;
+        let mut last_authorized = (sx0, sy0);
         let steps = steps.max(1);
         for i in 1..=steps {
+            if result.is_err() {
+                break;
+            }
             sleep(Duration::from_millis(8));
             let t = i as f64 / steps as f64;
             let x = sx0 + ((sx1 - sx0) as f64 * t).round() as i32;
             let y = sy0 + ((sy1 - sy0) as f64 * t).round() as i32;
+            if !exact_target_visible_at_point(target, expected_pid, x, y) {
+                result = Err(windows::core::Error::new(
+                    windows::core::HRESULT(0x80004005u32 as i32),
+                    "exact target ownership or recipient changed during synthetic pen drag",
+                ));
+                break;
+            }
             let mv = mk(
                 POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,
                 x,
                 y,
             );
-            res = res.and(InjectSyntheticPointerInput(dev, &[mv]));
+            if let Err(error) = InjectSyntheticPointerInput(dev, &[mv]) {
+                result = Err(error);
+                break;
+            }
+            last_authorized = (x, y);
         }
-        // Release at the end.
         sleep(Duration::from_millis(8));
-        let up = mk(POINTER_FLAG_UP, sx1, sy1);
-        res = res.and(InjectSyntheticPointerInput(dev, &[up]));
+        let up = mk(POINTER_FLAG_UP, last_authorized.0, last_authorized.1);
+        let cleanup_authorized = exact_target_visible_at_point(
+            target,
+            expected_pid,
+            last_authorized.0,
+            last_authorized.1,
+        );
+        let cleanup = cleanup_release_is_authorized(down_may_have_landed, cleanup_authorized)
+            .then(|| InjectSyntheticPointerInput(dev, &[up]));
         let _ = DestroySyntheticPointerDevice(dev);
-        res.map_err(|e| anyhow::anyhow!("InjectSyntheticPointerInput(pen drag): {e}"))?;
+        match (result, cleanup, cleanup_authorized) {
+            (Ok(()), Some(Ok(())), true) => {}
+            (Ok(()), None, false) => {
+                return Err(anyhow::anyhow!(
+                    "synthetic pen drag release was withheld because exact recipient authority was lost; transient device destroyed"
+                ));
+            }
+            (Ok(()), Some(Err(cleanup)), _) => {
+                return Err(anyhow::anyhow!(
+                    "InjectSyntheticPointerInput(pen drag cleanup): {cleanup}"
+                ));
+            }
+            (Err(primary), Some(Err(cleanup)), _) => {
+                return Err(anyhow::anyhow!(
+                    "InjectSyntheticPointerInput(pen drag): {primary}; release cleanup also failed: {cleanup}"
+                ));
+            }
+            (Err(primary), None, false) => {
+                return Err(anyhow::anyhow!(
+                    "InjectSyntheticPointerInput(pen drag): {primary}; release cleanup was withheld because recipient authority was lost; transient device destroyed"
+                ));
+            }
+            (Err(primary), _, _) => {
+                return Err(anyhow::anyhow!(
+                    "InjectSyntheticPointerInput(pen drag): {primary}"
+                ));
+            }
+            (_, Some(_), false) => {
+                unreachable!("unauthorized pen drag cleanup is never injected")
+            }
+            (_, None, true) => unreachable!("authorized pen cleanup always produces a result"),
+        }
     }
     Ok(())
 }
@@ -602,7 +843,15 @@ static TOUCH_DEV: Mutex<isize> = Mutex::new(0);
 /// mouse pointer along), a touch contact from a standing digitizer is consumed
 /// as touch/stylus and does NOT move the user's cursor. Serialized on the
 /// single shared device (one stroke at a time across all sessions).
-fn touch_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize) -> Result<()> {
+fn touch_drag(
+    target: HWND,
+    expected_pid: u32,
+    sx0: i32,
+    sy0: i32,
+    sx1: i32,
+    sy1: i32,
+    steps: usize,
+) -> Result<()> {
     let mut dev_guard = TOUCH_DEV.lock().unwrap_or_else(|e| e.into_inner());
     unsafe {
         // A non-pointer-aware window (WPF) makes the OS promote the PRIMARY touch
@@ -615,8 +864,11 @@ fn touch_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize) -> Result<()
         // is a brief flick rather than a sustained drag. Pointer-aware targets
         // (Chromium) never promote, so the cursor never moves and this restore is
         // a harmless no-op.
-        let mut cpos = POINT::default();
-        let have_cpos = GetCursorPos(&mut cpos).is_ok();
+        let cursor_target = crate::win32::capture_current_cursor_target().ok_or_else(|| {
+            anyhow::anyhow!(
+                "cursor_restore_unavailable: stable pre-touch cursor recipient could not be captured; no touch mutation was attempted"
+            )
+        })?;
         let dev = if *dev_guard != 0 {
             HSYNTHETICPOINTERDEVICE(*dev_guard as *mut c_void)
         } else {
@@ -666,35 +918,101 @@ fn touch_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize) -> Result<()
             sx0,
             sy0,
         );
+        if !exact_target_visible_at_point(target, expected_pid, sx0, sy0) {
+            bail!("exact target ownership or recipient changed before synthetic touch drag down");
+        }
         let mut res = InjectSyntheticPointerInput(dev, &[down]);
+        let down_may_have_landed = true;
+        let mut last_authorized = (sx0, sy0);
         let steps = steps.clamp(1, 3);
         for i in 1..=steps {
+            if res.is_err() {
+                break;
+            }
             sleep(Duration::from_millis(2));
             let t = i as f64 / steps as f64;
             let x = sx0 + ((sx1 - sx0) as f64 * t).round() as i32;
             let y = sy0 + ((sy1 - sy0) as f64 * t).round() as i32;
+            if !exact_target_visible_at_point(target, expected_pid, x, y) {
+                res = Err(windows::core::Error::new(
+                    windows::core::HRESULT(0x80004005u32 as i32),
+                    "exact target ownership or recipient changed during synthetic touch drag",
+                ));
+                break;
+            }
             let mv = mk(
                 POINTER_FLAG_UPDATE | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT,
                 x,
                 y,
             );
-            res = res.and(InjectSyntheticPointerInput(dev, &[mv]));
+            if let Err(error) = InjectSyntheticPointerInput(dev, &[mv]) {
+                res = Err(error);
+                break;
+            }
+            last_authorized = (x, y);
         }
         sleep(Duration::from_millis(2));
-        let up = mk(POINTER_FLAG_UP, sx1, sy1);
-        res = res.and(InjectSyntheticPointerInput(dev, &[up]));
+        let up = mk(POINTER_FLAG_UP, last_authorized.0, last_authorized.1);
+        let cleanup_authorized = exact_target_visible_at_point(
+            target,
+            expected_pid,
+            last_authorized.0,
+            last_authorized.1,
+        );
+        let cleanup = cleanup_release_is_authorized(down_may_have_landed, cleanup_authorized)
+            .then(|| InjectSyntheticPointerInput(dev, &[up]));
+        let cancel_device = down_may_have_landed
+            && (!cleanup_authorized || cleanup.as_ref().is_some_and(Result::is_err));
+        let cancel_result = cancel_device.then(|| DestroySyntheticPointerDevice(dev));
+        if cancel_device {
+            *dev_guard = 0;
+        }
         // Snap the cursor back to where the user left it. The OS processes the
         // promoted mouse messages slightly after injection, so a single restore
         // right after the `up` can be overrun by that late move — settle briefly,
         // then restore, and restore once more to win the race. No-op for
         // pointer-aware targets (Chromium) that never moved the cursor.
-        if have_cpos {
-            let _ = SetCursorPos(cpos.x, cpos.y);
-            sleep(Duration::from_millis(12));
-            let _ = SetCursorPos(cpos.x, cpos.y);
-        }
+        let cursor_restored = crate::win32::restore_cursor_target(cursor_target);
+        sleep(Duration::from_millis(12));
+        let cursor_restored_after_settle = crate::win32::restore_cursor_target(cursor_target);
         // device intentionally NOT destroyed — see TOUCH_DEV.
-        res.map_err(|e| anyhow::anyhow!("InjectSyntheticPointerInput(touch drag): {e}"))?;
+        match (res, cleanup, cleanup_authorized) {
+            (Ok(()), Some(Ok(())), true) => {}
+            (Ok(()), None, false) => {
+                return Err(anyhow::anyhow!(
+                    "synthetic touch drag release was withheld because exact recipient authority was lost; persistent device cancel result: {cancel_result:?}"
+                ));
+            }
+            (Ok(()), Some(Err(cleanup)), _) => {
+                return Err(anyhow::anyhow!(
+                    "InjectSyntheticPointerInput(touch drag cleanup): {cleanup}; device cancel result: {cancel_result:?}"
+                ));
+            }
+            (Err(primary), Some(Err(cleanup)), _) => {
+                return Err(anyhow::anyhow!(
+                    "InjectSyntheticPointerInput(touch drag): {primary}; release cleanup also failed: {cleanup}; device cancel result: {cancel_result:?}"
+                ));
+            }
+            (Err(primary), None, false) => {
+                return Err(anyhow::anyhow!(
+                    "InjectSyntheticPointerInput(touch drag): {primary}; release cleanup was withheld because recipient authority was lost; device cancel result: {cancel_result:?}"
+                ));
+            }
+            (Err(primary), _, _) => {
+                return Err(anyhow::anyhow!(
+                    "InjectSyntheticPointerInput(touch drag): {primary}"
+                ));
+            }
+            (_, Some(_), false) => {
+                unreachable!("unauthorized touch drag cleanup is never injected")
+            }
+            (_, None, true) => unreachable!("authorized touch cleanup always produces a result"),
+        }
+        if !cursor_restored || !cursor_restored_after_settle {
+            bail!(
+                "cursor_restore_failed after synthetic touch drag: stable prior cursor destination was not confirmed"
+            );
+        }
     }
     Ok(())
 }
@@ -709,6 +1027,7 @@ fn touch_drag(sx0: i32, sy0: i32, sx1: i32, sy1: i32, steps: usize) -> Result<()
 /// non-activatable + cloaked so any transient raise stays invisible.
 pub fn inject_drag_screen(
     target: u64,
+    expected_pid: u32,
     sx0: i32,
     sy0: i32,
     sx1: i32,
@@ -720,10 +1039,8 @@ pub fn inject_drag_screen(
         bail!("inject_drag_screen: null target window");
     }
     let target_h = HWND(target as *mut _);
-    unsafe {
-        if !IsWindow(target_h).as_bool() {
-            bail!("inject_drag_screen: invalid or stale target HWND");
-        }
+    if crate::win32::capture_foreground_target(target, Some(expected_pid)).is_none() {
+        bail!("inject_drag_screen: target HWND changed ownership");
     }
     if let Some(msg) = crate::input::post_message_blocked_by_uipi(target) {
         bail!(msg);
@@ -747,34 +1064,57 @@ pub fn inject_drag_screen(
     }
     // Coordinate-routed touch/pen lands on the topmost VISIBLE window at the
     // start point. If the target is occluded there, bail rather than raise it.
-    if unsafe { !target_visible_at_point(target_h, sx0, sy0) } {
+    if !exact_target_visible_at_point(target_h, expected_pid, sx0, sy0) {
         bail!(
             "background drag cannot reach this target at the start point ({sx0},{sy0}) \
              — it is occluded by another window. Escalate to delivery_mode:\"foreground\"."
         );
     }
-    let prev_fg = unsafe { GetForegroundWindow() };
+    let prev_fg_target = match crate::win32::capture_current_foreground_target() {
+        Some(previous) if previous.hwnd() != target => Some(previous),
+        Some(_) => None,
+        None => {
+            bail!(
+                "foreground_restore_unavailable: a stable prior foreground identity could not be captured; no background drag mutation was attempted"
+            )
+        }
+    };
+    let displaced = crate::win32::capture_foreground_target(target, Some(expected_pid))
+        .ok_or_else(|| anyhow::anyhow!("inject_drag_screen: target ownership changed"))?;
     // Left drag → touch contact (coordinate-routed). Right/barrel drag has no
     // touch equivalent, so fall back to a pen (rare).
     let stroke = |()| {
         if barrel {
-            pen_drag(sx0, sy0, sx1, sy1, steps, true)
+            pen_drag(target_h, expected_pid, sx0, sy0, sx1, sy1, steps, true)
         } else {
-            touch_drag(sx0, sy0, sx1, sy1, steps)
+            touch_drag(target_h, expected_pid, sx0, sy0, sx1, sy1, steps)
         }
     };
     // Chromium/GTK: pointer-aware, process injection in the background — hold
     // non-activatable (no raise), inject, then re-assert the user's foreground.
-    let r = {
-        let _noact = NoActivateGuard::arm(target_h);
-        stroke(())
-    };
-    unsafe {
-        if !prev_fg.0.is_null() && prev_fg != target_h {
-            force_foreground_attached(prev_fg);
+    let mut noact = NoActivateGuard::arm_for_pid(target_h, expected_pid)?;
+    let mut result = stroke(());
+    if let Err(restoration) = noact.finish() {
+        result = Err(match result {
+            Ok(()) => restoration,
+            Err(primary) => anyhow::anyhow!("{primary}; cleanup failure: {restoration}"),
+        });
+    }
+    if let Some(previous) = prev_fg_target {
+        let restored = crate::win32::restore_foreground_target_if_still_displaced(
+            previous,
+            displaced,
+            Duration::from_millis(500),
+        );
+        if restored == crate::win32::ForegroundRestoreOutcome::Failed {
+            let restore_error = anyhow::anyhow!("foreground_restore_failed after background drag");
+            result = Err(match result {
+                Ok(_) => restore_error,
+                Err(error) => anyhow::anyhow!("{error}; cleanup failure: {restore_error}"),
+            });
         }
     }
-    r
+    result
 }
 
 // (Removed inject_key_cloaked / inject_text_cloaked.) The macOS-aligned

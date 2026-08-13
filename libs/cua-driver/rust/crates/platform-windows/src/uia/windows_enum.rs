@@ -35,11 +35,7 @@ use windows::Win32::System::Com::{
 use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomationElement, IUIAutomationInvokePattern,
     IUIAutomationTogglePattern, TreeScope_Children, TreeScope_Subtree,
-    UIA_AcceleratorKeyPropertyId, UIA_ButtonControlTypeId, UIA_CheckBoxControlTypeId,
-    UIA_HyperlinkControlTypeId, UIA_InvokePatternId, UIA_ListItemControlTypeId,
-    UIA_MenuItemControlTypeId, UIA_RadioButtonControlTypeId, UIA_SplitButtonControlTypeId,
-    UIA_TabItemControlTypeId, UIA_TogglePatternId, UIA_TreeItemControlTypeId, UIA_CONTROLTYPE_ID,
-    UIA_PROPERTY_ID,
+    UIA_AcceleratorKeyPropertyId, UIA_InvokePatternId, UIA_TogglePatternId, UIA_PROPERTY_ID,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
@@ -402,221 +398,6 @@ fn probe_desktop_availability_unbounded() -> Result<(), String> {
 /// `CurrentBoundingRectangle` contains the point AND which exposes
 /// `InvokePattern`. Smallest-area approximates "deepest" without
 /// having to track tree depth explicitly.
-/// Returns `true` when the element's control type has a *coord-independent*
-/// primary action — i.e. a UIA `Invoke()` on it does something semantically
-/// equivalent to "click the element" regardless of where inside its bounding
-/// rectangle the click was requested.
-///
-/// Used by the `x, y` click path to decide whether to take the UIA Invoke
-/// route or fall through to PostMessage with the literal coords. The split
-/// matters for canvases, panes, and custom-drawn surfaces where Invoke would
-/// fire `mousedown` at the element centre — losing the caller's pixel
-/// precision (see #1621).
-fn is_coord_independent_action(elem: &IUIAutomationElement) -> bool {
-    let ct: UIA_CONTROLTYPE_ID = match unsafe { elem.CurrentControlType() } {
-        Ok(t) => t,
-        Err(_) => return false,
-    };
-    matches!(
-        ct,
-        UIA_ButtonControlTypeId
-            | UIA_MenuItemControlTypeId
-            | UIA_HyperlinkControlTypeId
-            | UIA_TabItemControlTypeId
-            | UIA_ListItemControlTypeId
-            | UIA_CheckBoxControlTypeId
-            | UIA_RadioButtonControlTypeId
-            | UIA_SplitButtonControlTypeId
-            | UIA_TreeItemControlTypeId
-    )
-}
-
-pub fn try_invoke_in_window_at_point(hwnd: isize, sx: i32, sy: i32) -> bool {
-    run_uia_with_deadline_cancelable(
-        "window hit-test invoke",
-        SUBTREE_OP_TIMEOUT,
-        "PostMessage click delivery",
-        move |cancelled| try_invoke_in_window_at_point_unbounded(hwnd, sx, sy, &cancelled),
-    )
-    .unwrap_or(false)
-}
-
-fn try_invoke_in_window_at_point_unbounded(
-    hwnd: isize,
-    sx: i32,
-    sy: i32,
-    cancelled: &AtomicBool,
-) -> bool {
-    // Keep this first so COM interfaces drop before CoUninitialize.
-    let _com = ComInit::new();
-    if hwnd == 0 {
-        return false;
-    }
-    let uia = match get_uia() {
-        Some(u) => u,
-        None => return false,
-    };
-    unsafe {
-        let root = match uia.ElementFromHandle(HWND(hwnd as *mut _)) {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(target: "click", "ElementFromHandle(0x{hwnd:x}) failed: {e}");
-                return false;
-            }
-        };
-        let cond = match uia.CreateTrueCondition() {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(target: "click", "CreateTrueCondition failed: {e}");
-                return false;
-            }
-        };
-        let arr = match root.FindAll(TreeScope_Subtree, &cond) {
-            Ok(a) => a,
-            Err(e) => {
-                tracing::debug!(target: "click", "FindAll(Subtree) on 0x{hwnd:x} failed: {e}");
-                return false;
-            }
-        };
-        let n = arr.Length().unwrap_or(0);
-        let mut best: Option<(IUIAutomationElement, i64)> = None;
-        for i in 0..n {
-            let elem = match arr.GetElement(i) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let rect = match elem.CurrentBoundingRectangle() {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            if sx < rect.left || sx > rect.right || sy < rect.top || sy > rect.bottom {
-                continue;
-            }
-            // Accept elements that support EITHER InvokePattern OR
-            // ExpandCollapsePattern. Qt menu-bar items advertise both —
-            // Invoke does nothing on them, only Expand opens the submenu.
-            // (See FreeCAD finding 2026-05-21: clicking File menu via Invoke
-            // returned ✅ but the menu never opened.)
-            let has_invoke = elem.GetCurrentPattern(UIA_InvokePatternId).is_ok();
-            let has_expand = elem
-                .GetCurrentPattern(windows::Win32::UI::Accessibility::UIA_ExpandCollapsePatternId)
-                .is_ok();
-            if !has_invoke && !has_expand {
-                continue;
-            }
-            // For coordinate-addressed clicks, only accept elements whose
-            // control type has a *coord-independent* primary action. UIA
-            // `Invoke()` fires the element's default action at its centre,
-            // ignoring the requested (sx, sy). For container surfaces
-            // (Pane, Image, Custom, Document, Group, etc.) that means the
-            // caller's pixel precision is silently lost — see #1621, where
-            // `click(canvas, x=110, y=677)` reported success but actually
-            // fired the canvas's `mousedown` at its centre (152, 77).
-            // Buttons / MenuItems / Hyperlinks / TabItems / ListItems /
-            // CheckBoxes / RadioButtons / SplitButtons / TreeItems all
-            // have a single primary action whose location is the element
-            // itself — Invoke is the right path for those. Everything
-            // else falls through to PostMessage with the literal coords.
-            if !is_coord_independent_action(&elem) {
-                continue;
-            }
-            let w = (rect.right - rect.left).max(0) as i64;
-            let h = (rect.bottom - rect.top).max(0) as i64;
-            let area = w.saturating_mul(h);
-            match &best {
-                None => best = Some((elem, area)),
-                Some((_, prev)) if area < *prev => best = Some((elem, area)),
-                _ => {}
-            }
-        }
-        let (winner, _) = match best {
-            Some(b) => b,
-            None => {
-                tracing::debug!(
-                    target: "click",
-                    "no Invoke/ExpandCollapse descendant of 0x{hwnd:x} contains screen ({sx},{sy}) (scanned {n} elems)"
-                );
-                return false;
-            }
-        };
-        if cancelled.load(Ordering::Acquire) {
-            tracing::debug!(target: "click", "UIA hit-test invoke cancelled before activation");
-            return false;
-        }
-        // Pattern preference for menu items: when both Invoke AND
-        // ExpandCollapse are advertised, the element is almost always a
-        // top-level MenuItem whose intended click behaviour is "open the
-        // submenu" — Invoke would be a no-op. Prefer ExpandCollapse.Expand
-        // in that case. Pure-Invoke leaves (buttons, links, etc.) go
-        // through Invoke as before.
-        let winner_has_expand = winner
-            .GetCurrentPattern(windows::Win32::UI::Accessibility::UIA_ExpandCollapsePatternId)
-            .is_ok();
-        let winner_has_invoke = winner.GetCurrentPattern(UIA_InvokePatternId).is_ok();
-        if cancelled.load(Ordering::Acquire) {
-            return false;
-        }
-        // UWP foreground-steal bypass: gate the entire activation block on
-        // `is_xaml_host_hwnd(hwnd)`. For non-XAML hosts the closure is a
-        // straight passthrough.
-        crate::uia::fg_bypass::run_with_uwp_bypass(hwnd, || {
-            if cancelled.load(Ordering::Acquire) {
-                return false;
-            }
-            if winner_has_expand && winner_has_invoke {
-                // Try Expand first, fall back to Invoke if Expand fails.
-                if let Ok(pat) = winner.GetCurrentPattern(
-                    windows::Win32::UI::Accessibility::UIA_ExpandCollapsePatternId,
-                ) {
-                    if let Ok(ec) = pat
-                        .cast::<windows::Win32::UI::Accessibility::IUIAutomationExpandCollapsePattern>()
-                    {
-                        if cancelled.load(Ordering::Acquire) {
-                            return false;
-                        }
-                        if ec.Expand().is_ok() {
-                            return true;
-                        }
-                    }
-                }
-                // Expand failed — fall through to Invoke as best-effort.
-            } else if winner_has_expand && !winner_has_invoke {
-                if let Ok(pat) = winner.GetCurrentPattern(
-                    windows::Win32::UI::Accessibility::UIA_ExpandCollapsePatternId,
-                ) {
-                    if let Ok(ec) = pat
-                        .cast::<windows::Win32::UI::Accessibility::IUIAutomationExpandCollapsePattern>()
-                    {
-                        if cancelled.load(Ordering::Acquire) {
-                            return false;
-                        }
-                        return ec.Expand().is_ok();
-                    }
-                }
-                return false;
-            }
-            let pattern = match winner.GetCurrentPattern(UIA_InvokePatternId) {
-                Ok(p) => p,
-                Err(_) => return false,
-            };
-            let inv: IUIAutomationInvokePattern = match pattern.cast() {
-                Ok(i) => i,
-                Err(_) => return false,
-            };
-            if cancelled.load(Ordering::Acquire) {
-                return false;
-            }
-            match inv.Invoke() {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::debug!(target: "click", "UIA Invoke (windowed) at ({sx},{sy}) failed: {e}");
-                    false
-                }
-            }
-        })
-    }
-}
-
 /// Find a descendant of `hwnd` whose UIA `AcceleratorKey` property matches
 /// `combo` (e.g. `ctrl+s`) and fire its `InvokePattern`.
 ///
@@ -624,13 +405,24 @@ fn try_invoke_in_window_at_point_unbounded(
 /// their keyboard accelerators are surfaced through UI Automation instead.
 /// This helper keeps that routing narrow by requiring an advertised
 /// AcceleratorKey match before invoking anything.
-pub fn try_invoke_accelerator_in_window(hwnd: isize, combo: &str) -> anyhow::Result<(bool, usize)> {
+pub fn try_invoke_accelerator_in_window(
+    hwnd: isize,
+    expected_pid: u32,
+    combo: &str,
+) -> anyhow::Result<(bool, usize)> {
     let combo = combo.to_owned();
     run_uia_with_deadline_cancelable(
         "accelerator invoke",
         SUBTREE_OP_TIMEOUT,
         "keyboard message delivery",
-        move |cancelled| try_invoke_accelerator_in_window_unbounded(hwnd, &combo, &cancelled),
+        move |cancelled| {
+            try_invoke_accelerator_in_window_unbounded(
+                hwnd,
+                expected_pid,
+                &combo,
+                &cancelled,
+            )
+        },
     )
     .unwrap_or_else(|_| {
         Err(anyhow::anyhow!(
@@ -642,6 +434,7 @@ pub fn try_invoke_accelerator_in_window(hwnd: isize, combo: &str) -> anyhow::Res
 
 fn try_invoke_accelerator_in_window_unbounded(
     hwnd: isize,
+    expected_pid: u32,
     combo: &str,
     cancelled: &AtomicBool,
 ) -> anyhow::Result<(bool, usize)> {
@@ -722,7 +515,7 @@ fn try_invoke_accelerator_in_window_unbounded(
             // as a TogglePattern button — calling .Invoke on it returns the
             // misleading "operation completed successfully (0x00000000)"
             // error because Invoke isn't supported on the element.
-            match try_invoke_via_patterns(&elem, hwnd, cancelled) {
+            match try_invoke_via_patterns(&elem, hwnd, expected_pid, cancelled) {
                 Ok(true) => return Ok((true, count as usize)),
                 Ok(false) => {
                     matched_failure = Some(format!(
@@ -837,6 +630,7 @@ fn accelerator_modifier_rank(value: &str) -> Option<usize> {
 unsafe fn try_invoke_via_patterns(
     elem: &IUIAutomationElement,
     host_hwnd: isize,
+    expected_pid: u32,
     cancelled: &AtomicBool,
 ) -> anyhow::Result<bool> {
     // Invoke first — that's what most accelerator-targeted controls advertise.
@@ -845,14 +639,23 @@ unsafe fn try_invoke_via_patterns(
             if cancelled.load(Ordering::Acquire) {
                 return Ok(false);
             }
-            return crate::uia::fg_bypass::run_with_uwp_bypass(host_hwnd, || {
-                if cancelled.load(Ordering::Acquire) {
-                    return Ok(false);
-                }
-                inv.Invoke()
-                    .map(|()| true)
-                    .map_err(|e| anyhow::anyhow!("InvokePattern.Invoke: {e}"))
-            });
+            return crate::uia::fg_bypass::run_with_uwp_bypass_for_pid(
+                host_hwnd,
+                expected_pid,
+                || {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Ok(false);
+                    }
+                    crate::uia::prove_element_mutation_target(
+                        elem,
+                        host_hwnd as usize as u64,
+                        expected_pid,
+                    )?;
+                    inv.Invoke()
+                        .map(|()| true)
+                        .map_err(|e| anyhow::anyhow!("InvokePattern.Invoke: {e}"))
+                },
+            );
         }
     }
     // Toggle next — Bold/Italic/Underline-style toolbar buttons sit here.
@@ -861,14 +664,23 @@ unsafe fn try_invoke_via_patterns(
             if cancelled.load(Ordering::Acquire) {
                 return Ok(false);
             }
-            return crate::uia::fg_bypass::run_with_uwp_bypass(host_hwnd, || {
-                if cancelled.load(Ordering::Acquire) {
-                    return Ok(false);
-                }
-                tog.Toggle()
-                    .map(|()| true)
-                    .map_err(|e| anyhow::anyhow!("TogglePattern.Toggle: {e}"))
-            });
+            return crate::uia::fg_bypass::run_with_uwp_bypass_for_pid(
+                host_hwnd,
+                expected_pid,
+                || {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Ok(false);
+                    }
+                    crate::uia::prove_element_mutation_target(
+                        elem,
+                        host_hwnd as usize as u64,
+                        expected_pid,
+                    )?;
+                    tog.Toggle()
+                        .map(|()| true)
+                        .map_err(|e| anyhow::anyhow!("TogglePattern.Toggle: {e}"))
+                },
+            );
         }
     }
     Ok(false)

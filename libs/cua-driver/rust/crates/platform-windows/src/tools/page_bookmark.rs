@@ -173,6 +173,10 @@ setTimeout(function(){{ document.title = _orig; }}, 500);\
 // ── blocking implementation ───────────────────────────────────────────────
 
 unsafe fn try_bookmark_exec_blocking(pid: i32, window_id: u32, javascript: &str) -> Result<String> {
+    let expected_pid = u32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid > 0)
+        .ok_or_else(|| anyhow!("bookmark execution requires a positive in-range pid"))?;
     let automation = init_uia()?;
     let hwnd_raw = window_id as u64;
 
@@ -192,25 +196,12 @@ unsafe fn try_bookmark_exec_blocking(pid: i32, window_id: u32, javascript: &str)
     // Electron app — the auto-toggle is restored. If the bar STILL isn't
     // visible after a brief settle, we bail with the same actionable
     // error (covers locked-down browser policies / classic Edge profiles).
-    let fav_bar = if let Some(bar) = find_favorites_bar(&automation, &edge_window) {
-        bar
-    } else {
-        // No SendInput, no SetForegroundWindow, no UIPI risk.
-        let _ = crate::input::post_key(hwnd_raw, "b", &["ctrl", "shift"]);
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        find_favorites_bar(&automation, &edge_window).ok_or_else(|| {
-            anyhow!(
-                "Favorites bar not visible after Ctrl+Shift+B PostMessage \
-                 — cua-driver-rs's bookmark-URL JS exec needs the bar so \
-                 we can invoke the `cua-driver-eval` bookmark. The toggle \
-                 keystroke didn't take (browser policy override, locked-down \
-                 profile, or non-Chromium target). Show the bar manually via \
-                 Ctrl+Shift+B in the browser — the setting persists across \
-                 sessions. `execute_javascript` will fall through to the \
-                 CDP fallback if it's configured."
-            )
-        })?
-    };
+    let fav_bar = find_favorites_bar(&automation, &edge_window).ok_or_else(|| {
+        anyhow!(
+            "Favorites bar is not visible. Bookmark execution refuses to mutate browser \
+             keyboard state to reveal it; show the bar manually or use the CDP fallback."
+        )
+    })?;
 
     // 3) Find or create the cua-driver-eval bookmark.
     let bookmark = find_bookmark(&automation, &fav_bar, BOOKMARK_NAME);
@@ -231,7 +222,13 @@ unsafe fn try_bookmark_exec_blocking(pid: i32, window_id: u32, javascript: &str)
     let bookmark = bookmark.unwrap();
 
     // 4) Edit the bookmark URL via the right-click → Edit dialog.
-    set_bookmark_url(&automation, &bookmark, &wrap_javascript(javascript))?;
+    set_bookmark_url(
+        &automation,
+        &bookmark,
+        hwnd_raw,
+        expected_pid,
+        &wrap_javascript(javascript),
+    )?;
 
     // 5) Capture the active tab's title before invocation. The wrapper
     //    restores this after 500 ms so the user doesn't see our marker.
@@ -265,16 +262,21 @@ unsafe fn try_bookmark_exec_blocking(pid: i32, window_id: u32, javascript: &str)
     // we log at trace level and continue — the brief activation is
     // unavoidable without forking Chromium, but the dwell time on the
     // browser is < ~150 ms instead of "until next user action".
-    let prev_fg_for_invoke =
-        unsafe { windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
-    invoke_element(&bookmark).context("InvokePattern.Invoke on bookmark failed")?;
+    let prior_target = crate::win32::capture_current_foreground_target()
+        .ok_or_else(|| anyhow!("stable prior foreground identity could not be captured"))?;
+    let displaced_target = crate::win32::capture_foreground_target(hwnd_raw, Some(expected_pid))
+        .ok_or_else(|| anyhow!("approved browser HWND changed ownership before bookmark invoke"))?;
+    invoke_element(&bookmark, hwnd_raw, expected_pid)
+        .context("InvokePattern.Invoke on bookmark failed")?;
     // Restore in a tight loop — at this point the bookmark URL is firing
     // and Chromium is about to activate. Poll for ~600 ms; once we see
     // Chromium grab foreground, swap back. We do this synchronously
     // (not via tokio::spawn) because we WANT to block the poll-marker
     // step below until the foreground is restored — otherwise a slow
     // restore leaves the browser frontmost while we read the title.
-    restore_foreground_after_browser_activation(prev_fg_for_invoke, pid as u32);
+    if prior_target.hwnd() != hwnd_raw {
+        restore_foreground_after_browser_activation(prior_target, displaced_target)?;
+    }
 
     // 7) Poll the active tab's title until it starts with CUA: / CUA_ERR:
     let result = poll_for_marker(&automation, &edge_window, &original_title)?;
@@ -434,6 +436,8 @@ unsafe fn read_automation_id(elem: &IUIAutomationElement) -> Option<String> {
 unsafe fn set_bookmark_url(
     automation: &IUIAutomation,
     bookmark: &IUIAutomationElement,
+    root_hwnd: u64,
+    expected_pid: u32,
     new_url: &str,
 ) -> Result<()> {
     // Open the right-click context menu via UIA.  Chromium's ListItem
@@ -459,7 +463,10 @@ unsafe fn set_bookmark_url(
     if bookmark_hwnd == 0 {
         bail!("bookmark item has no associated NativeWindowHandle");
     }
-    crate::input::post_click_screen(bookmark_hwnd, cx, cy, 1, "right")
+    if bookmark_hwnd != root_hwnd {
+        bail!("bookmark item belongs to a different native window");
+    }
+    crate::input::post_click_screen(bookmark_hwnd, expected_pid, cx, cy, 1, "right")
         .context("right-click on bookmark for Edit menu failed")?;
 
     // The context menu opens asynchronously; poll for the "Edit"
@@ -469,7 +476,8 @@ unsafe fn set_bookmark_url(
     // additional context depending on profile state). Match either.
     let edit_item = wait_for_menu_item(automation, &["Edit", "Edit..."], budget::DIALOG_APPEAR)
         .context("Edit menu item did not appear after right-click on bookmark")?;
-    invoke_element(&edit_item).context("InvokePattern.Invoke on Edit menu item failed")?;
+    invoke_element(&edit_item, root_hwnd, expected_pid)
+        .context("InvokePattern.Invoke on Edit menu item failed")?;
 
     // The Edit dialog is a top-level UIA Window. Edge 148 names it
     // "Edit favorite"; Chrome 148 names it "Edit bookmark". Both ship
@@ -498,13 +506,14 @@ unsafe fn set_bookmark_url(
 
     // SetValue. Use a brief settle between writes so the validator
     // doesn't toss the change.
-    set_value(&url_edit, new_url)?;
+    set_value(&url_edit, root_hwnd, expected_pid, new_url)?;
     std::thread::sleep(budget::UIA_SETTLE);
 
     // Save: find the Save / Done button.
     let save_btn = find_button_in_dialog(automation, &dialog, &["Save", "Done"])
         .context("Save button not found in Edit favorite dialog")?;
-    invoke_element(&save_btn).context("InvokePattern.Invoke on Save button failed")?;
+    invoke_element(&save_btn, root_hwnd, expected_pid)
+        .context("InvokePattern.Invoke on Save button failed")?;
     std::thread::sleep(budget::UIA_SETTLE);
     Ok(())
 }
@@ -665,25 +674,59 @@ unsafe fn find_button_in_dialog(
     ))
 }
 
-unsafe fn set_value(elem: &IUIAutomationElement, value: &str) -> Result<()> {
+fn prove_element_mutation_target(
+    elem: &IUIAutomationElement,
+    root_hwnd: u64,
+    expected_pid: u32,
+) -> Result<()> {
+    if crate::win32::capture_foreground_target(root_hwnd, Some(expected_pid)).is_none() {
+        bail!("approved browser HWND changed ownership before retained UIA mutation");
+    }
+    let element_pid = unsafe { elem.CurrentProcessId() }
+        .map_err(|error| anyhow!("could not revalidate retained UIA element process: {error}"))?;
+    if u32::try_from(element_pid).ok() != Some(expected_pid) {
+        bail!("retained UIA element no longer belongs to the approved browser process");
+    }
+    let native = unsafe { elem.CurrentNativeWindowHandle() }
+        .ok()
+        .map(|handle| handle.0 as usize as u64)
+        .unwrap_or(0);
+    if native != 0 && crate::win32::window_owner_pid(native) != Some(expected_pid) {
+        bail!("retained UIA element native HWND changed ownership before mutation");
+    }
+    Ok(())
+}
+
+unsafe fn set_value(
+    elem: &IUIAutomationElement,
+    root_hwnd: u64,
+    expected_pid: u32,
+    value: &str,
+) -> Result<()> {
     let pattern = elem
         .GetCurrentPattern(UIA_ValuePatternId)
         .map_err(|e| anyhow!("element does not support ValuePattern: {e}"))?;
     let vp: IUIAutomationValuePattern = pattern
         .cast()
         .map_err(|e| anyhow!("cast to IUIAutomationValuePattern failed: {e}"))?;
+    prove_element_mutation_target(elem, root_hwnd, expected_pid)?;
     vp.SetValue(&BSTR::from(value))
         .map_err(|e| anyhow!("ValuePattern.SetValue failed: {e}"))?;
     Ok(())
 }
 
-unsafe fn invoke_element(elem: &IUIAutomationElement) -> Result<()> {
+unsafe fn invoke_element(
+    elem: &IUIAutomationElement,
+    root_hwnd: u64,
+    expected_pid: u32,
+) -> Result<()> {
     let pattern = elem
         .GetCurrentPattern(UIA_InvokePatternId)
         .map_err(|e| anyhow!("element does not support InvokePattern: {e}"))?;
     let inv: IUIAutomationInvokePattern = pattern
         .cast()
         .map_err(|e| anyhow!("cast to IUIAutomationInvokePattern failed: {e}"))?;
+    prove_element_mutation_target(elem, root_hwnd, expected_pid)?;
     inv.Invoke()
         .map_err(|e| anyhow!("InvokePattern.Invoke failed: {e}"))?;
     Ok(())
@@ -710,81 +753,40 @@ unsafe fn invoke_element(elem: &IUIAutomationElement) -> Result<()> {
 /// not at UIAccess), the dwell time on the browser is still bounded to
 /// the ~600 ms poll budget. Without this guard the browser stays
 /// frontmost until the next user action.
-unsafe fn restore_foreground_after_browser_activation(
-    prev_fg: windows::Win32::Foundation::HWND,
-    browser_pid: u32,
-) {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId, IsWindow, SetForegroundWindow,
-    };
-
-    if prev_fg.0.is_null() {
-        tracing::trace!(
-            target: "page.bookmark_exec.focus_restore",
-            "no prior foreground to restore — skipping"
-        );
-        return;
-    }
-    if browser_pid == 0 {
-        tracing::trace!(
-            target: "page.bookmark_exec.focus_restore",
-            "no browser pid — skipping restore (no ownership signal)"
-        );
-        return;
-    }
-
+fn restore_foreground_after_browser_activation(
+    previous: crate::win32::ForegroundTarget,
+    displaced: crate::win32::ForegroundTarget,
+) -> Result<()> {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     // Poll for ~600 ms in 50 ms steps. Chromium's activation typically
     // lands within ~150 ms but the URL-load can stretch the window.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(600);
     while std::time::Instant::now() < deadline {
-        let fg_now = GetForegroundWindow();
-        if fg_now == prev_fg {
+        let fg_now = unsafe { GetForegroundWindow() }.0 as usize as u64;
+        if fg_now == previous.hwnd() {
             // Chromium didn't (yet) grab foreground — keep polling
             // briefly; if it never does we just exit cleanly.
             std::thread::sleep(std::time::Duration::from_millis(50));
             continue;
         }
-        let mut fg_pid: u32 = 0;
-        let _ = GetWindowThreadProcessId(fg_now, Some(&mut fg_pid));
-        if fg_pid != browser_pid {
+        if !crate::win32::foreground_matches_target_or_owned_window(displaced, fg_now) {
             // Foreground changed but to something we didn't expect
             // (user Alt-Tabbed mid-eval). Leave it alone.
-            tracing::trace!(
-                target: "page.bookmark_exec.focus_restore",
-                "foreground changed to non-browser pid {fg_pid} (expected {browser_pid}) — leaving as-is"
-            );
-            return;
+            return Ok(());
         }
-        // Chromium grabbed foreground — restore the user's window.
-        if !IsWindow(prev_fg).as_bool() {
-            tracing::trace!(
-                target: "page.bookmark_exec.focus_restore",
-                "prev foreground HWND no longer valid — skipping restore"
-            );
-            return;
-        }
-        let ok = SetForegroundWindow(prev_fg).as_bool();
-        if ok {
-            tracing::debug!(
-                target: "page.bookmark_exec.focus_restore",
-                "restored foreground to HWND 0x{:x} after browser pid {browser_pid} activation",
-                prev_fg.0 as usize
-            );
-        } else {
-            tracing::trace!(
-                target: "page.bookmark_exec.focus_restore",
-                "SetForegroundWindow returned FALSE (foreground-lock denial; need UIAccess) — \
-                 browser will keep focus until next user action"
-            );
-        }
-        return;
+        return match crate::win32::restore_foreground_target_if_still_displaced(
+            previous,
+            displaced,
+            Duration::from_millis(500),
+        ) {
+            crate::win32::ForegroundRestoreOutcome::Failed => Err(anyhow!(
+                "foreground restoration failed after bookmark invoke"
+            )),
+            crate::win32::ForegroundRestoreOutcome::Restored
+            | crate::win32::ForegroundRestoreOutcome::Superseded => Ok(()),
+        };
     }
-    tracing::trace!(
-        target: "page.bookmark_exec.focus_restore",
-        "browser pid {browser_pid} did not steal foreground within 600ms — no restore needed"
-    );
-    let _ = HWND::default(); // silence "unused import" possibility on cfg
+    Ok(())
 }
 
 /// Find the TabItem that's currently selected — Chromium exposes the

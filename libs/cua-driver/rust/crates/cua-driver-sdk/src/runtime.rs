@@ -827,18 +827,13 @@ fn configure_linux_runtime(prepare_desktop_environment: bool) -> Result<(), Runt
             acquire_linux_desktop_preparation_lock().map_err(RuntimeCreateError::Unavailable)?;
         platform_linux::xauth::ensure_xauthority_discovered();
         platform_linux::session_bus::ensure_session_bus_discovered();
-        if let Err(error) = platform_linux::a11y::ensure_accessibility_enabled(preparation_lock) {
-            tracing::warn!(
-                "accessibility preparation is unavailable; continuing without AT-SPI: {error}"
-            );
-        } else if let Err(error) = platform_linux::atspi::ensure_listener_active() {
-            // Accessibility is an optional capability. A reachable but wedged
-            // bus must not prevent the daemon from binding and serving tools
-            // whose exact delivery contracts do not depend on AT-SPI.
-            tracing::warn!(
-                "persistent AT-SPI listener is unavailable; continuing without AT-SPI: {error}"
-            );
-        }
+        platform_linux::a11y::ensure_accessibility_enabled(preparation_lock)
+            .map_err(RuntimeCreateError::Unavailable)?;
+        platform_linux::atspi::ensure_listener_active().map_err(|error| {
+            RuntimeCreateError::Unavailable(format!(
+                "persistent AT-SPI listener is unavailable: {error}"
+            ))
+        })?;
     }
     cua_driver_core::recording::set_screenshot_fn(|window_id, pid| {
         platform_linux::recording_hooks::screenshot_for_recording(window_id, pid)

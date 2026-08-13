@@ -538,7 +538,8 @@ impl SessionBackend {
             }
             Self::Service { client, closed } => {
                 if !closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                    client.abandon();
+                    let client = client.clone();
+                    std::thread::spawn(move || client.close());
                 }
             }
             Self::Remote(session) => session.close(),
@@ -1922,6 +1923,75 @@ mod tests {
                 max_idle_ttl_seconds: 30,
             },
         })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_service_session_explicitly_ends_its_daemon_lease() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("drop-service-session.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = std::thread::spawn(move || {
+            let (metadata_stream, _) = listener.accept().unwrap();
+            let mut metadata_line = String::new();
+            BufReader::new(metadata_stream.try_clone().unwrap())
+                .read_line(&mut metadata_line)
+                .unwrap();
+            let metadata_request: Value = serde_json::from_str(&metadata_line).unwrap();
+            assert_eq!(metadata_request["method"], "metadata");
+            let mut metadata_writer = metadata_stream;
+            writeln!(
+                metadata_writer,
+                "{}",
+                serde_json::json!({
+                    "ok": true,
+                    "result": cua_driver_core::daemon::current_daemon_metadata()
+                })
+            )
+            .unwrap();
+
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut writer = stream;
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let begin: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(begin["method"], "trusted_session_begin");
+            writeln!(
+                writer,
+                "{}",
+                serde_json::json!({
+                    "ok": true,
+                    "result": {"resume_credential": "drop-test-credential"}
+                })
+            )
+            .unwrap();
+
+            line.clear();
+            assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+            let end: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(end["method"], "trusted_session_end");
+            writeln!(
+                writer,
+                "{}",
+                serde_json::json!({"ok": true, "result": {"closed": true}})
+            )
+            .unwrap();
+        });
+
+        let driver = CuaDriver::connect(Some(socket.to_string_lossy().into_owned())).unwrap();
+        let session = driver
+            .create_trusted_session(TrustedSessionOptions {
+                public_session: "drop-service-session".into(),
+                mode: SessionPermissionMode::Standard,
+                ttl_seconds: 60,
+                idle_ttl_seconds: 30,
+                capability_manifest_path: None,
+                bounded_manifest_path: None,
+            })
+            .unwrap();
+        drop(session);
+        server.join().unwrap();
     }
 
     #[derive(Default)]

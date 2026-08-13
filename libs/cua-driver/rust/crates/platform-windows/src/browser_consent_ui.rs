@@ -103,12 +103,19 @@ fn exact_allow_button(nodes: &[UiaNode]) -> Result<Option<usize>, BrowserRefusal
     }
 }
 
-unsafe fn invoke(element_ptr: usize) -> Result<(), BrowserRefusal> {
+unsafe fn invoke(
+    element_ptr: usize,
+    root_hwnd: u64,
+    expected_pid: u32,
+) -> Result<(), BrowserRefusal> {
     let element = IUIAutomationElement::from_raw(element_ptr as *mut _);
-    let result = element
-        .GetCurrentPattern(UIA_InvokePatternId)
-        .and_then(|pattern| pattern.cast::<IUIAutomationInvokePattern>())
-        .and_then(|pattern| pattern.Invoke());
+    let result = (|| -> anyhow::Result<()> {
+        let pattern = element.GetCurrentPattern(UIA_InvokePatternId)?;
+        let pattern = pattern.cast::<IUIAutomationInvokePattern>()?;
+        crate::uia::prove_element_mutation_target(&element, root_hwnd, expected_pid)?;
+        pattern.Invoke()?;
+        Ok(())
+    })();
     std::mem::forget(element);
     result.map_err(|error| {
         refusal(
@@ -157,7 +164,8 @@ pub async fn handle(
         saw_prompt |= prompt_present;
         match exact_allow_button(&tree.nodes) {
             Ok(Some(element)) => {
-                let invoked = unsafe { invoke(element) };
+                let invoked = prove_window_owner(request.window_id, pid)
+                    .and_then(|()| unsafe { invoke(element, request.window_id, pid) });
                 release_nodes(&tree.nodes);
                 invoked?;
                 return Ok(BrowserConsentOutcome::Accepted);

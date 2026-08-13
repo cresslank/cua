@@ -1012,6 +1012,7 @@ dependencies = [
  "ureq",
  "uuid",
  "windows 0.61.3",
+ "zbus",
 ]
 
 [[package]]
@@ -1076,6 +1077,7 @@ dependencies = [
  "platform-windows",
  "serde",
  "serde_json",
+ "socket2",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

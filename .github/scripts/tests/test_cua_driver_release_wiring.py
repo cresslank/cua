@@ -529,6 +529,11 @@ class TestCuaDriverReleaseWiring(unittest.TestCase):
         build_and_release = workflow[workflow.index("  build-linux:") :]
         self.assertEqual(build_and_release.count(immutable_ref), 6)
         self.assertIn("path: candidate-source", workflow)
+        candidate_checkout = workflow[
+            workflow.index("- name: Check out exact candidate source contract") :
+            workflow.index("- name: Determine version", workflow.index("- name: Check out exact candidate source contract"))
+        ]
+        self.assertIn("ref: ${{ inputs.source_ref ||", candidate_checkout)
         self.assertIn(
             "--wayland-helper-source candidate-source/libs/cua-driver/wayland-helper",
             workflow,
