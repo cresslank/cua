@@ -147,14 +147,6 @@ fn is_active_proxy_session(session: Option<&str>) -> bool {
 }
 
 fn inject_browser_approvals(tool_name: &str, args: &mut serde_json::Value, session: Option<&str>) {
-    if tool_name == "browser_prepare" && is_active_proxy_session(session) {
-        if let Some(arguments) = args.as_object_mut() {
-            arguments.insert(
-                cua_driver_core::browser::approval::MCP_HOST_APPROVAL_ARG.to_owned(),
-                serde_json::Value::Bool(true),
-            );
-        }
-    }
     if tool_name == "browser_download" && is_active_proxy_session(session) {
         if let Some(arguments) = args.as_object_mut() {
             arguments.insert(
@@ -280,6 +272,134 @@ fn handle_action_lease_method(req: &DaemonRequest) -> Option<DaemonResponse> {
         }
         _ => None,
     }
+}
+
+fn history_control_response(
+    registry: &crate::sdk_adapter::SdkAdapter,
+    request: &DaemonRequest,
+    trusted_cli_connection: bool,
+) -> DaemonResponse {
+    if !trusted_cli_connection
+        || request.client_kind != Some(cua_driver_core::daemon::DaemonClientKind::Cli)
+        || request.observation_origin != Some(ToolObservationOrigin::Direct)
+    {
+        return DaemonResponse::err("history_control_requires_local_cli", 77);
+    }
+    let operation = request
+        .args
+        .as_ref()
+        .and_then(|value| value.get("operation"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("status");
+    let Some(history) = registry.history() else {
+        return if operation == "status" {
+            DaemonResponse::ok(serde_json::json!({
+                "supported": cfg!(target_os = "macos"),
+                "admitted": false,
+                "enabled": false,
+                "paused": false,
+                "encrypted": true,
+                "health": "not_admitted"
+            }))
+        } else {
+            DaemonResponse::err("history_preview_not_admitted", 77)
+        };
+    };
+    let result: Result<serde_json::Value, cua_driver_core::history::HistoryError> = match operation
+    {
+        "status" => serde_json::to_value(history.status()).map_err(|_| {
+            cua_driver_core::history::HistoryError::new(
+                cua_driver_core::history::HistoryHealthCategory::StorageCorrupt,
+            )
+        }),
+        "enable" => history.enable().and_then(|status| {
+            serde_json::to_value(status).map_err(|_| {
+                cua_driver_core::history::HistoryError::new(
+                    cua_driver_core::history::HistoryHealthCategory::StorageCorrupt,
+                )
+            })
+        }),
+        "disable" => history.disable().and_then(|status| {
+            serde_json::to_value(status).map_err(|_| {
+                cua_driver_core::history::HistoryError::new(
+                    cua_driver_core::history::HistoryHealthCategory::StorageCorrupt,
+                )
+            })
+        }),
+        "pause" => history.pause().and_then(|status| {
+            serde_json::to_value(status).map_err(|_| {
+                cua_driver_core::history::HistoryError::new(
+                    cua_driver_core::history::HistoryHealthCategory::StorageCorrupt,
+                )
+            })
+        }),
+        "resume" => history.resume().and_then(|status| {
+            serde_json::to_value(status).map_err(|_| {
+                cua_driver_core::history::HistoryError::new(
+                    cua_driver_core::history::HistoryHealthCategory::StorageCorrupt,
+                )
+            })
+        }),
+        "flush" => history.flush().and_then(|status| {
+            serde_json::to_value(status).map_err(|_| {
+                cua_driver_core::history::HistoryError::new(
+                    cua_driver_core::history::HistoryHealthCategory::StorageCorrupt,
+                )
+            })
+        }),
+        "delete" => history.delete_all().and_then(|status| {
+            serde_json::to_value(status).map_err(|_| {
+                cua_driver_core::history::HistoryError::new(
+                    cua_driver_core::history::HistoryHealthCategory::StorageCorrupt,
+                )
+            })
+        }),
+        "list" | "show" => {
+            let args = request.args.as_ref().unwrap_or(&serde_json::Value::Null);
+            let sequence = (operation == "show")
+                .then(|| args.get("sequence").and_then(serde_json::Value::as_u64))
+                .flatten();
+            let limit = if operation == "show" {
+                Some(1)
+            } else {
+                args.get("limit")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|value| value as usize)
+            };
+            history
+                .query(
+                    cua_driver_core::history::HistoryQuery {
+                        limit,
+                        session_id: None,
+                        since_sequence: sequence,
+                        until_sequence: sequence,
+                    },
+                    cua_driver_core::history::HistoryAccessOperation::LocalCli,
+                )
+                .map(|events| serde_json::json!({"events": events, "metadata_only": true}))
+        }
+        _ => return DaemonResponse::err("unknown_history_operation", 64),
+    };
+    match result {
+        Ok(value) => DaemonResponse::ok(value),
+        Err(error) => DaemonResponse::err(error.code(), 1),
+    }
+}
+
+fn history_relaunch_state_response(
+    request: &DaemonRequest,
+    trusted_cli_connection: bool,
+) -> DaemonResponse {
+    if !trusted_cli_connection
+        || request.client_kind != Some(cua_driver_core::daemon::DaemonClientKind::Cli)
+        || request.observation_origin != Some(ToolObservationOrigin::Direct)
+    {
+        return DaemonResponse::err("history_relaunch_state_requires_local_cli", 77);
+    }
+    DaemonResponse::ok(
+        serde_json::to_value(crate::history_runtime::daemon_launch_state())
+            .expect("daemon launch state is serializable"),
+    )
 }
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
@@ -621,6 +741,35 @@ fn authenticate_embedded_host_connection(stream: &tokio::net::UnixStream) -> any
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn authenticate_history_cli_connection(stream: &tokio::net::UnixStream) -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStringExt as _;
+
+    let peer_pid = stream
+        .peer_cred()
+        .map_err(|error| anyhow::anyhow!("read history control peer credentials: {error}"))?
+        .pid()
+        .ok_or_else(|| anyhow::anyhow!("history control peer PID is unavailable"))?;
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let length =
+        unsafe { libc::proc_pidpath(peer_pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if length <= 0 {
+        anyhow::bail!("history control peer executable path is unavailable");
+    }
+    let path_length = buffer[..length as usize]
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(length as usize);
+    buffer.truncate(path_length);
+    let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(buffer));
+    crate::history_runtime::verify_history_cli_executable_path(&path)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn authenticate_history_cli_connection(_stream: &tokio::net::UnixStream) -> anyhow::Result<()> {
+    anyhow::bail!("Computer History control is unavailable on this platform")
+}
+
 fn service_authorization_status(trusted_host_connection: bool) -> serde_json::Value {
     let mut status = cua_driver_core::authorization::status_json_with_provider(None);
     if trusted_host_connection {
@@ -649,7 +798,10 @@ fn service_authorization_status(trusted_host_connection: bool) -> serde_json::Va
 
 #[cfg(all(test, unix))]
 mod peer_authentication_tests {
-    use super::{authenticate_unix_peer, authenticate_unix_uid};
+    use super::{
+        authenticate_unix_peer, authenticate_unix_uid, history_relaunch_state_response,
+        DaemonRequest, ToolObservationOrigin,
+    };
 
     #[tokio::test]
     async fn same_user_unix_peer_is_accepted() {
@@ -662,6 +814,25 @@ mod peer_authentication_tests {
     fn foreign_unix_uid_is_rejected_before_request_parsing() {
         let error = authenticate_unix_uid(501, 502).unwrap_err();
         assert!(error.to_string().contains("reject Unix peer uid 502"));
+    }
+
+    #[test]
+    fn forged_cli_metadata_does_not_authenticate_history_control() {
+        let request = DaemonRequest {
+            method: "history_relaunch_state".to_owned(),
+            name: None,
+            args: None,
+            session_id: None,
+            observation_origin: Some(ToolObservationOrigin::Direct),
+            client_kind: Some(cua_driver_core::daemon::DaemonClientKind::Cli),
+        };
+        let response = history_relaunch_state_response(&request, false);
+        assert!(!response.ok);
+        assert_eq!(
+            response.error.as_deref(),
+            Some("history_relaunch_state_requires_local_cli")
+        );
+        assert!(history_relaunch_state_response(&request, true).ok);
     }
 }
 
@@ -735,6 +906,8 @@ pub async fn run_serve(
                 }
                 let trusted_host_connection =
                     authenticate_embedded_host_connection(&stream).is_ok();
+                let trusted_history_cli_connection =
+                    authenticate_history_cli_connection(&stream).is_ok();
                 let reg = sdk.clone();
                 let shutdown_tx2 = shutdown_tx.clone();
                 let trusted_resume_registry = trusted_resume_registry.clone();
@@ -769,6 +942,15 @@ pub async fn run_serve(
                         match req.method.as_str() {
                             "metadata" => {
                                 let resp = daemon_metadata_response();
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "history_relaunch_state" => {
+                                let resp = history_relaunch_state_response(
+                                    &req,
+                                    trusted_history_cli_connection,
+                                );
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -824,6 +1006,16 @@ pub async fn run_serve(
                                     DaemonResponse::ok(service_authorization_status(
                                         trusted_host_connection,
                                     ));
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "history_control" => {
+                                let resp = history_control_response(
+                                    &reg,
+                                    &req,
+                                    trusted_history_cli_connection,
+                                );
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -1489,6 +1681,12 @@ pub async fn run_serve(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
                             }
+                            "history_relaunch_state" => {
+                                let resp = history_relaunch_state_response(&req, false);
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
                             "shutdown" => {
                                 let resp = DaemonResponse::ok(serde_json::json!({"shutdown": true}));
                                 let _ = writer.write_all(
@@ -1523,6 +1721,12 @@ pub async fn run_serve(
                                     DaemonResponse::ok(service_authorization_status(
                                         trusted_host_connection,
                                     ));
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
+                            "history_control" => {
+                                let resp = history_control_response(&reg, &req, false);
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -2572,7 +2776,6 @@ mod session_boundary_tests {
         active_proxy_sessions, apply_session_identity, handle_action_lease_method,
         inject_browser_approvals,
     };
-    use cua_driver_core::browser::approval::MCP_HOST_APPROVAL_ARG;
     use cua_driver_core::browser::download::MCP_HOST_DOWNLOAD_APPROVAL_ARG;
     use serde_json::json;
 
@@ -2625,30 +2828,8 @@ mod session_boundary_tests {
     }
 
     #[test]
-    fn browser_prepare_approval_requires_a_live_proxy_session() {
+    fn browser_download_approval_requires_a_live_proxy_session() {
         let session = "approval-boundary-test";
-        let mut raw_args = json!({"pid": 42});
-        inject_browser_approvals("browser_prepare", &mut raw_args, Some(session));
-        assert!(raw_args.get(MCP_HOST_APPROVAL_ARG).is_none());
-
-        active_proxy_sessions()
-            .lock()
-            .unwrap()
-            .insert(session.to_owned());
-        let mut proxy_args = json!({"pid": 42});
-        inject_browser_approvals("browser_prepare", &mut proxy_args, Some(session));
-        active_proxy_sessions().lock().unwrap().remove(session);
-        assert_eq!(proxy_args[MCP_HOST_APPROVAL_ARG], true);
-
-        let mut other_tool = json!({"pid": 42});
-        active_proxy_sessions()
-            .lock()
-            .unwrap()
-            .insert(session.to_owned());
-        inject_browser_approvals("get_browser_state", &mut other_tool, Some(session));
-        active_proxy_sessions().lock().unwrap().remove(session);
-        assert!(other_tool.get(MCP_HOST_APPROVAL_ARG).is_none());
-
         let mut raw_download = json!({"destination_root": "/private/path"});
         inject_browser_approvals("browser_download", &mut raw_download, Some(session));
         assert!(raw_download.get(MCP_HOST_DOWNLOAD_APPROVAL_ARG).is_none());

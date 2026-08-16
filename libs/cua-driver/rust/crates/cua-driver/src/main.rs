@@ -22,6 +22,7 @@ mod bundle;
 mod check_update_tool;
 mod cli;
 mod doctor;
+mod history_runtime;
 mod mcp_http;
 mod private_worker;
 mod proxy;
@@ -48,7 +49,6 @@ fn init_logging() {
 fn configure_startup_permission_mode(
     permission_mode: Option<&str>,
     dangerously_bypass_approvals: bool,
-    allow_legacy_existing_profile_approval: bool,
     capability_manifest: Option<&str>,
     approve_capability_manifest: bool,
     grants: &[String],
@@ -69,12 +69,6 @@ fn configure_startup_permission_mode(
     }
     if dangerously_bypass_approvals {
         std::env::set_var(cua_driver_core::authorization::DANGEROUS_BYPASS_ENV, "1");
-    }
-    if allow_legacy_existing_profile_approval {
-        std::env::set_var(
-            cua_driver_core::authorization::LEGACY_EXISTING_PROFILE_APPROVAL_ENV,
-            "1",
-        );
     }
     if let Some(path) = capability_manifest {
         std::env::set_var(
@@ -303,7 +297,7 @@ fn build_driver(
         // Xauthority, session-bus, and accessibility behavior without the old
         // initialization deadlock.
         prepare_desktop_environment: true,
-        register_host_tools: Some(check_update_tool::register_into),
+        register_host_tools: Some(history_runtime::register_host_tools),
         authorization_host: None,
         activity_observer: None,
     })
@@ -342,7 +336,7 @@ fn inspect_tools_without_runtime() -> serde_json::Value {
         host_bundle_id: None,
         claude_code_compatibility: false,
         prepare_desktop_environment: false,
-        register_host_tools: Some(check_update_tool::register_into),
+        register_host_tools: Some(history_runtime::register_host_tools),
         authorization_host: None,
         activity_observer: None,
     })
@@ -453,6 +447,11 @@ mod mcp_runtime_selection_tests {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    // The packaged uninstaller needs a truly offline, pre-telemetry purge
+    // path while this exact signed executable still exists on disk.
+    if let Some(code) = history_runtime::run_offline_purge_if_requested() {
+        std::process::exit(code);
+    }
     init_logging();
     if let Some(code) = cli::run_permissions_host_request_if_requested() {
         std::process::exit(code);
@@ -540,17 +539,16 @@ fn main() {
             socket,
             permission_mode,
             dangerously_bypass_approvals,
-            allow_legacy_existing_profile_approval,
             capability_manifest,
             approve_capability_manifest,
             no_permissions_gate,
             claude_code_compat,
             grants,
+            experimental_history,
         } => {
             if let Err(error) = configure_startup_permission_mode(
                 permission_mode.as_deref(),
                 dangerously_bypass_approvals,
-                allow_legacy_existing_profile_approval,
                 capability_manifest.as_deref(),
                 approve_capability_manifest,
                 &grants,
@@ -559,6 +557,19 @@ fn main() {
                 std::process::exit(64);
             }
             responsibility::reexec_disclaimed_if_needed();
+            if let Err(error) = history_runtime::configure_admission(experimental_history) {
+                eprintln!("cua-driver: Computer History admission error: {error}");
+                std::process::exit(1);
+            }
+            history_runtime::configure_daemon_launch_state(
+                permission_mode.as_deref(),
+                dangerously_bypass_approvals,
+                capability_manifest.as_deref(),
+                approve_capability_manifest,
+                no_permissions_gate,
+                claude_code_compat,
+                &grants,
+            );
             let gate_opts =
                 platform_macos::permissions::GateOpts::from_env_and_flag(no_permissions_gate);
             if let Some((progress, context)) =
@@ -744,6 +755,15 @@ fn main() {
         } => {
             cli::run_recording_cmd(&subcommand, &args, socket.as_deref());
         }
+        cli::Command::History {
+            subcommand,
+            args,
+            socket,
+            json,
+            confirmed,
+        } => {
+            cli::run_history_cmd(&subcommand, &args, socket.as_deref(), json, confirmed);
+        }
         cli::Command::DumpDocs { pretty, doc_type } => {
             let tools = inspect_tools_without_runtime();
             cli::run_dump_docs_with_type(&tools, pretty, &doc_type);
@@ -786,23 +806,6 @@ fn main() {
         cli::Command::CursorTheme { args } => {
             run_cursor_theme_command(&args);
         }
-        cli::Command::BrowserApprove {
-            pid,
-            strategy,
-            window_id,
-            session,
-            profile_mode,
-            profile_name,
-        } => {
-            cli::run_browser_approve(
-                pid,
-                strategy.as_deref(),
-                window_id,
-                session.as_deref(),
-                profile_mode.as_deref(),
-                profile_name.as_deref(),
-            );
-        }
         cli::Command::Config {
             subcommand,
             key,
@@ -829,7 +832,7 @@ fn main() {
             let result = match mcp_uses_direct_runtime(socket.as_deref(), direct) {
                 Ok(true) => {
                     if let Err(error) =
-                        configure_startup_permission_mode(None, false, false, None, false, &grants)
+                        configure_startup_permission_mode(None, false, None, false, &grants)
                     {
                         Err(error)
                     } else {
@@ -932,17 +935,16 @@ fn main() -> anyhow::Result<()> {
             socket,
             permission_mode,
             dangerously_bypass_approvals,
-            allow_legacy_existing_profile_approval,
             capability_manifest,
             approve_capability_manifest,
             no_permissions_gate,
             claude_code_compat,
             grants,
+            experimental_history: _,
         } => {
             configure_startup_permission_mode(
                 permission_mode.as_deref(),
                 dangerously_bypass_approvals,
-                allow_legacy_existing_profile_approval,
                 capability_manifest.as_deref(),
                 approve_capability_manifest,
                 &grants,
@@ -1011,6 +1013,16 @@ fn main() -> anyhow::Result<()> {
             cli::run_recording_cmd(&subcommand, &args, socket.as_deref());
             return Ok(());
         }
+        cli::Command::History {
+            subcommand,
+            args,
+            socket,
+            json,
+            confirmed,
+        } => {
+            cli::run_history_cmd(&subcommand, &args, socket.as_deref(), json, confirmed);
+            return Ok(());
+        }
         cli::Command::DumpDocs { pretty, doc_type } => {
             let tools = inspect_tools_without_runtime();
             cli::run_dump_docs_with_type(&tools, pretty, &doc_type);
@@ -1061,24 +1073,6 @@ fn main() -> anyhow::Result<()> {
         cli::Command::CursorTheme { args } => {
             run_cursor_theme_command(&args);
         }
-        cli::Command::BrowserApprove {
-            pid,
-            strategy,
-            window_id,
-            session,
-            profile_mode,
-            profile_name,
-        } => {
-            cli::run_browser_approve(
-                pid,
-                strategy.as_deref(),
-                window_id,
-                session.as_deref(),
-                profile_mode.as_deref(),
-                profile_name.as_deref(),
-            );
-            return Ok(());
-        }
         cli::Command::Config {
             subcommand,
             key,
@@ -1105,7 +1099,7 @@ fn main() -> anyhow::Result<()> {
             version_check::maybe_announce_update();
             let result = match mcp_uses_direct_runtime(socket.as_deref(), direct) {
                 Ok(true) => {
-                    configure_startup_permission_mode(None, false, false, None, false, &grants)?;
+                    configure_startup_permission_mode(None, false, None, false, &grants)?;
                     telemetry::capture_mcp_startup_completed(
                         "sdk_owned_runtime",
                         "not_applicable",
