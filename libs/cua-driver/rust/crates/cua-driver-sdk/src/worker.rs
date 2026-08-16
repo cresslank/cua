@@ -24,7 +24,9 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout};
 #[cfg(not(target_os = "linux"))]
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::{AtomicU8, AtomicUsize};
 #[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
