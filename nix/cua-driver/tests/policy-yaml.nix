@@ -46,6 +46,7 @@ let
     request() {
       printf '%s\n' "$1" >&3
       IFS= read -r response <&4
+      printf 'response=%s\n' "$response" >&2
     }
 
     request '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'

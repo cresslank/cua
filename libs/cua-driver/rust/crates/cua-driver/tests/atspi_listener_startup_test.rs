@@ -20,7 +20,7 @@ fn process_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn hold_canonical_desktop_preparation_lock() -> std::fs::File {
@@ -77,21 +77,49 @@ impl RejectingRegistry {
 }
 
 fn spawn_private_bus(path: &Path, reaper: &mut ChildReaper) -> String {
-    let mut command = Command::new("dbus-daemon");
-    command
-        .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
-        .arg(format!("--address=unix:path={}", path.display()))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = spawn_in_job(&mut command).expect("spawn private dbus-daemon");
-    let mut address = String::new();
-    BufReader::new(child.stdout.take().expect("private bus stdout"))
-        .read_line(&mut address)
-        .expect("read private bus address");
-    assert!(!address.trim().is_empty(), "private bus printed no address");
-    reaper.push(child);
-    address.trim().to_string()
+    let mut failures = Vec::new();
+    for attempt in 1..=3 {
+        let _ = std::fs::remove_file(path);
+        let mut command = Command::new("dbus-daemon");
+        command
+            .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+            .arg(format!("--address=unix:path={}", path.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = spawn_in_job(&mut command).expect("spawn private dbus-daemon");
+        let mut address = String::new();
+        BufReader::new(child.stdout.take().expect("private bus stdout"))
+            .read_line(&mut address)
+            .expect("read private bus address");
+        if !address.trim().is_empty() {
+            reaper.push(child);
+            return address.trim().to_string();
+        }
+
+        let status = child.try_wait().ok().flatten();
+        if status.is_none() {
+            let _ = child.kill();
+        }
+        let mut stderr = String::new();
+        child
+            .stderr
+            .take()
+            .expect("private bus stderr")
+            .read_to_string(&mut stderr)
+            .expect("read private bus stderr");
+        let status = status.or_else(|| child.wait().ok());
+        failures.push(format!(
+            "attempt {attempt}: status={status:?}, stderr={}",
+            stderr.trim()
+        ));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "private bus printed no address for {}: {}",
+        path.display(),
+        failures.join("; ")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
