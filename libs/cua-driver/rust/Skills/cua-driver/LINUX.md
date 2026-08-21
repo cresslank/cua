@@ -165,13 +165,16 @@ common headless cases now "just work". For full AT-SPI inspection, two things
 must be true:
 
 1. **An accessibility bus must be running** in that session, and
-   **`toolkit-accessibility` must be on**. Cua's MCP/runtime can still start
-   without the bus and will report accessibility as degraded; only AX-dependent
-   operations require this capability. Cua enables only the generic
-   accessibility status by default; it does not claim that a screen reader is
-   active. Cua-launched Chromium-family apps receive the per-process
-   `--force-renderer-accessibility` flag. The session-wide screen-reader signal
-   is an explicit compatibility opt-in via
+   **`toolkit-accessibility` must be on**. Direct stdio MCP can still start
+   without the bus and reports accessibility as degraded; strict `serve` and
+   private-worker hosts refuse admission when preparation or listener startup
+   fails. Cua enables only the generic accessibility status by default on known
+   non-Cinnamon desktops; unknown identity and Cinnamon leave the session status
+   untouched. Recognized Chromium-family direct commands, common wrappers, and
+   resolved URL-handler launches receive the per-process
+   `--force-renderer-accessibility` flag. An unresolved `xdg-open` fallback
+   cannot receive process-specific arguments. The session-wide screen-reader
+   signal is an explicit compatibility opt-in via
    `CUA_DRIVER_RS_A11Y_ADVERTISE_MODE=all`. A session with no a11y bus at all
    (`/usr/libexec/at-spi-bus-launcher`) cannot expose a tree. `cua-driver doctor`
    probes `org.a11y.Bus` for real (not just "is there a bus?") and tells you

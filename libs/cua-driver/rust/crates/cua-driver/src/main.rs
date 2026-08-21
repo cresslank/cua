@@ -287,22 +287,29 @@ fn build_driver(
     host_owns_permission_ux: bool,
     require_atspi_listener: bool,
 ) -> Result<Arc<cua_driver_sdk::CuaDriver>, cua_driver_sdk::DriverError> {
-    cua_driver_sdk::CuaDriver::try_create_service_for_host(cua_driver_sdk::DriverHostOptions {
-        cursor,
-        host_owns_permission_ux,
-        host_bundle_id: std::env::var(cua_driver_core::HOST_BUNDLE_ID_ENV).ok(),
-        claude_code_compatibility: compatibility_mode,
-        // Action runtimes establish the complete desktop contract before
-        // admission. Linux preparation is cross-process serialized and its
-        // listener startup is separately bounded, so embedded hosts retain
-        // Xauthority, session-bus, and accessibility behavior without the old
-        // initialization deadlock.
-        prepare_desktop_environment: true,
-        require_atspi_listener,
-        register_host_tools: Some(history_runtime::register_host_tools),
-        authorization_host: None,
-        activity_observer: None,
-    })
+    let atspi_listener_policy = if require_atspi_listener {
+        cua_driver_sdk::AtspiListenerPolicy::Required
+    } else {
+        cua_driver_sdk::AtspiListenerPolicy::BestEffort
+    };
+    cua_driver_sdk::CuaDriver::try_create_service_for_host_with_atspi_policy(
+        cua_driver_sdk::DriverHostOptions {
+            cursor,
+            host_owns_permission_ux,
+            host_bundle_id: std::env::var(cua_driver_core::HOST_BUNDLE_ID_ENV).ok(),
+            claude_code_compatibility: compatibility_mode,
+            // Action runtimes establish the complete desktop contract before
+            // admission. Linux preparation is cross-process serialized and its
+            // listener startup is separately bounded, so embedded hosts retain
+            // Xauthority, session-bus, and accessibility behavior without the old
+            // initialization deadlock.
+            prepare_desktop_environment: true,
+            register_host_tools: Some(history_runtime::register_host_tools),
+            authorization_host: None,
+            activity_observer: None,
+        },
+        atspi_listener_policy,
+    )
 }
 
 #[cfg(test)]
@@ -316,7 +323,6 @@ fn build_driver_without_cursor() -> Arc<cua_driver_sdk::CuaDriver> {
         host_bundle_id: None,
         claude_code_compatibility: false,
         prepare_desktop_environment: false,
-        require_atspi_listener: false,
         register_host_tools: Some(check_update_tool::register_into),
         authorization_host: None,
         activity_observer: None,
@@ -339,7 +345,6 @@ fn inspect_tools_without_runtime() -> serde_json::Value {
         host_bundle_id: None,
         claude_code_compatibility: false,
         prepare_desktop_environment: false,
-        require_atspi_listener: false,
         register_host_tools: Some(history_runtime::register_host_tools),
         authorization_host: None,
         activity_observer: None,

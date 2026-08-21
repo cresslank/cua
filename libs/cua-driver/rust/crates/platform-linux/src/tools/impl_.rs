@@ -14,6 +14,7 @@ use cua_driver_core::{
 };
 use serde_json::{json, Value};
 use std::fs;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, RwLock};
@@ -722,6 +723,8 @@ mod list_windows_tests {
         assert!(chromium_family_program("/usr/bin/google-chrome-stable"));
         assert!(chromium_family_program("CuaTestHarness.Electron"));
         assert!(chromium_family_program("chromium-browser"));
+        assert!(chromium_family_program("/opt/Obsidian.AppImage"));
+        assert!(chromium_family_program("Discord-0.0.91.AppImage"));
         assert!(!chromium_family_program("/usr/bin/gnome-text-editor"));
     }
 
@@ -737,6 +740,26 @@ mod list_windows_tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn chromium_launch_detection_handles_common_wrappers_and_electron_products() {
+        for (program, arguments) in [
+            ("env", vec!["PROFILE=test".to_owned(), "code".to_owned()]),
+            (
+                "flatpak",
+                vec!["run".to_owned(), "com.slack.Slack".to_owned()],
+            ),
+            ("snap", vec!["run".to_owned(), "chromium".to_owned()]),
+        ] {
+            let mut arguments = arguments;
+            append_renderer_accessibility_argument(program, &mut arguments);
+            assert_eq!(
+                arguments.last().map(String::as_str),
+                Some("--force-renderer-accessibility"),
+                "program={program} arguments={arguments:?}"
+            );
+        }
     }
 
     #[test]
@@ -1142,7 +1165,7 @@ fn contains_remote_debugging_flag(value: &str) -> bool {
 /// Keep this scoped to the launched process instead of using the session-wide
 /// `ScreenReaderEnabled` signal, which can cause GNOME to launch Orca.
 fn append_renderer_accessibility_argument(prog: &str, args: &mut Vec<String>) {
-    if chromium_family_program(prog)
+    if launch_command_targets_chromium_family(prog, args)
         && !args
             .iter()
             .any(|arg| arg == "--force-renderer-accessibility")
@@ -1151,10 +1174,125 @@ fn append_renderer_accessibility_argument(prog: &str, args: &mut Vec<String>) {
     }
 }
 
+fn launch_command_targets_chromium_family(prog: &str, args: &[String]) -> bool {
+    if chromium_family_program(prog) {
+        return true;
+    }
+    let launcher = std::path::Path::new(prog)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(prog)
+        .to_ascii_lowercase();
+    match launcher.as_str() {
+        "env" => {
+            let mut skip_next = false;
+            args.iter()
+                .find(|arg| {
+                    if skip_next {
+                        skip_next = false;
+                        return false;
+                    }
+                    if arg == &"-u" || arg == &"--unset" || arg == &"-C" || arg == &"--chdir" {
+                        skip_next = true;
+                        return false;
+                    }
+                    arg == &"-" || (!arg.starts_with('-') && !arg.contains('='))
+                })
+                .is_some_and(|target| chromium_family_program(target))
+        }
+        "flatpak" | "snap" => args
+            .iter()
+            .skip_while(|arg| arg.as_str() != "run")
+            .skip(1)
+            .find(|arg| !arg.starts_with('-'))
+            .is_some_and(|target| chromium_family_program(target)),
+        _ => false,
+    }
+}
+
+fn url_scheme_handler_mime(url: &str) -> Option<String> {
+    let (scheme, _) = url.split_once(':')?;
+    if scheme.is_empty()
+        || !scheme
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+    {
+        return None;
+    }
+    Some(format!("x-scheme-handler/{}", scheme.to_ascii_lowercase()))
+}
+
+fn default_url_handler_id(url: &str) -> Option<String> {
+    let mime = url_scheme_handler_mime(url)?;
+    let child = std::process::Command::new("xdg-mime")
+        .args(["query", "default", &mime])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let output = bounded_child_output(child, std::time::Duration::from_millis(1500))?;
+    let id = std::str::from_utf8(&output).ok()?;
+    let id = id.trim().strip_suffix(".desktop").unwrap_or(id.trim());
+    (!id.is_empty()).then(|| id.to_owned())
+}
+
+fn bounded_child_output(
+    mut child: std::process::Child,
+    timeout: std::time::Duration,
+) -> Option<Vec<u8>> {
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().ok()? {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let stdout = child.stdout.take()?;
+    let descriptor = stdout.as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return None;
+    }
+    let mut output = vec![0u8; 4096];
+    let read = unsafe {
+        libc::read(
+            descriptor,
+            output.as_mut_ptr().cast::<libc::c_void>(),
+            output.len(),
+        )
+    };
+    if read <= 0 {
+        return None;
+    }
+    output.truncate(read as usize);
+    Some(output)
+}
+
+fn match_url_handler<'a>(
+    apps: &'a [crate::installed_apps::InstalledApp],
+    desktop_id: &str,
+) -> Option<&'a crate::installed_apps::InstalledApp> {
+    apps.iter()
+        .find(|app| app.bundle_id.eq_ignore_ascii_case(desktop_id))
+}
+
 /// Spawn a launcher command line (an executable plus arguments, e.g. an XDG
 /// `Exec=` value with field codes stripped) in the background and return the
 /// child pid.
-fn spawn_launch_command(cmd: &str, additional_arguments: &[String]) -> std::io::Result<u32> {
+fn spawn_launch_child(
+    cmd: &str,
+    additional_arguments: &[String],
+) -> std::io::Result<std::process::Child> {
     let mut parts = cmd.split_whitespace();
     let prog = parts.next().unwrap_or(cmd);
     let mut rest: Vec<String> = parts.map(str::to_owned).collect();
@@ -1171,7 +1309,11 @@ fn spawn_launch_command(cmd: &str, additional_arguments: &[String]) -> std::io::
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let child = launch.spawn()?;
+    launch.spawn()
+}
+
+fn spawn_launch_command(cmd: &str, additional_arguments: &[String]) -> std::io::Result<u32> {
+    let child = spawn_launch_child(cmd, additional_arguments)?;
     let pid = child.id();
     reap_in_background(child);
     Ok(pid)
@@ -1234,12 +1376,12 @@ fn match_installed_app<'a>(
         })
 }
 
-/// Watch a just-spawned `xdg-open` long enough to catch a fast failure.
+/// Watch a just-spawned launcher long enough to catch a fast failure.
 /// xdg-open's generic fallback can `exec` the target app and stay alive for
 /// its whole lifetime, so a child still running after the grace period counts
 /// as success; a quick non-zero exit (2 = file not found, 3 = no handler
 /// tool, 4 = action failed) is the only reliable failure signal.
-fn xdg_open_failure(mut child: std::process::Child) -> Option<String> {
+fn quick_launch_failure(mut child: std::process::Child, label: &str) -> Option<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1500);
     loop {
         // A branch that observes an exit status has already reaped the child;
@@ -1247,7 +1389,7 @@ fn xdg_open_failure(mut child: std::process::Child) -> Option<String> {
         // instead of dropping it and leaving a zombie behind.
         match child.try_wait() {
             Ok(Some(status)) if status.success() => return None,
-            Ok(Some(status)) => return Some(format!("xdg-open failed ({status})")),
+            Ok(Some(status)) => return Some(format!("{label} failed ({status})")),
             Ok(None) if std::time::Instant::now() >= deadline => {
                 reap_in_background(child);
                 return None;
@@ -1255,16 +1397,52 @@ fn xdg_open_failure(mut child: std::process::Child) -> Option<String> {
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
             Err(e) => {
                 reap_in_background(child);
-                return Some(format!("could not observe xdg-open: {e}"));
+                return Some(format!("could not observe {label}: {e}"));
             }
         }
     }
+}
+
+fn launch_urls_with_resolver(
+    urls: &[String],
+    installed: &[crate::installed_apps::InstalledApp],
+    resolve_handler: impl Fn(&str) -> Option<String>,
+    fallback_program: &str,
+) -> anyhow::Result<(usize, usize)> {
+    let mut direct = 0usize;
+    let mut fallback = 0usize;
+    for url in urls {
+        if let Some(handler) = resolve_handler(url)
+            .as_deref()
+            .and_then(|id| match_url_handler(installed, id))
+        {
+            if let Ok(child) = spawn_launch_child(&handler.launch_path, std::slice::from_ref(url)) {
+                if quick_launch_failure(child, "desktop URL handler").is_none() {
+                    direct += 1;
+                    continue;
+                }
+            }
+        }
+
+        let child = std::process::Command::new(fallback_program)
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()?;
+        if let Some(reason) = quick_launch_failure(child, "xdg-open") {
+            anyhow::bail!("could not open '{url}': {reason}");
+        }
+        fallback += 1;
+    }
+    Ok((direct, fallback))
 }
 
 #[cfg(test)]
 mod launch_app_tests {
     use super::*;
     use crate::installed_apps::InstalledApp;
+    use std::os::unix::fs::PermissionsExt;
 
     fn app(name: &str, bundle_id: &str, launch_path: &str) -> InstalledApp {
         InstalledApp {
@@ -1273,6 +1451,13 @@ mod launch_app_tests {
             launch_path: launch_path.to_owned(),
             last_used: None,
         }
+    }
+
+    fn write_executable(path: &std::path::Path, body: &str) {
+        std::fs::write(path, body).expect("write launcher fixture");
+        let mut permissions = std::fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions).unwrap();
     }
 
     fn fixture() -> Vec<InstalledApp> {
@@ -1330,6 +1515,195 @@ mod launch_app_tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+    }
+
+    #[test]
+    fn bounded_helper_output_does_not_wait_for_inherited_stdout_or_slow_processes() {
+        let mut inherited = std::process::Command::new("/bin/sh");
+        inherited
+            .args(["-c", "printf 'google-chrome.desktop\\n'; sleep 1 &"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let started = std::time::Instant::now();
+        let output = bounded_child_output(
+            inherited.spawn().expect("spawn inherited-stdout fixture"),
+            std::time::Duration::from_millis(500),
+        )
+        .expect("bounded output should retain the helper line");
+        assert_eq!(output, b"google-chrome.desktop\n");
+        assert!(started.elapsed() < std::time::Duration::from_millis(800));
+
+        let mut slow = std::process::Command::new("/bin/sh");
+        slow.args(["-c", "sleep 1"]).stdout(Stdio::piped());
+        let started = std::time::Instant::now();
+        assert!(bounded_child_output(
+            slow.spawn().expect("spawn slow helper"),
+            std::time::Duration::from_millis(50),
+        )
+        .is_none());
+        assert!(started.elapsed() < std::time::Duration::from_millis(800));
+    }
+
+    #[test]
+    fn url_launch_path_resolves_chromium_flags_and_falls_back_after_fast_failure() {
+        let directory = std::env::temp_dir().join(format!(
+            "cua-url-launch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let browser = directory.join("google-chrome-stable");
+        let browser_args = directory.join("browser-args");
+        write_executable(
+            &browser,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                browser_args.display()
+            ),
+        );
+        let fallback = directory.join("xdg-open-fixture");
+        let fallback_args = directory.join("fallback-args");
+        write_executable(
+            &fallback,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                fallback_args.display()
+            ),
+        );
+        let url = "https://example.invalid/".to_owned();
+        let apps = vec![app(
+            "Google Chrome",
+            "google-chrome",
+            browser.to_str().unwrap(),
+        )];
+
+        let (direct, fallback_count) = launch_urls_with_resolver(
+            std::slice::from_ref(&url),
+            &apps,
+            |_| Some("google-chrome".to_owned()),
+            fallback.to_str().unwrap(),
+        )
+        .expect("resolved URL handler launch");
+        assert_eq!((direct, fallback_count), (1, 0));
+        let arguments = std::fs::read_to_string(&browser_args).unwrap();
+        assert!(arguments.lines().any(|argument| argument == url));
+        assert!(arguments
+            .lines()
+            .any(|argument| argument == "--force-renderer-accessibility"));
+
+        let failed = vec![app("Broken Browser", "broken-browser", "/bin/false")];
+        let (direct, fallback_count) = launch_urls_with_resolver(
+            std::slice::from_ref(&url),
+            &failed,
+            |_| Some("broken-browser".to_owned()),
+            fallback.to_str().unwrap(),
+        )
+        .expect("fast handler failure should use the compatibility fallback");
+        assert_eq!((direct, fallback_count), (0, 1));
+        assert_eq!(std::fs::read_to_string(fallback_args).unwrap().trim(), url);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn launch_app_tool_urls_use_resolved_handler_and_fast_failure_fallback() {
+        const CHILD_ENV: &str = "CUA_URL_LAUNCH_TOOL_TEST_CHILD";
+        const HANDLER_ENV: &str = "CUA_URL_LAUNCH_TOOL_TEST_HANDLER";
+        let url = "https://example.invalid/";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let result = runtime.block_on(LaunchAppTool.invoke(json!({"urls": [url]})));
+            assert_ne!(result.is_error, Some(true), "tool result: {result:?}");
+            return;
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "cua-url-tool-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bin_dir = directory.join("bin");
+        let applications = directory.join("data/applications");
+        let empty_data = directory.join("empty-data");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&applications).unwrap();
+        std::fs::create_dir_all(&empty_data).unwrap();
+
+        let browser_args = directory.join("browser-args");
+        let browser = bin_dir.join("google-chrome-stable");
+        write_executable(
+            &browser,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                browser_args.display()
+            ),
+        );
+        let fallback_args = directory.join("fallback-args");
+        write_executable(
+            &bin_dir.join("xdg-open"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                fallback_args.display()
+            ),
+        );
+        write_executable(
+            &bin_dir.join("xdg-mime"),
+            &format!("#!/bin/sh\nprintf '%s.desktop\\n' \"${{{HANDLER_ENV}}}\"\n"),
+        );
+        std::fs::write(
+            applications.join("google-chrome.desktop"),
+            format!(
+                "[Desktop Entry]\nType=Application\nName=Chrome URL Handler\nExec={} %U\nNoDisplay=true\n",
+                browser.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            applications.join("broken-browser.desktop"),
+            "[Desktop Entry]\nType=Application\nName=Broken URL Handler\nExec=/bin/false %U\nNoDisplay=true\n",
+        )
+        .unwrap();
+
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let run_child = |handler: &str| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tools::impl_::launch_app_tests::launch_app_tool_urls_use_resolved_handler_and_fast_failure_fallback",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env(HANDLER_ENV, handler)
+                .env("PATH", &path)
+                .env("XDG_DATA_HOME", directory.join("data"))
+                .env("XDG_DATA_DIRS", &empty_data)
+                .status()
+                .expect("spawn tool-level URL launch test")
+        };
+
+        assert!(run_child("google-chrome").success());
+        let arguments = std::fs::read_to_string(&browser_args).unwrap();
+        assert!(arguments.lines().any(|argument| argument == url));
+        assert!(arguments
+            .lines()
+            .any(|argument| argument == "--force-renderer-accessibility"));
+        assert!(!fallback_args.exists());
+
+        assert!(run_child("broken-browser").success());
+        assert_eq!(std::fs::read_to_string(&fallback_args).unwrap().trim(), url);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1395,7 +1769,7 @@ impl Tool for LaunchAppTool {
                 "launch_path":{"type":"string","description":"Round-trip the `launch_path` returned by `list_apps` — the Exec= command from the .desktop file with XDG field codes already stripped. Highest precedence on Linux; spawned directly via the system shell."},
                 "name":{"type":"string","description":"App name or command to launch. Tried as a direct command first, then matched against installed .desktop applications (exact display name, desktop-file id, or Exec basename; else an unambiguous display-name substring)."},
                 "bundle_id":{"type":"string","description":"Ignored on Linux (macOS/Windows concept)."},
-                "urls":{"type":"array","items":{"type":"string"},"description":"URLs to open via xdg-open."},
+                "urls":{"type":"array","items":{"type":"string"},"description":"URLs to open through the resolved XDG desktop handler, with xdg-open as a compatibility fallback."},
                 "additional_arguments":{"type":"array","items":{"type":"string"},"description":"Extra command-line arguments passed to the launched process."}
             },"additionalProperties":false}),
             read_only: false, destructive: false, idempotent: false, open_world: true,
@@ -1431,29 +1805,30 @@ impl Tool for LaunchAppTool {
 
         let result = cua_driver_core::blocking::spawn(
             move || -> anyhow::Result<(String, Option<u32>, String)> {
-                // Open URLs via xdg-open.
+                // Resolve URL handlers to their desktop command first so a
+                // Chromium-family browser can receive the per-process renderer
+                // accessibility flag. Keep xdg-open as the compatibility
+                // fallback when no handler command can be resolved safely.
                 if !urls.is_empty() {
-                    let mut children = Vec::new();
-                    for url in &urls {
-                        children.push((
-                            url.clone(),
-                            std::process::Command::new("xdg-open")
-                                .arg(url)
-                                .stdin(Stdio::null())
-                                .stdout(Stdio::null())
-                                .stderr(Stdio::null())
-                                .spawn()?,
-                        ));
-                    }
-                    for (url, child) in children {
-                        if let Some(reason) = xdg_open_failure(child) {
-                            anyhow::bail!("could not open '{url}': {reason}");
-                        }
-                    }
+                    let installed = crate::installed_apps::list_url_handler_apps();
+                    let (direct, fallback) = launch_urls_with_resolver(
+                        &urls,
+                        &installed,
+                        default_url_handler_id,
+                        "xdg-open",
+                    )?;
+                    let launch_name = match (direct, fallback) {
+                        (_, 0) => "default URL handler",
+                        (0, _) => "xdg-open",
+                        _ => "default URL handler and xdg-open",
+                    };
                     return Ok((
-                        format!("Opened {} URL(s) via xdg-open.", urls.len()),
+                        format!(
+                            "Opened {} URL(s): {direct} via resolved desktop handlers, {fallback} via xdg-open.",
+                            urls.len(),
+                        ),
                         None,
-                        "xdg-open".to_owned(),
+                        launch_name.to_owned(),
                     ));
                 }
                 // launch_path > name. Both go through the same direct-exec path
@@ -1513,7 +1888,7 @@ impl Tool for LaunchAppTool {
                                 .stdout(Stdio::null())
                                 .stderr(Stdio::null())
                                 .spawn()?;
-                            if let Some(reason) = xdg_open_failure(child) {
+                            if let Some(reason) = quick_launch_failure(child, "xdg-open") {
                                 anyhow::bail!("could not open '{cmd}': {reason}");
                             }
                             // xdg-open may spawn a helper and exit, so do not
@@ -1578,9 +1953,35 @@ fn chromium_family_program(program: &str) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or(program)
         .to_ascii_lowercase();
+    let product = basename.strip_suffix(".appimage").unwrap_or(&basename);
     ["chrome", "chromium", "electron", "brave", "edge"]
         .iter()
         .any(|needle| basename.contains(needle))
+        || [
+            "code",
+            "code-insiders",
+            "codium",
+            "vscodium",
+            "slack",
+            "discord",
+            "discord-canary",
+            "obsidian",
+            "com.slack.slack",
+            "com.discordapp.discord",
+            "md.obsidian.obsidian",
+            "com.visualstudio.code",
+            "com.vscodium.codium",
+        ]
+        .iter()
+        .any(|alias| {
+            product == *alias
+                || product.strip_prefix(alias).is_some_and(|suffix| {
+                    suffix
+                        .strip_prefix('-')
+                        .and_then(|version| version.bytes().next())
+                        .is_some_and(|first| first.is_ascii_digit())
+                })
+        })
 }
 
 // ── shared helpers ────────────────────────────────────────────────────────────
