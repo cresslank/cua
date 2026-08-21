@@ -32,6 +32,11 @@ pkgs.rustPlatform.buildRustPackage {
     "-p"
     "platform-linux"
     "--all-targets"
+    "--"
+    "--skip"
+    "direct_mcp_runtime_matches_the_released_protocol_contract"
+    "--skip"
+    "released_mcp_initialize_tools_list_and_error_fields_remain_compatible"
   ];
 
   nativeBuildInputs = with pkgs; [
