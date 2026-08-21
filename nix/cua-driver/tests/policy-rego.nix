@@ -62,10 +62,18 @@ let
     jq -e '.id == 2 and .error == null and .result != null' <<<"$response" >/dev/null
 
     request '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"type_text","arguments":{"text":"blocked"}}}'
-    jq -e '.id == 3 and .error == null and .result.isError == true and (.result.content[0].text | startswith("Permission denied:"))' <<<"$response" >/dev/null
+    jq -e '.id == 3 and .error == null and .result.isError == true and (.result.content[0].text | startswith("Permission denied:"))' <<<"$response" >/dev/null || {
+      printf 'unexpected Rego policy response: %s\n' "$response" >/dev/console
+      cat /tmp/daemon.log /tmp/driver.log >/dev/console 2>&1 || true
+      exit 1
+    }
 
     request '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"click","arguments":{"x":2000,"y":100}}}'
-    jq -e '.id == 4 and .error == null and .result.isError == true and (.result.content[0].text | startswith("Permission denied:"))' <<<"$response" >/dev/null
+    jq -e '.id == 4 and .error == null and .result.isError == true and (.result.content[0].text | startswith("Permission denied:"))' <<<"$response" >/dev/null || {
+      printf 'unexpected Rego policy response: %s\n' "$response" >/dev/console
+      cat /tmp/daemon.log /tmp/driver.log >/dev/console 2>&1 || true
+      exit 1
+    }
   '';
 in
 pkgs.testers.runNixOSTest {

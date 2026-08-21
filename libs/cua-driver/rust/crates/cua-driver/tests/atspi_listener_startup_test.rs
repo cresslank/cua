@@ -82,11 +82,16 @@ fn spawn_private_bus(path: &Path, reaper: &mut ChildReaper) -> String {
         let _ = std::fs::remove_file(path);
         let mut command = Command::new("dbus-daemon");
         command
-            .args(["--session", "--nofork", "--nopidfile", "--print-address=1"])
+            .args(["--nofork", "--nopidfile", "--print-address=1"])
             .arg(format!("--address=unix:path={}", path.display()))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(config) = std::env::var_os("CUA_DRIVER_TEST_DBUS_SESSION_CONFIG") {
+            command.arg(format!("--config-file={}", config.to_string_lossy()));
+        } else {
+            command.arg("--session");
+        }
         let mut child = spawn_in_job(&mut command).expect("spawn private dbus-daemon");
         let mut address = String::new();
         BufReader::new(child.stdout.take().expect("private bus stdout"))

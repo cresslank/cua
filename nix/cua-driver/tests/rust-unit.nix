@@ -52,6 +52,9 @@ pkgs.rustPlatform.buildRustPackage {
   # The default Cargo test set is deliberately headless. The ignored desktop
   # matrix is run by the manual Linux e2e workflow and is not hidden in Nix.
   doCheck = true;
+  preCheck = ''
+    export CUA_DRIVER_TEST_DBUS_SESSION_CONFIG=${pkgs.dbus}/share/dbus-1/session.conf
+  '';
 
   installPhase = ''
     touch $out
