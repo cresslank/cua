@@ -161,14 +161,21 @@ cua-driver now **auto-discovers the session bus at startup** (mirroring the
 `XAUTHORITY` recovery): if `DBUS_SESSION_BUS_ADDRESS` is unset it adopts
 `/run/user/<uid>/bus`, or reads the address out of a running desktop-session
 process's `/proc/<pid>/environ` (`xfce4-session`, `gnome-session`, …). So the
-common headless cases now "just work". The two things that still must be true:
+common headless cases now "just work". For full AT-SPI inspection, two things
+must be true:
 
 1. **An accessibility bus must be running** in that session, and
-   **`toolkit-accessibility` must be on** — cua-driver advertises a screen
-   reader at startup to flip it, but a session with no a11y bus at all
-   (`/usr/libexec/at-spi-bus-launcher`) can't expose a tree. `cua-driver
-   doctor` now probes `org.a11y.Bus` for real (not just "is there a bus?")
-   and tells you which of the two is missing.
+   **`toolkit-accessibility` must be on**. Cua's MCP/runtime can still start
+   without the bus and will report accessibility as degraded; only AX-dependent
+   operations require this capability. Cua enables only the generic
+   accessibility status by default; it does not claim that a screen reader is
+   active. Cua-launched Chromium-family apps receive the per-process
+   `--force-renderer-accessibility` flag. The session-wide screen-reader signal
+   is an explicit compatibility opt-in via
+   `CUA_DRIVER_RS_A11Y_ADVERTISE_MODE=all`. A session with no a11y bus at all
+   (`/usr/libexec/at-spi-bus-launcher`) cannot expose a tree. `cua-driver doctor`
+   probes `org.a11y.Bus` for real (not just "is there a bus?") and tells you
+   which capability is missing.
 2. The daemon must run **as the desktop user** (so it can read that user's
    session-process environ and the `/run/user/<uid>/bus` socket). Running the
    daemon as root against a user session is the Linux analogue of the Windows

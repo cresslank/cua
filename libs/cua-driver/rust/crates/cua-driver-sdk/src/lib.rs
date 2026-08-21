@@ -597,6 +597,10 @@ pub struct DriverHostOptions {
     pub host_bundle_id: Option<String>,
     pub claude_code_compatibility: bool,
     pub prepare_desktop_environment: bool,
+    /// Whether runtime admission requires a working persistent AT-SPI listener.
+    /// Direct stdio MCP can keep transport/tool discovery usable when this is
+    /// false; daemon and private-worker hosts should keep it true.
+    pub require_atspi_listener: bool,
     /// Temporary compatibility hook for daemon-only administrative tools.
     /// Desktop operations must live behind the typed SDK contract instead.
     pub register_host_tools: Option<fn(&mut cua_driver_core::tool::ToolRegistry)>,
@@ -1012,6 +1016,7 @@ impl CuaDriver {
             host_bundle_id: options.host_bundle_id,
             compatibility_mode: options.claude_code_compatibility,
             prepare_desktop_environment: options.prepare_desktop_environment,
+            require_atspi_listener: options.require_atspi_listener,
             register_host_tools: options.register_host_tools,
             authorization_ceiling: None,
             compatibility_authorization: None,
@@ -1157,6 +1162,7 @@ impl CuaDriver {
                     host_bundle_id: options.host_bundle_id,
                     compatibility_mode: options.claude_code_compatibility,
                     prepare_desktop_environment: options.prepare_desktop_environment,
+                    require_atspi_listener: options.require_atspi_listener,
                     register_host_tools: options.register_host_tools,
                     authorization_ceiling: None,
                     compatibility_authorization: None,
@@ -1205,6 +1211,7 @@ impl CuaDriver {
                     host_bundle_id: options.host_bundle_id,
                     compatibility_mode: options.claude_code_compatibility,
                     prepare_desktop_environment: options.prepare_desktop_environment,
+                    require_atspi_listener: options.require_atspi_listener,
                     register_host_tools: options.register_host_tools,
                     authorization_ceiling: Some(ceiling),
                     compatibility_authorization: Some((mode, manifest)),
@@ -1850,6 +1857,7 @@ mod tests {
             host_bundle_id: None,
             claude_code_compatibility: false,
             prepare_desktop_environment: false,
+            require_atspi_listener: false,
             register_host_tools: None,
             authorization_host: None,
             activity_observer: None,
@@ -2125,6 +2133,7 @@ mod tests {
             host_bundle_id: None,
             claude_code_compatibility: false,
             prepare_desktop_environment: false,
+            require_atspi_listener: false,
             register_host_tools: None,
             authorization_host: None,
             activity_observer: None,
@@ -2221,6 +2230,7 @@ mod tests {
             host_bundle_id: None,
             claude_code_compatibility: false,
             prepare_desktop_environment: false,
+            require_atspi_listener: false,
             register_host_tools: Some(register_slow_host_tool),
             authorization_host: None,
             activity_observer: None,

@@ -724,6 +724,27 @@ mod list_windows_tests {
         assert!(chromium_family_program("chromium-browser"));
         assert!(!chromium_family_program("/usr/bin/gnome-text-editor"));
     }
+
+    #[test]
+    fn chromium_launch_uses_per_process_accessibility_flag() {
+        let mut args = vec!["--user-data-dir=/tmp/cua-test-profile".to_owned()];
+        append_renderer_accessibility_argument("/usr/bin/google-chrome-stable", &mut args);
+        append_renderer_accessibility_argument("/usr/bin/google-chrome-stable", &mut args);
+
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == "--force-renderer-accessibility")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn non_chromium_launch_does_not_get_renderer_accessibility_flag() {
+        let mut args = Vec::new();
+        append_renderer_accessibility_argument("/usr/bin/gnome-text-editor", &mut args);
+        assert!(args.is_empty());
+    }
 }
 
 // ── get_window_state ─────────────────────────────────────────────────────────
@@ -1117,6 +1138,19 @@ fn contains_remote_debugging_flag(value: &str) -> bool {
     lower.contains("--remote-debugging-port") || lower.contains("--remote-debugging-pipe")
 }
 
+/// Enable a Chromium-family renderer's accessibility tree for this child only.
+/// Keep this scoped to the launched process instead of using the session-wide
+/// `ScreenReaderEnabled` signal, which can cause GNOME to launch Orca.
+fn append_renderer_accessibility_argument(prog: &str, args: &mut Vec<String>) {
+    if chromium_family_program(prog)
+        && !args
+            .iter()
+            .any(|arg| arg == "--force-renderer-accessibility")
+    {
+        args.push("--force-renderer-accessibility".to_owned());
+    }
+}
+
 /// Spawn a launcher command line (an executable plus arguments, e.g. an XDG
 /// `Exec=` value with field codes stripped) in the background and return the
 /// child pid.
@@ -1125,6 +1159,7 @@ fn spawn_launch_command(cmd: &str, additional_arguments: &[String]) -> std::io::
     let prog = parts.next().unwrap_or(cmd);
     let mut rest: Vec<String> = parts.map(str::to_owned).collect();
     rest.extend(additional_arguments.iter().cloned());
+    append_renderer_accessibility_argument(prog, &mut rest);
     let mut launch = std::process::Command::new(prog);
     launch
         .args(&rest)
@@ -1136,13 +1171,6 @@ fn spawn_launch_command(cmd: &str, additional_arguments: &[String]) -> std::io::
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if chromium_family_program(prog)
-        && !rest
-            .iter()
-            .any(|arg| arg == "--force-renderer-accessibility")
-    {
-        launch.arg("--force-renderer-accessibility");
-    }
     let child = launch.spawn()?;
     let pid = child.id();
     reap_in_background(child);

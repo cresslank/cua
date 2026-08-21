@@ -2440,6 +2440,7 @@ mod gate_tests {
                 host_bundle_id: None,
                 claude_code_compatibility: false,
                 prepare_desktop_environment: false,
+                require_atspi_listener: false,
                 register_host_tools: Some(register_probe),
                 authorization_host: None,
                 activity_observer: None,

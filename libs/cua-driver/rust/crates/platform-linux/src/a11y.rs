@@ -1,4 +1,4 @@
-//! Switch on Chromium / Electron accessibility for the whole desktop session.
+//! Prepare Linux accessibility without implicitly claiming a screen reader.
 //!
 //! Chromium — and therefore every Electron, CEF, and Chrome-based app — ships
 //! its accessibility tree disabled and only builds it once it believes an
@@ -19,8 +19,9 @@
 //! reduced signal: its settings daemon derives toolkit accessibility from the
 //! screen-reader setting and can enter a high-frequency settings write loop when
 //! they disagree. Cinnamon therefore receives no advertisement by default.
-//! Other desktops retain the Chromium signal for compatibility, and a caller
-//! can choose either policy explicitly with `CUA_DRIVER_RS_A11Y_ADVERTISE_MODE`.
+//! Other desktops also get only the generic signal by default; the user-visible
+//! `ScreenReaderEnabled` signal is an explicit compatibility opt-in through
+//! `CUA_DRIVER_RS_A11Y_ADVERTISE_MODE=all`.
 //!
 //! Everything here is best-effort. A session without an accessibility bus (some
 //! headless or minimal setups) just yields an error we log and ignore; enabling
@@ -334,10 +335,12 @@ fn desktop_default_mode(desktop: Option<&str>) -> AdvertiseMode {
     // while advertising ScreenReaderEnabled launches Orca. Fail closed.
     if has_desktop("cinnamon") || has_desktop("x-cinnamon") {
         AdvertiseMode::None
-    } else if has_desktop("gnome") || has_desktop("cosmic") {
-        AdvertiseMode::IsEnabledOnly
     } else {
-        AdvertiseMode::All
+        // Desktop identity is often absent from direct MCP/private-worker
+        // launch environments. Never turn an incomplete launch environment
+        // into a user-visible screen-reader request; callers that need the
+        // Chromium session-wide compatibility signal must opt into `all`.
+        AdvertiseMode::IsEnabledOnly
     }
 }
 
@@ -355,6 +358,22 @@ mod tests {
     fn gnome_default_does_not_claim_a_screen_reader() {
         assert_eq!(
             advertise_mode_from(false, None, Some("ubuntu:GNOME")),
+            AdvertiseMode::IsEnabledOnly
+        );
+    }
+
+    #[test]
+    fn missing_desktop_identity_does_not_claim_a_screen_reader() {
+        assert_eq!(
+            advertise_mode_from(false, None, None),
+            AdvertiseMode::IsEnabledOnly
+        );
+    }
+
+    #[test]
+    fn unknown_desktop_identity_does_not_claim_a_screen_reader() {
+        assert_eq!(
+            advertise_mode_from(false, None, Some("unknown-desktop")),
             AdvertiseMode::IsEnabledOnly
         );
     }
@@ -391,10 +410,10 @@ mod tests {
     }
 
     #[test]
-    fn non_gnome_default_preserves_chromium_compatibility() {
+    fn non_gnome_default_does_not_claim_a_screen_reader() {
         assert_eq!(
             advertise_mode_from(false, None, Some("KDE")),
-            AdvertiseMode::All
+            AdvertiseMode::IsEnabledOnly
         );
     }
 

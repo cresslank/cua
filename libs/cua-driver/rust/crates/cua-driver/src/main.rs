@@ -285,6 +285,7 @@ fn build_driver(
     cursor: cursor_overlay::CursorConfig,
     compatibility_mode: bool,
     host_owns_permission_ux: bool,
+    require_atspi_listener: bool,
 ) -> Result<Arc<cua_driver_sdk::CuaDriver>, cua_driver_sdk::DriverError> {
     cua_driver_sdk::CuaDriver::try_create_service_for_host(cua_driver_sdk::DriverHostOptions {
         cursor,
@@ -297,6 +298,7 @@ fn build_driver(
         // Xauthority, session-bus, and accessibility behavior without the old
         // initialization deadlock.
         prepare_desktop_environment: true,
+        require_atspi_listener,
         register_host_tools: Some(history_runtime::register_host_tools),
         authorization_host: None,
         activity_observer: None,
@@ -314,6 +316,7 @@ fn build_driver_without_cursor() -> Arc<cua_driver_sdk::CuaDriver> {
         host_bundle_id: None,
         claude_code_compatibility: false,
         prepare_desktop_environment: false,
+        require_atspi_listener: false,
         register_host_tools: Some(check_update_tool::register_into),
         authorization_host: None,
         activity_observer: None,
@@ -336,6 +339,7 @@ fn inspect_tools_without_runtime() -> serde_json::Value {
         host_bundle_id: None,
         claude_code_compatibility: false,
         prepare_desktop_environment: false,
+        require_atspi_listener: false,
         register_host_tools: Some(history_runtime::register_host_tools),
         authorization_host: None,
         activity_observer: None,
@@ -365,7 +369,7 @@ fn run_mcp_direct(compatibility_mode: bool) -> anyhow::Result<()> {
         cursor.enabled = false;
         cursor
     };
-    let driver = build_driver(cursor, compatibility_mode, true)?;
+    let driver = build_driver(cursor, compatibility_mode, true, false)?;
     // Direct MCP owns one stdio channel. Keep independently launched clients
     // from multiplying the host CPU count into scheduler threads. Preserve
     // Tokio's blocking ceiling because timed-out native calls are uncancellable.
@@ -614,6 +618,7 @@ fn main() {
                 cursor_cfg.clone(),
                 claude_code_compat,
                 cua_driver_core::embedded_mode(),
+                true,
             ) {
                 Ok(driver) => driver,
                 Err(error) => {
@@ -968,6 +973,7 @@ fn main() -> anyhow::Result<()> {
                 cursor_cfg,
                 claude_code_compat,
                 cua_driver_core::embedded_mode(),
+                true,
             )?;
             maybe_init_pip();
             let sp = socket.unwrap_or_else(serve::default_socket_path);

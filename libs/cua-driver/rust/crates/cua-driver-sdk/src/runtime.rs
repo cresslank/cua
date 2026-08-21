@@ -52,6 +52,8 @@ pub(crate) struct RuntimeOptions {
     pub compatibility_mode: bool,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub prepare_desktop_environment: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub require_atspi_listener: bool,
     pub register_host_tools: Option<fn(&mut ToolRegistry)>,
     pub authorization_ceiling: Option<SessionModeCeiling>,
     pub compatibility_authorization: Option<(PermissionMode, Option<Arc<SessionManifest>>)>,
@@ -72,6 +74,7 @@ impl RuntimeOptions {
             host_bundle_id: None,
             compatibility_mode,
             prepare_desktop_environment: true,
+            require_atspi_listener: true,
             register_host_tools: None,
             authorization_ceiling: None,
             compatibility_authorization: None,
@@ -551,7 +554,10 @@ fn build_registry(options: &RuntimeOptions) -> Result<ToolRegistry, RuntimeCreat
 
     #[cfg(target_os = "linux")]
     let mut registry = {
-        configure_linux_runtime(options.prepare_desktop_environment)?;
+        configure_linux_runtime(
+            options.prepare_desktop_environment,
+            options.require_atspi_listener,
+        )?;
         platform_linux::register_tools_with_cursor_and_provider(
             options.authorization_host.clone(),
             options.cursor.clone(),
@@ -825,19 +831,43 @@ pub(crate) fn prepare_private_worker_accessibility_route(
 }
 
 #[cfg(target_os = "linux")]
-fn configure_linux_runtime(prepare_desktop_environment: bool) -> Result<(), RuntimeCreateError> {
+fn configure_linux_runtime(
+    prepare_desktop_environment: bool,
+    require_atspi_listener: bool,
+) -> Result<(), RuntimeCreateError> {
     if prepare_desktop_environment {
         let preparation_lock =
             acquire_linux_desktop_preparation_lock().map_err(RuntimeCreateError::Unavailable)?;
         platform_linux::xauth::ensure_xauthority_discovered();
         platform_linux::session_bus::ensure_session_bus_discovered();
-        platform_linux::a11y::ensure_accessibility_enabled(preparation_lock)
-            .map_err(RuntimeCreateError::Unavailable)?;
-        platform_linux::atspi::ensure_listener_active().map_err(|error| {
-            RuntimeCreateError::Unavailable(format!(
-                "persistent AT-SPI listener is unavailable: {error}"
-            ))
-        })?;
+        // AT-SPI is an optional desktop capability for the normal runtime:
+        // transport/tool discovery and X11-level observation remain useful in
+        // headless sessions. Keep the private-worker route strict below, but
+        // do not make a missing org.a11y.Bus fatal to MCP startup.
+        match platform_linux::a11y::ensure_accessibility_enabled(preparation_lock) {
+            Ok(()) => {
+                if let Err(error) = platform_linux::atspi::ensure_listener_active() {
+                    if require_atspi_listener {
+                        return Err(RuntimeCreateError::Unavailable(format!(
+                            "persistent AT-SPI listener is unavailable: {error}"
+                        )));
+                    }
+                    tracing::warn!(
+                        error = %error,
+                        "persistent AT-SPI listener unavailable; continuing with degraded accessibility capability"
+                    );
+                }
+            }
+            Err(error) => {
+                // A session with no AT-SPI bus at all is a valid degraded
+                // runtime, including for `serve`; strict admission applies
+                // once a reachable bus has rejected listener registration.
+                tracing::warn!(
+                    error = %error,
+                    "session accessibility unavailable; continuing with degraded accessibility capability"
+                );
+            }
+        }
     }
     cua_driver_core::recording::set_screenshot_fn(|window_id, pid| {
         platform_linux::recording_hooks::screenshot_for_recording(window_id, pid)
