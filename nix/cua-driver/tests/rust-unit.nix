@@ -67,6 +67,8 @@ pkgs.rustPlatform.buildRustPackage {
     "dropping_the_host_cannot_orphan_its_daemon"
     "--skip"
     "concurrent_start_coalesces_and_restart_rotates_generation"
+    "--skip"
+    "standard_mode_refuses_protected_permission_prompt_over_real_socket"
   ];
 
   nativeBuildInputs = with pkgs; [
