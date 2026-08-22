@@ -37,6 +37,30 @@ pkgs.rustPlatform.buildRustPackage {
     "direct_mcp_runtime_matches_the_released_protocol_contract"
     "--skip"
     "released_mcp_initialize_tools_list_and_error_fields_remain_compatible"
+    # These daemon-topology integration tests require an admitted desktop
+    # service. The Nix build sandbox intentionally has no AT-SPI session; Linux
+    # CI runs them on a host session, while this derivation retains unit/direct
+    # MCP and the explicit strict-admission process matrix.
+    "--skip"
+    "capability_manifest_narrows_standard_mode"
+    "--skip"
+    "capability_manifest_narrows_unrestricted_mode"
+    "--skip"
+    "bounded_manifest_is_an_immutable_deny_by_default_layer"
+    "--skip"
+    "cli_call_succeeds_through_test_owned_daemon"
+    "--skip"
+    "implicitly_started_named_session_survives_across_one_shot_cli_calls"
+    "--skip"
+    "named_cli_session_cleanup_is_isolated"
+    "--skip"
+    "named_session_survives_across_one_shot_cli_calls"
+    "--skip"
+    "revoke_cli_ends_the_exact_live_session"
+    "--skip"
+    "standard_mode_refuses_existing_profile_without_a_launch_grant"
+    "--skip"
+    "unrestricted_mode_skips_runtime_existing_profile_consent"
   ];
 
   nativeBuildInputs = with pkgs; [
