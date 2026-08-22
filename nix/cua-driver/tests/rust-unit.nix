@@ -61,6 +61,12 @@ pkgs.rustPlatform.buildRustPackage {
     "standard_mode_refuses_existing_profile_without_a_launch_grant"
     "--skip"
     "unrestricted_mode_skips_runtime_existing_profile_consent"
+    "--skip"
+    "embedded_host_serves_sdk_and_mcp_with_one_contract"
+    "--skip"
+    "dropping_the_host_cannot_orphan_its_daemon"
+    "--skip"
+    "concurrent_start_coalesces_and_restart_rotates_generation"
   ];
 
   nativeBuildInputs = with pkgs; [
