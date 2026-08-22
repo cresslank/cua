@@ -608,6 +608,23 @@ pub struct DriverHostOptions {
     pub activity_observer: Option<Arc<dyn DriverActivityObserver>>,
 }
 
+/// Linux AT-SPI readiness required before a Rust host accepts work.
+///
+/// Existing host constructors retain strict admission. Direct stdio MCP uses
+/// the explicit best-effort service constructor so transport and tool discovery
+/// remain available in a headless session without weakening daemon admission.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AtspiListenerPolicy {
+    Required,
+    BestEffort,
+}
+
+impl AtspiListenerPolicy {
+    fn is_required(self) -> bool {
+        self == Self::Required
+    }
+}
+
 /// Runtime that imported the shared UniFFI SDK library. The language package
 /// selects this automatically at its root entry point; callers do not need to
 /// supply telemetry metadata.
@@ -1012,6 +1029,7 @@ impl CuaDriver {
             host_bundle_id: options.host_bundle_id,
             compatibility_mode: options.claude_code_compatibility,
             prepare_desktop_environment: options.prepare_desktop_environment,
+            require_atspi_listener: true,
             register_host_tools: options.register_host_tools,
             authorization_ceiling: None,
             compatibility_authorization: None,
@@ -1149,6 +1167,14 @@ impl CuaDriver {
     /// conflicts instead of panicking. The compatibility wrapper above is
     /// retained for existing Rust callers.
     pub fn try_create_for_host(options: DriverHostOptions) -> Result<Arc<Self>, DriverError> {
+        Self::try_create_for_host_with_atspi_policy(options, AtspiListenerPolicy::Required)
+    }
+
+    /// Fallible host constructor with an explicit Linux AT-SPI admission policy.
+    pub fn try_create_for_host_with_atspi_policy(
+        options: DriverHostOptions,
+        atspi_listener_policy: AtspiListenerPolicy,
+    ) -> Result<Arc<Self>, DriverError> {
         Ok(Arc::new(Self {
             backend: DriverBackend::Embedded(Arc::new(NativeAbiDriver::create_for_host(
                 RuntimeOptions {
@@ -1157,6 +1183,7 @@ impl CuaDriver {
                     host_bundle_id: options.host_bundle_id,
                     compatibility_mode: options.claude_code_compatibility,
                     prepare_desktop_environment: options.prepare_desktop_environment,
+                    require_atspi_listener: atspi_listener_policy.is_required(),
                     register_host_tools: options.register_host_tools,
                     authorization_ceiling: None,
                     compatibility_authorization: None,
@@ -1178,6 +1205,14 @@ impl CuaDriver {
     /// constructor and are never inferred from a caller request.
     pub fn try_create_service_for_host(
         options: DriverHostOptions,
+    ) -> Result<Arc<Self>, DriverError> {
+        Self::try_create_service_for_host_with_atspi_policy(options, AtspiListenerPolicy::Required)
+    }
+
+    /// Service-host constructor with an explicit Linux AT-SPI admission policy.
+    pub fn try_create_service_for_host_with_atspi_policy(
+        options: DriverHostOptions,
+        atspi_listener_policy: AtspiListenerPolicy,
     ) -> Result<Arc<Self>, DriverError> {
         let mode =
             cua_driver_core::authorization::configured_permission_mode().map_err(|error| {
@@ -1205,6 +1240,7 @@ impl CuaDriver {
                     host_bundle_id: options.host_bundle_id,
                     compatibility_mode: options.claude_code_compatibility,
                     prepare_desktop_environment: options.prepare_desktop_environment,
+                    require_atspi_listener: atspi_listener_policy.is_required(),
                     register_host_tools: options.register_host_tools,
                     authorization_ceiling: Some(ceiling),
                     compatibility_authorization: Some((mode, manifest)),

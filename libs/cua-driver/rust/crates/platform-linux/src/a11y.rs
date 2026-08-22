@@ -1,4 +1,4 @@
-//! Switch on Chromium / Electron accessibility for the whole desktop session.
+//! Prepare Linux accessibility without implicitly claiming a screen reader.
 //!
 //! Chromium — and therefore every Electron, CEF, and Chrome-based app — ships
 //! its accessibility tree disabled and only builds it once it believes an
@@ -19,12 +19,15 @@
 //! reduced signal: its settings daemon derives toolkit accessibility from the
 //! screen-reader setting and can enter a high-frequency settings write loop when
 //! they disagree. Cinnamon therefore receives no advertisement by default.
-//! Other desktops retain the Chromium signal for compatibility, and a caller
-//! can choose either policy explicitly with `CUA_DRIVER_RS_A11Y_ADVERTISE_MODE`.
+//! Known non-Cinnamon desktops get only the generic signal by default. Missing
+//! or unknown desktop identity receives no session advertisement because it
+//! could be a Cinnamon session with a scrubbed launch environment. The
+//! user-visible `ScreenReaderEnabled` signal remains an explicit compatibility
+//! opt-in through `CUA_DRIVER_RS_A11Y_ADVERTISE_MODE=all`.
 //!
-//! Everything here is best-effort. A session without an accessibility bus (some
-//! headless or minimal setups) just yields an error we log and ignore; enabling
-//! accessibility must never be able to fail daemon startup.
+//! Direct stdio MCP treats this setup as best-effort so a headless session keeps
+//! transport and tool discovery. Strict daemon/private-worker hosts reject
+//! admission when accessibility preparation or listener startup fails.
 
 use std::sync::{Once, OnceLock};
 
@@ -334,10 +337,18 @@ fn desktop_default_mode(desktop: Option<&str>) -> AdvertiseMode {
     // while advertising ScreenReaderEnabled launches Orca. Fail closed.
     if has_desktop("cinnamon") || has_desktop("x-cinnamon") {
         AdvertiseMode::None
-    } else if has_desktop("gnome") || has_desktop("cosmic") {
+    } else if [
+        "gnome", "ubuntu", "kde", "plasma", "xfce", "cosmic", "mate", "lxqt", "budgie", "pantheon",
+    ]
+    .iter()
+    .any(|candidate| has_desktop(candidate))
+    {
         AdvertiseMode::IsEnabledOnly
     } else {
-        AdvertiseMode::All
+        // An absent/unknown identity could be a Cinnamon process launched from
+        // a scrubbed environment. Do not write even IsEnabled until the desktop
+        // is positively identified as one of the known-safe defaults above.
+        AdvertiseMode::None
     }
 }
 
@@ -356,6 +367,19 @@ mod tests {
         assert_eq!(
             advertise_mode_from(false, None, Some("ubuntu:GNOME")),
             AdvertiseMode::IsEnabledOnly
+        );
+    }
+
+    #[test]
+    fn missing_desktop_identity_leaves_accessibility_status_untouched() {
+        assert_eq!(advertise_mode_from(false, None, None), AdvertiseMode::None);
+    }
+
+    #[test]
+    fn unknown_desktop_identity_leaves_accessibility_status_untouched() {
+        assert_eq!(
+            advertise_mode_from(false, None, Some("unknown-desktop")),
+            AdvertiseMode::None
         );
     }
 
@@ -391,10 +415,10 @@ mod tests {
     }
 
     #[test]
-    fn non_gnome_default_preserves_chromium_compatibility() {
+    fn non_gnome_default_does_not_claim_a_screen_reader() {
         assert_eq!(
             advertise_mode_from(false, None, Some("KDE")),
-            AdvertiseMode::All
+            AdvertiseMode::IsEnabledOnly
         );
     }
 

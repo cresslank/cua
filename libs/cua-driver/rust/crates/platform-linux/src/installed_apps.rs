@@ -35,9 +35,28 @@ pub struct InstalledApp {
 /// `applications/` subdir (defaults to
 /// `/usr/local/share/applications:/usr/share/applications`).
 pub fn list_installed_apps() -> Vec<InstalledApp> {
+    list_installed_apps_with_nodisplay(false)
+}
+
+/// Return application entries eligible as XDG URL handlers, including
+/// `NoDisplay=true` helpers that are intentionally hidden from app launchers.
+/// `Hidden=true` tombstones remain excluded.
+pub(crate) fn list_url_handler_apps() -> Vec<InstalledApp> {
+    list_installed_apps_with_nodisplay(true)
+}
+
+fn list_installed_apps_with_nodisplay(include_nodisplay: bool) -> Vec<InstalledApp> {
+    list_installed_apps_from_dirs(xdg_application_dirs(), include_nodisplay)
+}
+
+fn list_installed_apps_from_dirs(
+    roots: impl IntoIterator<Item = PathBuf>,
+    include_nodisplay: bool,
+) -> Vec<InstalledApp> {
     let mut seen: std::collections::HashMap<String, InstalledApp> =
         std::collections::HashMap::new();
-    for root in xdg_application_dirs() {
+    let mut seen_ids = std::collections::HashSet::new();
+    for root in roots {
         let Ok(entries) = fs::read_dir(&root) else {
             continue;
         };
@@ -50,7 +69,14 @@ pub fn list_installed_apps() -> Vec<InstalledApp> {
             if id.is_empty() {
                 continue;
             }
-            let Some(app) = parse_desktop_file(&path, &id) else {
+            // Every higher-precedence desktop file shadows lower-precedence
+            // files with the same ID, even when it is Hidden, NoDisplay, or
+            // otherwise filtered. In particular, Hidden=true is an XDG
+            // tombstone and must not expose the masked system launcher.
+            if !seen_ids.insert(id.clone()) {
+                continue;
+            }
+            let Some(app) = parse_desktop_file(&path, &id, include_nodisplay) else {
                 continue;
             };
             // Per the spec, user-scope files (XDG_DATA_HOME) override
@@ -116,14 +142,18 @@ fn desktop_file_id(root: &Path, path: &Path) -> String {
 }
 
 /// Parse a `.desktop` file. Returns `None` for entries the caller should skip
-/// (`NoDisplay=true`, `Hidden=true`, `Type!=Application`, missing `Exec` or `Name`).
+/// (`Hidden=true`, `Type!=Application`, missing `Exec` or `Name`).
 ///
 /// `bundle_id` is the precomputed desktop file id (see `desktop_file_id`).
-fn parse_desktop_file(path: &Path, bundle_id: &str) -> Option<InstalledApp> {
+fn parse_desktop_file(
+    path: &Path,
+    bundle_id: &str,
+    include_nodisplay: bool,
+) -> Option<InstalledApp> {
     let text = fs::read_to_string(path).ok()?;
     let entry = extract_desktop_entry_section(&text)?;
 
-    if bool_key(&entry, "NoDisplay") || bool_key(&entry, "Hidden") {
+    if bool_key(&entry, "Hidden") || (!include_nodisplay && bool_key(&entry, "NoDisplay")) {
         return None;
     }
     let type_ = string_key(&entry, "Type").unwrap_or_default();
@@ -291,8 +321,61 @@ NoDisplay=true
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("hidden-helper.desktop");
         std::fs::write(&path, body).unwrap();
-        assert!(parse_desktop_file(&path, "hidden-helper").is_none());
+        assert!(parse_desktop_file(&path, "hidden-helper", false).is_none());
+        assert_eq!(
+            parse_desktop_file(&path, "hidden-helper", true)
+                .expect("NoDisplay URL handler remains resolvable")
+                .launch_path,
+            "/usr/libexec/helper"
+        );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn higher_precedence_hidden_or_nodisplay_entries_shadow_system_launchers() {
+        let root = std::env::temp_dir().join(format!(
+            "cua-desktop-precedence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let user = root.join("user");
+        let system = root.join("system");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        let user_entry = user.join("browser.desktop");
+        let system_entry = system.join("browser.desktop");
+        std::fs::write(
+            &system_entry,
+            "[Desktop Entry]\nType=Application\nName=System Browser\nExec=/bin/system-browser %U\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &user_entry,
+            "[Desktop Entry]\nType=Application\nName=Masked Browser\nExec=/bin/user-browser %U\nHidden=true\n",
+        )
+        .unwrap();
+
+        assert!(
+            list_installed_apps_from_dirs(vec![user.clone(), system.clone()], true).is_empty(),
+            "Hidden=true must tombstone the lower-precedence system handler"
+        );
+
+        std::fs::write(
+            &user_entry,
+            "[Desktop Entry]\nType=Application\nName=URL Helper\nExec=/bin/url-helper %U\nNoDisplay=true\n",
+        )
+        .unwrap();
+        assert!(
+            list_installed_apps_from_dirs(vec![user.clone(), system.clone()], false).is_empty(),
+            "a filtered NoDisplay entry must still shadow the system launcher"
+        );
+        let handlers = list_installed_apps_from_dirs(vec![user, system], true);
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(handlers[0].launch_path, "/bin/url-helper");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -307,7 +390,7 @@ Exec=/opt/demo/bin/demo %U
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("demo-app.desktop");
         std::fs::write(&path, body).unwrap();
-        let parsed = parse_desktop_file(&path, "demo-app").expect("parses");
+        let parsed = parse_desktop_file(&path, "demo-app", false).expect("parses");
         assert_eq!(parsed.name, "Demo App");
         assert_eq!(parsed.launch_path, "/opt/demo/bin/demo");
         assert_eq!(parsed.bundle_id, "demo-app");

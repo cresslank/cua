@@ -52,6 +52,8 @@ pub(crate) struct RuntimeOptions {
     pub compatibility_mode: bool,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub prepare_desktop_environment: bool,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub require_atspi_listener: bool,
     pub register_host_tools: Option<fn(&mut ToolRegistry)>,
     pub authorization_ceiling: Option<SessionModeCeiling>,
     pub compatibility_authorization: Option<(PermissionMode, Option<Arc<SessionManifest>>)>,
@@ -72,6 +74,7 @@ impl RuntimeOptions {
             host_bundle_id: None,
             compatibility_mode,
             prepare_desktop_environment: true,
+            require_atspi_listener: true,
             register_host_tools: None,
             authorization_ceiling: None,
             compatibility_authorization: None,
@@ -551,7 +554,10 @@ fn build_registry(options: &RuntimeOptions) -> Result<ToolRegistry, RuntimeCreat
 
     #[cfg(target_os = "linux")]
     let mut registry = {
-        configure_linux_runtime(options.prepare_desktop_environment)?;
+        configure_linux_runtime(
+            options.prepare_desktop_environment,
+            options.require_atspi_listener,
+        )?;
         platform_linux::register_tools_with_cursor_and_provider(
             options.authorization_host.clone(),
             options.cursor.clone(),
@@ -825,19 +831,26 @@ pub(crate) fn prepare_private_worker_accessibility_route(
 }
 
 #[cfg(target_os = "linux")]
-fn configure_linux_runtime(prepare_desktop_environment: bool) -> Result<(), RuntimeCreateError> {
+fn configure_linux_runtime(
+    prepare_desktop_environment: bool,
+    require_atspi_listener: bool,
+) -> Result<(), RuntimeCreateError> {
     if prepare_desktop_environment {
-        let preparation_lock =
-            acquire_linux_desktop_preparation_lock().map_err(RuntimeCreateError::Unavailable)?;
-        platform_linux::xauth::ensure_xauthority_discovered();
-        platform_linux::session_bus::ensure_session_bus_discovered();
-        platform_linux::a11y::ensure_accessibility_enabled(preparation_lock)
-            .map_err(RuntimeCreateError::Unavailable)?;
-        platform_linux::atspi::ensure_listener_active().map_err(|error| {
-            RuntimeCreateError::Unavailable(format!(
-                "persistent AT-SPI listener is unavailable: {error}"
-            ))
-        })?;
+        if let Some(preparation_lock) = linux_preparation_lock_for_admission(
+            require_atspi_listener,
+            acquire_linux_desktop_preparation_lock(),
+        )? {
+            platform_linux::xauth::ensure_xauthority_discovered();
+            platform_linux::session_bus::ensure_session_bus_discovered();
+            finish_linux_accessibility_admission(
+                require_atspi_listener,
+                platform_linux::a11y::ensure_accessibility_enabled(preparation_lock),
+                || {
+                    platform_linux::atspi::ensure_listener_active()
+                        .map_err(|error| error.to_string())
+                },
+            )?;
+        }
     }
     cua_driver_core::recording::set_screenshot_fn(|window_id, pid| {
         platform_linux::recording_hooks::screenshot_for_recording(window_id, pid)
@@ -859,6 +872,57 @@ fn configure_linux_runtime(prepare_desktop_environment: bool) -> Result<(), Runt
         cua_driver_core::video::set_video_backend_factory(Box::new(
             cua_driver_core::video_ffmpeg::FfmpegVideoBackendFactory,
         ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_preparation_lock_for_admission<T>(
+    require_atspi_listener: bool,
+    lock: Result<T, String>,
+) -> Result<Option<T>, RuntimeCreateError> {
+    match lock {
+        Ok(lock) => Ok(Some(lock)),
+        Err(error) if require_atspi_listener => Err(RuntimeCreateError::Unavailable(error)),
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "desktop preparation lock unavailable; continuing with degraded accessibility capability"
+            );
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn finish_linux_accessibility_admission(
+    require_atspi_listener: bool,
+    preparation: Result<(), String>,
+    ensure_listener: impl FnOnce() -> Result<(), String>,
+) -> Result<(), RuntimeCreateError> {
+    if let Err(error) = preparation {
+        if require_atspi_listener {
+            return Err(RuntimeCreateError::Unavailable(format!(
+                "session accessibility preparation failed: {error}"
+            )));
+        }
+        tracing::warn!(
+            error = %error,
+            "session accessibility unavailable; continuing with degraded accessibility capability"
+        );
+        return Ok(());
+    }
+
+    if let Err(error) = ensure_listener() {
+        if require_atspi_listener {
+            return Err(RuntimeCreateError::Unavailable(format!(
+                "persistent AT-SPI listener is unavailable: {error}"
+            )));
+        }
+        tracing::warn!(
+            error = %error,
+            "persistent AT-SPI listener unavailable; continuing with degraded accessibility capability"
+        );
     }
     Ok(())
 }
@@ -903,6 +967,92 @@ mod tests {
             RuntimeOptions::embedded_with_ceiling(false, ceiling, PermissionMode::Standard, None);
         options.authorization_host = Some(Arc::new(TestProtectedHost));
         options
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_linux_admission_rejects_accessibility_preparation_failure() {
+        let listener_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called = listener_called.clone();
+        let error = finish_linux_accessibility_admission(
+            true,
+            Err("org.a11y.Status rejected setup".into()),
+            move || {
+                called.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .expect_err("strict admission must reject preparation failures");
+
+        assert!(matches!(error, RuntimeCreateError::Unavailable(_)));
+        assert!(!listener_called.load(Ordering::SeqCst));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn desktop_preparation_lock_contention_obeys_linux_admission_policy() {
+        assert!(matches!(
+            linux_preparation_lock_for_admission::<()>(true, Err("lock deadline".into())),
+            Err(RuntimeCreateError::Unavailable(_))
+        ));
+        assert_eq!(
+            linux_preparation_lock_for_admission::<()>(false, Err("lock deadline".into()))
+                .expect("best-effort direct MCP should preserve transport"),
+            None
+        );
+        assert_eq!(
+            linux_preparation_lock_for_admission(false, Ok(7)).unwrap(),
+            Some(7)
+        );
+
+        let path = std::env::temp_dir().join(format!(
+            "cua-sdk-lock-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let effective_uid = unsafe { libc::geteuid() };
+        let held = acquire_linux_desktop_preparation_lock_at_until(
+            &path,
+            effective_uid,
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        let contended = acquire_linux_desktop_preparation_lock_at_until(
+            &path,
+            effective_uid,
+            std::time::Instant::now(),
+        );
+        assert!(linux_preparation_lock_for_admission(false, contended)
+            .expect("real contention should degrade for direct MCP")
+            .is_none());
+        drop(held);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn best_effort_linux_admission_degrades_on_accessibility_preparation_failure() {
+        finish_linux_accessibility_admission(
+            false,
+            Err("org.a11y.Bus is unavailable".into()),
+            || panic!("listener must not run after failed preparation"),
+        )
+        .expect("best-effort admission should preserve direct MCP transport");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn listener_failure_obeys_linux_admission_policy() {
+        let strict = finish_linux_accessibility_admission(true, Ok(()), || {
+            Err("registration rejected".into())
+        });
+        assert!(matches!(strict, Err(RuntimeCreateError::Unavailable(_))));
+
+        finish_linux_accessibility_admission(false, Ok(()), || Err("registration rejected".into()))
+            .expect("best-effort admission should degrade after listener rejection");
     }
 
     #[tokio::test]
