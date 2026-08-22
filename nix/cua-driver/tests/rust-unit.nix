@@ -97,6 +97,10 @@ pkgs.rustPlatform.buildRustPackage {
     "policies_are_isolated_immutable_and_enforced_over_mcp"
     "--skip"
     "persistent_capture_scope_key_is_retired"
+    # The host-wide lease path is intentionally outside a Nix build sandbox.
+    # Linux host CI covers the canonical /run/user/<uid> lock contract.
+    "--skip"
+    "host_raw_input_lease_is_exclusive_and_retryable_after_drop"
   ];
 
   nativeBuildInputs = with pkgs; [
