@@ -458,6 +458,7 @@ class RehearsalReleaseApi:
         self.posts = []
         self.patches = []
         self.uploads = []
+        self.asset_payloads = {}
 
     def get(self, path: str):
         if "/releases?" in path:
@@ -486,14 +487,19 @@ class RehearsalReleaseApi:
 
     def upload(self, url: str, path: Path):
         self.uploads.append((url, path.name))
+        asset_id = len(self.assets) + 1
+        self.asset_payloads[asset_id] = path.read_bytes()
         self.assets.append(
             {
-                "id": len(self.assets) + 1,
+                "id": asset_id,
                 "name": path.name,
                 "state": "uploaded",
                 "size": path.stat().st_size,
             }
         )
+
+    def download(self, path: str) -> bytes:
+        return self.asset_payloads[int(path.rsplit("/", 1)[1])]
 
     def patch(self, path: str, body: dict):
         self.patches.append((path, body))
