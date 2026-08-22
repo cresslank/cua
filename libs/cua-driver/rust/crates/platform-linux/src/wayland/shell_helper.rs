@@ -948,12 +948,12 @@ pub fn trusted_window_ids_for_pid(pid: u32) -> Option<Vec<u64>> {
 pub fn with_focused_window<T>(
     pid: u32,
     window_id: u64,
-    body: impl FnOnce() -> anyhow::Result<T>,
+    body: impl FnOnce(&ForegroundTransaction) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     trusted_window_for_id(pid, window_id)
         .ok_or_else(|| anyhow::anyhow!("no exact GNOME Shell window owns the approved target"))?;
     let transaction = begin_foreground(window_id)?;
-    let action = transaction.validate().and_then(|()| body());
+    let action = transaction.validate().and_then(|()| body(&transaction));
     let restoration = transaction.finish();
     match (action, restoration) {
         (Ok(value), Ok(_)) => Ok(value),

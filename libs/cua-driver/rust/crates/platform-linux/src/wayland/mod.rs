@@ -139,6 +139,14 @@ fn reject_unsafe_gnome_desktop_input(operation: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn with_operation_bound_validation<T>(
+    validate: &dyn Fn() -> anyhow::Result<()>,
+    operation: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    validate()?;
+    operation()
+}
+
 #[cfg(feature = "portal-input")]
 fn require_gnome_keyboard_transport_ready() -> anyhow::Result<()> {
     libei_wait_keyboard_ready()
@@ -1520,6 +1528,28 @@ pub fn validate_exact_target(target: &ExactTargetProof) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Operation-bound proof that an exact compositor target is still focused.
+/// Fields are private so callers cannot manufacture authority from a PID/window
+/// pair or a no-op callback.
+pub struct ExactTargetInputGuard<'a> {
+    target: ExactTargetProof,
+    transaction: Option<&'a shell_helper::ForegroundTransaction>,
+    sway_focus: Option<&'a sway_ipc::StatefulFocus>,
+}
+
+impl ExactTargetInputGuard<'_> {
+    fn validate(&self) -> anyhow::Result<()> {
+        validate_exact_target(&self.target)?;
+        if let Some(transaction) = self.transaction {
+            transaction.validate()?;
+        }
+        if let Some(focus) = self.sway_focus {
+            focus.validate()?;
+        }
+        Ok(())
+    }
+}
+
 /// Validate the immutable target against one authoritative window-list snapshot
 /// and require it to be the process's only native toplevel. Browser setup uses
 /// this stronger form when correlating a process-wide AT-SPI application tree:
@@ -1834,26 +1864,41 @@ pub fn activate_window_for_input_target(
 pub fn with_target_foreground<T>(
     pid: u32,
     window_id: u64,
-    body: impl FnOnce() -> anyhow::Result<T>,
+    body: impl FnOnce(&ExactTargetInputGuard<'_>) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    // Sway/GNOME focus, global input, and restoration form one host-global
-    // transaction. Serialize across both this process and the desktop session,
-    // then re-establish the exact PID/window identity after waiting for the
-    // lease so a stale pre-wait observation cannot authorize input.
+    // Focus, input, and restoration are one host-global transaction. The guard
+    // passed to the mutation closure revalidates the compositor proof at the
+    // final input boundary, after any intervening AT-SPI work.
     let _lease = acquire_host_raw_input_lease()?;
     let target = establish_exact_target(pid, window_id)?;
     validate_exact_target(&target)?;
-    if let Some(window) = sway_ipc::window_for_id(window_id) {
-        if window.pid != pid {
-            anyhow::bail!(
-                "foreground_unavailable: Sway window {window_id} belongs to pid {}, not pid {pid}",
-                window.pid
-            );
-        }
-        return sway_ipc::with_focused_container(pid, window_id, body);
+    if sway_ipc::window_for_id(window_id).is_some() {
+        let focus = sway_ipc::StatefulFocus::begin(pid, window_id)?;
+        let guard = ExactTargetInputGuard {
+            target: target.clone(),
+            transaction: None,
+            sway_focus: Some(&focus),
+        };
+        let action = body(&guard);
+        let restoration = focus.finish();
+        return match (action, restoration) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(action_error), Ok(())) => Err(action_error),
+            (Ok(_), Err(restoration_error)) => Err(restoration_error),
+            (Err(action_error), Err(restoration_error)) => Err(anyhow::anyhow!(
+                "{action_error}; foreground reconciliation also failed: {restoration_error}"
+            )),
+        };
     }
     if shell_helper::trusted_window_for_id(pid, window_id).is_some() {
-        return shell_helper::with_focused_window(pid, window_id, body);
+        return shell_helper::with_focused_window(pid, window_id, |transaction| {
+            let guard = ExactTargetInputGuard {
+                target,
+                transaction: Some(transaction),
+                sway_focus: None,
+            };
+            body(&guard)
+        });
     }
     anyhow::bail!(
         "foreground_unavailable: no trusted Wayland compositor adapter can confirm exact \
@@ -2597,6 +2642,17 @@ pub fn type_text_with_outcome(
 /// (for example after opening a Chromium tab).
 pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
     reject_unsafe_gnome_desktop_input("text input")?;
+    type_text_focused_unchecked(text)
+}
+
+pub fn type_text_focused_for_target(
+    guard: &ExactTargetInputGuard<'_>,
+    text: &str,
+) -> anyhow::Result<()> {
+    with_operation_bound_validation(&|| guard.validate(), || type_text_focused_unchecked(text))
+}
+
+fn type_text_focused_unchecked(text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
@@ -2691,6 +2747,17 @@ pub fn press_key_with_outcome(
 /// Press one key while an outer exact-container focus guard is active.
 pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
     reject_unsafe_gnome_desktop_input("key input")?;
+    press_key_focused_unchecked(key)
+}
+
+pub fn press_key_focused_for_target(
+    guard: &ExactTargetInputGuard<'_>,
+    key: &str,
+) -> anyhow::Result<()> {
+    with_operation_bound_validation(&|| guard.validate(), || press_key_focused_unchecked(key))
+}
+
+fn press_key_focused_unchecked(key: &str) -> anyhow::Result<()> {
     if is_inject_mode() {
         let target = inject_focused_target()?;
         return inject_press_key(target.window_id, key);
@@ -2771,6 +2838,17 @@ pub fn hotkey_with_outcome(
 /// Send a chord while an outer exact-container focus guard is active.
 pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
     reject_unsafe_gnome_desktop_input("hotkey input")?;
+    hotkey_focused_unchecked(keys)
+}
+
+pub fn hotkey_focused_for_target(
+    guard: &ExactTargetInputGuard<'_>,
+    keys: &[String],
+) -> anyhow::Result<()> {
+    with_operation_bound_validation(&|| guard.validate(), || hotkey_focused_unchecked(keys))
+}
+
+fn hotkey_focused_unchecked(keys: &[String]) -> anyhow::Result<()> {
     if is_inject_mode() {
         let target = inject_focused_target()?;
         return inject_hotkey(target.window_id, keys);
@@ -4336,6 +4414,31 @@ mod tests {
         assert!(desktop_name_is_gnome("GNOME:GNOME-Classic"));
         assert!(!desktop_name_is_gnome("KDE"));
         assert!(!desktop_name_is_gnome("sway"));
+    }
+
+    #[test]
+    fn exact_target_validation_is_operation_bound_and_fail_closed() {
+        let order = std::cell::RefCell::new(Vec::new());
+        with_operation_bound_validation(
+            &|| {
+                order.borrow_mut().push("validate");
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("mutate");
+                Ok(())
+            },
+        )
+        .expect("validated operation");
+        assert_eq!(*order.borrow(), ["validate", "mutate"]);
+
+        let mutated = std::cell::Cell::new(false);
+        let rejected = with_operation_bound_validation(&|| anyhow::bail!("stale target"), || {
+            mutated.set(true);
+            Ok(())
+        });
+        assert!(rejected.is_err());
+        assert!(!mutated.get());
     }
 
     #[test]
