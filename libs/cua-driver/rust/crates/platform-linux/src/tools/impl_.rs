@@ -3705,13 +3705,13 @@ impl Tool for TypeTextTool {
                 let result = cua_driver_core::blocking::spawn(move || {
                     let target = crate::wayland::establish_exact_target(pid, xid)?;
                     crate::wayland::validate_exact_target(&target)?;
-                    crate::wayland::with_target_foreground(pid, xid, || {
+                    crate::wayland::with_target_foreground(pid, xid, |validate| {
                         if !crate::atspi::focus_element(pid, idx)? {
                             anyhow::bail!(
                                 "AT-SPI Component.GrabFocus returned false for element {idx}"
                             );
                         }
-                        crate::wayland::type_text_focused(&text_w)
+                        crate::wayland::type_text_focused_for_target(validate, &text_w)
                     })?;
                     Ok::<
                         Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
@@ -3772,7 +3772,7 @@ impl Tool for TypeTextTool {
                 cua_driver_core::blocking::spawn(move || {
                     let target = crate::wayland::establish_exact_target(pid, xid)?;
                     crate::wayland::validate_exact_target(&target)?;
-                    crate::wayland::with_target_foreground(pid, xid, || {
+                    crate::wayland::with_target_foreground(pid, xid, |validate| {
                         if let Some(idx) = idx {
                             if !crate::atspi::focus_element(pid, idx)? {
                                 anyhow::bail!(
@@ -3780,7 +3780,7 @@ impl Tool for TypeTextTool {
                                 );
                             }
                         }
-                        crate::wayland::type_text_focused(&text_w)
+                        crate::wayland::type_text_focused_for_target(validate, &text_w)
                     })?;
                     Ok::<
                         Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
@@ -4318,7 +4318,7 @@ impl Tool for PressKeyTool {
                 cua_driver_core::blocking::spawn(move || {
                     let target = crate::wayland::establish_exact_target(pid, xid)?;
                     crate::wayland::validate_exact_target(&target)?;
-                    crate::wayland::with_target_foreground(pid, xid, || {
+                    crate::wayland::with_target_foreground(pid, xid, |validate| {
                         if let Some(idx) = idx {
                             if !crate::atspi::focus_element(pid, idx)? {
                                 anyhow::bail!(
@@ -4327,8 +4327,10 @@ impl Tool for PressKeyTool {
                             }
                         }
                         match chord {
-                            Some(keys) => crate::wayland::hotkey_focused(&keys),
-                            None => crate::wayland::press_key_focused(&key_w),
+                            Some(keys) => {
+                                crate::wayland::hotkey_focused_for_target(validate, &keys)
+                            }
+                            None => crate::wayland::press_key_focused_for_target(validate, &key_w),
                         }
                     })?;
                     Ok::<

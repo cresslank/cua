@@ -247,13 +247,9 @@ fn omnibox_holds_setup_url(node: &AtspiNode, descriptor: &BrowserSetupDescriptor
 /// accurate refusal.
 fn with_target_foreground<T>(
     target: &crate::wayland::ExactTargetProof,
-    operation: impl FnOnce() -> anyhow::Result<T>,
+    operation: impl FnOnce(&crate::wayland::ExactTargetInputGuard<'_>) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    crate::wayland::validate_exact_target(target)?;
-    let guard = crate::wayland::activate_window_for_input_target(target)?;
-    let result = operation();
-    drop(guard);
-    result
+    crate::wayland::with_target_foreground(target.pid(), target.window_id(), operation)
 }
 
 fn trusted_setup_navigation(
@@ -268,18 +264,21 @@ fn trusted_setup_navigation(
     // `ctrl+l` then focuses the address field. Both are single letters, so
     // neither depends on the keyboard layout the way punctuation does.
     let focus_omnibox = || -> anyhow::Result<()> {
-        with_target_foreground(target, || {
+        with_target_foreground(target, |guard| {
             if wayland {
-                crate::wayland::hotkey_focused(&["ctrl".to_owned(), "l".to_owned()])
+                crate::wayland::hotkey_focused_for_target(
+                    guard,
+                    &["ctrl".to_owned(), "l".to_owned()],
+                )
             } else {
                 crate::input::send_key_xtest("l", &["ctrl"])
             }
         })
     };
 
-    with_target_foreground(target, || {
+    with_target_foreground(target, |guard| {
         if wayland {
-            crate::wayland::hotkey_focused(&["ctrl".to_owned(), "t".to_owned()])
+            crate::wayland::hotkey_focused_for_target(guard, &["ctrl".to_owned(), "t".to_owned()])
         } else {
             crate::input::send_key_xtest("t", &["ctrl"])
         }
@@ -323,11 +322,11 @@ fn trusted_setup_navigation(
     clipboard
         .write_text(descriptor.setup_url.to_owned())
         .map_err(|error| anyhow::anyhow!("could not stage the fixed setup URL: {error}"))?;
-    let paste = with_target_foreground(target, || {
+    let paste = with_target_foreground(target, |guard| {
         if wayland {
-            crate::wayland::hotkey_focused(&["ctrl".to_owned(), "a".to_owned()])?;
+            crate::wayland::hotkey_focused_for_target(guard, &["ctrl".to_owned(), "a".to_owned()])?;
             std::thread::sleep(Duration::from_millis(60));
-            crate::wayland::hotkey_focused(&["ctrl".to_owned(), "v".to_owned()])
+            crate::wayland::hotkey_focused_for_target(guard, &["ctrl".to_owned(), "v".to_owned()])
         } else {
             crate::input::send_key_xtest("a", &["ctrl"])?;
             std::thread::sleep(Duration::from_millis(60));
@@ -343,9 +342,9 @@ fn trusted_setup_navigation(
 
     // Commit. Enter is the one synthesized keystroke left, and it carries no
     // layout dependency.
-    with_target_foreground(target, || {
+    with_target_foreground(target, |guard| {
         if wayland {
-            crate::wayland::hotkey_focused(&["enter".to_owned()])
+            crate::wayland::hotkey_focused_for_target(guard, &["enter".to_owned()])
         } else {
             crate::input::send_key_xtest("enter", &[])
         }
