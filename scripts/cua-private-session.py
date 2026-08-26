@@ -84,7 +84,13 @@ def _base_environment(args: argparse.Namespace, runtime: Path) -> dict[str, str]
         }
     )
     # Never inherit display/session endpoints from the human desktop.
-    for key in ("DISPLAY", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS", "AT_SPI_BUS_ADDRESS"):
+    for key in (
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "SWAYSOCK",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "AT_SPI_BUS_ADDRESS",
+    ):
         env.pop(key, None)
     return env
 

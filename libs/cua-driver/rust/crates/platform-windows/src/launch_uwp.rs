@@ -88,6 +88,16 @@ const PKEY_APP_USER_MODEL_ID: PROPERTYKEY = PROPERTYKEY {
 ///   packaged dependency unresolved (rare)
 /// - Any COM-init failure on a thread that has previously been
 ///   initialized with a conflicting apartment model
+fn foreground_belongs_to_activated_app_with(
+    hwnd: u64,
+    foreground_owner_pid: u32,
+    activated_pid: u32,
+    resolve_hosted_pid: impl FnOnce(u32, u64) -> Option<u32>,
+) -> bool {
+    foreground_owner_pid == activated_pid
+        || resolve_hosted_pid(foreground_owner_pid, hwnd) == Some(activated_pid)
+}
+
 pub(crate) fn launch_uwp(
     aumid: &str,
     args: &str,
@@ -123,7 +133,12 @@ pub(crate) fn launch_uwp(
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
-        if current.pid() != pid {
+        if !foreground_belongs_to_activated_app_with(
+            current.hwnd(),
+            current.pid(),
+            pid,
+            crate::win32::resolve_uwp_app_pid,
+        ) {
             return Ok(pid);
         }
         return match crate::win32::restore_foreground_target_if_still_displaced(
@@ -522,6 +537,28 @@ fn pwstr_to_string_and_free(p: PWSTR) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hosted_uwp_foreground_is_attributed_to_the_activated_app() {
+        assert!(foreground_belongs_to_activated_app_with(
+            0x1234,
+            700,
+            900,
+            |host_pid, hwnd| (host_pid == 700 && hwnd == 0x1234).then_some(900),
+        ));
+        assert!(foreground_belongs_to_activated_app_with(
+            0x1234,
+            900,
+            900,
+            |_, _| None,
+        ));
+        assert!(!foreground_belongs_to_activated_app_with(
+            0x1234,
+            701,
+            900,
+            |_, _| None,
+        ));
+    }
 
     #[tokio::test]
     async fn apps_folder_lookup_timeout_is_single_flight_and_recovers_after_cooldown() {

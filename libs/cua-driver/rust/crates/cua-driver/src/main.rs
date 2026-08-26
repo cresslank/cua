@@ -386,12 +386,34 @@ fn run_mcp_direct(compatibility_mode: bool) -> anyhow::Result<()> {
     runtime.block_on(proxy::run_direct(driver))
 }
 
+fn history_admission_requested(explicit: bool, persisted: bool) -> bool {
+    explicit || persisted
+}
+
+#[cfg(test)]
+mod history_admission_tests {
+    use super::history_admission_requested;
+
+    #[test]
+    fn persisted_preview_admission_survives_a_relaunch_without_the_cli_flag() {
+        assert!(history_admission_requested(false, true));
+    }
+
+    #[test]
+    fn admission_requires_an_explicit_or_persisted_request() {
+        assert!(!history_admission_requested(false, false));
+        assert!(history_admission_requested(true, false));
+        assert!(history_admission_requested(true, true));
+    }
+}
+
 fn mcp_uses_direct_runtime(socket: Option<&str>, direct: bool) -> anyhow::Result<bool> {
     mcp_uses_direct_runtime_for(
         cua_driver_core::embedded_mode(),
         socket,
         cfg!(target_os = "macos"),
         direct,
+        history_runtime::preview_admitted_preference(),
     )
 }
 
@@ -400,6 +422,7 @@ fn mcp_uses_direct_runtime_for(
     socket: Option<&str>,
     macos: bool,
     direct: bool,
+    history_preview_admitted: bool,
 ) -> anyhow::Result<bool> {
     if direct && socket.is_some() {
         anyhow::bail!("--direct and --socket are mutually exclusive");
@@ -414,7 +437,7 @@ fn mcp_uses_direct_runtime_for(
         // Preserve LaunchServices/TCC attribution for normal macOS clients.
         Ok(false)
     } else {
-        Ok(socket.is_none())
+        Ok(socket.is_none() && !history_preview_admitted)
     }
 }
 
@@ -424,30 +447,32 @@ mod mcp_runtime_selection_tests {
 
     #[test]
     fn embedded_host_without_private_endpoint_fails_closed() {
-        let error = mcp_uses_direct_runtime_for(true, None, false, false).unwrap_err();
+        let error = mcp_uses_direct_runtime_for(true, None, false, false, false).unwrap_err();
         assert!(error.to_string().contains("--socket"));
-        let error = mcp_uses_direct_runtime_for(true, None, true, false).unwrap_err();
+        let error = mcp_uses_direct_runtime_for(true, None, true, false, false).unwrap_err();
         assert!(error.to_string().contains("--socket"));
     }
 
     #[test]
     fn normal_linux_and_windows_stdio_own_the_runtime() {
-        assert!(mcp_uses_direct_runtime_for(false, None, false, false).unwrap());
-        assert!(!mcp_uses_direct_runtime_for(false, Some("service"), false, false).unwrap());
+        assert!(mcp_uses_direct_runtime_for(false, None, false, false, false).unwrap());
+        assert!(!mcp_uses_direct_runtime_for(false, Some("service"), false, false, false).unwrap());
+        assert!(!mcp_uses_direct_runtime_for(false, None, false, false, true).unwrap());
     }
 
     #[test]
     fn normal_macos_stdio_preserves_the_service_boundary() {
-        assert!(!mcp_uses_direct_runtime_for(false, None, true, false).unwrap());
-        assert!(!mcp_uses_direct_runtime_for(false, Some("service"), true, false).unwrap());
+        assert!(!mcp_uses_direct_runtime_for(false, None, true, false, false).unwrap());
+        assert!(!mcp_uses_direct_runtime_for(false, Some("service"), true, false, false).unwrap());
     }
 
     #[test]
     fn explicit_direct_owns_the_runtime_on_macos_and_in_embedded_hosts() {
-        assert!(mcp_uses_direct_runtime_for(false, None, true, true).unwrap());
-        assert!(mcp_uses_direct_runtime_for(true, None, true, true).unwrap());
-        assert!(mcp_uses_direct_runtime_for(true, None, false, true).unwrap());
-        let error = mcp_uses_direct_runtime_for(false, Some("service"), true, true).unwrap_err();
+        assert!(mcp_uses_direct_runtime_for(false, None, true, true, false).unwrap());
+        assert!(mcp_uses_direct_runtime_for(true, None, true, true, false).unwrap());
+        assert!(mcp_uses_direct_runtime_for(true, None, false, true, false).unwrap());
+        let error =
+            mcp_uses_direct_runtime_for(false, Some("service"), true, true, false).unwrap_err();
         assert!(error.to_string().contains("mutually exclusive"));
     }
 }
@@ -566,7 +591,10 @@ fn main() {
                 std::process::exit(64);
             }
             responsibility::reexec_disclaimed_if_needed();
-            if let Err(error) = history_runtime::configure_admission(experimental_history) {
+            if let Err(error) = history_runtime::configure_admission(history_admission_requested(
+                experimental_history,
+                history_runtime::preview_admitted_preference(),
+            )) {
                 eprintln!("cua-driver: Computer History admission error: {error}");
                 std::process::exit(1);
             }
@@ -884,6 +912,9 @@ fn main() {
 
 #[cfg(not(target_os = "macos"))]
 fn main() -> anyhow::Result<()> {
+    if let Some(code) = history_runtime::run_offline_purge_if_requested() {
+        std::process::exit(code);
+    }
     init_logging();
     if let Some(generation) = private_worker::requested_generation() {
         return private_worker::run(generation, None);
@@ -950,7 +981,7 @@ fn main() -> anyhow::Result<()> {
             no_permissions_gate,
             claude_code_compat,
             grants,
-            experimental_history: _,
+            experimental_history,
         } => {
             configure_startup_permission_mode(
                 permission_mode.as_deref(),
@@ -960,6 +991,19 @@ fn main() -> anyhow::Result<()> {
                 &grants,
             )?;
             responsibility::reexec_disclaimed_if_needed();
+            history_runtime::configure_admission(history_admission_requested(
+                experimental_history,
+                history_runtime::preview_admitted_preference(),
+            ))?;
+            history_runtime::configure_daemon_launch_state(
+                permission_mode.as_deref(),
+                dangerously_bypass_approvals,
+                capability_manifest.as_deref(),
+                approve_capability_manifest,
+                no_permissions_gate,
+                claude_code_compat,
+                &grants,
+            );
             telemetry::capture_start(
                 telemetry::event::SERVE_START_LEGACY,
                 telemetry::Transport::Daemon,

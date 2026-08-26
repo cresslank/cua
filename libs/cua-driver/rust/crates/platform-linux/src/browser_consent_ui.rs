@@ -111,9 +111,10 @@ fn allow_action(node: &AtspiNode) -> ExactAllowAction {
     }
 }
 
-fn exact_allow_button(
+fn exact_prompt_button(
     nodes: &[AtspiNode],
     bounds: &[(usize, i32, i32, u32, u32)],
+    label: &str,
 ) -> Result<Option<ExactAllowAction>, BrowserRefusal> {
     if !remote_debugging_prompt_present(nodes) {
         return Ok(None);
@@ -121,7 +122,7 @@ fn exact_allow_button(
     let matches = trusted_prompt_nodes(nodes)
         .filter(|node| {
             role_is(node, &["push button", "button"])
-                && normalized_text(node) == "allow"
+                && normalized_text(node) == label
                 && trusted_semantic_action(node).is_some()
                 && node.element_index.is_some()
         })
@@ -154,7 +155,7 @@ fn exact_allow_button(
         [node] => Ok(Some(allow_action(node))),
         _ => Err(refusal(
             BrowserRefusalCode::BrowserWrongTargetRefused,
-            "multiple exact Allow actions matched the browser consent prompt",
+            format!("multiple exact {label} actions matched the browser consent prompt"),
         )
         .with_detail(serde_json::json!({
             "candidates": matches.iter().map(|node| serde_json::json!({
@@ -166,6 +167,80 @@ fn exact_allow_button(
                 "parent_element_index": node.parent_element_index,
             })).collect::<Vec<_>>()
         }))),
+    }
+}
+
+fn exact_allow_button(
+    nodes: &[AtspiNode],
+    bounds: &[(usize, i32, i32, u32, u32)],
+) -> Result<Option<ExactAllowAction>, BrowserRefusal> {
+    exact_prompt_button(nodes, bounds, "allow")
+}
+
+fn exact_cancel_button(
+    nodes: &[AtspiNode],
+    bounds: &[(usize, i32, i32, u32, u32)],
+) -> Result<Option<ExactAllowAction>, BrowserRefusal> {
+    exact_prompt_button(nodes, bounds, "cancel")
+}
+
+pub fn dismiss(pid: u32, window_id: u64) -> Result<bool, BrowserRefusal> {
+    let target = crate::wayland::establish_exact_target(pid, window_id).map_err(|error| {
+        refusal(
+            BrowserRefusalCode::BrowserBindingStale,
+            format!("the approved browser window is not exact: {error}"),
+        )
+    })?;
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut dismissed = false;
+    loop {
+        crate::wayland::validate_exact_target(&target).map_err(|error| {
+            refusal(
+                BrowserRefusalCode::BrowserBindingStale,
+                format!("the approved browser window changed before cleanup: {error}"),
+            )
+        })?;
+        let tree = crate::atspi::walk_tree(pid, window_id, None);
+        let prompt_present = remote_debugging_prompt_present(&tree.nodes);
+        if !prompt_present {
+            return Ok(dismissed);
+        }
+        let cancel = exact_cancel_button(&tree.nodes, &tree.bounds)?.ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserWrongTargetRefused,
+                "the exact remote-debugging consent prompt exposed no semantic cancel action",
+            )
+        })?;
+        let expected_action = cancel.action.clone();
+        let result = crate::atspi::perform_verified_action_by_key(
+            &target,
+            cancel.element_key,
+            &cancel.role,
+            &cancel.name,
+            cancel.checked,
+            &cancel.actions,
+            &cancel.action,
+        )
+        .map_err(|error| {
+            refusal(
+                BrowserRefusalCode::BrowserWrongTargetRefused,
+                format!("the exact browser consent cancel action failed: {error}"),
+            )
+        })?;
+        if result.0 != expected_action || result.1 {
+            return Err(refusal(
+                BrowserRefusalCode::BrowserWrongTargetRefused,
+                "the exact browser consent cancel action was not explicitly acknowledged",
+            ));
+        }
+        dismissed = true;
+        if Instant::now() >= deadline {
+            return Err(refusal(
+                BrowserRefusalCode::BrowserWrongTargetRefused,
+                "the remote-debugging consent prompt remained after its exact cancel action",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -309,6 +384,10 @@ mod tests {
         assert_eq!(allow.element_index, 7);
         assert_eq!(allow.element_key, 0x77);
         assert_eq!(allow.action, "click");
+        let cancel = exact_cancel_button(&prompt(), &[]).unwrap().unwrap();
+        assert_eq!(cancel.element_index, 7);
+        assert_eq!(cancel.element_key, 0x77);
+        assert_eq!(cancel.action, "click");
         assert!(
             exact_allow_button(&[node("push button", "Allow", &["click"])], &[])
                 .unwrap()

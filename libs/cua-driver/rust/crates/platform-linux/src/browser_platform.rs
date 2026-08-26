@@ -1,20 +1,22 @@
 //! Linux identity and endpoint evidence for the first-class browser tools.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use cua_driver_core::browser::existing_profile_setup_descriptor;
 use cua_driver_core::browser::platform::{
-    BrowserConsentOutcome, BrowserConsentRequest, BrowserPlatform, ExistingProfileSetupOutcome,
-    ExistingProfileSetupRequest, PrepareAction, PrepareOutcome, PrepareRequest,
+    select_isolated_browser_executable, BrowserConsentOutcome, BrowserConsentRequest,
+    BrowserPlatform, ExistingProfileSetupOutcome, ExistingProfileSetupRequest, PrepareAction,
+    PrepareOutcome, PrepareRequest,
 };
 use cua_driver_core::browser::refusal::{BrowserRefusal, BrowserRefusalCode};
 use cua_driver_core::browser::types::{
-    BrowserClassification, BrowserEngineFamily, BrowserProduct, EndpointOwnershipMethod,
-    EndpointOwnershipProof, NativeOwnershipMethod, NativeOwnershipProof, NativeWindowInfo,
-    OwnedEndpoint, ProcessFingerprint, Rect,
+    BrowserClassification, BrowserEngineFamily, BrowserProcessRole, BrowserProduct,
+    EndpointOwnershipMethod, EndpointOwnershipProof, EndpointTransport, NativeOwnershipMethod,
+    NativeOwnershipProof, NativeWindowInfo, OwnedEndpoint, ProcessFingerprint, Rect,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -23,6 +25,21 @@ pub struct LinuxBrowserPlatform;
 
 fn refusal(code: BrowserRefusalCode, message: impl Into<String>) -> BrowserRefusal {
     BrowserRefusal::new(code, message)
+}
+
+const BROWSER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn run_existing_profile_cleanup<T: Send + 'static>(
+    cleanup: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, BrowserRefusal> {
+    cua_driver_core::blocking::run_browser_cleanup(BROWSER_CLEANUP_TIMEOUT, cleanup).map_err(
+        |error| {
+            refusal(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                format!("exact browser cleanup could not complete: {error}"),
+            )
+        },
+    )
 }
 
 fn is_chromium(name: &str) -> bool {
@@ -71,6 +88,68 @@ fn browser_product(identity: &str) -> BrowserProduct {
         BrowserProduct::Firefox
     } else {
         BrowserProduct::Other
+    }
+}
+
+fn isolated_browser_candidates() -> Vec<PathBuf> {
+    // These are the root-managed payload locations of supported Linux
+    // packages, not PATH shims. Core additionally rejects symlinked paths, so
+    // an isolated-launch grant cannot be redirected to a user-controlled file.
+    [
+        "/opt/google/chrome/google-chrome",
+        "/usr/lib/chromium/chromium",
+        "/usr/lib/chromium-browser/chromium-browser",
+        "/opt/microsoft/msedge/msedge",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
+}
+
+fn trusted_root_owned_installation(executable: &std::path::Path) -> bool {
+    if !executable.is_absolute() {
+        return false;
+    }
+    let mut current = Some(executable);
+    while let Some(path) = current {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() || metadata.uid() != 0 || metadata.mode() & 0o022 != 0
+        {
+            return false;
+        }
+        current = path.parent();
+    }
+    std::fs::metadata(executable)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.mode() & 0o111 != 0)
+}
+
+fn process_role_for_pid(pid: i64, product: BrowserProduct) -> BrowserProcessRole {
+    let helper = std::fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .is_some_and(|bytes| {
+            bytes.split(|byte| *byte == 0).any(|arg| {
+                arg.starts_with(b"--type=") && arg.get(7..).is_some_and(|kind| !kind.is_empty())
+            })
+        });
+    if helper {
+        BrowserProcessRole::Helper
+    } else if product == BrowserProduct::Electron {
+        BrowserProcessRole::EmbeddedApplication
+    } else if matches!(
+        product,
+        BrowserProduct::GoogleChrome
+            | BrowserProduct::Chromium
+            | BrowserProduct::MicrosoftEdge
+            | BrowserProduct::Brave
+            | BrowserProduct::Vivaldi
+            | BrowserProduct::Opera
+            | BrowserProduct::Arc
+    ) {
+        BrowserProcessRole::StandaloneConsumer
+    } else {
+        BrowserProcessRole::Unknown
     }
 }
 
@@ -299,6 +378,7 @@ fn active_port_endpoint(pid: i64) -> Result<Option<OwnedEndpoint>, BrowserRefusa
     Ok(Some(OwnedEndpoint {
         ws_url: format!("ws://127.0.0.1:{port}{path}"),
         http_port: Some(port),
+        transport: EndpointTransport::DevToolsActivePort,
         ownership: EndpointOwnershipProof {
             method: EndpointOwnershipMethod::DevtoolsActivePortsFile,
             owner_pid: pid,
@@ -396,6 +476,21 @@ async fn browser_websocket_url(port: u16) -> Option<String> {
 
 #[async_trait]
 impl BrowserPlatform for LinuxBrowserPlatform {
+    fn isolated_browser_executable(&self) -> Result<String, BrowserRefusal> {
+        for candidate in isolated_browser_candidates() {
+            let Ok(executable) = select_isolated_browser_executable([candidate]) else {
+                continue;
+            };
+            if trusted_root_owned_installation(std::path::Path::new(&executable)) {
+                return Ok(executable);
+            }
+        }
+        Err(refusal(
+            BrowserRefusalCode::BrowserRouteUnavailable,
+            "no root-owned, non-writable system Chromium executable is available for isolated launch",
+        ))
+    }
+
     fn standalone_trusted_input_background_limitation(&self) -> Option<&'static str> {
         Some("Chromium's trusted CDP Input route activates its standalone browser window on Linux")
     }
@@ -443,6 +538,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
             product_kind,
             product: Some(process.name),
             channel: None,
+            process_role: process_role_for_pid(pid, product_kind),
             supports_cdp: chromium,
         })
     }
@@ -650,10 +746,6 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         pid: i64,
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
         ensure_profile_discoverable(pid)?;
-        if let Some(endpoint) = active_port_endpoint(pid)? {
-            ensure_profile_discoverable(pid)?;
-            return Ok(Some(endpoint));
-        }
         let ports = cua_driver_core::blocking::spawn(move || loopback_ports_for_pid(pid))
             .await
             .map_err(|error| {
@@ -668,6 +760,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                 return Ok(Some(OwnedEndpoint {
                     ws_url,
                     http_port: Some(port),
+                    transport: EndpointTransport::LegacyJsonVersion,
                     ownership: EndpointOwnershipProof {
                         method: EndpointOwnershipMethod::ListeningSocketPid,
                         owner_pid: pid,
@@ -710,6 +803,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
             [(port, ws_url)] => Ok(Some(OwnedEndpoint {
                 ws_url: ws_url.clone(),
                 http_port: Some(*port),
+                transport: EndpointTransport::LegacyJsonVersion,
                 ownership: EndpointOwnershipProof {
                     method: EndpointOwnershipMethod::ListeningSocketPid,
                     owner_pid: pid,
@@ -736,6 +830,16 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                 "the approved existing-profile endpoint is not loopback-only",
             ));
         };
+        if let Some(endpoint) = active_port_endpoint(pid)? {
+            if endpoint.ws_url != expected_ws_url {
+                return Err(refusal(
+                    BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                    "the browser's exact DevTools endpoint changed after approval",
+                ));
+            }
+            ensure_profile_discoverable(pid)?;
+            return Ok(Some(endpoint));
+        }
         let ports = cua_driver_core::blocking::spawn(move || loopback_ports_for_pid(pid))
             .await
             .map_err(|error| {
@@ -752,6 +856,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         Ok(Some(OwnedEndpoint {
             ws_url: expected_ws_url.to_owned(),
             http_port: Some(port),
+            transport: EndpointTransport::LegacyJsonVersion,
             ownership: EndpointOwnershipProof {
                 method: EndpointOwnershipMethod::ListeningSocketPid,
                 owner_pid: pid,
@@ -883,6 +988,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
                     break Ok(OwnedEndpoint {
                         ws_url: ws_url.clone(),
                         http_port: Some(*port),
+                        transport: EndpointTransport::LegacyJsonVersion,
                         ownership: EndpointOwnershipProof {
                             method: EndpointOwnershipMethod::ListeningSocketPid,
                             owner_pid: request.pid,
@@ -1012,6 +1118,41 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         })?
     }
 
+    fn cleanup_existing_profile_setup(
+        &self,
+        request: ExistingProfileSetupRequest,
+    ) -> Result<bool, BrowserRefusal> {
+        let descriptor = existing_profile_setup_descriptor(request.browser).ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                format!(
+                    "existing-profile cleanup is not implemented for {:?}",
+                    request.browser
+                ),
+            )
+        })?;
+        let pid = u32::try_from(request.pid).map_err(|_| {
+            refusal(
+                BrowserRefusalCode::BrowserWrongTargetRefused,
+                "the approved browser pid is outside the Linux process-id range",
+            )
+        })?;
+        let window_id = request.window_id;
+        let profile_path = user_data_dir_for_pid(request.pid)?.ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserBindingStale,
+                "the approved browser profile path could not be proven for cleanup",
+            )
+        })?;
+        run_existing_profile_cleanup(move || {
+            let dismissed_before = crate::browser_consent_ui::dismiss(pid, window_id)?;
+            let closed_setup_page =
+                crate::browser_setup_ui::disable(pid, window_id, descriptor, &profile_path)?;
+            let dismissed_after = crate::browser_consent_ui::dismiss(pid, window_id)?;
+            Ok(dismissed_before || closed_setup_page || dismissed_after)
+        })?
+    }
+
     async fn abort_existing_profile_setup(
         &self,
         request: ExistingProfileSetupRequest,
@@ -1060,7 +1201,13 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         &self,
         request: PrepareRequest,
     ) -> Result<PrepareOutcome, BrowserRefusal> {
-        if let Some(endpoint) = self.discover_owned_endpoint(request.pid).await? {
+        let Some(pid) = request.pid else {
+            return Err(refusal(
+                BrowserRefusalCode::BrowserRequiresSetup,
+                "pid-free isolated launch is handled by shared core",
+            ));
+        };
+        if let Some(endpoint) = self.discover_owned_endpoint(pid).await? {
             return Ok(PrepareOutcome {
                 action: PrepareAction::AlreadyPrepared,
                 prepared_pid: Some(endpoint.ownership.owner_pid),
@@ -1080,6 +1227,44 @@ impl BrowserPlatform for LinuxBrowserPlatform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn existing_profile_cleanup_can_drive_atspi_runtime_from_async_session_teardown() {
+        let cleaned = run_existing_profile_cleanup(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("AT-SPI-style cleanup runtime")
+                .block_on(async { true })
+        })
+        .expect("cleanup worker");
+
+        assert!(cleaned);
+    }
+
+    #[test]
+    fn isolated_browser_candidates_use_only_root_managed_payloads() {
+        let candidates = isolated_browser_candidates();
+        assert!(candidates.iter().all(|candidate| candidate.is_absolute()));
+        assert_eq!(
+            candidates,
+            [
+                "/opt/google/chrome/google-chrome",
+                "/usr/lib/chromium/chromium",
+                "/usr/lib/chromium-browser/chromium-browser",
+                "/opt/microsoft/msedge/msedge",
+            ]
+            .map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn user_owned_writable_candidate_is_not_a_trusted_installation() {
+        let root = tempfile::tempdir().expect("temporary untrusted installation");
+        let executable = root.path().join("google-chrome");
+        std::fs::write(&executable, b"not a browser").expect("untrusted executable fixture");
+        assert!(!trusted_root_owned_installation(&executable));
+    }
 
     #[test]
     fn proc_net_parser_returns_only_loopback_listeners() {

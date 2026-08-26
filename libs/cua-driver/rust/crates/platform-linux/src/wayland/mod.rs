@@ -5,10 +5,9 @@
 //! staging `ext_foreign_toplevel_list_v1`, captures per-output screenshots via
 //! `zwlr_screencopy_manager_v1` + `wl_shm` (native — `grim` remains a
 //! fallback), and synthesises pointer / scroll / drag input via
-//! `zwlr_virtual_pointer_v1`. Per-window image capture is deferred until
-//! `ext-foreign-toplevel-image-capture-source-v1` lands in
-//! `wayland-protocols-wlr`; until then `screenshot_window_dispatch` returns a
-//! typed error on pure Wayland.
+//! `zwlr_virtual_pointer_v1`. Until identified per-toplevel capture is broadly
+//! available, window-scoped screenshots use output crops only for visible,
+//! compositor-attested surfaces and return a typed identity error otherwise.
 
 pub mod ext_screencopy;
 pub mod ext_toplevel;
@@ -308,6 +307,38 @@ fn identity_registry() -> &'static Mutex<HashMap<u64, ToplevelIdentity>> {
 fn observed_origin_registry() -> &'static Mutex<HashMap<u32, (i32, i32)>> {
     static REGISTRY: OnceLock<Mutex<HashMap<u32, (i32, i32)>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn listed_window_registry() -> &'static Mutex<HashMap<(u32, u64), u64>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<(u32, u64), u64>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remember_listed_windows(windows: &[WindowInfo]) {
+    if let Ok(mut registry) = listed_window_registry().lock() {
+        for window in windows {
+            if let Some((pid, instance_id)) = window.pid.and_then(|pid| {
+                crate::proc_fs::process_instance_id(pid).map(|instance_id| (pid, instance_id))
+            }) {
+                registry.insert((pid, window.xid), instance_id);
+            }
+        }
+    }
+}
+
+pub fn window_was_listed_for_pid(pid: u32, window_id: u64) -> bool {
+    let current_instance = crate::proc_fs::process_instance_id(pid);
+    listed_window_registry()
+        .lock()
+        .ok()
+        .and_then(|registry| registry.get(&(pid, window_id)).copied())
+        == current_instance
+        && current_instance.is_some()
+}
+
+fn listed_windows(windows: Vec<WindowInfo>) -> Vec<WindowInfo> {
+    remember_listed_windows(&windows);
+    windows
 }
 
 pub fn remember_observed_window_origins(windows: &[WindowInfo]) {
@@ -691,6 +722,17 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for State {
 /// available. pid is unknown (not exposed by the protocol); geometry is 0
 /// (the protocol does not surface position/size). app_id is folded into the
 /// title (`"<title> [<app_id>]"`) so callers matching on either still match.
+fn sway_windows_for_mode(
+    inject_mode: bool,
+    provider: impl FnOnce() -> Option<Vec<sway_ipc::Window>>,
+) -> Vec<sway_ipc::Window> {
+    if inject_mode {
+        Vec::new()
+    } else {
+        provider().unwrap_or_default()
+    }
+}
+
 pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
     let conn = Connection::connect_to_env()?;
     let mut queue = conn.new_event_queue::<State>();
@@ -708,7 +750,7 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
         queue.roundtrip(&mut state)?;
     }
 
-    let sway_windows = sway_ipc::list_windows().unwrap_or_default();
+    let sway_windows = sway_windows_for_mode(is_inject_mode(), sway_ipc::list_windows);
     let mut used_sway_ids = HashSet::new();
     let mut out = Vec::new();
     for (id, tl) in &state.toplevels {
@@ -721,20 +763,24 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
         } else {
             format!("{} [{}]", tl.title, tl.app_id)
         };
-        let sway = sway_windows
-            .iter()
-            .find(|window| {
-                !used_sway_ids.contains(&window.id)
-                    && !tl.title.is_empty()
-                    && window.title == tl.title
-            })
-            .or_else(|| {
-                sway_windows.iter().find(|window| {
+        let sway = if exact_private_target {
+            None
+        } else {
+            sway_windows
+                .iter()
+                .find(|window| {
                     !used_sway_ids.contains(&window.id)
-                        && !tl.app_id.is_empty()
-                        && window.app_id == tl.app_id
+                        && !tl.title.is_empty()
+                        && window.title == tl.title
                 })
-            });
+                .or_else(|| {
+                    sway_windows.iter().find(|window| {
+                        !used_sway_ids.contains(&window.id)
+                            && !tl.app_id.is_empty()
+                            && window.app_id == tl.app_id
+                    })
+                })
+        };
         let stable_id = if exact_private_target {
             private_target_window_id(&tl.app_id)
         } else {
@@ -1019,49 +1065,189 @@ pub(crate) unsafe fn borrowed_fd(fd: i32) -> std::os::fd::OwnedFd {
     std::os::fd::OwnedFd::from_raw_fd(dup)
 }
 
-/// Capture dispatcher: native Wayland (screencopy with grim fallback) when
-/// applicable, else X11. Mirrors `screenshot_window_dispatch` for the
-/// output-level path used by `get_window_state`'s vision payload.
-pub fn screenshot_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
-    if is_wayland() {
-        // The private compositor temporarily disables every other toplevel for
-        // one screencopy lease, so output capture becomes an exact target image
-        // even when that target was occluded. Drop restores the scene; the
-        // compositor also restores on socket close or a bounded timeout.
-        let _private_capture = if is_inject_mode() {
-            Some(inject_capture_lease(xid)?)
-        } else {
-            None
-        };
-        if shell_helper::present() {
-            if !shell_helper::available() {
-                anyhow::bail!(
-                    "helper_protocol_mismatch: installed GNOME WinRects helper does not support the required exact-target protocol"
-                );
-            }
-            // WinRects v3 binds the exact target, geometry, logical display
-            // dimensions, and pixels in one Shell transaction, then crops
-            // before returning to this target-level caller.
-            return shell_helper::screenshot_window(xid);
-        }
+/// A Wayland output crop cannot prove which surface supplied its pixels. This
+/// is especially unsafe for off-workspace XWayland windows: their X11 geometry
+/// can crop the active workspace at the requested coordinates.
+#[derive(Debug)]
+pub struct SurfaceIdentityUnproven {
+    window_id: u64,
+    reason: &'static str,
+}
 
-        let bytes = screenshot_display_dispatch()?;
-        let (x, y, width, height) = window_geometry(xid).ok_or_else(|| {
-            anyhow::anyhow!(
-                "stale_target: Wayland window {xid} disappeared before exact target crop"
-            )
-        })?;
-        crop_png_to_rect(
-            &bytes,
-            x,
-            y,
-            width,
-            height,
-            &format!("Wayland window {xid}"),
+impl std::fmt::Display for SurfaceIdentityUnproven {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "surface_identity_unproven: Wayland capture cannot prove pixels belong to window {}: {}",
+            self.window_id, self.reason
         )
-    } else {
-        crate::capture::screenshot_window_bytes(xid)
     }
+}
+
+impl std::error::Error for SurfaceIdentityUnproven {}
+
+pub fn is_surface_identity_unproven(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<SurfaceIdentityUnproven>().is_some()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WaylandWindowCrop {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+fn surface_identity_unproven(window_id: u64, reason: &'static str) -> anyhow::Error {
+    SurfaceIdentityUnproven { window_id, reason }.into()
+}
+
+fn attested_wayland_crop(
+    xid: u64,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    visible: bool,
+) -> anyhow::Result<WaylandWindowCrop> {
+    if !visible {
+        return Err(surface_identity_unproven(
+            xid,
+            "the compositor reports the surface is not visible on the active workspace",
+        ));
+    }
+    if width == 0 || height == 0 {
+        return Err(surface_identity_unproven(
+            xid,
+            "the compositor reports empty surface geometry",
+        ));
+    }
+    Ok(WaylandWindowCrop {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+/// Resolve a crop only from compositor-owned metadata that also proves the
+/// surface is present on the currently rendered workspace. X11 geometry and
+/// AT-SPI bounds are intentionally insufficient: an off-workspace XWayland
+/// window retains both while the output contains another application's pixels.
+fn wayland_window_crop(xid: u64) -> anyhow::Result<WaylandWindowCrop> {
+    if let Some(window) = sway_ipc::window_for_id(xid) {
+        return attested_wayland_crop(
+            xid,
+            window.x,
+            window.y,
+            window.width,
+            window.height,
+            window.visible,
+        );
+    }
+    if let Some(window) = shell_helper::list_windows(None)
+        .and_then(|windows| windows.into_iter().find(|window| window.xid == xid))
+    {
+        return attested_wayland_crop(
+            xid,
+            window.x,
+            window.y,
+            window.width,
+            window.height,
+            window.is_on_screen,
+        );
+    }
+    Err(surface_identity_unproven(
+        xid,
+        "no compositor-attested window geometry is available",
+    ))
+}
+
+fn screenshot_window_bytes_with_dispatch(
+    wayland: bool,
+    xid: u64,
+    wayland_crop: impl FnOnce(u64) -> anyhow::Result<WaylandWindowCrop>,
+    display_capture: impl FnOnce() -> anyhow::Result<Vec<u8>>,
+    x11_capture: impl FnOnce(u64) -> anyhow::Result<Vec<u8>>,
+) -> anyhow::Result<Vec<u8>> {
+    if wayland {
+        let crop = wayland_crop(xid)?;
+        let output = display_capture()?;
+        return crop_png_to_rect(
+            &output,
+            crop.x,
+            crop.y,
+            crop.width,
+            crop.height,
+            &format!("Wayland window {xid}"),
+        );
+    }
+    x11_capture(xid)
+}
+
+/// Window capture dispatcher. X11 uses its per-window capture path. Wayland
+/// crops output pixels only when compositor metadata proves that the requested
+/// surface is currently rendered; otherwise it fails closed. Output-level
+/// capture remains available through [`screenshot_display_dispatch`].
+pub fn screenshot_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
+    if !is_wayland() {
+        return crate::capture::screenshot_window_bytes(xid);
+    }
+
+    // The private compositor temporarily disables every other toplevel for one
+    // screencopy lease, so output capture becomes an exact target image even
+    // when that target was occluded. Its surface token is intentionally not a
+    // GNOME/Sway identity, so resolve geometry through the private compositor
+    // path while the isolation lease is held.
+    if is_inject_mode() {
+        let _private_capture = inject_capture_lease(xid)?;
+        return isolated_private_window_capture_with_dispatch(
+            xid,
+            screenshot_display_dispatch,
+            private_window_geometry,
+        );
+    }
+
+    // On GNOME, prefer the helper's atomic target-bound capture. A present but
+    // incompatible helper must fail closed rather than silently downgrade to an
+    // output crop from another surface or workspace.
+    if shell_helper::present() {
+        if !shell_helper::available() {
+            anyhow::bail!(
+                "helper_protocol_mismatch: installed GNOME WinRects helper does not support the required exact-target protocol"
+            );
+        }
+        return shell_helper::screenshot_window(xid);
+    }
+
+    screenshot_window_bytes_with_dispatch(
+        true,
+        xid,
+        wayland_window_crop,
+        screenshot_display_dispatch,
+        crate::capture::screenshot_window_bytes,
+    )
+}
+
+fn isolated_private_window_capture_with_dispatch(
+    xid: u64,
+    display_capture: impl FnOnce() -> anyhow::Result<Vec<u8>>,
+    geometry: impl FnOnce(u64) -> Option<(i32, i32, u32, u32)>,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = display_capture()?;
+    let (x, y, width, height) = geometry(xid).ok_or_else(|| {
+        anyhow::anyhow!(
+            "stale_target: private Wayland window {xid} disappeared before exact target crop"
+        )
+    })?;
+    crop_png_to_rect(
+        &bytes,
+        x,
+        y,
+        width,
+        height,
+        &format!("private Wayland window {xid}"),
+    )
 }
 
 fn crop_png_to_rect(
@@ -1205,31 +1391,19 @@ pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
     crate::capture::screenshot_display_bytes_x11()
 }
 
-/// Per-window capture dispatcher. On X11 forwards to the existing window
-/// capture path; on pure Wayland returns a typed error pointing at the
-/// staging `ext-image-copy-capture-v1` protocol — wlr-screencopy is
-/// output-only, and `foreign-toplevel` exposes no per-window geometry to
-/// crop with.
+fn checked_shell_helper_capture(
+    available: bool,
+    capture: impl FnOnce() -> Option<Vec<u8>>,
+) -> Option<anyhow::Result<Vec<u8>>> {
+    available
+        .then(|| capture().ok_or_else(|| anyhow::anyhow!("GNOME compositor helper capture failed")))
+}
+
+/// Per-window capture dispatcher. Kept as the explicit window-capture entry
+/// point for callers outside `get_window_state`; it shares the same fail-closed
+/// Wayland contract as [`screenshot_dispatch`].
 pub fn screenshot_window_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
-    if is_wayland() {
-        if let Some((x, y, width, height)) = window_geometry(xid) {
-            return crop_png_to_rect(
-                &screenshot_display_dispatch()?,
-                x,
-                y,
-                width,
-                height,
-                &format!("Wayland window {xid}"),
-            );
-        }
-        anyhow::bail!(
-            "per-window screenshot is not yet supported on native Wayland — \
-             zwlr_screencopy_manager_v1 is output-only and ext-image-copy-capture-v1 \
-             is not yet shipped in wayland-protocols-wlr. Run under XWayland to crop \
-             to a single window, or capture the full output instead."
-        );
-    }
-    crate::capture::screenshot_window_bytes(xid)
+    screenshot_dispatch(xid)
 }
 
 // ── Input session helper ─────────────────────────────────────────────────────
@@ -3737,6 +3911,49 @@ fn inject_window_origin_for_window(window_id: u64) -> Option<(i32, i32)> {
         .map(|geometry| geometry.1)
 }
 
+fn select_private_window_geometry(
+    exact: &WindowInfo,
+    accessible: &[WindowInfo],
+    origin: (i32, i32),
+) -> Option<(i32, i32, u32, u32)> {
+    let target = exact.target_id.as_deref()?;
+    if !target.starts_with("surface:") {
+        return None;
+    }
+    let pid = exact.pid?;
+    if private_target_client_pid(target) != Some(pid) {
+        return None;
+    }
+    let candidates = accessible
+        .iter()
+        .filter(|window| {
+            window.pid == Some(pid)
+                && window.width > 0
+                && window.height > 0
+                && (exact.title.is_empty() || window.title == exact.title)
+        })
+        .collect::<Vec<_>>();
+    let [window] = candidates.as_slice() else {
+        return None;
+    };
+    Some((origin.0, origin.1, window.width, window.height))
+}
+
+fn private_window_geometry(window_id: u64) -> Option<(i32, i32, u32, u32)> {
+    if !is_inject_mode() {
+        return None;
+    }
+    // Enumerate directly from the private Wayland connection. Do not consult
+    // list_windows_dispatch/window_geometry: those intentionally include host
+    // GNOME and Sway providers that are outside the private session's trust root.
+    let native = list_windows().ok()?;
+    let exact = native.iter().find(|window| window.xid == window_id)?;
+    let pid = exact.pid?;
+    let accessible = crate::atspi::list_windows(Some(pid));
+    let origin = inject_window_origin_for_window(window_id)?;
+    select_private_window_geometry(exact, &accessible, origin)
+}
+
 /// Resolve a window_id to its xdg app_id via the stable identity registry that
 /// [`list_windows`] populates (falling back to sway IPC / AT-SPI through
 /// [`identity_for`]) — the nested cua-compositor injection protocol addresses
@@ -4018,9 +4235,55 @@ fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     windows
 }
 
+fn private_session_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
+    let mut native = match list_windows() {
+        Ok(windows) => windows,
+        Err(error) => {
+            tracing::error!("private compositor window enumeration failed: {error}");
+            return Vec::new();
+        }
+    };
+    let accessible = crate::atspi::list_windows(filter_pid);
+    for window in &mut native {
+        let private_exact = window
+            .target_id
+            .as_deref()
+            .is_some_and(|target| target.starts_with("surface:"));
+        if !private_exact {
+            continue;
+        }
+        let Some(origin) = inject_window_origin_for_window(window.xid) else {
+            continue;
+        };
+        if let Some((x, y, width, height)) =
+            select_private_window_geometry(window, &accessible, origin)
+        {
+            window.x = x;
+            window.y = y;
+            window.width = width;
+            window.height = height;
+            window.is_on_screen = true;
+        }
+    }
+    native.retain(|window| {
+        window
+            .target_id
+            .as_deref()
+            .is_some_and(|target| target.starts_with("surface:"))
+            && filter_pid.is_none_or(|pid| window.pid == Some(pid))
+    });
+    listed_windows(native)
+}
+
 /// Window-enumeration dispatcher: native Wayland when available, else X11.
 pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     if wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        // A private compositor is its own identity and geometry trust root.
+        // Select it before ambient GNOME D-Bus or SWAYSOCK providers so host
+        // windows can never be mistaken for nested private targets.
+        if is_inject_mode() {
+            return private_session_windows(filter_pid);
+        }
         if shell_helper::present() {
             if !shell_helper::available() {
                 tracing::error!(
@@ -4050,26 +4313,26 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
             Ok(ws) if !ws.is_empty() => {
                 if let Some(pid) = filter_pid {
                     if let Some(filtered) = native_windows_for_pid(ws, pid) {
-                        return filtered;
+                        return listed_windows(filtered);
                     }
                 } else {
-                    return ws;
+                    return listed_windows(ws);
                 }
                 // A compositor window without pid metadata cannot satisfy a
                 // pid-scoped request. Continue to the AT-SPI registry.
                 let ws = wayland_atspi_windows(filter_pid);
                 if !ws.is_empty() {
-                    return ws;
+                    return listed_windows(ws);
                 }
             }
             Ok(_) => {
                 if let Some(ws) = shell_helper::list_windows(filter_pid).filter(|ws| !ws.is_empty())
                 {
-                    return ws;
+                    return listed_windows(ws);
                 }
                 let ws = wayland_atspi_windows(filter_pid);
                 if !ws.is_empty() {
-                    return ws;
+                    return listed_windows(ws);
                 }
             }
             Err(e) => {
@@ -4078,12 +4341,12 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
                     tracing::debug!(
                         "native Wayland protocols unavailable ({e}); using compositor helper"
                     );
-                    return ws;
+                    return listed_windows(ws);
                 }
                 tracing::warn!("native Wayland list_windows failed: {e}; trying AT-SPI registry");
                 let ws = wayland_atspi_windows(filter_pid);
                 if !ws.is_empty() {
-                    return ws;
+                    return listed_windows(ws);
                 }
             }
         }
@@ -4111,7 +4374,7 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
             merge_atspi_windows(&mut ws, &seen, wayland_atspi_windows(filter_pid));
         }
     }
-    ws
+    listed_windows(ws)
 }
 
 fn merge_atspi_windows(
@@ -4648,7 +4911,40 @@ mod tests {
     }
 
     #[test]
-    fn sway_window_capture_is_cropped_to_compositor_geometry() {
+    fn private_mode_never_invokes_the_ambient_sway_provider() {
+        let called = std::cell::Cell::new(false);
+        let windows = sway_windows_for_mode(true, || {
+            called.set(true);
+            Some(Vec::new())
+        });
+        assert!(windows.is_empty());
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn private_compositor_geometry_uses_credential_pid_and_unique_accessible_window() {
+        let pid = 123;
+        let mut exact = window(42, Some(pid), "Private fixture");
+        exact.target_id = Some(format!("surface:1111111111111111:2222222222222222:{pid}"));
+        let mut accessible = window(7, Some(pid), "Private fixture");
+        accessible.width = 3;
+        accessible.height = 4;
+        let mut host_distractor = window(8, Some(999), "Private fixture");
+        host_distractor.width = 900;
+        host_distractor.height = 700;
+
+        assert_eq!(
+            select_private_window_geometry(&exact, &[accessible.clone(), host_distractor], (2, 1)),
+            Some((2, 1, 3, 4))
+        );
+        assert!(
+            select_private_window_geometry(&exact, &[accessible.clone(), accessible], (2, 1),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn private_compositor_capture_uses_isolated_output_geometry() {
         let source = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
             8,
             6,
@@ -4658,9 +4954,111 @@ mod tests {
         source
             .write_to(&mut encoded, image::ImageFormat::Png)
             .expect("encode fixture PNG");
-        let cropped =
-            crop_png_to_rect_with_logical_size(encoded.get_ref(), 2, 1, 3, 4, "fixture", None)
-                .expect("crop fixture PNG");
+        let requested = std::cell::Cell::new(None);
+        let cropped = isolated_private_window_capture_with_dispatch(
+            42,
+            || Ok(encoded.into_inner()),
+            |xid| {
+                requested.set(Some(xid));
+                Some((2, 1, 3, 4))
+            },
+        )
+        .expect("private exact-output capture should crop by private compositor geometry");
+        assert_eq!(requested.get(), Some(42));
+        let decoded = image::load_from_memory(&cropped).expect("decode cropped PNG");
+        assert_eq!((decoded.width(), decoded.height()), (3, 4));
+    }
+
+    #[test]
+    fn wayland_window_capture_fails_closed_without_using_x11_pixels() {
+        let display_called = std::cell::Cell::new(false);
+        let x11_called = std::cell::Cell::new(false);
+        let error = screenshot_window_bytes_with_dispatch(
+            true,
+            0x2962,
+            |xid| {
+                Err(surface_identity_unproven(
+                    xid,
+                    "fixture surface is off-workspace",
+                ))
+            },
+            || {
+                display_called.set(true);
+                Ok(vec![9, 9, 9])
+            },
+            |_| {
+                x11_called.set(true);
+                Ok(vec![1, 2, 3])
+            },
+        )
+        .expect_err("Wayland output pixels cannot prove a window surface");
+
+        assert!(is_surface_identity_unproven(&error));
+        assert!(error.to_string().contains("window 10594"));
+        assert!(!display_called.get());
+        assert!(!x11_called.get());
+    }
+
+    #[test]
+    fn x11_window_capture_keeps_the_existing_per_window_path() {
+        let captured_xid = std::cell::Cell::new(None);
+        let bytes = screenshot_window_bytes_with_dispatch(
+            false,
+            42,
+            |_| panic!("X11 must not resolve a Wayland crop"),
+            || panic!("X11 must not capture the Wayland output"),
+            |xid| {
+                captured_xid.set(Some(xid));
+                Ok(vec![1, 2, 3])
+            },
+        )
+        .expect("X11 per-window capture should remain available");
+
+        assert_eq!(captured_xid.get(), Some(42));
+        assert_eq!(bytes, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn listed_wayland_identity_remains_valid_when_current_enumeration_hides_it() {
+        let pid = std::process::id();
+        let window_id = 0xf2962_0001;
+        assert!(!window_was_listed_for_pid(pid, window_id));
+
+        let mut listed = window(window_id, Some(pid), "");
+        listed.is_on_screen = false;
+        remember_listed_windows(&[listed]);
+
+        assert!(window_was_listed_for_pid(pid, window_id));
+        assert!(!window_was_listed_for_pid(pid + 1, window_id));
+        assert!(!window_was_listed_for_pid(pid, window_id + 1));
+    }
+
+    #[test]
+    fn compositor_attested_visible_wayland_surface_keeps_window_capture() {
+        let source = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            8,
+            6,
+            image::Rgba([20, 40, 60, 255]),
+        ));
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        source
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode fixture PNG");
+        let cropped = screenshot_window_bytes_with_dispatch(
+            true,
+            42,
+            |_| {
+                Ok(WaylandWindowCrop {
+                    x: 2,
+                    y: 1,
+                    width: 3,
+                    height: 4,
+                })
+            },
+            || Ok(encoded.into_inner()),
+            |_| panic!("Wayland must not use the X11 capture path"),
+        )
+        .expect("visible compositor-attested Wayland surface should capture");
         let decoded = image::load_from_memory(&cropped).expect("decode cropped PNG");
         assert_eq!((decoded.width(), decoded.height()), (3, 4));
     }

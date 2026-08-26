@@ -992,11 +992,12 @@ pub fn abort_pending(pid: u32, window_id: u64, error: BrowserRefusal) -> Browser
     }
 }
 
-pub fn enable(
+fn set_remote_debugging(
     pid: u32,
     window_id: u64,
     descriptor: &'static BrowserSetupDescriptor,
     profile_path: &Path,
+    desired_enabled: bool,
 ) -> Result<SetupUiHandle, BrowserRefusal> {
     let target = crate::wayland::establish_exact_target(pid, window_id).map_err(|error| {
         refusal(
@@ -1072,13 +1073,15 @@ pub fn enable(
         };
         match exact_setup_checkbox(&tree.nodes, descriptor, handle.trusted_setup_navigation) {
             Ok(Some(node)) => match node.checked {
-                Some(true) => {
-                    if handle.enable_attempted {
+                Some(state) if state == desired_enabled => {
+                    if desired_enabled && handle.enable_attempted {
                         handle.enabled_remote_debugging = true;
+                    } else if !desired_enabled {
+                        handle.enabled_remote_debugging = false;
                     }
                     return Ok(handle);
                 }
-                Some(false) if !handle.enable_attempted => {
+                Some(state) if state != desired_enabled && !handle.enable_attempted => {
                     let element_key = node.element_key;
                     if let Err(error) = validate_single_exact_native_window(&handle.target) {
                         return Err(handle.abort(refusal(
@@ -1096,7 +1099,7 @@ pub fn enable(
                         handle.trusted_setup_navigation,
                     ) {
                         Ok(Some(current_checkbox))
-                            if current_checkbox.checked == Some(false)
+                            if current_checkbox.checked == Some(state)
                                 && current_checkbox.element_key == element_key =>
                         {
                             current_checkbox
@@ -1131,7 +1134,7 @@ pub fn enable(
                         )));
                     }
                 }
-                Some(false)
+                Some(_)
                     if descriptor.product == BrowserProduct::MicrosoftEdge
                         && !handle.trusted_checkbox_fallback_attempted =>
                 {
@@ -1155,10 +1158,10 @@ pub fn enable(
                                 "the exact Microsoft Edge remote-debugging checkbox became stale before the trusted click"
                             )
                         })?;
-                        if checkbox.checked == Some(true) {
+                        if checkbox.checked == Some(desired_enabled) {
                             return Ok(false);
                         }
-                        if checkbox.checked != Some(false) {
+                        if checkbox.checked != Some(!desired_enabled) {
                             anyhow::bail!(
                                 "the exact Microsoft Edge remote-debugging checkbox had an unknown state before the trusted click"
                             );
@@ -1178,7 +1181,7 @@ pub fn enable(
                                 "the exact Microsoft Edge checkbox disappeared before the trusted click"
                             )
                         })?;
-                        if current_checkbox.checked != Some(false)
+                        if current_checkbox.checked != Some(!desired_enabled)
                             || current_checkbox.element_key != element_key
                         {
                             anyhow::bail!(
@@ -1236,7 +1239,7 @@ pub fn enable(
                         }
                     }
                 }
-                Some(false) => {}
+                Some(_) => {}
                 None => {
                     return Err(handle.abort(refusal(
                         BrowserRefusalCode::BrowserWrongTargetRefused,
@@ -1255,6 +1258,25 @@ pub fn enable(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+pub fn enable(
+    pid: u32,
+    window_id: u64,
+    descriptor: &'static BrowserSetupDescriptor,
+    profile_path: &Path,
+) -> Result<SetupUiHandle, BrowserRefusal> {
+    set_remote_debugging(pid, window_id, descriptor, profile_path, true)
+}
+
+pub fn disable(
+    pid: u32,
+    window_id: u64,
+    descriptor: &'static BrowserSetupDescriptor,
+    profile_path: &Path,
+) -> Result<bool, BrowserRefusal> {
+    let handle = set_remote_debugging(pid, window_id, descriptor, profile_path, false)?;
+    Ok(handle.close_for_success()?.unwrap_or(false))
 }
 
 #[cfg(test)]

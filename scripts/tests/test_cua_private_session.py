@@ -24,6 +24,7 @@ def test_private_environment_drops_human_desktop_endpoints(tmp_path, monkeypatch
     monkeypatch.setenv("HOME", "/home/human")
     monkeypatch.setenv("DISPLAY", ":99")
     monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-human")
+    monkeypatch.setenv("SWAYSOCK", "/run/user/1000/sway-human.sock")
     monkeypatch.setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/human")
     args = module._parser().parse_args(
         ["--name", "lane-a", "--state-dir", str(tmp_path / "state"), "--dry-run"]
@@ -32,6 +33,7 @@ def test_private_environment_drops_human_desktop_endpoints(tmp_path, monkeypatch
 
     assert "DISPLAY" not in env
     assert "WAYLAND_DISPLAY" not in env
+    assert "SWAYSOCK" not in env
     assert "DBUS_SESSION_BUS_ADDRESS" not in env
     assert env["HOME"] == str(tmp_path / "state/home")
     assert env["XDG_STATE_HOME"].endswith("instances/lane-a/state")
