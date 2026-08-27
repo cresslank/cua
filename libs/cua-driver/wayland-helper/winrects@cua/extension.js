@@ -1554,7 +1554,9 @@ export default class WinRectsExtension extends Extension {
         const visible = record.requestedVisible && target && this._isTargetVisible(target);
         if (visible) {
             record.actor.show();
-            this._updateCursorBadge(record);
+            // The per-record frame callback owns badge fade and visibility.
+            // Revalidating the exact target here must not call the removed
+            // pre-animation badge rebuild path.
         } else {
             record.actor.hide();
             record.badge.hide();

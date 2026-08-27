@@ -70,6 +70,11 @@ async function waitUntil(predicate, failure, timeoutMs = 5000) {
     throw new Error(typeof failure === 'function' ? failure() : failure);
 }
 
+async function closeOverview(failure) {
+    Main.overview.hide();
+    await waitUntil(() => !Main.overview.visible, failure);
+}
+
 function windowActor(window) {
     return global.get_window_actors()
         .find(actor => actor.meta_window === window) ?? null;
@@ -81,11 +86,7 @@ function windowRect(window) {
 }
 
 export async function run() {
-    Main.overview.hide();
-    await waitUntil(
-        () => !Main.overview.visible,
-        'GNOME dev-kit overview did not close'
-    );
+    await closeOverview('GNOME dev-kit overview did not close');
 
     const existingIds = new Set(global.get_window_actors()
         .map(actor => actor.meta_window?.get_stable_sequence())
@@ -107,6 +108,7 @@ export async function run() {
         'GNOME dev-kit did not publish the first test window'
     );
     await Scripting.waitTestWindows();
+    await closeOverview('GNOME dev-kit overview reopened while mapping the first test window');
     // GNOME 50's no-X11 dev-kit does not expose a perf-helper actor until
     // input arrives. WaitWindows proves that the client mapped and painted;
     // show() stages that painted actor without involving the live desktop.
@@ -153,6 +155,7 @@ export async function run() {
         'GNOME dev-kit did not publish the second test window'
     );
     await Scripting.waitTestWindows();
+    await closeOverview('GNOME dev-kit overview reopened while mapping the second test window');
     // Stage the second mapped client actor for the same contained fixture.
     windowActor(topWindow).show();
     topWindow.unminimize();

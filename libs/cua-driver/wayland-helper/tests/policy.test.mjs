@@ -249,6 +249,7 @@ test('cursor ownership is connection-derived with disconnect and bounded-idle cl
     assert.match(extensionSource, /record\.lastUsedAt < cutoff/);
     assert.match(extensionSource, /MoveCursorForAsync/);
     assert.doesNotMatch(extensionSource, /\n\s*MoveCursorFor\(owner,/);
+    assert.doesNotMatch(extensionSource, /this\._updateCursorBadge\(/);
 });
 
 test('capture protocol exposes one exact target and one atomic result', async () => {
