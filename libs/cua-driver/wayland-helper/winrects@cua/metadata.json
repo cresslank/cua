@@ -3,5 +3,5 @@
   "description": "Exact GNOME window geometry, atomic target capture, bounded foreground transactions, and connection-owned semantic agent cursor/session-badge overlays for Cua",
   "uuid": "winrects@cua",
   "shell-version": ["45", "46", "47", "48", "49", "50"],
-  "version": 13
+  "version": 14
 }

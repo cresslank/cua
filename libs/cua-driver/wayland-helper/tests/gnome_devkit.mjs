@@ -233,6 +233,7 @@ export async function run() {
     topWindow = fixtureWindows.get(top.id);
     bottomWindow = fixtureWindows.get(bottom.id);
     assert(top.target_id.startsWith(`${top.helper_epoch}:`), 'top target is not epoch-bound');
+    assert(bottom.visible === true, 'painted overlapped target disappeared from discovery');
     assert(bottom.capture_current === false, 'overlapped lower target was marked capture-current');
 
     const [captureJson] = await call(

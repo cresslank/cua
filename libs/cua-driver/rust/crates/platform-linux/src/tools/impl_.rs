@@ -304,6 +304,127 @@ impl ToolState {
 pub struct ListAppsTool;
 static LIST_APPS_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+fn exact_installed_process_match(
+    process: &crate::proc_fs::ProcessInfo,
+    installed: &[crate::installed_apps::InstalledApp],
+) -> Option<usize> {
+    let argv0 = process
+        .argv
+        .first()
+        .map(String::as_str)
+        .or_else(|| (!process.cmdline.is_empty()).then_some(process.cmdline.as_str()))
+        .unwrap_or(&process.name);
+    let flatpak_id_matches = installed
+        .iter()
+        .enumerate()
+        .filter(|(_, app)| {
+            let launcher_tokens = app.launch_path.split_whitespace().collect::<Vec<_>>();
+            let is_flatpak_launcher = exec_basename(&app.launch_path) == "flatpak"
+                && launcher_tokens.get(1) == Some(&"run")
+                && launcher_tokens.iter().any(|token| *token == app.bundle_id);
+            let claims_id = process
+                .argv
+                .windows(2)
+                .any(|pair| pair[0] == "--name" && pair[1] == app.bundle_id)
+                || process
+                    .argv
+                    .iter()
+                    .any(|arg| arg.strip_prefix("--name=") == Some(app.bundle_id.as_str()));
+            let wm_class_matches = app
+                .startup_wm_class
+                .as_deref()
+                .is_none_or(|wm_class| wm_class == process.name);
+            is_flatpak_launcher && claims_id && wm_class_matches
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if flatpak_id_matches.len() == 1 {
+        return flatpak_id_matches.first().copied();
+    }
+    if !flatpak_id_matches.is_empty() {
+        return None;
+    }
+
+    let exact_executable_matches = installed
+        .iter()
+        .enumerate()
+        .filter(|(_, app)| {
+            exec_basename(&app.launch_path) != "flatpak"
+                && exec_program_token(&app.launch_path) == argv0
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if exact_executable_matches.len() == 1 {
+        return exact_executable_matches.first().copied();
+    }
+    None
+}
+
+fn merge_processes_with_installed_apps(
+    processes: &[crate::proc_fs::ProcessInfo],
+    installed: &[crate::installed_apps::InstalledApp],
+) -> Vec<Value> {
+    let mut consumed = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for process in processes {
+        let merged = exact_installed_process_match(process, installed);
+        if let Some(index) = merged {
+            consumed.insert(index);
+        }
+        let executable = process
+            .argv
+            .first()
+            .map(String::as_str)
+            .or_else(|| (!process.cmdline.is_empty()).then_some(process.cmdline.as_str()))
+            .unwrap_or(&process.name);
+        let basename = exec_basename(executable);
+        if basename.is_empty() {
+            continue;
+        }
+        let (name, bundle_id, launch_path, kind, last_used) = match merged {
+            Some(index) => {
+                let app = &installed[index];
+                (
+                    app.name.clone(),
+                    Some(app.bundle_id.clone()),
+                    Some(app.launch_path.clone()),
+                    Some("desktop".to_owned()),
+                    app.last_used.clone(),
+                )
+            }
+            None => (
+                if process.name.is_empty() {
+                    basename
+                } else {
+                    process.name.clone()
+                },
+                None,
+                None,
+                None,
+                None,
+            ),
+        };
+        out.push(json!({
+            "pid": process.pid, "bundle_id": bundle_id, "name": name,
+            "running": true, "active": false, "kind": kind,
+            "launch_path": launch_path, "last_used": last_used,
+            "windows": Vec::<Value>::new(),
+        }));
+    }
+    for (index, app) in installed.iter().enumerate() {
+        if consumed.contains(&index) {
+            continue;
+        }
+        out.push(json!({
+            "pid": 0, "bundle_id": app.bundle_id, "name": app.name,
+            "running": false, "active": false, "kind": "desktop",
+            "launch_path": app.launch_path, "last_used": app.last_used,
+            "windows": Vec::<Value>::new(),
+        }));
+    }
+    out
+}
+
 #[async_trait]
 impl Tool for ListAppsTool {
     fn def(&self) -> &ToolDef {
@@ -326,8 +447,9 @@ impl Tool for ListAppsTool {
                 Running apps come from `/proc`. Installed apps come from XDG Desktop Entry \
                 files in $XDG_DATA_HOME/applications and each $XDG_DATA_DIRS entry's \
                 applications/ subdir. Entries with `NoDisplay=true` or `Hidden=true` are \
-                filtered. A `.desktop` file whose launcher matches a running process \
-                (by basename) is merged into a single entry with `running: true`.\n\n\
+                filtered. A `.desktop` file is merged with a running process only from an exact, \
+                unambiguous executable path or a constrained `--name` desktop-ID claim \
+                corroborated by StartupWMClass when present; ambiguous aliases fail closed.\n\n\
                 Use this for \"is X installed?\" as well as \"is X running?\". For per-window \
                 state — visibility, geometry, titles — call list_windows instead."
                     .into(),
@@ -344,91 +466,7 @@ impl Tool for ListAppsTool {
             let procs = crate::proc_fs::list_processes();
             let installed = crate::installed_apps::list_installed_apps();
 
-            // Match running processes to installed apps by executable
-            // basename (Exec=firefox %u → "firefox"; cmdline /usr/bin/firefox
-            // → "firefox"). Many distros register multiple .desktop entries
-            // sharing the same basename (e.g. several `firefox` profiles, a
-            // `code` and a `code-insiders` both shelling `code`), so the
-            // bucket is `Vec<usize>` — we pick a winner per running process
-            // via `disambiguate_installed_match` instead of overwriting.
-            let mut by_exe: std::collections::HashMap<String, Vec<usize>> =
-                std::collections::HashMap::new();
-            for (i, app) in installed.iter().enumerate() {
-                let basename = exec_basename(&app.launch_path);
-                if !basename.is_empty() {
-                    by_exe.entry(basename).or_default().push(i);
-                }
-            }
-
-            let mut consumed: std::collections::HashSet<usize> = std::collections::HashSet::new();
-            let mut out = Vec::new();
-            for p in &procs {
-                let key_source = if !p.cmdline.is_empty() {
-                    &p.cmdline
-                } else {
-                    &p.name
-                };
-                let basename = exec_basename(key_source);
-                if basename.is_empty() {
-                    continue;
-                }
-                let candidates = by_exe.get(&basename).map(|v| v.as_slice()).unwrap_or(&[]);
-                let merged = disambiguate_installed_match(candidates, &installed, key_source);
-                if let Some(idx) = merged {
-                    consumed.insert(idx);
-                }
-                let (name, bundle_id, launch_path, kind, last_used) = match merged {
-                    Some(idx) => {
-                        let a = &installed[idx];
-                        (
-                            a.name.clone(),
-                            Some(a.bundle_id.clone()),
-                            Some(a.launch_path.clone()),
-                            Some("desktop".to_owned()),
-                            a.last_used.clone(),
-                        )
-                    }
-                    None => (
-                        if !p.name.is_empty() {
-                            p.name.clone()
-                        } else {
-                            basename.clone()
-                        },
-                        None,
-                        None,
-                        None,
-                        None,
-                    ),
-                };
-                out.push(json!({
-                    "pid":         p.pid,
-                    "bundle_id":   bundle_id,
-                    "name":        name,
-                    "running":     true,
-                    "active":      false,
-                    "kind":        kind,
-                    "launch_path": launch_path,
-                    "last_used":   last_used,
-                    "windows":     Vec::<serde_json::Value>::new(),
-                }));
-            }
-            for (i, app) in installed.iter().enumerate() {
-                if consumed.contains(&i) {
-                    continue;
-                }
-                out.push(json!({
-                    "pid":         0,
-                    "bundle_id":   app.bundle_id.clone(),
-                    "name":        app.name.clone(),
-                    "running":     false,
-                    "active":      false,
-                    "kind":        "desktop",
-                    "launch_path": app.launch_path.clone(),
-                    "last_used":   app.last_used.clone(),
-                    "windows":     Vec::<serde_json::Value>::new(),
-                }));
-            }
-            out
+            merge_processes_with_installed_apps(&procs, &installed)
         })
         .await
         .unwrap_or_default();
@@ -462,54 +500,9 @@ impl Tool for ListAppsTool {
     }
 }
 
-/// Pick which of several `.desktop`-derived installed apps best matches a
-/// running process whose basename collided. Precedence:
-///   1. exact full-launch-path equality with the process's cmdline token
-///      (so `/usr/bin/firefox` beats `/snap/firefox/current/firefox`)
-///   2. most recently modified launcher (`last_used` desc, RFC3339 string
-///      ordering is lexicographic-safe for our format)
-///   3. first candidate (deterministic by source order)
-fn disambiguate_installed_match(
-    candidates: &[usize],
-    installed: &[crate::installed_apps::InstalledApp],
-    proc_key_source: &str,
-) -> Option<usize> {
-    if candidates.is_empty() {
-        return None;
-    }
-    if candidates.len() == 1 {
-        return Some(candidates[0]);
-    }
-
-    // Look for an exact path match against the cmdline's first token.
-    let proc_path = proc_key_source.split_whitespace().next().unwrap_or("");
-    if !proc_path.is_empty() {
-        if let Some(&idx) = candidates
-            .iter()
-            .find(|&&i| installed[i].launch_path == proc_path)
-        {
-            return Some(idx);
-        }
-    }
-
-    // Fall back to the candidate with the most recent `last_used`.
-    candidates
-        .iter()
-        .copied()
-        .max_by(|&a, &b| {
-            installed[a]
-                .last_used
-                .as_deref()
-                .unwrap_or("")
-                .cmp(installed[b].last_used.as_deref().unwrap_or(""))
-        })
-        .or_else(|| candidates.first().copied())
-}
-
-/// Return the lowercase basename of an executable token, stripping any
-/// leading shell-wrapper words and quoting. `env FOO=1 /usr/bin/firefox %U`
-/// → `firefox`. `firefox %u` → `firefox`.
-fn exec_basename(s: &str) -> String {
+/// Return the executable token after stripping leading `env` assignments and
+/// outer quoting. `env FOO=1 /usr/bin/firefox %U` → `/usr/bin/firefox`.
+fn exec_program_token(s: &str) -> String {
     // Take the first whitespace-separated token that looks like a binary,
     // skipping `env`-style prefixes and `K=V` assignments.
     for tok in s.split_whitespace() {
@@ -521,19 +514,200 @@ fn exec_basename(s: &str) -> String {
             continue;
         }
         let cleaned = tok.trim_matches(|c| c == '"' || c == '\'');
-        let basename = std::path::Path::new(cleaned)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(cleaned);
-        return basename.to_ascii_lowercase();
+        return cleaned.to_owned();
     }
     String::new()
+}
+
+/// Return the lowercase basename of the executable token.
+fn exec_basename(s: &str) -> String {
+    let program = exec_program_token(s);
+    std::path::Path::new(&program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&program)
+        .to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod list_apps_tests {
+    use super::*;
+
+    fn app(
+        name: &str,
+        id: &str,
+        exec: &str,
+        wm_class: Option<&str>,
+    ) -> crate::installed_apps::InstalledApp {
+        crate::installed_apps::InstalledApp {
+            name: name.to_owned(),
+            bundle_id: id.to_owned(),
+            launch_path: exec.to_owned(),
+            startup_wm_class: wm_class.map(str::to_owned),
+            last_used: None,
+        }
+    }
+    fn process(pid: u32, name: &str, argv: &[&str]) -> crate::proc_fs::ProcessInfo {
+        crate::proc_fs::ProcessInfo {
+            pid,
+            name: name.to_owned(),
+            cmdline: argv.first().copied().unwrap_or_default().to_owned(),
+            argv: argv.iter().map(|arg| (*arg).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn exact_flatpak_identity_merges_running_zen_without_pid_zero_duplicate() {
+        let installed = vec![app(
+            "Zen Browser",
+            "app.zen_browser.zen",
+            "/usr/bin/flatpak run --branch=stable app.zen_browser.zen",
+            Some("zen"),
+        )];
+        let processes = vec![
+            process(
+                4242,
+                "zen",
+                &["/app/zen/zen", "--name", "app.zen_browser.zen"],
+            ),
+            process(
+                4243,
+                "Socket Process",
+                &["/app/zen/zen", "-contentproc", "-parentBuildID", "fixture"],
+            ),
+        ];
+        let apps = merge_processes_with_installed_apps(&processes, &installed);
+        let canonical = apps
+            .iter()
+            .filter(|app| app["bundle_id"] == "app.zen_browser.zen")
+            .collect::<Vec<_>>();
+        assert_eq!(canonical.len(), 1);
+        assert_eq!(canonical[0]["pid"], 4242);
+        assert_eq!(canonical[0]["name"], "Zen Browser");
+        assert!(apps
+            .iter()
+            .any(|app| app["pid"] == 4243 && app["bundle_id"].is_null()));
+        assert!(!apps.iter().any(|app| app["pid"] == 0));
+    }
+
+    #[test]
+    fn ambiguous_exact_aliases_fail_closed() {
+        let installed = vec![
+            app(
+                "First",
+                "org.example.First",
+                "/opt/first/shared",
+                Some("shared"),
+            ),
+            app(
+                "Second",
+                "org.example.Second",
+                "/opt/second/shared",
+                Some("shared"),
+            ),
+        ];
+        let apps = merge_processes_with_installed_apps(
+            &[process(7, "shared", &["/app/bin/shared"])],
+            &installed,
+        );
+        assert!(apps.iter().find(|app| app["pid"] == 7).unwrap()["bundle_id"].is_null());
+        assert_eq!(apps.iter().filter(|app| app["pid"] == 0).count(), 2);
+    }
+
+    #[test]
+    fn freeform_bundle_argument_and_wm_class_alone_do_not_claim_identity() {
+        let installed = vec![app(
+            "Zen Browser",
+            "app.zen_browser.zen",
+            "/usr/bin/flatpak run app.zen_browser.zen",
+            Some("zen"),
+        )];
+        let apps = merge_processes_with_installed_apps(
+            &[process(
+                11,
+                "zen",
+                &["/tmp/unrelated", "app.zen_browser.zen"],
+            )],
+            &installed,
+        );
+        assert!(apps
+            .iter()
+            .any(|app| app["pid"] == 11 && app["bundle_id"].is_null()));
+        assert!(apps
+            .iter()
+            .any(|app| { app["pid"] == 0 && app["bundle_id"] == "app.zen_browser.zen" }));
+    }
+
+    #[test]
+    fn flatpak_launcher_process_and_nonflatpak_name_claim_do_not_cross_identity_lanes() {
+        let installed = vec![
+            app(
+                "Zen Browser",
+                "app.zen_browser.zen",
+                "/usr/bin/flatpak run app.zen_browser.zen",
+                Some("zen"),
+            ),
+            app("Native", "org.example.Native", "/usr/bin/native", None),
+        ];
+        let apps = merge_processes_with_installed_apps(
+            &[
+                process(
+                    21,
+                    "flatpak",
+                    &["/usr/bin/flatpak", "run", "app.zen_browser.zen"],
+                ),
+                process(
+                    22,
+                    "unrelated",
+                    &["/tmp/unrelated", "--name", "org.example.Native"],
+                ),
+            ],
+            &installed,
+        );
+        for pid in [21, 22] {
+            assert!(apps
+                .iter()
+                .any(|app| app["pid"] == pid && app["bundle_id"].is_null()));
+        }
+        assert_eq!(apps.iter().filter(|app| app["pid"] == 0).count(), 2);
+    }
+
+    #[test]
+    fn unmatched_stays_installed_only_and_exact_executable_merges() {
+        let installed = vec![
+            app("Calculator", "org.example.Calc", "/usr/bin/calc", None),
+            app("Editor", "org.example.Editor", "/usr/bin/editor", None),
+        ];
+        let apps = merge_processes_with_installed_apps(
+            &[process(9, "calc", &["/usr/bin/calc"])],
+            &installed,
+        );
+        assert!(apps
+            .iter()
+            .any(|app| app["pid"] == 9 && app["name"] == "Calculator"));
+        assert!(apps
+            .iter()
+            .any(|app| app["pid"] == 0 && app["name"] == "Editor"));
+        assert!(!apps
+            .iter()
+            .any(|app| app["pid"] == 0 && app["name"] == "Calculator"));
+    }
 }
 
 // ── list_windows ─────────────────────────────────────────────────────────────
 
 pub struct ListWindowsTool;
 static LIST_WINDOWS_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+
+fn filter_on_screen_windows(
+    mut windows: Vec<crate::x11::WindowInfo>,
+    on_screen_only: bool,
+) -> Vec<crate::x11::WindowInfo> {
+    if on_screen_only {
+        windows.retain(|window| window.is_on_screen);
+    }
+    windows
+}
 
 #[async_trait]
 impl Tool for ListWindowsTool {
@@ -564,9 +738,7 @@ impl Tool for ListWindowsTool {
         .unwrap_or_default();
         // AT-SPI can retain defunct applications after exit; never expose stale targets.
         windows.retain(|window| window.pid.map_or(true, crate::proc_fs::is_process_live));
-        if on_screen_only {
-            windows.retain(|window| window.is_on_screen);
-        }
+        windows = filter_on_screen_windows(windows, on_screen_only);
         if crate::wayland::is_wayland() {
             crate::wayland::remember_observed_window_origins(&windows);
         }
@@ -716,6 +888,41 @@ mod list_windows_tests {
         };
 
         assert_eq!(window_record_json(&w)["z_index"], Value::Null);
+    }
+
+    #[test]
+    fn painted_visible_capture_stale_survives_on_screen_filter_and_serialization() {
+        let w = crate::x11::WindowInfo {
+            xid: 44,
+            pid: Some(1234),
+            app_name: "zen".to_owned(),
+            title: "Zen".to_owned(),
+            is_on_screen: true,
+            z_index: Some(1),
+            x: 0,
+            y: 40,
+            width: 2049,
+            height: 1688,
+            native_window_id: Some(44),
+            target_id: Some("epoch:44".to_owned()),
+            helper_epoch: Some("epoch".to_owned()),
+            transient_for_window_id: None,
+            transient_for_target_id: None,
+            is_attached_dialog: None,
+            is_modal: None,
+            window_type: None,
+            workspace_index: Some(0),
+            workspace_active: Some(true),
+            sticky: Some(false),
+            monitor: Some(0),
+            capture_current: Some(false),
+            identity_capabilities: None,
+        };
+        let filtered = filter_on_screen_windows(vec![w], true);
+        assert_eq!(filtered.len(), 1);
+        let record = window_record_json(&filtered[0]);
+        assert_eq!(record["is_on_screen"], true);
+        assert_eq!(record["capture_current"], false);
     }
 
     #[test]
@@ -1490,6 +1697,7 @@ mod launch_app_tests {
             name: name.to_owned(),
             bundle_id: bundle_id.to_owned(),
             launch_path: launch_path.to_owned(),
+            startup_wm_class: None,
             last_used: None,
         }
     }
@@ -2565,33 +2773,34 @@ fn resolve_cursor_key(args: &Value) -> String {
     "default".to_owned()
 }
 
-#[cfg(test)]
-mod cursor_key_resolution_tests {
-    use super::resolve_cursor_key;
-    use serde_json::json;
+/// Return the cursor key only for a lifecycle-owned session. Cursor positioning
+/// for keyboard actions deliberately does not opt anonymous calls or the
+/// legacy cursor_id-only path into session semantics. The proxy-minted
+/// `_session_id` is trusted lifecycle state and must behave like a public named
+/// session for cursor ownership.
+fn named_session_cursor_key(args: &Value) -> Option<String> {
+    ["session", "_session_id"].into_iter().find_map(|key| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .filter(|session| !session.is_empty())
+            .map(str::to_owned)
+    })
+}
 
-    #[test]
-    fn trusted_implicit_session_owns_the_cursor() {
-        assert_eq!(resolve_cursor_key(&json!({})), "default");
-        assert_eq!(
-            resolve_cursor_key(&json!({"_session_id": "implicit-lease"})),
-            "implicit-lease"
-        );
-        assert_eq!(
-            resolve_cursor_key(&json!({
-                "_session_id": "implicit-lease",
-                "cursor_id": "legacy"
-            })),
-            "implicit-lease"
-        );
-        assert_eq!(
-            resolve_cursor_key(&json!({
-                "session": "named",
-                "_session_id": "implicit-lease"
-            })),
-            "named"
-        );
-    }
+fn finite_cursor_point(point: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    point.filter(|(x, y)| x.is_finite() && y.is_finite())
+}
+
+fn choose_keyboard_cursor_target(
+    explicit: Option<(f64, f64)>,
+    remembered: Option<(f64, f64)>,
+    window_center: Option<(f64, f64)>,
+    current_pointer: Option<(f64, f64)>,
+) -> Option<(f64, f64)> {
+    finite_cursor_point(explicit)
+        .or_else(|| finite_cursor_point(remembered))
+        .or_else(|| finite_cursor_point(window_center))
+        .or_else(|| finite_cursor_point(current_pointer))
 }
 
 fn mouse_hold_json(cursor_id: &str, hold: Option<&MouseHoldState>) -> Value {
@@ -2671,12 +2880,19 @@ fn overlay_move_to_for(cursor_id: &str, sx: f64, sy: f64, heading: Option<f64>) 
 }
 
 async fn overlay_glide_to_for(cursor_id: &str, sx: f64, sy: f64) {
-    if !crate::overlay::is_enabled_for(cursor_id) {
+    // Input always revives its agent cursor. Hiding it is useful while idle,
+    // but a hidden cursor must not make pointer or keyboard control invisible.
+    crate::overlay::send_command_for(
+        cursor_id.to_owned(),
+        cursor_overlay::OverlayCommand::SetEnabled(true),
+    );
+    // Every Wayland backend owns its animation loop. Send one destination and
+    // let the Linux overlay layer select the exact-target semantic helper,
+    // layer-shell, or older helper fallback without a competing interpolation.
+    if crate::wayland::is_wayland() {
+        overlay_move_to_for(cursor_id, sx, sy, None);
         return;
     }
-    // On GNOME, send_command_for forwards through WinRects v2 only after the
-    // cursor key has been pinned to an exact target. There is intentionally no
-    // unqualified Shell-global cursor movement path.
     let pos = crate::overlay::current_position_for(cursor_id);
     if pos.0 < 0.0 && pos.1 < 0.0 {
         crate::overlay::send_command_for(
@@ -2688,6 +2904,146 @@ async fn overlay_glide_to_for(cursor_id: &str, sx: f64, sy: f64) {
     crate::overlay::animate_cursor_to_for(cursor_id.to_owned(), sx, sy).await;
 }
 
+/// Keep the logical cursor position in sync with every visibly targeted
+/// pointer action. Overlay delivery is intentionally best-effort: registry
+/// state is still updated when no renderer is running or its queue is closed.
+async fn reveal_pointer_action_for(
+    state: &ToolState,
+    cursor_id: &str,
+    sx: f64,
+    sy: f64,
+    click_pulse: bool,
+) {
+    if !sx.is_finite() || !sy.is_finite() {
+        return;
+    }
+    state.cursor_registry.set_enabled(cursor_id, true);
+    state.cursor_registry.update_position(cursor_id, sx, sy);
+    overlay_glide_to_for(cursor_id, sx, sy).await;
+    if click_pulse {
+        crate::overlay::send_command_for(
+            cursor_id.to_owned(),
+            cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
+        );
+    }
+}
+
+fn keyboard_window_center(xid: u64) -> Option<(f64, f64)> {
+    if xid == 0 {
+        return None;
+    }
+    if crate::wayland::is_wayland() {
+        return crate::wayland::window_geometry(xid).and_then(|(x, y, width, height)| {
+            (width > 0 && height > 0).then_some((
+                f64::from(x) + f64::from(width) / 2.0,
+                f64::from(y) + f64::from(height) / 2.0,
+            ))
+        });
+    }
+    window_screen_center(xid)
+        .ok()
+        .map(|(x, y)| (f64::from(x), f64::from(y)))
+}
+
+fn current_pointer_position() -> Option<(f64, f64)> {
+    if crate::wayland::is_wayland() {
+        return crate::wayland::last_synth_cursor_pos().map(|(x, y)| (f64::from(x), f64::from(y)));
+    }
+
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    use x11rb::rust_connection::RustConnection;
+
+    let (connection, screen_num) = RustConnection::connect(None).ok()?;
+    let root = connection.setup().roots[screen_num].root;
+    let reply = connection.query_pointer(root).ok()?.reply().ok()?;
+    Some((f64::from(reply.root_x), f64::from(reply.root_y)))
+}
+
+fn explicit_keyboard_cursor_target(
+    pid: u32,
+    xid: u64,
+    element_index: Option<usize>,
+    pixel_target: Option<(f64, f64)>,
+) -> Option<(f64, f64)> {
+    if let Some(element_index) = element_index {
+        let (sx, sy) = element_screen_center(pid, element_index).ok()?;
+        return Some((sx, sy));
+    }
+
+    let (x, y) = pixel_target?;
+    if crate::wayland::wayland_input_enabled() {
+        return crate::wayland::window_geometry(xid)
+            .map(|(wx, wy, _, _)| (f64::from(wx) + x.round(), f64::from(wy) + y.round()));
+    }
+    window_local_to_screen(xid, x, y).ok()
+}
+
+/// Position and reveal a named session's cursor before keyboard/value input.
+/// `preserve_legacy_element_visual` retains the existing element-only feedback
+/// for type_text/set_value anonymous calls without adding session-style fallback
+/// placement to them. Geometry and overlay failures are observational and never
+/// affect the tool's actual input result.
+async fn position_named_session_keyboard_cursor(
+    state: &ToolState,
+    args: &Value,
+    pid: u32,
+    xid: u64,
+    element_index: Option<usize>,
+    pixel_target: Option<(f64, f64)>,
+    preserve_legacy_element_visual: bool,
+) {
+    let named_cursor_id = named_session_cursor_key(args);
+    let cursor_id = match named_cursor_id {
+        Some(ref cursor_id) => cursor_id.clone(),
+        None if preserve_legacy_element_visual && element_index.is_some() => {
+            resolve_cursor_key(args)
+        }
+        None => return,
+    };
+
+    let remembered = named_cursor_id.as_ref().and_then(|_| {
+        state
+            .cursor_registry
+            .get(&cursor_id)
+            .and_then(|cursor| cursor.x.zip(cursor.y))
+    });
+    let explicit = tokio::task::spawn_blocking(move || {
+        explicit_keyboard_cursor_target(pid, xid, element_index, pixel_target)
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let fallback = if named_cursor_id.is_some()
+        && explicit.is_none()
+        && finite_cursor_point(remembered).is_none()
+    {
+        tokio::task::spawn_blocking(move || {
+            let center = keyboard_window_center(xid);
+            let pointer = center.is_none().then(current_pointer_position).flatten();
+            (center, pointer)
+        })
+        .await
+        .unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+
+    let Some((sx, sy)) =
+        choose_keyboard_cursor_target(explicit, remembered, fallback.0, fallback.1)
+    else {
+        return;
+    };
+    if xid != 0 {
+        crate::overlay::send_command_for(
+            cursor_id.clone(),
+            cursor_overlay::OverlayCommand::PinAbove(xid),
+        );
+    }
+    reveal_pointer_action_for(state, &cursor_id, sx, sy, false).await;
+}
+
 async fn track_overlay_drag_for(
     cursor_id: String,
     from: (f64, f64),
@@ -2695,9 +3051,10 @@ async fn track_overlay_drag_for(
     duration_ms: u64,
     steps: usize,
 ) {
-    if !crate::overlay::is_enabled_for(&cursor_id) {
-        return;
-    }
+    crate::overlay::send_command_for(
+        cursor_id.clone(),
+        cursor_overlay::OverlayCommand::SetEnabled(true),
+    );
     crate::overlay::send_command_for(
         cursor_id.clone(),
         cursor_overlay::OverlayCommand::SetPressed(true),
@@ -2955,7 +3312,8 @@ impl Tool for ClickTool {
             // / Windows desktop paths already do this). Without it the overlay
             // sits idle elsewhere while only the real pointer warps, so a viewer
             // sees the cursor "click somewhere else."
-            overlay_glide_to_for(&cursor_id, sx as f64, sy as f64).await;
+            reveal_pointer_action_for(&self.state, &cursor_id, f64::from(sx), f64::from(sy), true)
+                .await;
             let r = cua_driver_core::blocking::spawn(move || {
                 if crate::wayland::wayland_input_enabled() {
                     if !modifiers.is_empty() {
@@ -3094,11 +3452,7 @@ impl Tool for ClickTool {
                     cursor_overlay::OverlayCommand::PinAbove(xid),
                 );
             }
-            overlay_glide_to_for(&cursor_id, sx, sy).await;
-            crate::overlay::send_command_for(
-                cursor_id.clone(),
-                cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
-            );
+            reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, true).await;
 
             // Chromium can execute a genuine AT-SPI action without focus. Try
             // that route before applying its background synthetic-input gate.
@@ -3237,11 +3591,7 @@ impl Tool for ClickTool {
                 .and_then(|r| r.ok())
         };
         if let Some((sx, sy)) = glide_target {
-            overlay_glide_to_for(&cursor_id, sx, sy).await;
-            crate::overlay::send_command_for(
-                cursor_id.clone(),
-                cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
-            );
+            reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, true).await;
         }
 
         let (xi, yi) = (x as i32, y as i32);
@@ -3533,6 +3883,8 @@ impl Tool for TypeTextTool {
             let text =
                 cua_driver_core::text_sanitize::strip_trailing_agent_protocol_tags(&input.text)
                     .into_owned();
+            position_named_session_keyboard_cursor(&self.state, &args, 0, 0, None, None, false)
+                .await;
             let wayland = crate::wayland::wayland_input_enabled();
             let path = if wayland { "wayland_focused" } else { "xtest" };
             let result = cua_driver_core::blocking::spawn(move || {
@@ -3634,21 +3986,16 @@ impl Tool for TypeTextTool {
             );
         }
 
-        let cursor_id = resolve_cursor_key(&args);
-        if let Some(idx) = resolved_elem_idx {
-            crate::overlay::send_command_for(
-                cursor_id.clone(),
-                cursor_overlay::OverlayCommand::PinAbove(xid),
-            );
-            if let Ok(Ok((screen_x, screen_y))) =
-                cua_driver_core::blocking::spawn(move || element_screen_center(pid, idx)).await
-            {
-                overlay_glide_to_for(&cursor_id, screen_x, screen_y).await;
-                self.state
-                    .cursor_registry
-                    .update_position(&cursor_id, screen_x, screen_y);
-            }
-        }
+        position_named_session_keyboard_cursor(
+            &self.state,
+            &args,
+            pid,
+            xid,
+            resolved_elem_idx,
+            px.zip(py),
+            true,
+        )
+        .await;
 
         let text_len = text.chars().count();
         // Native toolkit editables have a stronger focus-free route than raw
@@ -4161,6 +4508,8 @@ impl Tool for PressKeyTool {
             let key = input.key;
             let display = key.clone();
             let modifiers = input.modifiers.unwrap_or_default();
+            position_named_session_keyboard_cursor(&self.state, &args, 0, 0, None, None, false)
+                .await;
             let wayland = crate::wayland::wayland_input_enabled();
             let path = if wayland { "wayland_focused" } else { "xtest" };
             let result = cua_driver_core::blocking::spawn(move || {
@@ -4210,6 +4559,12 @@ impl Tool for PressKeyTool {
             Ok(r) => r,
             Err(e) => return e,
         };
+        let resolved_element_index = match &resolved {
+            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
+                Some(*element_index)
+            }
+            cua_driver_core::element_token::ResolvedElement::None => None,
+        };
         let xid_opt = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => {
                 window_id_arg.or_else(|| window_id.map(|v| v as u64))
@@ -4225,12 +4580,6 @@ impl Tool for PressKeyTool {
                 "required": ["pid", "window_id"],
             }));
         }
-        let resolved_element_idx = match &resolved {
-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
-                Some(*element_index)
-            }
-            cua_driver_core::element_token::ResolvedElement::None => None,
-        };
         let xid = match xid_opt {
             Some(x) => x,
             None => {
@@ -4292,17 +4641,28 @@ impl Tool for PressKeyTool {
         if px.is_some() != py.is_some() {
             return ToolResult::error("Pass both x and y to press_key, or neither.");
         }
-        if px.is_some() && resolved_element_idx.is_some() {
+        if px.is_some() && resolved_element_index.is_some() {
             return ToolResult::error(
                 "Pass either element_index (ax) or x,y (px) to press_key, not both.",
             );
         }
 
+        position_named_session_keyboard_cursor(
+            &self.state,
+            &args,
+            pid,
+            xid,
+            resolved_element_index,
+            px.zip(py),
+            false,
+        )
+        .await;
+
         // Nested cua-compositor addresses the owning Wayland client directly.
         // Preserve legacy modifiers by promoting the request to a chord.
         if crate::wayland::is_inject_mode() {
             if let Err(error) =
-                focus_nested_inject_target(pid, xid, resolved_element_idx, px.zip(py)).await
+                focus_nested_inject_target(pid, xid, resolved_element_index, px.zip(py)).await
             {
                 return error;
             }
@@ -4354,7 +4714,7 @@ impl Tool for PressKeyTool {
         if crate::wayland::wayland_input_enabled() {
             let key_w = key.clone();
             let chord = press_key_chord(&mods, &key);
-            let idx = resolved_element_idx;
+            let idx = resolved_element_index;
             let result =
                 cua_driver_core::blocking::spawn(move || {
                     let target = crate::wayland::establish_exact_target(pid, xid)?;
@@ -4396,7 +4756,7 @@ impl Tool for PressKeyTool {
         // click restores the prior top-level before returning.
         let deliver_fg = delivery.is_foreground();
         let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<()> {
-            if resolved_element_idx.is_none()
+            if resolved_element_index.is_none()
                 && mods.is_empty()
                 && key_for_task.eq_ignore_ascii_case("enter")
             {
@@ -4412,7 +4772,7 @@ impl Tool for PressKeyTool {
             // XSendEvent (no focus steal) for apps that accept it.
             if deliver_fg {
                 return crate::input::with_x11_foreground(xid, 80, || {
-                    if let Some(element_index) = resolved_element_idx {
+                    if let Some(element_index) = resolved_element_index {
                         if !crate::atspi::focus_element(pid, element_index)? {
                             anyhow::bail!(
                                 "AT-SPI Component.GrabFocus returned false for element {element_index}"
@@ -4422,7 +4782,7 @@ impl Tool for PressKeyTool {
                     crate::input::send_key_xtest(&key_for_task, &m)
                 });
             }
-            if let Some(element_index) = resolved_element_idx {
+            if let Some(element_index) = resolved_element_index {
                 if !crate::atspi::focus_element(pid, element_index)? {
                     anyhow::bail!(
                         "AT-SPI Component.GrabFocus returned false for element {element_index}"
@@ -4523,6 +4883,8 @@ impl Tool for HotkeyTool {
                 return ToolResult::error("keys must include at least one non-modifier key.");
             };
             let display = keys.join("+");
+            position_named_session_keyboard_cursor(&self.state, &args, 0, 0, None, None, false)
+                .await;
             let wayland = crate::wayland::wayland_input_enabled();
             let path = if wayland { "wayland_focused" } else { "xtest" };
             let result = cua_driver_core::blocking::spawn(move || {
@@ -4648,6 +5010,17 @@ impl Tool for HotkeyTool {
                 "Pass either element_index (ax) or x,y (px) to hotkey, not both.",
             );
         }
+
+        position_named_session_keyboard_cursor(
+            &self.state,
+            &args,
+            pid,
+            xid,
+            resolved_element_index,
+            px.zip(py),
+            false,
+        )
+        .await;
 
         if crate::wayland::is_inject_mode() {
             if let Err(error) =
@@ -4801,7 +5174,9 @@ impl Tool for HotkeyTool {
 
 // ── set_value ─────────────────────────────────────────────────────────────────
 
-pub struct SetValueTool;
+pub struct SetValueTool {
+    state: Arc<ToolState>,
+}
 static SV_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 #[async_trait]
@@ -4847,17 +5222,15 @@ impl Tool for SetValueTool {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (idx, resolved_window_id) = match resolved {
+        let (idx, resolved_window_id) = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element {
                 element_index,
                 window_id,
                 ..
-            } => (element_index, window_id.map(u64::from)),
-            cua_driver_core::element_token::ResolvedElement::None => {
-                return ToolResult::error(
-                    "set_value requires element_index or element_token to address the target element.",
-                );
-            }
+            } => (*element_index, window_id.map(u64::from)),
+            cua_driver_core::element_token::ResolvedElement::None => return ToolResult::error(
+                "set_value requires element_index or element_token to address the target element.",
+            ),
         };
         let exact_window_id = args.opt_u64("window_id").or(resolved_window_id);
         if crate::wayland::is_gnome_wayland_session() && exact_window_id.is_none() {
@@ -4881,24 +5254,10 @@ impl Tool for SetValueTool {
                 Err(error) => return ToolResult::error(format!("Task error: {error}")),
             }
         }
-        let cursor_id = resolve_cursor_key(&args);
         let value_for_task = value.clone();
-        // Pulse the agent cursor onto the target element before writing, so a
-        // value write gets the same visual feedback as a click — the viewer can
-        // see *where* the agent is acting. No-op when the element bounds can't
-        // be resolved or the overlay is disabled.
-        if let Ok(Ok((sx, sy))) =
-            cua_driver_core::blocking::spawn(move || element_screen_center(pid, idx)).await
-        {
-            let window_id = exact_window_id.unwrap_or(0);
-            if window_id != 0 {
-                crate::overlay::send_command_for(
-                    cursor_id.clone(),
-                    cursor_overlay::OverlayCommand::PinAbove(window_id),
-                );
-            }
-            overlay_glide_to_for(&cursor_id, sx, sy).await;
-        }
+        let xid = exact_window_id.unwrap_or(0);
+        position_named_session_keyboard_cursor(&self.state, &args, pid, xid, Some(idx), None, true)
+            .await;
         let result = cua_driver_core::blocking::spawn(move || {
             crate::atspi::set_value(pid, idx, &value_for_task)
         })
@@ -4913,7 +5272,9 @@ impl Tool for SetValueTool {
 
 // ── scroll ────────────────────────────────────────────────────────────────────
 
-pub struct ScrollTool;
+pub struct ScrollTool {
+    state: Arc<ToolState>,
+}
 static SCROLL_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 #[async_trait]
@@ -4965,6 +5326,16 @@ impl Tool for ScrollTool {
             let display = direction.clone();
             let wayland = crate::wayland::wayland_input_enabled();
             let path = if wayland { "wayland_desktop" } else { "xtest" };
+            if named_session_cursor_key(&args).is_some() {
+                reveal_pointer_action_for(
+                    &self.state,
+                    &cursor_id,
+                    f64::from(x),
+                    f64::from(y),
+                    false,
+                )
+                .await;
+            }
             let result = cua_driver_core::blocking::spawn(move || {
                 if wayland {
                     crate::wayland::scroll_desktop(x, y, &direction, amount as u32)
@@ -5055,6 +5426,49 @@ impl Tool for ScrollTool {
             }
         };
 
+        let pixel_target = match (
+            args.get("x").and_then(|value| value.as_f64()),
+            args.get("y").and_then(|value| value.as_f64()),
+        ) {
+            (Some(x), Some(y)) => {
+                // Pixel targets use the latest screenshot's coordinate frame.
+                // Apply the same buffer-to-window ratio as click/drag before
+                // positioning either the agent cursor or the input device.
+                let ratio = self.state.resize_registry.ratio(pid).unwrap_or(1.0);
+                Some((x * ratio, y * ratio))
+            }
+            (None, None) => None,
+            _ => return ToolResult::error("Pass both x and y to pixel-target scroll."),
+        };
+        let resolved_element_index = match &resolved {
+            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
+                Some(*element_index)
+            }
+            cua_driver_core::element_token::ResolvedElement::None => None,
+        };
+        if pixel_target.is_some() && resolved_element_index.is_some() {
+            return ToolResult::error(
+                "Pass either element_index (ax) or x,y (px) to scroll, not both.",
+            );
+        }
+
+        if named_session_cursor_key(&args).is_some() {
+            let visual_target = tokio::task::spawn_blocking(move || {
+                explicit_keyboard_cursor_target(pid, xid, resolved_element_index, pixel_target)
+                    .or_else(|| keyboard_window_center(xid))
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some((sx, sy)) = visual_target {
+                crate::overlay::send_command_for(
+                    cursor_id.clone(),
+                    cursor_overlay::OverlayCommand::PinAbove(xid),
+                );
+                reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, false).await;
+            }
+        }
+
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
         if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
             return refusal;
@@ -5089,25 +5503,6 @@ impl Tool for ScrollTool {
                     }));
                 }
             }
-        }
-
-        let pixel_target = match (
-            args.get("x").and_then(|value| value.as_f64()),
-            args.get("y").and_then(|value| value.as_f64()),
-        ) {
-            (Some(x), Some(y)) => Some((x, y)),
-            (None, None) => None,
-            _ => return ToolResult::error("Pass both x and y to pixel-target scroll."),
-        };
-        if pixel_target.is_some()
-            && matches!(
-                &resolved,
-                cua_driver_core::element_token::ResolvedElement::Element { .. }
-            )
-        {
-            return ToolResult::error(
-                "Pass either element_index (ax) or x,y (px) to scroll, not both.",
-            );
         }
 
         if crate::wayland::is_inject_mode() {
@@ -5460,11 +5855,7 @@ impl Tool for DoubleClickTool {
                             cursor_id.clone(),
                             cursor_overlay::OverlayCommand::PinAbove(xid),
                         );
-                        overlay_glide_to_for(&cursor_id, sx, sy).await;
-                        crate::overlay::send_command_for(
-                            cursor_id.clone(),
-                            cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
-                        );
+                        reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, true).await;
                     }
                     let lxi = lx as i32;
                     let lyi = ly as i32;
@@ -5563,11 +5954,7 @@ impl Tool for DoubleClickTool {
                 .and_then(|r| r.ok())
         };
         if let Some((sx, sy)) = glide_target {
-            overlay_glide_to_for(&cursor_id, sx, sy).await;
-            crate::overlay::send_command_for(
-                cursor_id.clone(),
-                cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
-            );
+            reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, true).await;
         }
         let (xi, yi) = (x as i32, y as i32);
         let cursor_id_for_task = cursor_id.clone();
@@ -5727,11 +6114,7 @@ impl Tool for RightClickTool {
                             cursor_id.clone(),
                             cursor_overlay::OverlayCommand::PinAbove(xid),
                         );
-                        overlay_glide_to_for(&cursor_id, sx, sy).await;
-                        crate::overlay::send_command_for(
-                            cursor_id.clone(),
-                            cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
-                        );
+                        reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, true).await;
                     }
                     let lxi = lx as i32;
                     let lyi = ly as i32;
@@ -5830,11 +6213,7 @@ impl Tool for RightClickTool {
                 .and_then(|r| r.ok())
         };
         if let Some((sx, sy)) = glide_target {
-            overlay_glide_to_for(&cursor_id, sx, sy).await;
-            crate::overlay::send_command_for(
-                cursor_id.clone(),
-                cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
-            );
+            reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, true).await;
         }
         let (xi, yi) = (x as i32, y as i32);
         let cursor_id_for_task = cursor_id.clone();
@@ -7253,6 +7632,46 @@ fn x11_screen_size() -> anyhow::Result<(u32, u32)> {
     Ok((w, h))
 }
 
+/// Put the desktop image in the exact coordinate frame consumed by desktop
+/// actions. Native Wayland capture buffers may use backing pixels while the
+/// compositor's pointer protocol and reported screen geometry use logical
+/// pixels. Returning the backing image alongside logical dimensions violates
+/// the screenshot-to-action contract and makes every vision-grounded action
+/// miss by the output scale.
+fn normalize_desktop_capture_for_action_frame(
+    png: Vec<u8>,
+    action_width: u32,
+    action_height: u32,
+) -> anyhow::Result<(Vec<u8>, u32, u32, f64)> {
+    if action_width == 0 || action_height == 0 {
+        anyhow::bail!("desktop action frame is empty: {action_width}x{action_height}");
+    }
+
+    let (capture_width, capture_height) = crate::capture::png_dimensions_pub(&png)?;
+    let scale_x = f64::from(capture_width) / f64::from(action_width);
+    let scale_y = f64::from(capture_height) / f64::from(action_height);
+    if (scale_x - scale_y).abs() > 0.01 {
+        anyhow::bail!(
+            "desktop capture {capture_width}x{capture_height} cannot be mapped uniformly to \
+             action frame {action_width}x{action_height} (scale {scale_x:.4}x{scale_y:.4})"
+        );
+    }
+
+    if capture_width == action_width && capture_height == action_height {
+        return Ok((png, action_width, action_height, 1.0));
+    }
+
+    let image = image::load_from_memory_with_format(&png, image::ImageFormat::Png)?;
+    let resized = image.resize_exact(
+        action_width,
+        action_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let mut encoded = std::io::Cursor::new(Vec::new());
+    resized.write_to(&mut encoded, image::ImageFormat::Png)?;
+    Ok((encoded.into_inner(), action_width, action_height, scale_x))
+}
+
 // ── get_desktop_state ─────────────────────────────────────────────────────────
 
 pub struct GetDesktopStateTool;
@@ -7263,8 +7682,8 @@ impl Tool for GetDesktopStateTool {
     fn def(&self) -> &ToolDef {
         GDS_DEF.get_or_init(|| ToolDef {
             name: "get_desktop_state".into(),
-            description: "Capture the full display in true screen pixels with no downscale. \
-                Use its native-size PNG as the coordinate source for actions whose target is \
+            description: "Capture the full display in the desktop action coordinate frame. \
+                Use the returned PNG directly as the coordinate source for actions whose target is \
                 {kind:\"desktop\",display_id:\"primary\"}. No AT-SPI walk.".into(),
             input_schema: json!({"type":"object","properties":{
                 "session":{"type":"string","description":"For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session."},
@@ -7282,10 +7701,11 @@ impl Tool for GetDesktopStateTool {
         let out_file = input.screenshot_out_file;
 
         let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<_> {
-            // Vision-only: capture the FULL DISPLAY at native size. No downscale
-            // so screen-absolute pixels land exactly.
-            let png = crate::capture::screenshot_display_bytes()?;
-            let (shot_w, shot_h) = crate::capture::png_dimensions_pub(&png)?;
+            // Capture the full display at native size first. When the
+            // compositor consumes logical input coordinates, normalize the
+            // image below so screenshot pixels still land exactly.
+            let native_png = crate::capture::screenshot_display_bytes()?;
+            let (native_w, native_h) = crate::capture::png_dimensions_pub(&native_png)?;
             // True screen size. On a pure-Wayland session (native backend
             // opted in, no X11 DISPLAY) the capture above came from the
             // wlroots `zwlr_screencopy` cascade, whose full-display buffer is
@@ -7296,10 +7716,12 @@ impl Tool for GetDesktopStateTool {
             // Only fall back to the X11 root-window geometry off Wayland, so
             // the X11 / XWayland path is unchanged. See #2017 / Sway testing.
             let (screen_w, screen_h) = if crate::wayland::is_wayland() {
-                (shot_w, shot_h)
+                (native_w, native_h)
             } else {
                 x11_screen_size()?
             };
+            let (png, shot_w, shot_h, scale_factor) =
+                normalize_desktop_capture_for_action_frame(native_png, screen_w, screen_h)?;
             // Optional: write PNG to disk instead of returning base64.
             let written = if let Some(path) = out_file.as_deref() {
                 std::fs::write(path, &png)?;
@@ -7313,12 +7735,20 @@ impl Tool for GetDesktopStateTool {
             } else {
                 Some(B64.encode(&png))
             };
-            Ok((b64, shot_w, shot_h, screen_w, screen_h, written))
+            Ok((
+                b64,
+                shot_w,
+                shot_h,
+                screen_w,
+                screen_h,
+                scale_factor,
+                written,
+            ))
         })
         .await;
 
         match result {
-            Ok(Ok((b64_opt, shot_w, shot_h, screen_w, screen_h, written))) => {
+            Ok(Ok((b64_opt, shot_w, shot_h, screen_w, screen_h, scale_factor, written))) => {
                 let mut content = Vec::new();
                 let mut structured = json!({
                     "platform": "linux",
@@ -7327,7 +7757,7 @@ impl Tool for GetDesktopStateTool {
                     "screenshot_height": shot_h,
                     "screen_width": screen_w,
                     "screen_height": screen_h,
-                    "scale_factor": 1.0,
+                    "scale_factor": scale_factor,
                     "screenshot_mime_type": "image/png",
                 });
                 if let Some(b64) = b64_opt {
@@ -7427,12 +7857,25 @@ pub struct MoveCursorTool {
 
 static MCURSOR_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CursorControlScope {
+    Agent,
+    Desktop,
+}
+
+fn cursor_control_scope(args: &Value) -> CursorControlScope {
+    match args.get("scope").and_then(Value::as_str) {
+        Some("desktop") => CursorControlScope::Desktop,
+        _ => CursorControlScope::Agent,
+    }
+}
+
 #[async_trait]
 impl Tool for MoveCursorTool {
     fn def(&self) -> &ToolDef {
         MCURSOR_DEF.get_or_init(|| ToolDef {
             name: "move_cursor".into(),
-            description: "Move the agent cursor overlay, or with scope=desktop move the real OS pointer in get_desktop_state coordinates.".into(),
+            description: "Move the synthetic agent cursor without changing the user's pointer. Only an explicit scope=desktop request moves the real OS pointer in get_desktop_state coordinates.".into(),
             input_schema: json!({"type":"object","required":["x","y"],"properties":{
                 "x":{"type":"number"},"y":{"type":"number"},"pid":{"type":"integer","minimum":1},"window_id":{"type":"integer","minimum":1},"session": cua_driver_core::tool_schema::session_schema(),"cursor_id":{"type":"string"},"scope":{"type":"string","enum":["window","desktop"],"default":"window"}
             },"additionalProperties":false}),
@@ -7441,7 +7884,7 @@ impl Tool for MoveCursorTool {
     }
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
-        if args.opt_str("scope").as_deref() == Some("desktop") {
+        if cursor_control_scope(&args) == CursorControlScope::Desktop {
             let input = match parse_typed_projection::<MoveCursorInput>("move_cursor", &args) {
                 Ok(input) => input,
                 Err(result) => return result,
@@ -7536,39 +7979,9 @@ impl Tool for MoveCursorTool {
         // overlay arrow settles to the natural macOS-style pose.
         // Use the acknowledged animation path so a first-ever move seeds and
         // displays the session cursor just as reliably as a coordinate click.
-        crate::overlay::animate_cursor_to_for(cursor_id.clone(), output_x, output_y).await;
-        // Native Wayland: also warp the real cursor via zwlr_virtual_pointer.
-        // Off-thread because the wayland-client roundtrip is blocking. Best-effort
-        // — overlay update + registry write already succeeded; surface a warning
-        // only if the warp itself failed.
-        let (real_warp_note, foreground_outcome) = if crate::wayland::wayland_input_enabled() {
-            let xi = output_x.round() as i32;
-            let yi = output_y.round() as i32;
-            let target = target.clone();
-            let exact_private_warp = crate::wayland::is_inject_mode();
-            match cua_driver_core::blocking::spawn(move || {
-                crate::wayland::move_cursor_absolute_with_outcome(target, xi, yi)
-            })
-            .await
-            {
-                Ok(Ok(outcome)) => (" (real cursor warped via virtual-pointer)", outcome),
-                Ok(Err(error)) if exact_private_warp => {
-                    return ToolResult::error(error.to_string());
-                }
-                Err(error) if exact_private_warp => {
-                    return ToolResult::error(format!("Task error: {error}"));
-                }
-                Ok(Err(_)) | Err(_) => (" (overlay updated; real-cursor warp failed)", None),
-            }
-        } else {
-            ("", None)
-        };
+        reveal_pointer_action_for(&self.state, &cursor_id, output_x, output_y, false).await;
         ToolResult::text(format!(
-            "Agent cursor '{cursor_id}' moved to ({output_x:.1}, {output_y:.1}).{real_warp_note}"
-        ))
-        .with_structured(with_foreground_diagnostics(
-            json!({ "verified": false }),
-            foreground_outcome,
+            "Agent cursor '{cursor_id}' moved to ({output_x:.1}, {output_y:.1}); the user pointer was unchanged."
         ))
     }
 }
@@ -9011,8 +9424,18 @@ pub fn build_registry_with_provider(
         },
         &pid_window_candidates,
     ));
-    r.register(pid_window_guarded(SetValueTool, &pid_window_candidates));
-    r.register(pid_window_guarded(ScrollTool, &pid_window_candidates));
+    r.register(pid_window_guarded(
+        SetValueTool {
+            state: state.clone(),
+        },
+        &pid_window_candidates,
+    ));
+    r.register(pid_window_guarded(
+        ScrollTool {
+            state: state.clone(),
+        },
+        &pid_window_candidates,
+    ));
     cua_driver_core::clipboard::register_clipboard_tools(
         &mut r,
         Arc::new(crate::clipboard::LinuxClipboard::new()),
@@ -9239,5 +9662,122 @@ mod pid_window_target_tests {
             PidWindowTargetResolution::Ambiguous(windows)
                 if windows.iter().map(|window| window.window_id).collect::<Vec<_>>() == [7, 8]
         ));
+    }
+}
+
+#[cfg(test)]
+mod session_cursor_target_tests {
+    use super::{
+        choose_keyboard_cursor_target, cursor_control_scope, named_session_cursor_key,
+        reveal_pointer_action_for, CursorControlScope, ToolState,
+    };
+    use serde_json::json;
+
+    #[test]
+    fn lifecycle_owned_sessions_opt_into_keyboard_cursor_positioning() {
+        assert_eq!(
+            named_session_cursor_key(&json!({"session": "editing-run"})).as_deref(),
+            Some("editing-run")
+        );
+        assert_eq!(
+            named_session_cursor_key(&json!({"cursor_id": "legacy"})),
+            None
+        );
+        assert_eq!(
+            named_session_cursor_key(&json!({"_session_id": "implicit"})).as_deref(),
+            Some("implicit")
+        );
+        assert_eq!(named_session_cursor_key(&json!({})), None);
+    }
+
+    #[test]
+    fn keyboard_cursor_uses_explicit_then_remembered_then_safe_seed() {
+        let explicit = Some((10.0, 20.0));
+        let remembered = Some((30.0, 40.0));
+        let window_center = Some((50.0, 60.0));
+        let current_pointer = Some((70.0, 80.0));
+
+        assert_eq!(
+            choose_keyboard_cursor_target(explicit, remembered, window_center, current_pointer),
+            explicit
+        );
+        assert_eq!(
+            choose_keyboard_cursor_target(None, remembered, window_center, current_pointer),
+            remembered
+        );
+        assert_eq!(
+            choose_keyboard_cursor_target(None, None, window_center, current_pointer),
+            window_center
+        );
+        assert_eq!(
+            choose_keyboard_cursor_target(None, None, None, current_pointer),
+            current_pointer
+        );
+    }
+
+    #[test]
+    fn invalid_coordinates_do_not_poison_session_position_reuse() {
+        assert_eq!(
+            choose_keyboard_cursor_target(Some((f64::NAN, 1.0)), Some((12.0, 34.0)), None, None,),
+            Some((12.0, 34.0))
+        );
+    }
+
+    #[test]
+    fn real_pointer_control_requires_explicit_desktop_scope() {
+        assert_eq!(cursor_control_scope(&json!({})), CursorControlScope::Agent);
+        assert_eq!(
+            cursor_control_scope(&json!({"scope": "window"})),
+            CursorControlScope::Agent
+        );
+        assert_eq!(
+            cursor_control_scope(&json!({"scope": "desktop"})),
+            CursorControlScope::Desktop
+        );
+    }
+
+    #[tokio::test]
+    async fn pointer_position_survives_an_unavailable_overlay() {
+        let state = ToolState::new();
+        reveal_pointer_action_for(&state, "no-renderer", 123.0, 456.0, true).await;
+
+        let cursor = state
+            .cursor_registry
+            .get("no-renderer")
+            .expect("pointer action records its position independently of rendering");
+        assert!(cursor.config.enabled, "input must revive its agent cursor");
+        assert_eq!(cursor.x.zip(cursor.y), Some((123.0, 456.0)));
+    }
+}
+
+#[cfg(test)]
+mod desktop_capture_frame_tests {
+    use super::normalize_desktop_capture_for_action_frame;
+
+    fn png(width: u32, height: u32) -> Vec<u8> {
+        let rgba = vec![0x7f; (width * height * 4) as usize];
+        cua_driver_core::image_utils::encode_rgba_to_png(&rgba, width, height)
+            .expect("encode fixture")
+    }
+
+    #[test]
+    fn native_wayland_capture_is_resized_to_the_reported_action_frame() {
+        let (normalized, width, height, scale) =
+            normalize_desktop_capture_for_action_frame(png(3200, 2000), 1600, 1000)
+                .expect("normalize 2x capture");
+
+        assert_eq!((width, height), (1600, 1000));
+        assert_eq!(
+            cua_driver_core::image_utils::png_dimensions(&normalized).unwrap(),
+            (1600, 1000)
+        );
+        assert_eq!(scale, 2.0);
+    }
+
+    #[test]
+    fn nonuniform_capture_mapping_fails_instead_of_distorting_coordinates() {
+        let error = normalize_desktop_capture_for_action_frame(png(3200, 2000), 1600, 1200)
+            .expect_err("nonuniform mapping must fail closed");
+        assert!(error.to_string().contains("cannot be mapped uniformly"));
     }
 }

@@ -42,7 +42,7 @@ const INTROSPECT_IFACE: &str = "org.gnome.Shell.Introspect";
 /// Public helper API carried by `GetVersion`; follows the upstream cursor and
 /// session-badge contract and is intentionally independent from the exact-
 /// target capability protocol advertised by `GetCapabilities`.
-const REQUIRED_HELPER_API_VERSION: u32 = 13;
+const REQUIRED_HELPER_API_VERSION: u32 = 14;
 const REQUIRED_EXACT_TARGET_PROTOCOL: u64 = 4;
 static OVERLAY_DISPATCH_TX: OnceLock<Option<std::sync::mpsc::SyncSender<OverlayDispatchRequest>>> =
     OnceLock::new();
@@ -1629,6 +1629,15 @@ mod tests {
     }
 
     #[test]
+    fn painted_visible_capture_stale_record_remains_on_screen() {
+        let raw = r#"('[{"id":46,"target_id":"epoch-a:46","helper_epoch":"epoch-a","protocol_version":4,"pid":6079,"app_id":"app.zen_browser.zen","title":"Zen","x":0,"y":40,"w":2049,"h":1688,"minimized":false,"visible":true,"capture_current":false,"workspace_active":true,"stacking":1}]',)"#;
+        let windows = parse_windows(raw, Some(6079)).expect("valid helper response");
+        assert_eq!(windows.len(), 1);
+        assert!(windows[0].is_on_screen);
+        assert_eq!(windows[0].capture_current, Some(false));
+    }
+
+    #[test]
     fn helper_epoch_changes_public_window_identity() {
         assert_ne!(
             public_window_id("epoch-a:46"),
@@ -1722,9 +1731,9 @@ mod tests {
     }
 
     #[test]
-    fn bundled_helper_v13_uses_host_owned_modifier_badge_chips() {
+    fn bundled_helper_v14_uses_v14_api_and_host_owned_modifier_badge_chips() {
         assert!(EXTENSION_SOURCE.contains("GetVersion()"));
-        assert!(EXTENSION_SOURCE.contains("const HELPER_API_VERSION = 13;"));
+        assert!(EXTENSION_SOURCE.contains("const HELPER_API_VERSION = 14;"));
         assert!(EXTENSION_SOURCE.contains("return HELPER_API_VERSION;"));
         assert!(EXTENSION_SOURCE.contains("SetCursorState"));
         assert!(EXTENSION_SOURCE.contains("SetCursorColor"));
@@ -1751,7 +1760,7 @@ mod tests {
         assert!(!EXTENSION_SOURCE.contains("function drawModifiers"));
         let metadata: serde_json::Value =
             serde_json::from_str(EXTENSION_METADATA).expect("valid bundled helper metadata");
-        assert_eq!(metadata["version"], 13);
+        assert_eq!(metadata["version"], 14);
 
         for action in [
             "idle", "observe", "click", "drag", "scroll", "text", "key", "navigate", "app",

@@ -22,7 +22,7 @@ import {
 
 Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
 
-const HELPER_API_VERSION = 13;
+const HELPER_API_VERSION = 14;
 const EXACT_TARGET_PROTOCOL_VERSION = 4;
 const FOREGROUND_TIMEOUT_MS = 30_000;
 const CURSOR_IDLE_TIMEOUT_US = 5 * 60 * 1_000_000;
@@ -978,8 +978,8 @@ export default class WinRectsExtension extends Extension {
         }
     }
 
-    _isTargetVisible(window) {
-        if (!window || !this._captureContextIsSafe())
+    _isTargetPainted(window) {
+        if (!window)
             return false;
         const actor = this._actorFor(window);
         return targetIsPainted({
@@ -987,6 +987,10 @@ export default class WinRectsExtension extends Extension {
             minimized: window.minimized,
             shellShowing: this._windowShowing(window),
         });
+    }
+
+    _isTargetVisible(window) {
+        return this._captureContextIsSafe() && this._isTargetPainted(window);
     }
 
     _canActivateTarget(window) {
@@ -1102,6 +1106,7 @@ export default class WinRectsExtension extends Extension {
             try { sticky = Boolean(w.is_on_all_workspaces()); } catch (_error) {}
             let workspaceIndex = -1;
             try { workspaceIndex = workspace?.index() ?? -1; } catch (_error) {}
+            const paintedVisible = this._isTargetPainted(w);
             const captureCurrent = this._isTargetVisible(w) && this._isTargetUnoccluded(w);
             let transientFor = null;
             try { transientFor = w.get_transient_for(); } catch (_error) {}
@@ -1128,7 +1133,7 @@ export default class WinRectsExtension extends Extension {
                 buffer_y: buffer.y,
                 focused: focusedWindow === w,
                 minimized,
-                visible: captureCurrent,
+                visible: paintedVisible,
                 capture_current: captureCurrent,
                 workspace_index: workspaceIndex,
                 workspace_active: sticky || workspace === activeWorkspace,

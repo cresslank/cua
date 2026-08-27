@@ -22,6 +22,8 @@ pub struct InstalledApp {
     /// Path the launcher would run — the unexpanded first token of `Exec=`
     /// (field codes like `%U`, `%f` stripped). Pass to `launch_app(launch_path=...)`.
     pub launch_path: String,
+    /// Exact WM class alias declared by `StartupWMClass=`, when present.
+    pub startup_wm_class: Option<String>,
     /// RFC3339 timestamp from the `.desktop` file's filesystem mtime, or
     /// `None` if the metadata could not be read.
     pub last_used: Option<String>,
@@ -172,6 +174,7 @@ fn parse_desktop_file(
         return None;
     }
     let bundle_id = bundle_id.to_owned();
+    let startup_wm_class = string_key(&entry, "StartupWMClass");
 
     let last_used = fs::metadata(path)
         .ok()
@@ -183,6 +186,7 @@ fn parse_desktop_file(
         name,
         bundle_id,
         launch_path,
+        startup_wm_class,
         last_used,
     })
 }
@@ -394,7 +398,21 @@ Exec=/opt/demo/bin/demo %U
         assert_eq!(parsed.name, "Demo App");
         assert_eq!(parsed.launch_path, "/opt/demo/bin/demo");
         assert_eq!(parsed.bundle_id, "demo-app");
+        assert_eq!(parsed.startup_wm_class, None);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn retains_exact_startup_wm_class_alias() {
+        let body = "[Desktop Entry]\nType=Application\nName=Zen Browser\nExec=/usr/bin/flatpak run app.zen_browser.zen\nStartupWMClass=zen\n";
+        let dir = std::env::temp_dir().join(format!("cua-startup-wm-class-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("app.zen_browser.zen.desktop");
+        std::fs::write(&path, body).unwrap();
+        let parsed = parse_desktop_file(&path, "app.zen_browser.zen", false).unwrap();
+        assert_eq!(parsed.startup_wm_class.as_deref(), Some("zen"));
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

@@ -70,6 +70,19 @@ test('overlap proof rejects only positive-area intersections', () => {
     assert.equal(rectanglesOverlap(target, {x: 10, y: 10, width: 0, height: 20}), false);
 });
 
+test('a one-pixel positive overlap blocks exact capture without erasing painted discovery', () => {
+    const zen = {x: 0, y: 40, width: 2049, height: 1688};
+    const ghostty = {x: 2048, y: 40, width: 2048, height: 1688};
+    const visible = targetIsPainted({
+        actorVisible: true,
+        minimized: false,
+        shellShowing: true,
+    });
+    const captureCurrent = visible && !rectanglesOverlap(zen, ghostty);
+    assert.equal(visible, true);
+    assert.equal(captureCurrent, false);
+});
+
 test('capture rejects zero-sized or non-finite display and stage geometry', () => {
     assert.equal(captureAreaIsSafe({
         displayWidth: 3136,
@@ -124,6 +137,8 @@ test('extension uses an explicit positive area and never implicit stage capture'
     assert.match(extensionSource, /target_geometry_changed_during_capture/);
     assert.match(extensionSource, /target_occluded_during_capture/);
     assert.doesNotMatch(extensionSource, /\.screenshot\(false, stream\)/);
+    assert.match(extensionSource, /visible: paintedVisible/);
+    assert.match(extensionSource, /capture_current: captureCurrent/);
 });
 
 test('overview and lock screen make the capture context fail closed', () => {

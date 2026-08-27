@@ -11,6 +11,8 @@ pub struct ProcessInfo {
     pub pid: u32,
     pub name: String,
     pub cmdline: String,
+    /// Exact argv entries from `/proc/<pid>/cmdline` (without NUL separators).
+    pub argv: Vec<String>,
 }
 
 fn is_process_live_state(status: &str) -> bool {
@@ -89,19 +91,23 @@ pub fn list_processes() -> Vec<ProcessInfo> {
             .unwrap_or_default();
 
         let cmdline_path = proc_dir.join(&*pid_str).join("cmdline");
-        let cmdline = fs::read(cmdline_path)
+        let argv = fs::read(cmdline_path)
             .ok()
             .map(|b| {
-                // cmdline is NUL-separated; first entry is argv[0].
                 let s = String::from_utf8_lossy(&b);
-                s.split('\0').next().unwrap_or("").trim().to_owned()
+                s.split('\0')
+                    .filter(|arg| !arg.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let cmdline = argv.first().cloned().unwrap_or_default();
 
         result.push(ProcessInfo {
             pid,
             name: proc_name,
             cmdline,
+            argv,
         });
     }
 
