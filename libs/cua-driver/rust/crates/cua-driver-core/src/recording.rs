@@ -1028,7 +1028,9 @@ mod tests {
         assert_eq!(action["action_truth"]["route"], "synthetic_events");
         assert_eq!(action["action_truth"]["requested_delivery"], "background");
 
-        let snapshot_id = crate::element_token::global().register_snapshot(1, 77, 1);
+        let snapshot_id = crate::element_token::global()
+            .register_snapshot(1, 77, 1)
+            .unwrap();
         let token = crate::element_token::token_for(snapshot_id, 0);
         let pending = session
             .begin_turn(
@@ -1047,9 +1049,13 @@ mod tests {
         assert_eq!(token_action["click_point"]["y"], 1.0);
         assert!(token_turn.join("click.png").exists());
 
-        let stale_snapshot = crate::element_token::global().register_snapshot(1, 88, 1);
+        let stale_snapshot = crate::element_token::global()
+            .register_snapshot(1, 88, 1)
+            .unwrap();
         let stale_token = crate::element_token::token_for(stale_snapshot, 0);
-        let _newer_snapshot = crate::element_token::global().register_snapshot(1, 88, 1);
+        let _newer_snapshot = crate::element_token::global()
+            .register_snapshot(1, 88, 1)
+            .unwrap();
         let pending = session
             .begin_turn(
                 "click",

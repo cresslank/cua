@@ -985,6 +985,28 @@ pub struct GetWindowStateTool {
 
 static GWS_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+fn snapshot_publication_error(error: cua_driver_core::element_token::RegistryError) -> ToolResult {
+    use cua_driver_core::element_token::RegistryError;
+    let code = match error {
+        RegistryError::CapacityExhausted { .. }
+        | RegistryError::GenerationExhausted
+        | RegistryError::PublicHandleExhausted
+        | RegistryError::EntropyUnavailable
+        | RegistryError::Collision => "capacity_exhausted",
+        RegistryError::Poisoned(_) => "snapshot_poisoned",
+        RegistryError::Stale | RegistryError::NotCurrent | RegistryError::Superseded => {
+            "stale_snapshot"
+        }
+        RegistryError::Closing | RegistryError::PublicationTimeout => "snapshot_busy",
+        RegistryError::ProcessIncarnationUnavailable(_) => "process_identity_unavailable",
+    };
+    let message = error.to_string();
+    ToolResult::error(message.clone()).with_structured(json!({
+        "status": "refused",
+        "refusal": { "code": code, "message": message }
+    }))
+}
+
 #[async_trait]
 impl Tool for GetWindowStateTool {
     fn def(&self) -> &ToolDef {
@@ -1186,24 +1208,26 @@ impl Tool for GetWindowStateTool {
                     content.push(cua_driver_core::protocol::Content::text(
                         header + &tr.tree_markdown,
                     ));
-                    if !observation_only {
-                        state.element_cache.update(pid, xid, &tr.nodes);
-                    }
+                    // Build the immutable AT-SPI payload outside registry locks,
+                    // then publish token metadata and cache rows as one generation.
+                    // This is fallible; Linux has no production `expect` wrapper.
+                    let snapshot_id = if observation_only {
+                        None
+                    } else {
+                        let candidate = match state.element_cache.prepare(pid, xid, &tr.nodes) {
+                            Ok(candidate) => candidate,
+                            Err(error) => return snapshot_publication_error(error),
+                        };
+                        match state.element_cache.publish(candidate) {
+                            Ok(snapshot_id) => Some(snapshot_id),
+                            Err(error) => return snapshot_publication_error(error),
+                        }
+                    };
                     structured["element_count"] = json!(count);
                     // AT-SPI's current bounded walker does not surface an
                     // exhaustive-walk proof. Keep negative existence unknown.
                     structured["elements_complete"] = json!(false);
                     structured["tree_markdown"] = json!(tr.tree_markdown);
-
-                    // Surface 6: register a snapshot in the global token
-                    // registry so each actionable element can be addressed
-                    // by an opaque per-snapshot `element_token` alongside
-                    // its existing integer `element_index`. The integer
-                    // surface stays unchanged — the token is additive.
-                    let snapshot_id = (!observation_only).then(|| {
-                        cua_driver_core::element_token::global()
-                            .register_snapshot(pid as i32, xid as u32, count)
-                    });
 
                     // Structured `elements` array: one entry per actionable node.
                     // Shape: `{element_index, element_token, role, label,
@@ -3384,7 +3408,7 @@ impl Tool for ClickTool {
             element_index_arg,
             element_token_arg.as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            window_id_arg.map(|v| v as u32),
+            window_id_arg,
             "click",
         ) {
             Ok(r) => r,
@@ -3921,7 +3945,7 @@ impl Tool for TypeTextTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "type_text",
         ) {
             Ok(r) => r,
@@ -4553,7 +4577,7 @@ impl Tool for PressKeyTool {
             element_index_arg,
             element_token_arg.as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            window_id_arg.map(|v| v as u32),
+            window_id_arg,
             "press_key",
         ) {
             Ok(r) => r,
@@ -4913,7 +4937,7 @@ impl Tool for HotkeyTool {
             element_index_arg,
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            window_id_arg.map(|value| value as u32),
+            window_id_arg,
             "hotkey",
         ) {
             Ok(resolved) => resolved,
@@ -5216,7 +5240,7 @@ impl Tool for SetValueTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "set_value",
         ) {
             Ok(r) => r,
@@ -5372,7 +5396,7 @@ impl Tool for ScrollTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "scroll",
         ) {
             Ok(r) => r,
@@ -5811,7 +5835,7 @@ impl Tool for DoubleClickTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "double_click",
         ) {
             Ok(r) => r,
@@ -6070,7 +6094,7 @@ impl Tool for RightClickTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "right_click",
         ) {
             Ok(r) => r,

@@ -87,7 +87,7 @@ impl Tool for DoubleClickTool {
         // Surface 6: token / index precedence — see click.rs for the
         // canonical comment.
         let element_token_arg = args.opt_str("element_token");
-        let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
+        let window_id_arg = args.opt_u64("window_id");
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             pid,
@@ -106,7 +106,15 @@ impl Tool for DoubleClickTool {
                 window_id: wid,
                 element_index: idx,
                 via_token: _,
+                ..
             } => (Some(idx), wid),
+        };
+        let window_id = match cua_driver_core::element_token::checked_optional_native_window_id(
+            window_id,
+            "double_click",
+        ) {
+            Ok(window_id) => window_id,
+            Err(error) => return error,
         };
 
         // ── AX element path ──────────────────────────────────────────────────

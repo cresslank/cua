@@ -229,7 +229,7 @@ impl Tool for HotkeyTool {
         let key = non_modifiers.last().unwrap().clone();
         let key_display = raw_keys.join("+");
         let element_token_arg = args.opt_str("element_token");
-        let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
+        let window_id_arg = args.opt_u64("window_id");
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             pid,
@@ -248,7 +248,14 @@ impl Tool for HotkeyTool {
                 window_id,
                 element_index,
                 via_token: _,
+                ..
             } => (Some(element_index), window_id),
+        };
+        let window_id = match cua_driver_core::element_token::checked_optional_native_window_id(
+            window_id, "hotkey",
+        ) {
+            Ok(window_id) => window_id,
+            Err(error) => return error,
         };
         // delivery_mode gates whether we raise: background (default) never fronts
         // the window — passing window_id only targets the combo. foreground is the

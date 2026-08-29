@@ -4373,10 +4373,12 @@ resources:
 
     #[tokio::test]
     async fn element_tokens_are_bound_to_the_dispatch_runtime_generation() {
-        let pid = 8_675_309;
+        let pid = i32::try_from(std::process::id()).unwrap();
         let token = DISPATCH_RUNTIME_SCOPE
             .scope("runtime-a".to_owned(), async {
-                let snapshot = crate::element_token::global().register_snapshot(pid, 44, 1);
+                let snapshot = crate::element_token::global()
+                    .register_snapshot(pid, 44, 1)
+                    .unwrap();
                 crate::element_token::token_for(snapshot, 0)
             })
             .await;

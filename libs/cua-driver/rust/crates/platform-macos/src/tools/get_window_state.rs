@@ -488,11 +488,20 @@ impl Tool for GetWindowStateTool {
             .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
             .unwrap_or(0);
         let snapshot_id = if scope_matched && !observation_only {
-            Some(cua_driver_core::element_token::global().register_snapshot(
+            match cua_driver_core::element_token::global().register_snapshot(
                 pid,
                 window_id,
                 elem_count_for_snapshot,
-            ))
+            ) {
+                Ok(snapshot_id) => Some(snapshot_id),
+                Err(error) => {
+                    let message = format!("snapshot publication failed: {error}");
+                    return ToolResult::error(message.clone()).with_structured(serde_json::json!({
+                        "status": "refused",
+                        "refusal": { "code": "snapshot_publication_failed", "message": message }
+                    }));
+                }
+            }
         } else {
             None
         };
@@ -1332,7 +1341,7 @@ mod tests {
     fn build_elements_array_with_token_emits_element_token_per_row() {
         let reg = cua_driver_core::element_token::global();
         let pid = 0x6abc_0001_i32;
-        let sid = reg.register_snapshot(pid, /* window_id = */ 9, 3);
+        let sid = reg.register_snapshot(pid, /* window_id = */ 9, 3).unwrap();
         let nodes = vec![
             node(Some(0), "AXButton", Some("A"), 1, None, None),
             node(Some(1), "AXButton", Some("B"), 1, None, None),

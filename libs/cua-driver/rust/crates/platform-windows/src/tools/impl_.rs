@@ -1379,17 +1379,24 @@ impl Tool for GetWindowStateTool {
                     structured["tree_markdown"] = json!(tr.tree_markdown);
 
                     // Surface 6: register a snapshot in the global token
-                    // registry. Windows uses u64 HWND but the registry
-                    // stores u32 — truncate (HWND fits in 32-bit on
-                    // every supported edition; the upper 32 bits are
-                    // zero in user-space).
-                    let snapshot_id = (!observation_only).then(|| {
-                        cua_driver_core::element_token::global().register_snapshot(
-                            pid as i32,
-                            hwnd as u32,
-                            count,
-                        )
-                    });
+                    // registry while preserving the full-width HWND in the
+                    // shared identity. Windows behavior is otherwise unchanged.
+                    let snapshot_id = if observation_only {
+                        None
+                    } else {
+                        match cua_driver_core::element_token::global()
+                            .register_snapshot(pid as i32, hwnd, count)
+                        {
+                            Ok(snapshot_id) => Some(snapshot_id),
+                            Err(error) => {
+                                let message = format!("snapshot publication failed: {error}");
+                                return ToolResult::error(message.clone()).with_structured(json!({
+                                    "status": "refused",
+                                    "refusal": { "code": "snapshot_publication_failed", "message": message }
+                                }));
+                            }
+                        }
+                    };
 
                     // Structured `elements` array — preferred consumption
                     // path. Shape matches the cross-platform spec:
@@ -2960,7 +2967,7 @@ impl Tool for ClickTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "click",
         ) {
             Ok(r) => r,
@@ -4071,7 +4078,7 @@ impl Tool for TypeTextTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "type_text",
         ) {
             Ok(r) => r,
@@ -4847,7 +4854,7 @@ impl Tool for PressKeyTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "press_key",
         ) {
             Ok(r) => r,
@@ -5269,7 +5276,7 @@ impl Tool for HotkeyTool {
             args.opt_u64("element_index").map(|value| value as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|value| value as u32),
+            args.opt_u64("window_id"),
             "hotkey",
         ) {
             Ok(resolved) => resolved,
@@ -5558,7 +5565,7 @@ impl Tool for SetValueTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "set_value",
         ) {
             Ok(r) => r,
@@ -5819,7 +5826,7 @@ impl Tool for ScrollTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "scroll",
         ) {
             Ok(r) => r,
@@ -6268,7 +6275,7 @@ impl Tool for DoubleClickTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "double_click",
         ) {
             Ok(r) => r,
@@ -6604,7 +6611,7 @@ impl Tool for RightClickTool {
             args.opt_u64("element_index").map(|v| v as usize),
             args.opt_str("element_token").as_deref(),
             args.opt_str("snapshot_id").as_deref(),
-            args.opt_u64("window_id").map(|v| v as u32),
+            args.opt_u64("window_id"),
             "right_click",
         ) {
             Ok(r) => r,

@@ -108,7 +108,7 @@ impl Tool for SetValueTool {
         // is now schema-required so the resolver can centralize the
         // "missing addressing" error message.
         let element_token_arg = args.opt_str("element_token");
-        let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
+        let window_id_arg = args.opt_u64("window_id");
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             pid,
@@ -132,6 +132,7 @@ impl Tool for SetValueTool {
                 window_id: Some(wid),
                 element_index: idx,
                 via_token: _,
+                ..
             } => (idx, wid),
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: None, ..
@@ -141,6 +142,13 @@ impl Tool for SetValueTool {
                  (omit only when supplying element_token, which carries it).",
                 )
             }
+        };
+        let window_id = match cua_driver_core::element_token::checked_native_window_id(
+            window_id,
+            "set_value",
+        ) {
+            Ok(window_id) => window_id,
+            Err(error) => return error,
         };
 
         // Retain out of the cache so a concurrent get_window_state can't free

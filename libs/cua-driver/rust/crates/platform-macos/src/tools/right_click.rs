@@ -97,7 +97,7 @@ impl Tool for RightClickTool {
 
         // Surface 6: element_token / element_index precedence resolution.
         let element_token_arg = args.opt_str("element_token");
-        let window_id_arg = args.opt_u64("window_id").map(|v| v as u32);
+        let window_id_arg = args.opt_u64("window_id");
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
         let resolved = match cua_driver_core::element_token::resolve_element_args(
             pid,
@@ -116,7 +116,15 @@ impl Tool for RightClickTool {
                 window_id: wid,
                 element_index: idx,
                 via_token: _,
+                ..
             } => (Some(idx), wid),
+        };
+        let window_id = match cua_driver_core::element_token::checked_optional_native_window_id(
+            window_id,
+            "right_click",
+        ) {
+            Ok(window_id) => window_id,
+            Err(error) => return error,
         };
         let x = args.opt_f64("x");
         let y = args.opt_f64("y");
