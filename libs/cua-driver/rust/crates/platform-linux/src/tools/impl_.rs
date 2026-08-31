@@ -3436,18 +3436,24 @@ impl Tool for ClickTool {
                 "required": ["pid", "window_id"],
             }));
         }
-        if crate::wayland::is_gnome_wayland_session() {
-            let exact_window_id = window_id_resolved.expect("checked above");
+        let exact_target_proof = if crate::wayland::wayland_input_enabled() {
+            let Some(exact_window_id) = window_id_resolved else {
+                return ToolResult::error(
+                    "exact_target_required: native Wayland click requires caller-approved pid and window_id",
+                );
+            };
             match cua_driver_core::blocking::spawn(move || {
                 crate::wayland::establish_exact_target(pid, exact_window_id)
             })
             .await
             {
-                Ok(Ok(_)) => {}
+                Ok(Ok(proof)) => Some(proof),
                 Ok(Err(error)) => return ToolResult::error(error.to_string()),
                 Err(error) => return ToolResult::error(format!("Task error: {error}")),
             }
-        }
+        } else {
+            None
+        };
 
         if let Some(idx) = elem_idx_resolved {
             let xid_hint = window_id_resolved;
@@ -3481,10 +3487,29 @@ impl Tool for ClickTool {
             // Chromium can execute a genuine AT-SPI action without focus. Try
             // that route before applying its background synthetic-input gate.
             if modifiers.is_empty() {
-                let ax_result = cua_driver_core::blocking::spawn(move || {
-                    crate::atspi::perform_action(pid, idx)
-                })
-                .await;
+                let element_key_for_ax = if exact_target_proof.is_some() {
+                    let xid = xid_hint.expect("native Wayland exact target has window id");
+                    match self.state.element_cache.get_element_key(pid, xid, idx) {
+                        Some(key) => Some(key),
+                        None => {
+                            return ToolResult::error(format!(
+                                "stale_element_token: no cached AT-SPI key for element [{idx}] in window {xid}"
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                let proof_for_ax = exact_target_proof.clone();
+                let ax_result =
+                    cua_driver_core::blocking::spawn(move || match proof_for_ax.as_ref() {
+                        Some(proof) => crate::atspi::perform_action_in_exact_window(
+                            proof,
+                            element_key_for_ax.expect("exact action has key"),
+                        ),
+                        None => crate::atspi::perform_action(pid, idx),
+                    })
+                    .await;
                 if let Ok(Ok((_action, suspected_noop))) = ax_result {
                     let mut structured = json!({
                         "path": "ax",
@@ -3622,6 +3647,7 @@ impl Tool for ClickTool {
         let (output_x, output_y) = wayland_output_point.unwrap_or((xi, yi));
         let cursor_id_for_task = cursor_id.clone();
         let modifiers_for_task = modifiers.clone();
+        let exact_target_for_task = exact_target_proof.clone();
         // delivery_mode: background (default) = no-focus-steal injection;
         // foreground = activate the target window (EWMH) first, then inject,
         // then restore prior active. Mirrors macOS/Windows.
@@ -3644,9 +3670,14 @@ impl Tool for ClickTool {
                 // working. (x,y) are screen coords here, matching the frames in
                 // `get_window_state`. Miss → fall through to the injection paths.
                 if !delivery.is_foreground() && button == 1 && count == 1 {
-                    if let Ok(Some(_)) =
-                        crate::atspi::perform_action_at_screen_point(pid, xid, output_x, output_y)
-                    {
+                    let proof = exact_target_for_task.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("exact_target_required: native Wayland pixel action omitted proof")
+                    })?;
+                    if let Ok(Some(_)) = crate::atspi::perform_action_at_screen_point(
+                        proof,
+                        output_x,
+                        output_y,
+                    ) {
                         return Ok(("wayland_atspi", None));
                     }
                 }
@@ -5266,24 +5297,48 @@ impl Tool for SetValueTool {
                 "required": ["pid", "window_id"],
             }));
         }
-        if crate::wayland::is_gnome_wayland_session() {
-            let exact_window_id = exact_window_id.expect("checked above");
+        let exact_target_proof = if crate::wayland::wayland_input_enabled() {
+            let Some(exact_window_id) = exact_window_id else {
+                return ToolResult::error(
+                    "exact_target_required: native Wayland set_value requires caller-approved pid and window_id",
+                );
+            };
             match cua_driver_core::blocking::spawn(move || {
                 crate::wayland::establish_exact_target(pid, exact_window_id)
             })
             .await
             {
-                Ok(Ok(_)) => {}
+                Ok(Ok(proof)) => Some(proof),
                 Ok(Err(error)) => return ToolResult::error(error.to_string()),
                 Err(error) => return ToolResult::error(format!("Task error: {error}")),
             }
-        }
+        } else {
+            None
+        };
         let value_for_task = value.clone();
         let xid = exact_window_id.unwrap_or(0);
         position_named_session_keyboard_cursor(&self.state, &args, pid, xid, Some(idx), None, true)
             .await;
-        let result = cua_driver_core::blocking::spawn(move || {
-            crate::atspi::set_value(pid, idx, &value_for_task)
+        let element_key_for_value = if exact_target_proof.is_some() {
+            match self.state.element_cache.get_element_key(pid, xid, idx) {
+                Some(key) => Some(key),
+                None => {
+                    return ToolResult::error(format!(
+                        "stale_element_token: no cached AT-SPI key for element [{idx}] in window {xid}"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        let proof_for_value = exact_target_proof.clone();
+        let result = cua_driver_core::blocking::spawn(move || match proof_for_value.as_ref() {
+            Some(proof) => crate::atspi::set_value_in_exact_window(
+                proof,
+                element_key_for_value.expect("exact value action has key"),
+                &value_for_task,
+            ),
+            None => crate::atspi::set_value(pid, idx, &value_for_task),
         })
         .await;
         match result {

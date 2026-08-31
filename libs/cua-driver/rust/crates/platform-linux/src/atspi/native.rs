@@ -1997,6 +1997,120 @@ pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
     )
 }
 
+fn exact_window_element_index(
+    indexed_elements: &[(usize, u64)],
+    scoped_frame: usize,
+    element_key: u64,
+    window_id: u64,
+) -> Result<usize> {
+    let mut matches = indexed_elements
+        .iter()
+        .enumerate()
+        .filter(|(_, (frame, key))| *frame == scoped_frame && *key == element_key)
+        .map(|(index, _)| index);
+    let index = matches.next().ok_or_else(|| {
+        anyhow!("AT-SPI element key {element_key:#x} is stale for exact window {window_id}")
+    })?;
+    if matches.next().is_some() {
+        anyhow::bail!(
+            "AT-SPI element key {element_key:#x} is ambiguous in exact window {window_id}"
+        );
+    }
+    Ok(index)
+}
+
+#[cfg(test)]
+mod exact_window_element_tests {
+    use super::exact_window_element_index;
+
+    #[test]
+    fn stable_key_survives_process_wide_ordinal_reordering() {
+        let reordered = [(0, 0x99), (1, 0x41), (1, 0x42)];
+        assert_eq!(
+            exact_window_element_index(&reordered, 1, 0x41, 7).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn same_key_in_another_window_cannot_retarget() {
+        let records = [(0, 0x41), (1, 0x42)];
+        assert!(exact_window_element_index(&records, 1, 0x41, 7).is_err());
+    }
+
+    #[test]
+    fn duplicate_key_in_exact_window_fails_closed() {
+        let records = [(1, 0x41), (1, 0x41)];
+        assert!(exact_window_element_index(&records, 1, 0x41, 7).is_err());
+    }
+}
+
+/// Actuate an application-wide element index only when the action-time AT-SPI
+/// walk proves that the indexed object belongs to the carried exact window.
+/// The retained proxy is mutated directly; never hand the ordinal back to a
+/// second process-wide walk, where top-level reordering could retarget it.
+pub fn perform_action_in_exact_window(
+    target_proof: &crate::wayland::ExactTargetProof,
+    element_key: u64,
+) -> Result<(String, bool)> {
+    crate::wayland::validate_single_exact_target(target_proof)?;
+    let target_proof = target_proof.clone();
+    let pid = target_proof.pid();
+    let window_id = target_proof.window_id();
+    bounded(
+        async {
+            let conn = shared_connection().await?;
+            let (visited, scoped_frame) = collect_visited_bounded(conn, pid, window_id, None, None)
+                .await?
+                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+            let scoped_frame = scoped_frame.ok_or_else(|| {
+                anyhow!("could not scope AT-SPI action to exact window {window_id}")
+            })?;
+            let action_nodes: Vec<&Visited> =
+                visited.iter().filter(|node| is_indexable(node)).collect();
+            let indexed_elements: Vec<(usize, u64)> = action_nodes
+                .iter()
+                .map(|node| (node.frame_ordinal, node.element_key))
+                .collect();
+            let target = action_nodes[exact_window_element_index(
+                &indexed_elements,
+                scoped_frame,
+                element_key,
+                window_id,
+            )?];
+            let suspected_noop = is_passive_role(&target.role);
+            let action_proxy = target
+                .acc
+                .proxies()
+                .await
+                .map_err(|error| anyhow!("interface proxies unavailable: {error}"))?
+                .action()
+                .await
+                .map_err(|error| anyhow!("Action unavailable: {error}"))?;
+
+            let proof_for_action = target_proof.clone();
+            cua_driver_core::blocking::spawn(move || {
+                crate::wayland::validate_single_exact_target(&proof_for_action)
+            })
+            .await
+            .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
+            let action = invoke_live_activation(
+                &action_proxy,
+                &target.role,
+                &format!("element key {element_key:#x} in exact window {window_id}"),
+            )
+            .await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok((action, suspected_noop))
+        },
+        || {
+            Err(anyhow!(
+                "perform_action_in_exact_window timed out for pid {pid} window {window_id}"
+            ))
+        },
+    )
+}
+
 /// Resolve the AT-SPI top-level ancestry that corresponds to an exact native
 /// window. A compositor-backed window ID is not generally an AT-SPI object ID,
 /// so the browser-setup singleton contract is the correlation authority. When
@@ -2427,18 +2541,25 @@ pub fn perform_action_at_point(pid: u32, win_x: i32, win_y: i32) -> Result<Optio
 /// on a hit, `Ok(None)` when no element covers the point so the caller can fall
 /// back to its native injection path.
 pub fn perform_action_at_screen_point(
-    pid: u32,
-    xid: u64,
+    target_proof: &crate::wayland::ExactTargetProof,
     screen_x: i32,
     screen_y: i32,
 ) -> Result<Option<String>> {
+    crate::wayland::validate_single_exact_target(target_proof)?;
+    let target_proof = target_proof.clone();
+    let pid = target_proof.pid();
+    let xid = target_proof.window_id();
     bounded(
         async {
             let conn = shared_connection().await?;
-            let visited = match collect_visited(conn, pid).await? {
-                Some(v) => v,
-                None => return Ok(None),
-            };
+            let (visited, scoped_frame) =
+                match collect_visited_bounded(conn, pid, xid, None, None).await? {
+                    Some(walked) => walked,
+                    None => return Ok(None),
+                };
+            let scoped_frame = scoped_frame.ok_or_else(|| {
+                anyhow!("could not scope AT-SPI screen-point action to exact window {xid}")
+            })?;
             let web_document_origin = web_document_origin_for_visited(&visited, pid)
                 .await
                 .unwrap_or((0, 0));
@@ -2456,10 +2577,13 @@ pub fn perform_action_at_screen_point(
             };
             let (ox, oy) = offset.unwrap_or((0, 0));
 
-            // (element_index, x, y, w, h, is_passive_label) over the SAME indexable
-            // list `perform_action`/`get_window_state` use, so the chosen index
-            // maps straight back to a verified `element_index` actuation.
-            let action_nodes: Vec<&Visited> = visited.iter().filter(|v| is_indexable(v)).collect();
+            // Restrict both hit-testing and mutation to the one action-time
+            // correlated top-level. Indices here are local to this retained set
+            // and are never passed to a second process-wide traversal.
+            let action_nodes: Vec<&Visited> = visited
+                .iter()
+                .filter(|node| node.frame_ordinal == scoped_frame && is_indexable(node))
+                .collect();
             let mut frames: Vec<(usize, i32, i32, u32, u32, bool)> = Vec::new();
             for (idx, node) in action_nodes.iter().enumerate() {
                 if !node.has_component {
@@ -2504,6 +2628,12 @@ pub fn perform_action_at_screen_point(
                 .action()
                 .await
                 .map_err(|e| anyhow!("Action unavailable: {e}"))?;
+            let proof_for_action = target_proof.clone();
+            cua_driver_core::blocking::spawn(move || {
+                crate::wayland::validate_single_exact_target(&proof_for_action)
+            })
+            .await
+            .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
             let action = invoke_live_activation(&ap, &target.role, "screen-point target").await?;
             Ok(Some(action))
         },
@@ -2613,6 +2743,93 @@ pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
         || {
             Err(anyhow!(
                 "set_value timed out for pid {pid} (app unresponsive to AT-SPI)"
+            ))
+        },
+    )
+}
+
+/// Set an indexed value only through the retained object from an action-time,
+/// exact-window-scoped traversal.
+pub fn set_value_in_exact_window(
+    target_proof: &crate::wayland::ExactTargetProof,
+    element_key: u64,
+    value: &str,
+) -> Result<()> {
+    crate::wayland::validate_single_exact_target(target_proof)?;
+    let target_proof = target_proof.clone();
+    let pid = target_proof.pid();
+    let window_id = target_proof.window_id();
+    bounded(
+        async {
+            let conn = shared_connection().await?;
+            let (visited, scoped_frame) = collect_visited_bounded(conn, pid, window_id, None, None)
+                .await?
+                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+            let scoped_frame = scoped_frame.ok_or_else(|| {
+                anyhow!("could not scope AT-SPI value mutation to exact window {window_id}")
+            })?;
+            let action_nodes: Vec<&Visited> =
+                visited.iter().filter(|node| is_indexable(node)).collect();
+            let indexed_elements: Vec<(usize, u64)> = action_nodes
+                .iter()
+                .map(|node| (node.frame_ordinal, node.element_key))
+                .collect();
+            let target = action_nodes[exact_window_element_index(
+                &indexed_elements,
+                scoped_frame,
+                element_key,
+                window_id,
+            )?];
+            let proxies = target
+                .acc
+                .proxies()
+                .await
+                .map_err(|error| anyhow!("interface proxies unavailable: {error}"))?;
+
+            let proof_for_action = target_proof.clone();
+            cua_driver_core::blocking::spawn(move || {
+                crate::wayland::validate_single_exact_target(&proof_for_action)
+            })
+            .await
+            .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
+
+            if let Ok(editable) = proxies.editable_text().await {
+                if editable.set_text_contents(value).await.unwrap_or(false) {
+                    return Ok(());
+                }
+                let offset = match proxies.text().await {
+                    Ok(text) => text.caret_offset().await.unwrap_or(0),
+                    Err(_) => 0,
+                };
+                let len = value.chars().count() as i32;
+                if editable
+                    .insert_text(offset, value, len)
+                    .await
+                    .unwrap_or(false)
+                {
+                    return Ok(());
+                }
+            }
+            if target.has_value {
+                let numeric: f64 = value
+                    .parse()
+                    .map_err(|_| anyhow!("value '{value}' is not numeric for a Value element"))?;
+                proxies
+                    .value()
+                    .await
+                    .map_err(|error| anyhow!("Value unavailable: {error}"))?
+                    .set_current_value(numeric)
+                    .await
+                    .map_err(|error| anyhow!("setCurrentValue failed: {error}"))?;
+                return Ok(());
+            }
+            Err(anyhow!(
+                "element key {element_key:#x} exposes neither EditableText nor Value"
+            ))
+        },
+        || {
+            Err(anyhow!(
+                "set_value_in_exact_window timed out for pid {pid} window {window_id}"
             ))
         },
     )

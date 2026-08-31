@@ -26,6 +26,10 @@ const DBUS_DEST: &str = "org.freedesktop.DBus";
 const DBUS_PATH: &str = "/org/freedesktop/DBus";
 const DBUS_IFACE: &str = "org.freedesktop.DBus";
 pub const PROTOCOL_VERSION: u32 = 1;
+// The local immutable release closure does not currently carry this ABI-bound
+// effect. An ad-hoc service on the session bus must not upgrade support or
+// provide mutation identity: its numeric tokens recycle across effect reloads.
+const IMMUTABLE_INSTALL_PAYLOAD_AVAILABLE: bool = false;
 const CALL_TIMEOUT: Duration = Duration::from_secs(3);
 const GEOMETRY_DELTA_PX: i32 = 64;
 
@@ -74,7 +78,14 @@ pub fn available() -> bool {
     false
 }
 
+pub fn immutable_install_ready() -> bool {
+    IMMUTABLE_INSTALL_PAYLOAD_AVAILABLE
+}
+
 pub fn list_windows() -> Option<Vec<KwinWindow>> {
+    if !immutable_install_ready() {
+        return None;
+    }
     snapshot_for_owner(&helper_owner()?)
 }
 
@@ -113,7 +124,7 @@ pub fn list_window_infos() -> Option<Vec<WindowInfo>> {
 }
 
 pub fn trusted_window_for_id(pid: u32, token: u64) -> Option<KwinWindow> {
-    snapshot_for_owner(&helper_owner()?)?
+    list_windows()?
         .into_iter()
         .find(|window| window.pid == pid && window.token == token)
 }
@@ -442,6 +453,8 @@ mod tests {
     #[test]
     fn raw_input_capability_is_fail_closed() {
         assert!(!available());
+        assert!(!immutable_install_ready());
+        assert!(list_windows().is_none());
 
         let called = std::cell::Cell::new(false);
         let error = with_focused_window(42, 7, || {

@@ -1,6 +1,6 @@
 use platform_linux::wayland::kwin_helper::{
-    available, correlate_atspi_window, parse_snapshot, require_active_target, with_focused_window,
-    CorrelationError,
+    available, correlate_atspi_window, immutable_install_ready, parse_snapshot,
+    require_active_target, with_focused_window, CorrelationError,
 };
 use platform_linux::x11::WindowInfo;
 
@@ -170,4 +170,12 @@ fn raw_kwin_input_is_refused_before_dispatch() {
         "input body must not run on the focus-only KWin path"
     );
     assert!(error.to_string().contains("target-bound KWin input path"));
+}
+
+#[test]
+fn kwin_support_is_not_ready_without_immutable_install_payload() {
+    assert!(!immutable_install_ready());
+    assert!(platform_linux::wayland::kwin_helper::list_windows().is_none());
+    assert!(platform_linux::wayland::kwin_helper::list_window_infos().is_none());
+    assert!(platform_linux::wayland::kwin_helper::trusted_window_for_id(1200, 41).is_none());
 }

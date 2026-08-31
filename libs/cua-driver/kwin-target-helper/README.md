@@ -5,8 +5,13 @@ the portable `cua-driver` binary and must be built against the user's installed
 KWin/Qt/KF6 development files. Do not use a helper built for a different KWin
 or Qt ABI.
 
-The helper is intentionally **read-only**. It provides trusted KWin window
-identity and state metadata: stable opaque tokens, PID, geometry,
+The immutable Cua local-install closure does not currently package this helper.
+Accordingly, the driver does not advertise or consume an ad-hoc installation as
+production-ready identity. The current numeric tokens can recycle across effect
+reloads; they are discovery metadata, not mutation authorization.
+
+The helper is intentionally **read-only**. It provides KWin window
+identity and state metadata: opaque effect-lifetime tokens, PID, geometry,
 active/minimized state, and stacking order. It does not expose window activation
 or input mutation methods. KWin portal/libei input is focus-bound, so focus can
 change between any focus check and compositor-side input processing. Cua

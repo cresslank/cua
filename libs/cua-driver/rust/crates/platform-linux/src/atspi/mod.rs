@@ -163,6 +163,13 @@ pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
     native::perform_action(pid, idx)
 }
 
+pub fn perform_action_in_exact_window(
+    target_proof: &crate::wayland::ExactTargetProof,
+    element_key: u64,
+) -> Result<(String, bool)> {
+    native::perform_action_in_exact_window(target_proof, element_key)
+}
+
 pub fn perform_verified_action_by_key(
     target_proof: &crate::wayland::ExactTargetProof,
     element_key: u64,
@@ -216,12 +223,11 @@ pub fn perform_action_at_point(pid: u32, win_x: i32, win_y: i32) -> Result<Optio
 /// generally (no `CoordType::Screen`, which reports (0,0)). See
 /// [`native::perform_action_at_screen_point`].
 pub fn perform_action_at_screen_point(
-    pid: u32,
-    xid: u64,
+    target_proof: &crate::wayland::ExactTargetProof,
     screen_x: i32,
     screen_y: i32,
 ) -> Result<Option<String>> {
-    native::perform_action_at_screen_point(pid, xid, screen_x, screen_y)
+    native::perform_action_at_screen_point(target_proof, screen_x, screen_y)
 }
 
 /// Try to type text into any editable field in the window via AT-SPI EditableText.
@@ -242,6 +248,14 @@ pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
 /// `Value.set_current_value(float)`.
 pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
     native::set_value(pid, idx, value)
+}
+
+pub fn set_value_in_exact_window(
+    target_proof: &crate::wayland::ExactTargetProof,
+    element_key: u64,
+    value: &str,
+) -> Result<()> {
+    native::set_value_in_exact_window(target_proof, element_key, value)
 }
 
 /// Insert `text` into a GUI app's editable field via AT-SPI EditableText —
