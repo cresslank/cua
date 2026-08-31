@@ -11,6 +11,7 @@
 
 pub mod ext_screencopy;
 pub mod ext_toplevel;
+pub mod kwin_helper;
 pub mod overlay;
 pub mod persistent_vptr;
 pub(crate) mod portal;
@@ -2069,6 +2070,13 @@ pub fn with_target_foreground<T>(
     let _lease = acquire_host_raw_input_lease()?;
     let target = establish_exact_target(pid, window_id)?;
     validate_exact_target(&target)?;
+    if kwin_helper::trusted_window_for_id(pid, window_id).is_some() {
+        return kwin_helper::with_focused_window(pid, window_id, || {
+            anyhow::bail!(
+                "foreground_unavailable: KWin did not provide an operation-bound input guard"
+            )
+        });
+    }
     if sway_ipc::window_for_id(window_id).is_some() {
         let focus = sway_ipc::StatefulFocus::begin(pid, window_id)?;
         let guard = ExactTargetInputGuard {
@@ -4258,6 +4266,13 @@ fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     windows
 }
 
+fn apply_pid_filter(mut windows: Vec<WindowInfo>, filter_pid: Option<u32>) -> Vec<WindowInfo> {
+    if let Some(pid) = filter_pid {
+        windows.retain(|window| window.pid == Some(pid));
+    }
+    windows
+}
+
 fn private_session_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     let mut native = match list_windows() {
         Ok(windows) => windows,
@@ -4306,6 +4321,9 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
         // windows can never be mistaken for nested private targets.
         if is_inject_mode() {
             return private_session_windows(filter_pid);
+        }
+        if let Some(windows) = kwin_helper::list_window_infos() {
+            return listed_windows(apply_pid_filter(windows, filter_pid));
         }
         if shell_helper::present() {
             if !shell_helper::available() {
@@ -4822,6 +4840,21 @@ mod tests {
         assert_eq!(windows[0].xid, 10);
         assert_eq!(windows[1].pid, Some(200));
         assert_eq!(windows[2].pid, None);
+    }
+
+    #[test]
+    fn pid_filter_excludes_other_process_windows() {
+        let filtered = apply_pid_filter(
+            vec![
+                window(10, Some(100), "wanted"),
+                window(20, Some(200), "other"),
+                window(30, None, "unknown"),
+            ],
+            Some(100),
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].pid, Some(100));
+        assert_eq!(filtered[0].xid, 10);
     }
 
     #[test]
