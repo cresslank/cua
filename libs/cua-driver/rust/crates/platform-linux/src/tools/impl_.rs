@@ -275,6 +275,34 @@ pub struct ToolState {
     pub zoom_registry: Arc<ZoomRegistry>,
     pub mouse_hold: std::sync::Mutex<std::collections::HashMap<String, MouseHoldState>>,
     pub config: Arc<RwLock<DriverConfig>>,
+    #[cfg(test)]
+    production_route_backend: Option<Arc<ProductionRouteBackend>>,
+}
+
+#[cfg(test)]
+struct ProductionRouteBackend {
+    establish:
+        Arc<dyn Fn(u32, u64) -> anyhow::Result<crate::wayland::ExactTargetProof> + Send + Sync>,
+    point_action: Arc<
+        dyn Fn(&crate::wayland::ExactTargetProof, i32, i32) -> anyhow::Result<Option<String>>
+            + Send
+            + Sync,
+    >,
+    click: Arc<
+        dyn Fn(
+                crate::wayland::ExactTargetProof,
+                i32,
+                i32,
+                u32,
+                u8,
+            )
+                -> anyhow::Result<Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>>
+            + Send
+            + Sync,
+    >,
+    set_value: Arc<
+        dyn Fn(&crate::wayland::ExactTargetProof, u64, &str) -> anyhow::Result<()> + Send + Sync,
+    >,
 }
 
 #[derive(Clone, Debug)]
@@ -295,7 +323,93 @@ impl ToolState {
             zoom_registry: Arc::new(ZoomRegistry::new()),
             mouse_hold: std::sync::Mutex::new(Default::default()),
             config: Arc::new(RwLock::new(load_driver_config())),
+            #[cfg(test)]
+            production_route_backend: None,
         })
+    }
+
+    #[cfg(test)]
+    fn new_with_production_route_backend(backend: ProductionRouteBackend) -> Arc<Self> {
+        let mut state = Arc::try_unwrap(Self::new()).ok().expect("fresh tool state");
+        state.production_route_backend = Some(Arc::new(backend));
+        Arc::new(state)
+    }
+
+    fn wayland_input_enabled(&self) -> bool {
+        #[cfg(test)]
+        if self.production_route_backend.is_some() {
+            return true;
+        }
+        crate::wayland::wayland_input_enabled()
+    }
+
+    fn wayland_inject_mode(&self) -> bool {
+        #[cfg(test)]
+        if self.production_route_backend.is_some() {
+            return true;
+        }
+        crate::wayland::is_inject_mode()
+    }
+
+    fn window_local_to_output(&self, xid: u64, x: i32, y: i32) -> (i32, i32) {
+        #[cfg(test)]
+        if self.production_route_backend.is_some() {
+            return (x, y);
+        }
+        crate::wayland::window_local_to_output(xid, x, y)
+    }
+
+    fn establish_exact_target(
+        &self,
+        pid: u32,
+        xid: u64,
+    ) -> anyhow::Result<crate::wayland::ExactTargetProof> {
+        #[cfg(test)]
+        if let Some(backend) = &self.production_route_backend {
+            return (backend.establish)(pid, xid);
+        }
+        crate::wayland::establish_exact_target(pid, xid)
+    }
+
+    fn point_action(
+        &self,
+        proof: &crate::wayland::ExactTargetProof,
+        x: i32,
+        y: i32,
+    ) -> anyhow::Result<Option<String>> {
+        #[cfg(test)]
+        if let Some(backend) = &self.production_route_backend {
+            return (backend.point_action)(proof, x, y);
+        }
+        crate::atspi::perform_action_at_screen_point(proof, x, y)
+    }
+
+    fn exact_click(
+        &self,
+        proof: crate::wayland::ExactTargetProof,
+        x: i32,
+        y: i32,
+        count: u32,
+        button: u8,
+    ) -> anyhow::Result<Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>> {
+        #[cfg(test)]
+        if let Some(backend) = &self.production_route_backend {
+            return (backend.click)(proof, x, y, count, button);
+        }
+        crate::wayland::click_with_outcome(proof, x, y, count, button)
+    }
+
+    fn exact_set_value(
+        &self,
+        proof: &crate::wayland::ExactTargetProof,
+        element_key: u64,
+        value: &str,
+    ) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let Some(backend) = &self.production_route_backend {
+            return (backend.set_value)(proof, element_key, value);
+        }
+        crate::atspi::set_value_in_exact_window(proof, element_key, value)
     }
 }
 
@@ -3017,6 +3131,10 @@ async fn position_named_session_keyboard_cursor(
     pixel_target: Option<(f64, f64)>,
     preserve_legacy_element_visual: bool,
 ) {
+    #[cfg(test)]
+    if state.production_route_backend.is_some() {
+        return;
+    }
     let named_cursor_id = named_session_cursor_key(args);
     let cursor_id = match named_cursor_id {
         Some(ref cursor_id) => cursor_id.clone(),
@@ -3453,14 +3571,15 @@ impl Tool for ClickTool {
                 "required": ["pid", "window_id"],
             }));
         }
-        let exact_target_proof = if crate::wayland::wayland_input_enabled() {
+        let exact_target_proof = if self.state.wayland_input_enabled() {
             let Some(exact_window_id) = window_id_resolved else {
                 return ToolResult::error(
                     "exact_target_required: native Wayland click requires caller-approved pid and window_id",
                 );
             };
+            let state_for_target = self.state.clone();
             match cua_driver_core::blocking::spawn(move || {
-                crate::wayland::establish_exact_target(pid, exact_window_id)
+                state_for_target.establish_exact_target(pid, exact_window_id)
             })
             .await
             {
@@ -3664,12 +3783,11 @@ impl Tool for ClickTool {
         // Resolve the screen point the cursor glides to. Tool coordinates are
         // always window-local screenshot pixels; native Wayland translates
         // through compositor/AT-SPI geometry while X11 uses XTranslateCoordinates.
-        let wayland_output_point = if crate::wayland::wayland_input_enabled() {
-            Some(crate::wayland::window_local_to_output(
-                xid,
-                x.round() as i32,
-                y.round() as i32,
-            ))
+        let wayland_output_point = if self.state.wayland_input_enabled() {
+            Some(
+                self.state
+                    .window_local_to_output(xid, x.round() as i32, y.round() as i32),
+            )
         } else {
             None
         };
@@ -3690,6 +3808,7 @@ impl Tool for ClickTool {
         let cursor_id_for_task = cursor_id.clone();
         let modifiers_for_task = modifiers.clone();
         let exact_target_for_task = exact_target_proof.clone();
+        let state_for_task = self.state.clone();
         // delivery_mode: background (default) = no-focus-steal injection;
         // foreground = activate the target window (EWMH) first, then inject,
         // then restore prior active. Mirrors macOS/Windows.
@@ -3697,7 +3816,7 @@ impl Tool for ClickTool {
             &'static str,
             Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
         )> {
-            if crate::wayland::wayland_input_enabled() {
+            if state_for_task.wayland_input_enabled() {
                 if !modifiers_for_task.is_empty() {
                     anyhow::bail!(
                         "modified coordinate clicks are unavailable on native Wayland: \
@@ -3715,13 +3834,9 @@ impl Tool for ClickTool {
                     let proof = exact_target_for_task.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("exact_target_required: native Wayland pixel action omitted proof")
                     })?;
-                    match exact_point_action_may_fallback(
-                        crate::atspi::perform_action_at_screen_point(
-                            proof,
-                            output_x,
-                            output_y,
-                        ),
-                    ) {
+                    match exact_point_action_may_fallback(state_for_task.point_action(
+                        proof, output_x, output_y,
+                    )) {
                         Ok(false) => return Ok(("wayland_atspi", None)),
                         Ok(true) => {}
                         Err(error) => {
@@ -3731,7 +3846,7 @@ impl Tool for ClickTool {
                         }
                     }
                 }
-                if crate::wayland::is_inject_mode() {
+                if state_for_task.wayland_inject_mode() {
                     // Never reconstruct authority from recyclable `(pid, xid)` here:
                     // carry the caller-established epoch/incarnation proof unchanged
                     // through the AT-SPI miss and into the injection boundary.
@@ -3740,7 +3855,7 @@ impl Tool for ClickTool {
                             "exact_target_required: native Wayland click omitted proof"
                         )
                     })?;
-                    let outcome = crate::wayland::click_with_outcome(
+                    let outcome = state_for_task.exact_click(
                         target,
                         output_x,
                         output_y,
@@ -3758,7 +3873,7 @@ impl Tool for ClickTool {
                 let target = exact_target_for_task.clone().ok_or_else(|| {
                     anyhow::anyhow!("exact_target_required: native Wayland click omitted proof")
                 })?;
-                let outcome = crate::wayland::click_with_outcome(
+                let outcome = state_for_task.exact_click(
                     target,
                     output_x,
                     output_y,
@@ -5354,14 +5469,15 @@ impl Tool for SetValueTool {
                 "required": ["pid", "window_id"],
             }));
         }
-        let exact_target_proof = if crate::wayland::wayland_input_enabled() {
+        let exact_target_proof = if self.state.wayland_input_enabled() {
             let Some(exact_window_id) = exact_window_id else {
                 return ToolResult::error(
                     "exact_target_required: native Wayland set_value requires caller-approved pid and window_id",
                 );
             };
+            let state_for_target = self.state.clone();
             match cua_driver_core::blocking::spawn(move || {
-                crate::wayland::establish_exact_target(pid, exact_window_id)
+                state_for_target.establish_exact_target(pid, exact_window_id)
             })
             .await
             {
@@ -5377,15 +5493,14 @@ impl Tool for SetValueTool {
         position_named_session_keyboard_cursor(&self.state, &args, pid, xid, Some(idx), None, true)
             .await;
         let proof_for_value = exact_target_proof.clone();
+        let state_for_value = self.state.clone();
         let value_task = match self.state.element_cache.spawn_element_mutation(
             snapshot_identity,
             idx,
             move |snapshot_element_key| match proof_for_value.as_ref() {
-                Some(proof) => crate::atspi::set_value_in_exact_window(
-                    proof,
-                    snapshot_element_key,
-                    &value_for_task,
-                ),
+                Some(proof) => {
+                    state_for_value.exact_set_value(proof, snapshot_element_key, &value_for_task)
+                }
                 None => crate::atspi::set_value(pid, idx, &value_for_task),
             },
         ) {
@@ -9635,9 +9750,12 @@ pub fn build_registry_with_provider(
 mod click_button_schema_tests {
     use super::{
         bounded_click_count_arg, chromium_background_must_refuse, element_ax_failure_may_fallback,
-        exact_point_action_may_fallback, maps_indicate_gtk, ClickTool,
+        exact_point_action_may_fallback, maps_indicate_gtk, ClickTool, ProductionRouteBackend,
+        SetValueTool, ToolState,
     };
     use cua_driver_core::tool::Tool;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     /// Surface 5: schema must advertise the three canonical button values and
     /// describe the back-compat default. Linux already routed button=middle/right
@@ -9676,38 +9794,222 @@ mod click_button_schema_tests {
         assert_eq!(count.get("maximum").and_then(|v| v.as_u64()), Some(3));
     }
 
-    #[test]
-    fn production_coordinate_route_preserves_original_exact_proof_for_every_fallback() {
-        let source = include_str!("impl_.rs");
-        let coordinate_route = source
-            .split("// Coordinate-based path.")
-            .nth(1)
-            .and_then(|tail| tail.split("async fn focus_by_pixel").next())
-            .expect("coordinate click production route");
-        assert!(
-            !coordinate_route.contains("establish_exact_target(pid, xid)"),
-            "coordinate fallback must not reconstruct authority from recyclable ids"
-        );
-        assert_eq!(
-            coordinate_route
-                .matches("let target = exact_target_for_task.clone().ok_or_else")
-                .count(),
-            2,
-            "inject and foreground fallbacks must both consume the original proof"
-        );
+    fn fixed_proof(pid: u32, xid: u64, target: &str) -> crate::wayland::ExactTargetProof {
+        let epoch = target.split(':').next().expect("test target epoch");
+        crate::wayland::ExactTargetProof::for_production_route_test(xid, pid, epoch, target)
     }
 
-    #[test]
-    fn production_click_route_keeps_indeterminate_point_results_terminal() {
-        let source = include_str!("impl_.rs");
-        let point_dispatch = source
-            .split("match exact_point_action_may_fallback(")
-            .nth(1)
-            .and_then(|tail| tail.split("if crate::wayland::is_inject_mode()").next())
-            .expect("production point dispatch");
-        assert!(point_dispatch.contains("Ok(true) => {}"));
-        assert!(point_dispatch.contains("Err(error) =>"));
-        assert!(point_dispatch.contains("refusing coordinate replay"));
+    fn backend_with(
+        point_action: impl Fn(&crate::wayland::ExactTargetProof, i32, i32) -> anyhow::Result<Option<String>>
+            + Send
+            + Sync
+            + 'static,
+        click: impl Fn(
+                crate::wayland::ExactTargetProof,
+                i32,
+                i32,
+                u32,
+                u8,
+            )
+                -> anyhow::Result<Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>>
+            + Send
+            + Sync
+            + 'static,
+        set_value: impl Fn(&crate::wayland::ExactTargetProof, u64, &str) -> anyhow::Result<()>
+            + Send
+            + Sync
+            + 'static,
+    ) -> ProductionRouteBackend {
+        ProductionRouteBackend {
+            establish: Arc::new(|pid, xid| Ok(fixed_proof(pid, xid, "epoch-a:target-a"))),
+            point_action: Arc::new(point_action),
+            click: Arc::new(click),
+            set_value: Arc::new(set_value),
+        }
+    }
+
+    fn coordinate_click(state: Arc<ToolState>) -> ClickTool {
+        ClickTool { state }
+    }
+
+    #[tokio::test]
+    async fn click_invoke_allows_only_a_point_miss_to_reach_coordinate_delivery() {
+        let clicks = Arc::new(AtomicUsize::new(0));
+        let clicks_for_backend = clicks.clone();
+        let state = ToolState::new_with_production_route_backend(backend_with(
+            |_proof, _, _| Ok(None),
+            move |_proof, _, _, _, _| {
+                clicks_for_backend.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            },
+            |_, _, _| Ok(()),
+        ));
+        let result = coordinate_click(state)
+            .invoke(serde_json::json!({"pid": 41001, "window_id": 71, "x": 12, "y": 14}))
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        assert_eq!(clicks.load(Ordering::SeqCst), 1);
+
+        for error in [
+            "point hit-test failed",
+            "perform_action_at_screen_point timed out; delivery is indeterminate",
+            "screen-point recipient changed at final mutation boundary",
+        ] {
+            let clicks = Arc::new(AtomicUsize::new(0));
+            let clicks_for_backend = clicks.clone();
+            let state = ToolState::new_with_production_route_backend(backend_with(
+                move |_, _, _| Err(anyhow::anyhow!(error)),
+                move |_, _, _, _, _| {
+                    clicks_for_backend.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                },
+                |_, _, _| Ok(()),
+            ));
+            let result = coordinate_click(state)
+                .invoke(serde_json::json!({"pid": 41002, "window_id": 72, "x": 1, "y": 2}))
+                .await;
+            assert_eq!(result.is_error, Some(true), "{error}");
+            assert_eq!(clicks.load(Ordering::SeqCst), 0, "{error} replayed");
+        }
+    }
+
+    #[tokio::test]
+    async fn click_invoke_carries_original_epoch_identity_across_point_miss() {
+        let current = Arc::new(Mutex::new("epoch-a:target-a".to_owned()));
+        let establish_calls = Arc::new(AtomicUsize::new(0));
+        let current_at_establish = current.clone();
+        let calls_at_establish = establish_calls.clone();
+        let current_at_point = current.clone();
+        let current_at_click = current.clone();
+        let state = ToolState::new_with_production_route_backend(ProductionRouteBackend {
+            establish: Arc::new(move |pid, xid| {
+                calls_at_establish.fetch_add(1, Ordering::SeqCst);
+                Ok(fixed_proof(pid, xid, &current_at_establish.lock().unwrap()))
+            }),
+            point_action: Arc::new(move |_, _, _| {
+                *current_at_point.lock().unwrap() = "epoch-b:target-b".to_owned();
+                Ok(None)
+            }),
+            click: Arc::new(move |proof, _, _, _, _| {
+                let (_, target) = proof.production_route_test_identity();
+                if target != Some(current_at_click.lock().unwrap().as_str()) {
+                    anyhow::bail!("stale_target: immutable epoch/target identity was replaced");
+                }
+                Ok(None)
+            }),
+            set_value: Arc::new(|_, _, _| Ok(())),
+        });
+        let result = coordinate_click(state)
+            .invoke(serde_json::json!({"pid": 41003, "window_id": 73, "x": 3, "y": 4}))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(establish_calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn value_node(key: u64) -> crate::atspi::AtspiNode {
+        crate::atspi::AtspiNode {
+            element_index: Some(0),
+            role: "text".into(),
+            name: None,
+            value: None,
+            checked: None,
+            enabled: Some(true),
+            selected: None,
+            description: None,
+            actions: vec![],
+            element_key: key,
+            depth: 0,
+            parent_element_index: None,
+            in_web_content: false,
+        }
+    }
+
+    static NEXT_VALUE_XID: AtomicU64 = AtomicU64::new(0x7f20_0000);
+
+    fn publish_value_snapshot(state: &ToolState, pid: u32, xid: u64, key: u64) -> String {
+        let candidate = state
+            .element_cache
+            .prepare(pid, xid, &[value_node(key)])
+            .unwrap();
+        let snapshot_id = state.element_cache.publish(candidate).unwrap();
+        format!("s{snapshot_id:08x}")
+    }
+
+    #[tokio::test]
+    async fn set_value_invoke_reports_final_ancestry_race_without_mutation_fallback() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_backend = calls.clone();
+        let state = ToolState::new_with_production_route_backend(backend_with(
+            |_, _, _| Ok(None),
+            |_, _, _, _, _| Ok(None),
+            move |_, _, _| {
+                calls_for_backend.fetch_add(1, Ordering::SeqCst);
+                anyhow::bail!("exact window ancestry changed before mutation")
+            },
+        ));
+        let pid = std::process::id();
+        let xid = NEXT_VALUE_XID.fetch_add(1, Ordering::Relaxed);
+        let snapshot_id = publish_value_snapshot(&state, pid, xid, 0x41);
+        let result = SetValueTool { state }
+            .invoke(serde_json::json!({"pid": pid, "window_id": xid, "element_index": 0, "snapshot_id": snapshot_id, "value": "new"}))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelling_set_value_invoke_keeps_generation_permit_in_native_task() {
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let state = ToolState::new_with_production_route_backend(backend_with(
+            |_, _, _| Ok(None),
+            |_, _, _, _, _| Ok(None),
+            move |_, key, _| {
+                assert_eq!(key, 0x41);
+                started_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                Ok(())
+            },
+        ));
+        let pid = std::process::id();
+        let xid = NEXT_VALUE_XID.fetch_add(1, Ordering::Relaxed);
+        let snapshot_id = publish_value_snapshot(&state, pid, xid, 0x41);
+        let tool = SetValueTool {
+            state: state.clone(),
+        };
+        {
+            let invocation = tool.invoke(serde_json::json!({"pid": pid, "window_id": xid, "element_index": 0, "snapshot_id": snapshot_id, "value": "new"}));
+            tokio::pin!(invocation);
+            tokio::select! {
+                started = &mut started_rx => started.unwrap(),
+                result = &mut invocation => panic!("invoke completed before native mutation was released: {result:?}"),
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => panic!("invoke did not reach native mutation"),
+            }
+        }
+
+        let next = state
+            .element_cache
+            .prepare(pid, xid, &[value_node(0x99)])
+            .unwrap();
+        let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            published_tx
+                .send(
+                    cua_driver_core::element_token::global()
+                        .publish(next, std::time::Duration::from_secs(2)),
+                )
+                .unwrap();
+        });
+        assert!(published_rx
+            .recv_timeout(std::time::Duration::from_millis(40))
+            .is_err());
+        release_tx.send(()).unwrap();
+        published_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

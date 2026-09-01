@@ -1582,6 +1582,26 @@ pub struct ExactTargetProof {
 }
 
 impl ExactTargetProof {
+    #[cfg(test)]
+    pub(crate) fn for_production_route_test(
+        window_id: u64,
+        pid: u32,
+        helper_epoch: &str,
+        target_id: &str,
+    ) -> Self {
+        Self {
+            window_id,
+            pid,
+            helper_epoch: Some(helper_epoch.to_owned()),
+            target_id: Some(target_id.to_owned()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn production_route_test_identity(&self) -> (Option<&str>, Option<&str>) {
+        (self.helper_epoch.as_deref(), self.target_id.as_deref())
+    }
+
     fn from_window(window: &crate::x11::WindowInfo, expected_pid: u32) -> anyhow::Result<Self> {
         if window.pid != Some(expected_pid) {
             anyhow::bail!(

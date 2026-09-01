@@ -130,15 +130,6 @@ async fn invoke_exact_live_activation(
         .collect::<Vec<_>>();
     exact_window_element_index(&indexed_elements, scoped_frame, element_key, window_id)?;
 
-    // Validate immutable compositor identity before the final AT-SPI authority
-    // read. The point route performs one last fresh hit-test below.
-    let proof_for_action = target_proof.clone();
-    cua_driver_core::blocking::spawn(move || {
-        crate::wayland::validate_exact_target(&proof_for_action)
-    })
-    .await
-    .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
-
     if let Some((screen_x, screen_y, coord, ox, oy)) = point {
         let web_document_origin = web_document_origin_for_visited(&visited, pid)
             .await
@@ -192,7 +183,16 @@ async fn invoke_exact_live_activation(
         }
     }
 
-    // No AT-SPI round trip follows the final ancestry/point authority read.
+    // The AT-SPI ancestry/recipient walk is now final. Revalidate the immutable
+    // compositor epoch/incarnation proof after it, with no intervening await
+    // before DoAction. A recyclable pid/xid correlation is not authority.
+    let proof_for_action = target_proof.clone();
+    cua_driver_core::blocking::spawn(move || {
+        crate::wayland::validate_exact_target(&proof_for_action)
+    })
+    .await
+    .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
+
     let accepted = action
         .do_action(chosen)
         .await
@@ -3017,13 +3017,13 @@ pub fn set_value_in_exact_window(
             .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
 
             if let Ok(editable) = proxies.editable_text().await {
+                revalidate_exact_window_element_ancestry(conn, pid, window_id, element_key).await?;
                 let proof = target_proof.clone();
                 cua_driver_core::blocking::spawn(move || {
                     crate::wayland::validate_exact_target(&proof)
                 })
                 .await
                 .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
-                revalidate_exact_window_element_ancestry(conn, pid, window_id, element_key).await?;
                 let accepted = editable
                     .set_text_contents(value)
                     .await
@@ -3042,13 +3042,13 @@ pub fn set_value_in_exact_window(
                     .value()
                     .await
                     .map_err(|error| anyhow!("Value unavailable: {error}"))?;
+                revalidate_exact_window_element_ancestry(conn, pid, window_id, element_key).await?;
                 let proof = target_proof.clone();
                 cua_driver_core::blocking::spawn(move || {
                     crate::wayland::validate_exact_target(&proof)
                 })
                 .await
                 .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
-                revalidate_exact_window_element_ancestry(conn, pid, window_id, element_key).await?;
                 value_proxy
                     .set_current_value(numeric)
                     .await
@@ -3810,50 +3810,6 @@ mod coord_tests {
         let reordered = [(0, 40, 10, 20, 20, false), (1, 10, 10, 20, 20, false)];
         assert_eq!(selected_key_at_point(&initial, &keys, 15, 15), Some(0x41));
         assert_eq!(selected_key_at_point(&reordered, &keys, 15, 15), Some(0x42));
-    }
-
-    #[test]
-    fn production_mutation_routes_put_fresh_authority_reads_at_the_boundary() {
-        let source = include_str!("native.rs");
-        let activation = source
-            .split("async fn invoke_exact_live_activation")
-            .nth(1)
-            .and_then(|tail| tail.split("fn normalized_action_name").next())
-            .expect("exact activation production route");
-        let final_hit = activation
-            .find("screen-point recipient changed at final mutation boundary")
-            .expect("final point-recipient check");
-        let mutation = activation
-            .find(".do_action(chosen)")
-            .expect("DoAction mutation");
-        assert!(final_hit < mutation);
-        assert!(
-            !activation[final_hit..mutation].contains(".await"),
-            "no round trip may reopen the point-recipient race"
-        );
-
-        let set_value = source
-            .split("pub fn set_value_in_exact_window")
-            .nth(1)
-            .and_then(|tail| tail.split("pub fn get_element_bounds").next())
-            .expect("exact set_value production route");
-        assert_eq!(
-            set_value
-                .matches("revalidate_exact_window_element_ancestry(conn, pid, window_id, element_key).await?;")
-                .count(),
-            2,
-            "EditableText and Value mutations each require a fresh ancestry walk"
-        );
-        for mutation in [".set_text_contents(value)", ".set_current_value(numeric)"] {
-            let mutation_at = set_value.find(mutation).expect("set_value mutation");
-            let ancestry_at = set_value[..mutation_at]
-                .rfind("revalidate_exact_window_element_ancestry")
-                .expect("fresh ancestry check before mutation");
-            assert!(
-                !set_value[ancestry_at..mutation_at].contains("validate_exact_target"),
-                "ancestry revalidation must remain the final authority round trip"
-            );
-        }
     }
 
     #[test]
