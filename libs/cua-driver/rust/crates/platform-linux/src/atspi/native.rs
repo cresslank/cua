@@ -109,6 +109,7 @@ async fn invoke_exact_live_activation(
     element_key: u64,
     role: &str,
     context: &str,
+    point: Option<(i32, i32, CoordType, i32, i32)>,
 ) -> Result<String> {
     let (chosen, selected) = select_live_activation(action, role, context).await?;
 
@@ -129,9 +130,8 @@ async fn invoke_exact_live_activation(
         .collect::<Vec<_>>();
     exact_window_element_index(&indexed_elements, scoped_frame, element_key, window_id)?;
 
-    // This is the final authority boundary: every AT-SPI proxy, action-vector,
-    // geometry, and ancestry round trip has completed. Re-read the exact live
-    // compositor identity now, with no intervening await before DoAction.
+    // Validate immutable compositor identity before the final AT-SPI authority
+    // read. The point route performs one last fresh hit-test below.
     let proof_for_action = target_proof.clone();
     cua_driver_core::blocking::spawn(move || {
         crate::wayland::validate_exact_target(&proof_for_action)
@@ -139,6 +139,60 @@ async fn invoke_exact_live_activation(
     .await
     .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
 
+    if let Some((screen_x, screen_y, coord, ox, oy)) = point {
+        let web_document_origin = web_document_origin_for_visited(&visited, pid)
+            .await
+            .unwrap_or((0, 0));
+        let action_nodes = visited
+            .iter()
+            .filter(|node| node.frame_ordinal == scoped_frame && is_indexable(node))
+            .collect::<Vec<_>>();
+        let mut frames = Vec::new();
+        for (index, node) in action_nodes.iter().enumerate() {
+            if !node.has_component {
+                continue;
+            }
+            let proxies = node
+                .acc
+                .proxies()
+                .await
+                .map_err(|error| anyhow!("final hit-test proxies unavailable: {error}"))?;
+            let component = proxies
+                .component()
+                .await
+                .map_err(|error| anyhow!("final hit-test component unavailable: {error}"))?;
+            let (x, y, w, h) = component
+                .get_extents(coord)
+                .await
+                .map_err(|error| anyhow!("final hit-test extents unavailable: {error}"))?;
+            if x == i32::MIN || y == i32::MIN || w <= 1 || h <= 1 {
+                continue;
+            }
+            let (document_x, document_y) = if node.in_web_doc {
+                web_document_origin
+            } else {
+                (0, 0)
+            };
+            frames.push((
+                index,
+                x + ox + document_x,
+                y + oy + document_y,
+                w as u32,
+                h as u32,
+                is_passive_role(&node.role),
+            ));
+        }
+        let keys = action_nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (index, node.element_key))
+            .collect::<Vec<_>>();
+        if selected_key_at_point(&frames, &keys, screen_x, screen_y) != Some(element_key) {
+            anyhow::bail!("screen-point recipient changed at final mutation boundary");
+        }
+    }
+
+    // No AT-SPI round trip follows the final ancestry/point authority read.
     let accepted = action
         .do_action(chosen)
         .await
@@ -2170,6 +2224,7 @@ pub fn perform_action_in_exact_window(
                 element_key,
                 &target.role,
                 &format!("element key {element_key:#x} in exact window {window_id}"),
+                None,
             )
             .await?;
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2764,6 +2819,7 @@ pub fn perform_action_at_screen_point(
                 target.element_key,
                 &target.role,
                 "screen-point target",
+                Some((screen_x, screen_y, coord, ox, oy)),
             )
             .await?;
             Ok(Some(action))
@@ -2828,6 +2884,26 @@ fn selected_key_at_point(
     indexed_keys
         .iter()
         .find_map(|(candidate, key)| (*candidate == index).then_some(*key))
+}
+
+async fn revalidate_exact_window_element_ancestry(
+    conn: &AccessibilityConnection,
+    pid: u32,
+    window_id: u64,
+    element_key: u64,
+) -> Result<()> {
+    let (visited, scoped_frame) = collect_visited_bounded(conn, pid, window_id, None, None)
+        .await?
+        .ok_or_else(|| anyhow!("exact target disappeared before mutation"))?;
+    let scoped_frame = scoped_frame
+        .ok_or_else(|| anyhow!("could not revalidate exact window ancestry before mutation"))?;
+    let indexed_elements = visited
+        .iter()
+        .filter(|node| is_indexable(node))
+        .map(|node| (node.frame_ordinal, node.element_key))
+        .collect::<Vec<_>>();
+    exact_window_element_index(&indexed_elements, scoped_frame, element_key, window_id)?;
+    Ok(())
 }
 
 pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
@@ -2947,6 +3023,7 @@ pub fn set_value_in_exact_window(
                 })
                 .await
                 .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
+                revalidate_exact_window_element_ancestry(conn, pid, window_id, element_key).await?;
                 let accepted = editable
                     .set_text_contents(value)
                     .await
@@ -2971,6 +3048,7 @@ pub fn set_value_in_exact_window(
                 })
                 .await
                 .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
+                revalidate_exact_window_element_ancestry(conn, pid, window_id, element_key).await?;
                 value_proxy
                     .set_current_value(numeric)
                     .await
@@ -3732,6 +3810,50 @@ mod coord_tests {
         let reordered = [(0, 40, 10, 20, 20, false), (1, 10, 10, 20, 20, false)];
         assert_eq!(selected_key_at_point(&initial, &keys, 15, 15), Some(0x41));
         assert_eq!(selected_key_at_point(&reordered, &keys, 15, 15), Some(0x42));
+    }
+
+    #[test]
+    fn production_mutation_routes_put_fresh_authority_reads_at_the_boundary() {
+        let source = include_str!("native.rs");
+        let activation = source
+            .split("async fn invoke_exact_live_activation")
+            .nth(1)
+            .and_then(|tail| tail.split("fn normalized_action_name").next())
+            .expect("exact activation production route");
+        let final_hit = activation
+            .find("screen-point recipient changed at final mutation boundary")
+            .expect("final point-recipient check");
+        let mutation = activation
+            .find(".do_action(chosen)")
+            .expect("DoAction mutation");
+        assert!(final_hit < mutation);
+        assert!(
+            !activation[final_hit..mutation].contains(".await"),
+            "no round trip may reopen the point-recipient race"
+        );
+
+        let set_value = source
+            .split("pub fn set_value_in_exact_window")
+            .nth(1)
+            .and_then(|tail| tail.split("pub fn get_element_bounds").next())
+            .expect("exact set_value production route");
+        assert_eq!(
+            set_value
+                .matches("revalidate_exact_window_element_ancestry(conn, pid, window_id, element_key).await?;")
+                .count(),
+            2,
+            "EditableText and Value mutations each require a fresh ancestry walk"
+        );
+        for mutation in [".set_text_contents(value)", ".set_current_value(numeric)"] {
+            let mutation_at = set_value.find(mutation).expect("set_value mutation");
+            let ancestry_at = set_value[..mutation_at]
+                .rfind("revalidate_exact_window_element_ancestry")
+                .expect("fresh ancestry check before mutation");
+            assert!(
+                !set_value[ancestry_at..mutation_at].contains("validate_exact_target"),
+                "ancestry revalidation must remain the final authority round trip"
+            );
+        }
     }
 
     #[test]

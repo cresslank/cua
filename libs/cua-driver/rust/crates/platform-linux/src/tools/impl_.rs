@@ -3732,10 +3732,14 @@ impl Tool for ClickTool {
                     }
                 }
                 if crate::wayland::is_inject_mode() {
-                    // The private socket's numeric window id is only a selector.
-                    // Carry the caller-approved PID into an immutable surface proof,
-                    // then revalidate that proof at the actual injection boundary.
-                    let target = crate::wayland::establish_exact_target(pid, xid)?;
+                    // Never reconstruct authority from recyclable `(pid, xid)` here:
+                    // carry the caller-established epoch/incarnation proof unchanged
+                    // through the AT-SPI miss and into the injection boundary.
+                    let target = exact_target_for_task.clone().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "exact_target_required: native Wayland click omitted proof"
+                        )
+                    })?;
                     let outcome = crate::wayland::click_with_outcome(
                         target,
                         output_x,
@@ -3751,7 +3755,9 @@ impl Tool for ClickTool {
                 // Native Wayland: focus+raise the target toplevel
                 // (foreign-toplevel `activate`), then drive `count` virtual-pointer
                 // button events. Wayland injection routes to the compositor focus.
-                let target = crate::wayland::establish_exact_target(pid, xid)?;
+                let target = exact_target_for_task.clone().ok_or_else(|| {
+                    anyhow::anyhow!("exact_target_required: native Wayland click omitted proof")
+                })?;
                 let outcome = crate::wayland::click_with_outcome(
                     target,
                     output_x,
@@ -9668,6 +9674,40 @@ mod click_button_schema_tests {
         let count = props.get("count").expect("count field present");
         assert_eq!(count.get("minimum").and_then(|v| v.as_u64()), Some(1));
         assert_eq!(count.get("maximum").and_then(|v| v.as_u64()), Some(3));
+    }
+
+    #[test]
+    fn production_coordinate_route_preserves_original_exact_proof_for_every_fallback() {
+        let source = include_str!("impl_.rs");
+        let coordinate_route = source
+            .split("// Coordinate-based path.")
+            .nth(1)
+            .and_then(|tail| tail.split("async fn focus_by_pixel").next())
+            .expect("coordinate click production route");
+        assert!(
+            !coordinate_route.contains("establish_exact_target(pid, xid)"),
+            "coordinate fallback must not reconstruct authority from recyclable ids"
+        );
+        assert_eq!(
+            coordinate_route
+                .matches("let target = exact_target_for_task.clone().ok_or_else")
+                .count(),
+            2,
+            "inject and foreground fallbacks must both consume the original proof"
+        );
+    }
+
+    #[test]
+    fn production_click_route_keeps_indeterminate_point_results_terminal() {
+        let source = include_str!("impl_.rs");
+        let point_dispatch = source
+            .split("match exact_point_action_may_fallback(")
+            .nth(1)
+            .and_then(|tail| tail.split("if crate::wayland::is_inject_mode()").next())
+            .expect("production point dispatch");
+        assert!(point_dispatch.contains("Ok(true) => {}"));
+        assert!(point_dispatch.contains("Err(error) =>"));
+        assert!(point_dispatch.contains("refusing coordinate replay"));
     }
 
     #[test]
