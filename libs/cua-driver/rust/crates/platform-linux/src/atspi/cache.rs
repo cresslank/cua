@@ -87,6 +87,26 @@ impl ElementCache {
         Ok((permit, key))
     }
 
+    /// Start one native element mutation with the generation permit owned by
+    /// the native task itself. Aborting or dropping the async waiter can detach
+    /// a blocking task, so the permit must not remain in the caller's future.
+    pub fn spawn_element_mutation<F, R>(
+        &self,
+        identity: SnapshotIdentity,
+        idx: usize,
+        mutation: F,
+    ) -> Result<tokio::task::JoinHandle<R>, RegistryError>
+    where
+        F: FnOnce(u64) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let (permit, key) = self.acquire_element_mutation(identity, idx)?;
+        Ok(cua_driver_core::blocking::spawn(move || {
+            let _permit = permit;
+            mutation(key)
+        }))
+    }
+
     pub fn element_count(&self, pid: u32, xid: u64) -> usize {
         self.snapshot(pid, xid)
             .map_or(0, |snapshot| snapshot.elements.len())
@@ -162,5 +182,66 @@ mod tests {
             cache.acquire_element_mutation(first_identity, 0),
             Err(RegistryError::NotCurrent)
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_waiter_cannot_publish_or_act_on_b_before_native_a_ends() {
+        static NEXT_XID: AtomicU64 = AtomicU64::new(0x7f10_0000);
+        let xid = NEXT_XID.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let cache = ElementCache::new();
+        let first = cache.prepare(pid, xid, &[node(0, 41)]).unwrap();
+        let first_identity = first.identity();
+        cache.publish(first).unwrap();
+
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let active_in_a = active.clone();
+        let task_a = cache
+            .spawn_element_mutation(first_identity, 0, move |key| {
+                assert_eq!(key, 41);
+                active_in_a.store(true, Ordering::SeqCst);
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                active_in_a.store(false, Ordering::SeqCst);
+            })
+            .unwrap();
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        task_a.abort();
+        assert!(task_a.await.unwrap_err().is_cancelled());
+
+        let second = cache.prepare(pid, xid, &[node(0, 99)]).unwrap();
+        let second_identity = second.identity();
+        let active_at_publish = active.clone();
+        let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            let result =
+                cua_driver_core::element_token::global().publish(second, Duration::from_secs(1));
+            published_tx
+                .send((result, active_at_publish.load(Ordering::SeqCst)))
+                .unwrap();
+        });
+        assert!(published_rx
+            .recv_timeout(Duration::from_millis(40))
+            .is_err());
+
+        release_tx.send(()).unwrap();
+        let (published, overlapped_a) = published_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        published.unwrap();
+        assert!(
+            !overlapped_a,
+            "generation B published while native A was active"
+        );
+
+        let active_in_b = active.clone();
+        cache
+            .spawn_element_mutation(second_identity, 0, move |key| {
+                assert_eq!(key, 99);
+                assert!(!active_in_b.load(Ordering::SeqCst));
+            })
+            .unwrap()
+            .await
+            .unwrap();
     }
 }

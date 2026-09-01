@@ -3227,6 +3227,17 @@ fn element_ax_failure_may_fallback(exact_wayland_action: bool) -> bool {
     !exact_wayland_action
 }
 
+/// Only an affirmative, pre-dispatch `None` permits a native Wayland point
+/// action to try another route. Errors include failed or indeterminate delivery
+/// and must propagate without replay.
+fn exact_point_action_may_fallback(result: anyhow::Result<Option<String>>) -> anyhow::Result<bool> {
+    match result {
+        Ok(Some(_)) => Ok(false),
+        Ok(None) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
 fn bounded_click_count_arg(args: &Value) -> Result<u32, ToolResult> {
     let count = match args.opt_u32("count") {
         Ok(Some(count)) => count,
@@ -3462,20 +3473,7 @@ impl Tool for ClickTool {
         };
 
         if let Some(idx) = elem_idx_resolved {
-            // Linearize resolution against publication and retain this exact
-            // generation's immutable key until mutation completes.
-            let (_mutation_permit, snapshot_element_key) = match self
-                .state
-                .element_cache
-                .acquire_element_mutation(snapshot_identity.expect("element has identity"), idx)
-            {
-                Ok(admitted) => admitted,
-                Err(error) => {
-                    return ToolResult::error(format!(
-                        "stale_element_token: snapshot generation is not mutable: {error}"
-                    ))
-                }
-            };
+            let snapshot_identity = snapshot_identity.expect("element has identity");
             let xid_hint = window_id_resolved;
             // Resolve the element's screen center + its window FIRST, so the
             // agent cursor glides to the target *before* the click fires —
@@ -3507,18 +3505,27 @@ impl Tool for ClickTool {
             // Chromium can execute a genuine AT-SPI action without focus. Try
             // that route before applying its background synthetic-input gate.
             if modifiers.is_empty() {
-                let element_key_for_ax = exact_target_proof.as_ref().map(|_| snapshot_element_key);
                 let proof_for_ax = exact_target_proof.clone();
                 let exact_wayland_action = proof_for_ax.is_some();
-                let ax_result =
-                    cua_driver_core::blocking::spawn(move || match proof_for_ax.as_ref() {
+                let ax_task = match self.state.element_cache.spawn_element_mutation(
+                    snapshot_identity,
+                    idx,
+                    move |snapshot_element_key| match proof_for_ax.as_ref() {
                         Some(proof) => crate::atspi::perform_action_in_exact_window(
                             proof,
-                            element_key_for_ax.expect("exact action has key"),
+                            snapshot_element_key,
                         ),
                         None => crate::atspi::perform_action(pid, idx),
-                    })
-                    .await;
+                    },
+                ) {
+                    Ok(task) => task,
+                    Err(error) => {
+                        return ToolResult::error(format!(
+                            "stale_element_token: snapshot generation is not mutable: {error}"
+                        ))
+                    }
+                };
+                let ax_result = ax_task.await;
                 match ax_result {
                     Ok(Ok((_action, suspected_noop))) => {
                         let mut structured = json!({
@@ -3553,41 +3560,52 @@ impl Tool for ClickTool {
 
             // The AX route was unavailable. Fall back to a target-addressed
             // X11 event for toolkits that accept it.
-            let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<()> {
-                let (xid2, lx, ly) = resolve_element_local_coords(pid, idx, xid_hint)?;
-                let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                if crate::wayland::wayland_input_enabled() && !modifier_refs.is_empty() {
-                    anyhow::bail!(
-                        "modified element clicks are unavailable on native Wayland: \
+            let result = match self.state.element_cache.spawn_element_mutation(
+                snapshot_identity,
+                idx,
+                move |_snapshot_element_key| -> anyhow::Result<()> {
+                    let (xid2, lx, ly) = resolve_element_local_coords(pid, idx, xid_hint)?;
+                    let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                    if crate::wayland::wayland_input_enabled() && !modifier_refs.is_empty() {
+                        anyhow::bail!(
+                            "modified element clicks are unavailable on native Wayland: \
                          the pointer route cannot carry keyboard modifier state"
-                    );
-                }
-                // An explicit X11 foreground request needs the real XTest path
-                // even for a plain click. Some native widgets (notably GTK
-                // selectable rows) expose bounds but no AT-SPI Action and
-                // ignore a targeted XSendEvent; limiting XTest to modified
-                // clicks made those rows addressable but not selectable.
-                if delivery.is_foreground() && !crate::wayland::wayland_input_enabled() {
-                    crate::input::with_x11_foreground(xid2, 80, || {
-                        crate::input::send_click_xtest_desktop_with_modifiers(
-                            sx.round() as i32,
-                            sy.round() as i32,
-                            button,
+                        );
+                    }
+                    // An explicit X11 foreground request needs the real XTest path
+                    // even for a plain click. Some native widgets (notably GTK
+                    // selectable rows) expose bounds but no AT-SPI Action and
+                    // ignore a targeted XSendEvent; limiting XTest to modified
+                    // clicks made those rows addressable but not selectable.
+                    if delivery.is_foreground() && !crate::wayland::wayland_input_enabled() {
+                        crate::input::with_x11_foreground(xid2, 80, || {
+                            crate::input::send_click_xtest_desktop_with_modifiers(
+                                sx.round() as i32,
+                                sy.round() as i32,
+                                button,
+                                count,
+                                &modifier_refs,
+                            )
+                        })
+                    } else {
+                        crate::input::send_click_with_modifiers(
+                            xid2,
+                            lx as i32,
+                            ly as i32,
                             count,
+                            button,
                             &modifier_refs,
                         )
-                    })
-                } else {
-                    crate::input::send_click_with_modifiers(
-                        xid2,
-                        lx as i32,
-                        ly as i32,
-                        count,
-                        button,
-                        &modifier_refs,
-                    )
+                    }
+                },
+            ) {
+                Ok(task) => task,
+                Err(error) => {
+                    return ToolResult::error(format!(
+                        "stale_element_token: snapshot generation is not mutable: {error}"
+                    ))
                 }
-            })
+            }
             .await;
             return match result {
                 // An element click is never driver-verifiable (no read-back) —
@@ -3697,12 +3715,20 @@ impl Tool for ClickTool {
                     let proof = exact_target_for_task.as_ref().ok_or_else(|| {
                         anyhow::anyhow!("exact_target_required: native Wayland pixel action omitted proof")
                     })?;
-                    if let Ok(Some(_)) = crate::atspi::perform_action_at_screen_point(
-                        proof,
-                        output_x,
-                        output_y,
+                    match exact_point_action_may_fallback(
+                        crate::atspi::perform_action_at_screen_point(
+                            proof,
+                            output_x,
+                            output_y,
+                        ),
                     ) {
-                        return Ok(("wayland_atspi", None));
+                        Ok(false) => return Ok(("wayland_atspi", None)),
+                        Ok(true) => {}
+                        Err(error) => {
+                            return Err(anyhow::anyhow!(
+                                "exact Wayland point action failed or became indeterminate; refusing coordinate replay: {error}"
+                            ))
+                        }
                     }
                 }
                 if crate::wayland::is_inject_mode() {
@@ -5342,31 +5368,29 @@ impl Tool for SetValueTool {
         };
         let value_for_task = value.clone();
         let xid = exact_window_id.unwrap_or(0);
-        let (_mutation_permit, snapshot_element_key) = match self
-            .state
-            .element_cache
-            .acquire_element_mutation(snapshot_identity, idx)
-        {
-            Ok(admitted) => admitted,
+        position_named_session_keyboard_cursor(&self.state, &args, pid, xid, Some(idx), None, true)
+            .await;
+        let proof_for_value = exact_target_proof.clone();
+        let value_task = match self.state.element_cache.spawn_element_mutation(
+            snapshot_identity,
+            idx,
+            move |snapshot_element_key| match proof_for_value.as_ref() {
+                Some(proof) => crate::atspi::set_value_in_exact_window(
+                    proof,
+                    snapshot_element_key,
+                    &value_for_task,
+                ),
+                None => crate::atspi::set_value(pid, idx, &value_for_task),
+            },
+        ) {
+            Ok(task) => task,
             Err(error) => {
                 return ToolResult::error(format!(
                     "stale_element_token: snapshot generation is not mutable: {error}"
                 ))
             }
         };
-        position_named_session_keyboard_cursor(&self.state, &args, pid, xid, Some(idx), None, true)
-            .await;
-        let element_key_for_value = exact_target_proof.as_ref().map(|_| snapshot_element_key);
-        let proof_for_value = exact_target_proof.clone();
-        let result = cua_driver_core::blocking::spawn(move || match proof_for_value.as_ref() {
-            Some(proof) => crate::atspi::set_value_in_exact_window(
-                proof,
-                element_key_for_value.expect("exact value action has key"),
-                &value_for_task,
-            ),
-            None => crate::atspi::set_value(pid, idx, &value_for_task),
-        })
-        .await;
+        let result = value_task.await;
         match result {
             Ok(Ok(())) => ToolResult::text(format!("Set value of element [{idx}] to '{value}'.")),
             Ok(Err(e)) => ToolResult::error(e.to_string()),
@@ -9605,7 +9629,7 @@ pub fn build_registry_with_provider(
 mod click_button_schema_tests {
     use super::{
         bounded_click_count_arg, chromium_background_must_refuse, element_ax_failure_may_fallback,
-        maps_indicate_gtk, ClickTool,
+        exact_point_action_may_fallback, maps_indicate_gtk, ClickTool,
     };
     use cua_driver_core::tool::Tool;
 
@@ -9650,6 +9674,21 @@ mod click_button_schema_tests {
     fn exact_wayland_ax_failure_never_allows_pointer_fallback() {
         assert!(!element_ax_failure_may_fallback(true));
         assert!(element_ax_failure_may_fallback(false));
+    }
+
+    #[test]
+    fn exact_wayland_point_dispatch_errors_never_replay_coordinates() {
+        assert!(exact_point_action_may_fallback(Err(anyhow::anyhow!("doAction failed"))).is_err());
+        assert!(exact_point_action_may_fallback(Err(anyhow::anyhow!(
+            "point action timed out; delivery indeterminate"
+        )))
+        .is_err());
+    }
+
+    #[test]
+    fn only_pre_dispatch_point_miss_allows_coordinate_fallback() {
+        assert!(exact_point_action_may_fallback(Ok(None)).unwrap());
+        assert!(!exact_point_action_may_fallback(Ok(Some("click".into()))).unwrap());
     }
 
     #[test]

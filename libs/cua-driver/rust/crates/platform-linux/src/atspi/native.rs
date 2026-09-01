@@ -75,20 +75,72 @@ fn require_affirmative_ack(accepted: bool, operation: &str) -> Result<()> {
     Ok(())
 }
 
+async fn select_live_activation(
+    action: &atspi::proxy::action::ActionProxy<'_>,
+    role: &str,
+    context: &str,
+) -> Result<(i32, String)> {
+    // Native action indexes are not stable authority. Re-read the complete
+    // vector at the mutation boundary and select only by live semantics.
+    let names = live_action_names(action).await?;
+    let chosen = activation_index(role, &names)
+        .ok_or_else(|| anyhow!("{context} has no live safe activation action"))?;
+    Ok((chosen as i32, names[chosen].clone()))
+}
+
 async fn invoke_live_activation(
     action: &atspi::proxy::action::ActionProxy<'_>,
     role: &str,
     context: &str,
 ) -> Result<String> {
-    // Native action indexes are not stable authority. Re-read the complete
-    // vector on the retained proxy at the mutation boundary, select by live
-    // semantics, and require an affirmative native acknowledgement.
-    let names = live_action_names(action).await?;
-    let chosen = activation_index(role, &names)
-        .ok_or_else(|| anyhow!("{context} has no live safe activation action"))?;
-    let selected = names[chosen].clone();
+    let (chosen, selected) = select_live_activation(action, role, context).await?;
     let accepted = action
-        .do_action(chosen as i32)
+        .do_action(chosen)
+        .await
+        .map_err(|error| anyhow!("doAction failed: {error}"))?;
+    require_affirmative_ack(accepted, &format!("{context} live action {selected:?}"))?;
+    Ok(selected)
+}
+
+async fn invoke_exact_live_activation(
+    action: &atspi::proxy::action::ActionProxy<'_>,
+    conn: &AccessibilityConnection,
+    target_proof: &crate::wayland::ExactTargetProof,
+    element_key: u64,
+    role: &str,
+    context: &str,
+) -> Result<String> {
+    let (chosen, selected) = select_live_activation(action, role, context).await?;
+
+    // Re-walk after the action-vector round trips. This catches a retained
+    // object that was reparented into a same-process sibling while its proxy was
+    // being resolved; a compositor identity check alone cannot see that move.
+    let pid = target_proof.pid();
+    let window_id = target_proof.window_id();
+    let (visited, scoped_frame) = collect_visited_bounded(conn, pid, window_id, None, None)
+        .await?
+        .ok_or_else(|| anyhow!("exact target disappeared before mutation"))?;
+    let scoped_frame = scoped_frame
+        .ok_or_else(|| anyhow!("could not revalidate exact window ancestry before mutation"))?;
+    let indexed_elements = visited
+        .iter()
+        .filter(|node| is_indexable(node))
+        .map(|node| (node.frame_ordinal, node.element_key))
+        .collect::<Vec<_>>();
+    exact_window_element_index(&indexed_elements, scoped_frame, element_key, window_id)?;
+
+    // This is the final authority boundary: every AT-SPI proxy, action-vector,
+    // geometry, and ancestry round trip has completed. Re-read the exact live
+    // compositor identity now, with no intervening await before DoAction.
+    let proof_for_action = target_proof.clone();
+    cua_driver_core::blocking::spawn(move || {
+        crate::wayland::validate_exact_target(&proof_for_action)
+    })
+    .await
+    .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
+
+    let accepted = action
+        .do_action(chosen)
         .await
         .map_err(|error| anyhow!("doAction failed: {error}"))?;
     require_affirmative_ack(accepted, &format!("{context} live action {selected:?}"))?;
@@ -2111,14 +2163,11 @@ pub fn perform_action_in_exact_window(
                 .await
                 .map_err(|error| anyhow!("Action unavailable: {error}"))?;
 
-            let proof_for_action = target_proof.clone();
-            cua_driver_core::blocking::spawn(move || {
-                crate::wayland::validate_exact_target(&proof_for_action)
-            })
-            .await
-            .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
-            let action = invoke_live_activation(
+            let action = invoke_exact_live_activation(
                 &action_proxy,
+                conn,
+                &target_proof,
+                element_key,
                 &target.role,
                 &format!("element key {element_key:#x} in exact window {window_id}"),
             )
@@ -2250,17 +2299,6 @@ pub fn perform_verified_action_by_key(
                 .await
                 .map_err(|error| anyhow!("Action unavailable: {error}"))?;
 
-            // This is the mutation boundary. Use the carried, structurally
-            // immutable proof and one authoritative singleton-window snapshot;
-            // never reconstruct authority from the PID or object key.
-            // Revalidate on a blocking worker so a Wayland AT-SPI fallback
-            // cannot recursively block this module's private Tokio runtime.
-            let proof_for_action = target_proof.clone();
-            cua_driver_core::blocking::spawn(move || {
-                crate::wayland::validate_single_exact_target(&proof_for_action)
-            })
-            .await
-            .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
             let live_actions = live_action_names(&proxy).await?;
             if live_actions != expected_actions {
                 anyhow::bail!(
@@ -2276,6 +2314,16 @@ pub fn perform_verified_action_by_key(
                     )
                 })?;
             let action = live_actions[action_index].clone();
+
+            // No AT-SPI/D-Bus await follows this authoritative compositor
+            // read before DoAction, so replacement or helper-epoch drift during
+            // the final semantic round trips refuses instead of retargeting.
+            let proof_for_action = target_proof.clone();
+            cua_driver_core::blocking::spawn(move || {
+                crate::wayland::validate_single_exact_target(&proof_for_action)
+            })
+            .await
+            .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
             let accepted = proxy
                 .do_action(action_index as i32)
                 .await
@@ -2612,15 +2660,18 @@ pub fn perform_action_at_screen_point(
                 if !node.has_component {
                     continue;
                 }
-                let Some(Ok(proxies)) = call(node.acc.proxies()).await else {
-                    continue;
-                };
-                let Some(Ok(comp)) = call(proxies.component()).await else {
-                    continue;
-                };
-                let Some(Ok((x, y, w, h))) = call(comp.get_extents(coord)).await else {
-                    continue;
-                };
+                let proxies = call(node.acc.proxies())
+                    .await
+                    .ok_or_else(|| anyhow!("point hit-test proxy lookup timed out"))?
+                    .map_err(|error| anyhow!("point hit-test proxies unavailable: {error}"))?;
+                let comp = call(proxies.component())
+                    .await
+                    .ok_or_else(|| anyhow!("point hit-test component lookup timed out"))?
+                    .map_err(|error| anyhow!("point hit-test component unavailable: {error}"))?;
+                let (x, y, w, h) = call(comp.get_extents(coord))
+                    .await
+                    .ok_or_else(|| anyhow!("point hit-test extents lookup timed out"))?
+                    .map_err(|error| anyhow!("point hit-test extents unavailable: {error}"))?;
                 if x == i32::MIN || y == i32::MIN || w <= 1 || h <= 1 {
                     continue;
                 }
@@ -2706,10 +2757,22 @@ pub fn perform_action_at_screen_point(
             {
                 anyhow::bail!("screen-point recipient changed before mutation");
             }
-            let action = invoke_live_activation(&ap, &target.role, "screen-point target").await?;
+            let action = invoke_exact_live_activation(
+                &ap,
+                conn,
+                &target_proof,
+                target.element_key,
+                &target.role,
+                "screen-point target",
+            )
+            .await?;
             Ok(Some(action))
         },
-        || Ok(None),
+        || {
+            Err(anyhow!(
+                "perform_action_at_screen_point timed out for pid {pid} window {xid}; delivery is indeterminate and must not be replayed"
+            ))
+        },
     )
 }
 
