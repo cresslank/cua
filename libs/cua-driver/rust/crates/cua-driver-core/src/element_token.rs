@@ -257,6 +257,12 @@ impl MutationPermit {
     pub fn identity(&self) -> SnapshotIdentity {
         self.generation.identity
     }
+    /// Read the immutable payload owned by the generation this permit admits.
+    /// Callers must not look up `current_payload` after token resolution: a
+    /// newer publication could otherwise pair the old index with new data.
+    pub fn payload<T: Any + Send + Sync>(&self) -> Option<Arc<T>> {
+        self.generation.payload::<T>()
+    }
     pub fn poison_before_release(
         &mut self,
         reason: impl Into<String>,

@@ -68,6 +68,13 @@ async fn live_action_names(action: &atspi::proxy::action::ActionProxy<'_>) -> Re
     Ok(names)
 }
 
+fn require_affirmative_ack(accepted: bool, operation: &str) -> Result<()> {
+    if !accepted {
+        anyhow::bail!("{operation} returned false");
+    }
+    Ok(())
+}
+
 async fn invoke_live_activation(
     action: &atspi::proxy::action::ActionProxy<'_>,
     role: &str,
@@ -84,9 +91,7 @@ async fn invoke_live_activation(
         .do_action(chosen as i32)
         .await
         .map_err(|error| anyhow!("doAction failed: {error}"))?;
-    if !accepted {
-        anyhow::bail!("{context} rejected live action {selected:?}");
-    }
+    require_affirmative_ack(accepted, &format!("{context} live action {selected:?}"))?;
     Ok(selected)
 }
 
@@ -670,9 +675,12 @@ async fn resolve_window_frame(
         // that more certain.
         return Some(0);
     }
-    let window = crate::x11::list_windows(Some(pid))
-        .into_iter()
-        .find(|candidate| candidate.xid == xid)?;
+    let windows = if crate::wayland::is_wayland() {
+        crate::wayland::list_windows_dispatch(Some(pid))
+    } else {
+        crate::x11::list_windows(Some(pid))
+    };
+    let window = windows.into_iter().find(|candidate| candidate.xid == xid)?;
     let mut candidates: Vec<(usize, (i32, i32, i32, i32))> = Vec::new();
     for (ordinal, oref) in seeds.iter().enumerate() {
         let Some(Ok(acc)) = call(accessible_for(conn, oref)).await else {
@@ -2003,17 +2011,26 @@ fn exact_window_element_index(
     element_key: u64,
     window_id: u64,
 ) -> Result<usize> {
-    let mut matches = indexed_elements
+    let matches = indexed_elements
         .iter()
         .enumerate()
-        .filter(|(_, (frame, key))| *frame == scoped_frame && *key == element_key)
-        .map(|(index, _)| index);
-    let index = matches.next().ok_or_else(|| {
-        anyhow!("AT-SPI element key {element_key:#x} is stale for exact window {window_id}")
-    })?;
-    if matches.next().is_some() {
+        .filter(|(_, (_, key))| *key == element_key)
+        .map(|(index, (frame, _))| (index, *frame))
+        .collect::<Vec<_>>();
+    let (index, frame) = match matches.as_slice() {
+        [(index, frame)] => (*index, *frame),
+        [] => {
+            return Err(anyhow!(
+                "AT-SPI element key {element_key:#x} is stale for exact window {window_id}"
+            ))
+        }
+        _ => {
+            anyhow::bail!("AT-SPI element key {element_key:#x} is ambiguous across pid toplevels")
+        }
+    };
+    if frame != scoped_frame {
         anyhow::bail!(
-            "AT-SPI element key {element_key:#x} is ambiguous in exact window {window_id}"
+            "AT-SPI element key {element_key:#x} belongs to a same-process sibling, not exact window {window_id}"
         );
     }
     Ok(index)
@@ -2043,6 +2060,12 @@ mod exact_window_element_tests {
         let records = [(1, 0x41), (1, 0x41)];
         assert!(exact_window_element_index(&records, 1, 0x41, 7).is_err());
     }
+
+    #[test]
+    fn duplicate_key_in_same_pid_sibling_fails_before_frame_filter() {
+        let records = [(0, 0x41), (1, 0x41), (1, 0x42)];
+        assert!(exact_window_element_index(&records, 1, 0x41, 7).is_err());
+    }
 }
 
 /// Actuate an application-wide element index only when the action-time AT-SPI
@@ -2053,7 +2076,7 @@ pub fn perform_action_in_exact_window(
     target_proof: &crate::wayland::ExactTargetProof,
     element_key: u64,
 ) -> Result<(String, bool)> {
-    crate::wayland::validate_single_exact_target(target_proof)?;
+    crate::wayland::validate_exact_target(target_proof)?;
     let target_proof = target_proof.clone();
     let pid = target_proof.pid();
     let window_id = target_proof.window_id();
@@ -2090,7 +2113,7 @@ pub fn perform_action_in_exact_window(
 
             let proof_for_action = target_proof.clone();
             cua_driver_core::blocking::spawn(move || {
-                crate::wayland::validate_single_exact_target(&proof_for_action)
+                crate::wayland::validate_exact_target(&proof_for_action)
             })
             .await
             .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
@@ -2545,7 +2568,7 @@ pub fn perform_action_at_screen_point(
     screen_x: i32,
     screen_y: i32,
 ) -> Result<Option<String>> {
-    crate::wayland::validate_single_exact_target(target_proof)?;
+    crate::wayland::validate_exact_target(target_proof)?;
     let target_proof = target_proof.clone();
     let pid = target_proof.pid();
     let xid = target_proof.window_id();
@@ -2630,10 +2653,59 @@ pub fn perform_action_at_screen_point(
                 .map_err(|e| anyhow!("Action unavailable: {e}"))?;
             let proof_for_action = target_proof.clone();
             cua_driver_core::blocking::spawn(move || {
-                crate::wayland::validate_single_exact_target(&proof_for_action)
+                crate::wayland::validate_exact_target(&proof_for_action)
             })
             .await
             .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
+
+            // Re-hit-test the retained object set at the mutation boundary. A
+            // renderer reorder or geometry move must not let the earlier winner
+            // authorize a different current recipient.
+            let mut live_frames = Vec::new();
+            for (idx, node) in action_nodes.iter().enumerate() {
+                if !node.has_component {
+                    continue;
+                }
+                let proxies = node
+                    .acc
+                    .proxies()
+                    .await
+                    .map_err(|error| anyhow!("live hit-test proxies unavailable: {error}"))?;
+                let component = proxies
+                    .component()
+                    .await
+                    .map_err(|error| anyhow!("live hit-test component unavailable: {error}"))?;
+                let (x, y, w, h) = component
+                    .get_extents(coord)
+                    .await
+                    .map_err(|error| anyhow!("live hit-test extents unavailable: {error}"))?;
+                if x == i32::MIN || y == i32::MIN || w <= 1 || h <= 1 {
+                    continue;
+                }
+                let (document_x, document_y) = if node.in_web_doc {
+                    web_document_origin
+                } else {
+                    (0, 0)
+                };
+                live_frames.push((
+                    idx,
+                    x + ox + document_x,
+                    y + oy + document_y,
+                    w as u32,
+                    h as u32,
+                    is_passive_role(&node.role),
+                ));
+            }
+            let live_keys = action_nodes
+                .iter()
+                .enumerate()
+                .map(|(index, node)| (index, node.element_key))
+                .collect::<Vec<_>>();
+            if selected_key_at_point(&live_frames, &live_keys, screen_x, screen_y)
+                != Some(target.element_key)
+            {
+                anyhow::bail!("screen-point recipient changed before mutation");
+            }
             let action = invoke_live_activation(&ap, &target.role, "screen-point target").await?;
             Ok(Some(action))
         },
@@ -2681,6 +2753,18 @@ fn select_click_target(
         }
     }
     best_active.or(best_passive).map(|(_, idx)| idx)
+}
+
+fn selected_key_at_point(
+    frames: &[(usize, i32, i32, u32, u32, bool)],
+    indexed_keys: &[(usize, u64)],
+    px: i32,
+    py: i32,
+) -> Option<u64> {
+    let index = select_click_target(frames, px, py)?;
+    indexed_keys
+        .iter()
+        .find_map(|(candidate, key)| (*candidate == index).then_some(*key))
 }
 
 pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
@@ -2755,7 +2839,7 @@ pub fn set_value_in_exact_window(
     element_key: u64,
     value: &str,
 ) -> Result<()> {
-    crate::wayland::validate_single_exact_target(target_proof)?;
+    crate::wayland::validate_exact_target(target_proof)?;
     let target_proof = target_proof.clone();
     let pid = target_proof.pid();
     let window_id = target_proof.window_id();
@@ -2788,36 +2872,43 @@ pub fn set_value_in_exact_window(
 
             let proof_for_action = target_proof.clone();
             cua_driver_core::blocking::spawn(move || {
-                crate::wayland::validate_single_exact_target(&proof_for_action)
+                crate::wayland::validate_exact_target(&proof_for_action)
             })
             .await
             .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
 
             if let Ok(editable) = proxies.editable_text().await {
-                if editable.set_text_contents(value).await.unwrap_or(false) {
-                    return Ok(());
-                }
-                let offset = match proxies.text().await {
-                    Ok(text) => text.caret_offset().await.unwrap_or(0),
-                    Err(_) => 0,
-                };
-                let len = value.chars().count() as i32;
-                if editable
-                    .insert_text(offset, value, len)
+                let proof = target_proof.clone();
+                cua_driver_core::blocking::spawn(move || {
+                    crate::wayland::validate_exact_target(&proof)
+                })
+                .await
+                .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
+                let accepted = editable
+                    .set_text_contents(value)
                     .await
-                    .unwrap_or(false)
-                {
-                    return Ok(());
-                }
+                    .map_err(|error| anyhow!("SetTextContents failed: {error}"))?;
+                require_affirmative_ack(
+                    accepted,
+                    &format!("SetTextContents for element key {element_key:#x}"),
+                )?;
+                return Ok(());
             }
             if target.has_value {
                 let numeric: f64 = value
                     .parse()
                     .map_err(|_| anyhow!("value '{value}' is not numeric for a Value element"))?;
-                proxies
+                let value_proxy = proxies
                     .value()
                     .await
-                    .map_err(|error| anyhow!("Value unavailable: {error}"))?
+                    .map_err(|error| anyhow!("Value unavailable: {error}"))?;
+                let proof = target_proof.clone();
+                cua_driver_core::blocking::spawn(move || {
+                    crate::wayland::validate_exact_target(&proof)
+                })
+                .await
+                .map_err(|error| anyhow!("exact target validation worker failed: {error}"))??;
+                value_proxy
                     .set_current_value(numeric)
                     .await
                     .map_err(|error| anyhow!("setCurrentValue failed: {error}"))?;
@@ -3553,7 +3644,8 @@ mod coord_tests {
         ensure_element_descends_from_exact_window, exact_window_top_level_key, is_enabled_state,
         is_indexable_capabilities, is_passive_role, is_web_process_bus,
         prefer_authoritative_wayland_origin, push_action_name_slot, rebase_renderer_window_offset,
-        screen_extent_rebase, select_click_target, ApplicationSelection,
+        require_affirmative_ack, screen_extent_rebase, select_click_target, selected_key_at_point,
+        ApplicationSelection,
     };
     use super::{element_key_for_object, RawObjectRef};
     use atspi::{State, StateSet};
@@ -3568,6 +3660,21 @@ mod coord_tests {
 
         assert_eq!(actions, ["first", "", "third"]);
         assert_eq!(actions.iter().position(|action| action == "third"), Some(2));
+    }
+
+    #[test]
+    fn point_reorder_changes_recipient_and_must_refuse() {
+        let keys = [(0, 0x41), (1, 0x42)];
+        let initial = [(0, 10, 10, 20, 20, false), (1, 40, 10, 20, 20, false)];
+        let reordered = [(0, 40, 10, 20, 20, false), (1, 10, 10, 20, 20, false)];
+        assert_eq!(selected_key_at_point(&initial, &keys, 15, 15), Some(0x41));
+        assert_eq!(selected_key_at_point(&reordered, &keys, 15, 15), Some(0x42));
+    }
+
+    #[test]
+    fn false_native_acknowledgement_is_a_failure() {
+        assert!(require_affirmative_ack(false, "SetTextContents").is_err());
+        assert!(require_affirmative_ack(true, "SetTextContents").is_ok());
     }
 
     #[test]

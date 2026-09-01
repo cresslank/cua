@@ -5,7 +5,9 @@
 //! map and therefore cannot expose a token/cache split.
 
 use super::AtspiNode;
-use cua_driver_core::element_token::{RegistryError, SnapshotCandidate};
+use cua_driver_core::element_token::{
+    MutationPermit, RegistryError, SnapshotCandidate, SnapshotIdentity,
+};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,10 +61,7 @@ impl ElementCache {
     }
 
     pub fn publish(&self, candidate: SnapshotCandidate) -> Result<u32, RegistryError> {
-        // Action dispatch has not adopted permits in Slice 1, so ordinary
-        // publication is expected to be immediate. A zero wait also guarantees
-        // this synchronous tool path never sleeps while publishing.
-        cua_driver_core::element_token::global().publish(candidate, Duration::ZERO)
+        cua_driver_core::element_token::global().publish(candidate, Duration::from_secs(2))
     }
 
     fn snapshot(&self, pid: u32, xid: u64) -> Option<Arc<CachedSnapshot>> {
@@ -71,6 +70,21 @@ impl ElementCache {
 
     pub fn get_element_key(&self, pid: u32, xid: u64, idx: usize) -> Option<u64> {
         self.snapshot(pid, xid)?.elements.get(idx).copied()
+    }
+
+    /// Admit mutation against exactly the generation resolved from the caller's
+    /// token and read its key from that generation's immutable payload.
+    pub fn acquire_element_mutation(
+        &self,
+        identity: SnapshotIdentity,
+        idx: usize,
+    ) -> Result<(MutationPermit, u64), RegistryError> {
+        let permit = cua_driver_core::element_token::global().try_acquire_mutation(identity)?;
+        let key = permit
+            .payload::<CachedSnapshot>()
+            .and_then(|snapshot| snapshot.elements.get(idx).copied())
+            .ok_or(RegistryError::Stale)?;
+        Ok((permit, key))
     }
 
     pub fn element_count(&self, pid: u32, xid: u64) -> usize {
@@ -88,6 +102,7 @@ impl Default for ElementCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn node(index: usize, key: u64) -> AtspiNode {
         AtspiNode {
@@ -114,5 +129,38 @@ mod tests {
             collect_unique_element_keys(nodes.iter()),
             Err(RegistryError::Collision)
         );
+    }
+
+    #[test]
+    fn permit_reads_resolved_generation_and_stale_generation_refuses() {
+        static NEXT_XID: AtomicU64 = AtomicU64::new(0x7f00_0000);
+        let xid = NEXT_XID.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let cache = ElementCache::new();
+        let first = cache.prepare(pid, xid, &[node(0, 41)]).unwrap();
+        let first_identity = first.identity();
+        cache.publish(first).unwrap();
+        let (permit, key) = cache.acquire_element_mutation(first_identity, 0).unwrap();
+        assert_eq!(key, 41);
+
+        let next = cache.prepare(pid, xid, &[node(0, 99)]).unwrap();
+        let (sent, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            sent.send(
+                cua_driver_core::element_token::global().publish(next, Duration::from_secs(1)),
+            )
+            .unwrap();
+        });
+        assert!(received.recv_timeout(Duration::from_millis(40)).is_err());
+        assert_eq!(permit.payload::<CachedSnapshot>().unwrap().elements[0], 41);
+        drop(permit);
+        received
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            cache.acquire_element_mutation(first_identity, 0),
+            Err(RegistryError::NotCurrent)
+        ));
     }
 }

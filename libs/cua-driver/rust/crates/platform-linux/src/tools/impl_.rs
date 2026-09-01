@@ -3223,6 +3223,10 @@ fn inject_terminal_input(pid: u32, xid: u64, text: &str) -> anyhow::Result<bool>
 // Desktop-raw. Core dispatch waits for portal/libei, then takes the resource
 // lease before this tool injects. Do not start a second seat-wide lease here.
 
+fn element_ax_failure_may_fallback(exact_wayland_action: bool) -> bool {
+    !exact_wayland_action
+}
+
 fn bounded_click_count_arg(args: &Value) -> Result<u32, ToolResult> {
     let count = match args.opt_u32("count") {
         Ok(Some(count)) => count,
@@ -3414,11 +3418,13 @@ impl Tool for ClickTool {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let elem_idx_resolved: Option<usize> = match &resolved {
-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
-                Some(*element_index)
-            }
-            cua_driver_core::element_token::ResolvedElement::None => None,
+        let (elem_idx_resolved, snapshot_identity) = match &resolved {
+            cua_driver_core::element_token::ResolvedElement::Element {
+                element_index,
+                snapshot_identity,
+                ..
+            } => (Some(*element_index), Some(*snapshot_identity)),
+            cua_driver_core::element_token::ResolvedElement::None => (None, None),
         };
         let window_id_resolved: Option<u64> = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => {
@@ -3456,6 +3462,20 @@ impl Tool for ClickTool {
         };
 
         if let Some(idx) = elem_idx_resolved {
+            // Linearize resolution against publication and retain this exact
+            // generation's immutable key until mutation completes.
+            let (_mutation_permit, snapshot_element_key) = match self
+                .state
+                .element_cache
+                .acquire_element_mutation(snapshot_identity.expect("element has identity"), idx)
+            {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    return ToolResult::error(format!(
+                        "stale_element_token: snapshot generation is not mutable: {error}"
+                    ))
+                }
+            };
             let xid_hint = window_id_resolved;
             // Resolve the element's screen center + its window FIRST, so the
             // agent cursor glides to the target *before* the click fires —
@@ -3487,20 +3507,9 @@ impl Tool for ClickTool {
             // Chromium can execute a genuine AT-SPI action without focus. Try
             // that route before applying its background synthetic-input gate.
             if modifiers.is_empty() {
-                let element_key_for_ax = if exact_target_proof.is_some() {
-                    let xid = xid_hint.expect("native Wayland exact target has window id");
-                    match self.state.element_cache.get_element_key(pid, xid, idx) {
-                        Some(key) => Some(key),
-                        None => {
-                            return ToolResult::error(format!(
-                                "stale_element_token: no cached AT-SPI key for element [{idx}] in window {xid}"
-                            ));
-                        }
-                    }
-                } else {
-                    None
-                };
+                let element_key_for_ax = exact_target_proof.as_ref().map(|_| snapshot_element_key);
                 let proof_for_ax = exact_target_proof.clone();
+                let exact_wayland_action = proof_for_ax.is_some();
                 let ax_result =
                     cua_driver_core::blocking::spawn(move || match proof_for_ax.as_ref() {
                         Some(proof) => crate::atspi::perform_action_in_exact_window(
@@ -3510,18 +3519,33 @@ impl Tool for ClickTool {
                         None => crate::atspi::perform_action(pid, idx),
                     })
                     .await;
-                if let Ok(Ok((_action, suspected_noop))) = ax_result {
-                    let mut structured = json!({
-                        "path": "ax",
-                        "verified": false,
-                        "effect": if suspected_noop { "suspected_noop" } else { "unverifiable" },
-                    });
-                    if suspected_noop {
-                        structured["escalation"] = non_ax_escalation();
+                match ax_result {
+                    Ok(Ok((_action, suspected_noop))) => {
+                        let mut structured = json!({
+                            "path": "ax",
+                            "verified": false,
+                            "effect": if suspected_noop { "suspected_noop" } else { "unverifiable" },
+                        });
+                        if suspected_noop {
+                            structured["escalation"] = non_ax_escalation();
+                        }
+                        return ToolResult::text(format!("Clicked element [{idx}] (pid {pid})."))
+                            .with_structured(structured);
                     }
-                    return ToolResult::text(format!("Clicked element [{idx}] (pid {pid})."))
-                        .with_structured(structured);
+                    Ok(Err(error)) if !element_ax_failure_may_fallback(exact_wayland_action) => {
+                        return ToolResult::error(format!(
+                            "exact Wayland element action refused: {error}"
+                        ));
+                    }
+                    Err(error) if exact_wayland_action => {
+                        return ToolResult::error(format!("Task error: {error}"));
+                    }
+                    _ => {}
                 }
+            } else if exact_target_proof.is_some() {
+                return ToolResult::error(
+                    "exact Wayland element action cannot fall through to pointer injection",
+                );
             }
             if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
                 return refusal;
@@ -5277,12 +5301,13 @@ impl Tool for SetValueTool {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (idx, resolved_window_id) = match &resolved {
+        let (idx, resolved_window_id, snapshot_identity) = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element {
                 element_index,
                 window_id,
+                snapshot_identity,
                 ..
-            } => (*element_index, window_id.map(u64::from)),
+            } => (*element_index, window_id.map(u64::from), *snapshot_identity),
             cua_driver_core::element_token::ResolvedElement::None => return ToolResult::error(
                 "set_value requires element_index or element_token to address the target element.",
             ),
@@ -5317,20 +5342,21 @@ impl Tool for SetValueTool {
         };
         let value_for_task = value.clone();
         let xid = exact_window_id.unwrap_or(0);
+        let (_mutation_permit, snapshot_element_key) = match self
+            .state
+            .element_cache
+            .acquire_element_mutation(snapshot_identity, idx)
+        {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                return ToolResult::error(format!(
+                    "stale_element_token: snapshot generation is not mutable: {error}"
+                ))
+            }
+        };
         position_named_session_keyboard_cursor(&self.state, &args, pid, xid, Some(idx), None, true)
             .await;
-        let element_key_for_value = if exact_target_proof.is_some() {
-            match self.state.element_cache.get_element_key(pid, xid, idx) {
-                Some(key) => Some(key),
-                None => {
-                    return ToolResult::error(format!(
-                        "stale_element_token: no cached AT-SPI key for element [{idx}] in window {xid}"
-                    ));
-                }
-            }
-        } else {
-            None
-        };
+        let element_key_for_value = exact_target_proof.as_ref().map(|_| snapshot_element_key);
         let proof_for_value = exact_target_proof.clone();
         let result = cua_driver_core::blocking::spawn(move || match proof_for_value.as_ref() {
             Some(proof) => crate::atspi::set_value_in_exact_window(
@@ -9578,7 +9604,8 @@ pub fn build_registry_with_provider(
 #[cfg(test)]
 mod click_button_schema_tests {
     use super::{
-        bounded_click_count_arg, chromium_background_must_refuse, maps_indicate_gtk, ClickTool,
+        bounded_click_count_arg, chromium_background_must_refuse, element_ax_failure_may_fallback,
+        maps_indicate_gtk, ClickTool,
     };
     use cua_driver_core::tool::Tool;
 
@@ -9617,6 +9644,12 @@ mod click_button_schema_tests {
         let count = props.get("count").expect("count field present");
         assert_eq!(count.get("minimum").and_then(|v| v.as_u64()), Some(1));
         assert_eq!(count.get("maximum").and_then(|v| v.as_u64()), Some(3));
+    }
+
+    #[test]
+    fn exact_wayland_ax_failure_never_allows_pointer_fallback() {
+        assert!(!element_ax_failure_may_fallback(true));
+        assert!(element_ax_failure_may_fallback(false));
     }
 
     #[test]
