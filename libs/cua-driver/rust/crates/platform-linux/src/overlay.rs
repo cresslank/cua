@@ -706,6 +706,7 @@ pub fn remove_cursor(key: CursorKey) {
     if key.is_empty() {
         return;
     }
+    #[cfg(target_os = "linux")]
     if crate::wayland::is_gnome_wayland_session() {
         let Ok(_order) = GNOME_CURSOR_ORDER.lock() else {
             return;
@@ -745,6 +746,7 @@ pub fn revive_cursor(key: CursorKey) {
 
 /// Spawn the overlay on a dedicated thread.  Non-blocking.
 pub fn run_on_thread() {
+    #[cfg(target_os = "linux")]
     if crate::wayland::is_gnome_wayland_session() {
         tracing::debug!("GNOME Wayland session: external X11 cursor overlay disabled");
         return;

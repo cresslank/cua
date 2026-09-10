@@ -750,6 +750,19 @@ impl TokenRegistry {
         let (generation, index) = self.resolve_generation(pid, token)?;
         Ok((generation.lane.window_id, index))
     }
+    /// Compatibility alias for callers that explicitly request full-width native IDs.
+    pub fn resolve_wide(&self, pid: i32, token: &str) -> Result<(u64, usize), String> {
+        self.resolve(pid, token)
+    }
+    /// Compatibility entry point preserving full-width native window IDs.
+    pub fn register_snapshot_wide(
+        &self,
+        pid: i32,
+        window_id: u64,
+        element_count: usize,
+    ) -> Result<u32, RegistryError> {
+        self.register_snapshot(pid, window_id, element_count)
+    }
     pub fn current_payload<T: Any + Send + Sync>(
         &self,
         pid: i32,
@@ -1206,6 +1219,25 @@ pub enum ResolvedElement {
     },
 }
 pub fn resolve_element_args(
+    pid: i32,
+    args_element_index: Option<usize>,
+    args_element_token: Option<&str>,
+    args_snapshot_id: Option<&str>,
+    args_window_id: Option<u64>,
+    tool_name: &str,
+) -> Result<ResolvedElement, crate::protocol::ToolResult> {
+    resolve_element_args_wide(
+        pid,
+        args_element_index,
+        args_element_token,
+        args_snapshot_id,
+        args_window_id,
+        tool_name,
+    )
+}
+
+/// The same target validation without narrowing a platform's native ID.
+pub fn resolve_element_args_wide(
     pid: i32,
     args_element_index: Option<usize>,
     args_element_token: Option<&str>,

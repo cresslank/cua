@@ -502,6 +502,15 @@ pub enum ProtectedResourceOwnership {
 pub trait Tool: Send + Sync {
     fn def(&self) -> &ToolDef;
 
+    /// Implementation-attested routing that cannot touch the primary input
+    /// lane. The adapter must serialize its own lifecycle and fail closed if
+    /// that independent route is unavailable; it must never fall back to
+    /// global input. Caller fields alone cannot establish this guarantee.
+    /// Existing platform routes conservatively retain global coordination.
+    fn has_independent_input_lane(&self, _args: &Value) -> bool {
+        false
+    }
+
     /// Trusted implementation-side provenance for prompt-light disposable
     /// resources. The default is deliberately conservative: caller arguments
     /// never establish ownership, and an adapter may skip protected consent
@@ -942,7 +951,7 @@ impl ToolRegistry {
                 .await;
         }
         let context = match crate::session_authorization::configured_registry()
-            .and_then(crate::session_authorization::SessionAuthorizationRegistry::legacy_context)
+            .and_then(|registry| registry.legacy_context())
         {
             Ok(context) => context,
             Err(error) => {
@@ -960,7 +969,7 @@ impl ToolRegistry {
     pub async fn invoke_from_trusted_adapter(&self, name: &str, mut args: Value) -> ToolResult {
         let evidence = TrustedInvocationEvidence::extract_from_adapter_args(&mut args);
         let context = match crate::session_authorization::configured_registry()
-            .and_then(crate::session_authorization::SessionAuthorizationRegistry::legacy_context)
+            .and_then(|registry| registry.legacy_context())
         {
             Ok(context) => context,
             Err(error) => {
@@ -1499,7 +1508,11 @@ impl ToolRegistry {
             })
             .flatten();
 
-        let mut result = tool.invoke(args.clone()).await;
+        let mut result = crate::recording::scope_dispatch_click_capture(
+            pending_turn.as_ref(),
+            tool.invoke(args.clone()),
+        )
+        .await;
         drop(lifecycle_dispatch);
         drop(_action_lease);
         if result.action_record.is_none() {
@@ -2950,6 +2963,18 @@ mod runtime_isolation_tests {
         Arc::new(registry)
     }
 
+    // Use the same canonical spelling as manifest loading, including Windows'
+    // drive and extended-length prefix. This is an identity fixture only.
+    fn fixture_executable() -> String {
+        std::env::current_exe()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
     fn attested_registry(
         name: &str,
         provider: Option<Arc<dyn ProtectedConsentProvider>>,
@@ -2963,7 +2988,7 @@ mod runtime_isolation_tests {
                 "fingerprint": {
                     "pid": 424242,
                     "start_time": 7,
-                    "executable": "/synthetic/fixture"
+                    "executable": fixture_executable()
                 }
             }),
             "get_window_state" => serde_json::json!({
@@ -2973,7 +2998,7 @@ mod runtime_isolation_tests {
                 "fingerprint": {
                     "pid": 424242,
                     "start_time": 7,
-                    "executable": "/synthetic/fixture"
+                    "executable": fixture_executable()
                 }
             }),
             _ => serde_json::json!({
@@ -3190,7 +3215,7 @@ mod runtime_isolation_tests {
     async fn bounded_observation_uses_only_the_manifest_without_a_protected_host() {
         let hits = Arc::new(AtomicUsize::new(0));
         let registry = attested_registry("get_window_state", None, hits.clone(), false);
-        let context = bounded_context(
+        let context = bounded_context(&format!(
             r#"
 version: 2
 mode: bounded
@@ -3200,12 +3225,13 @@ allow:
   tools: [get_window_state]
 resources:
   apps:
-    - executable: /synthetic/fixture
+    - executable: {executable}
       launch: false
       windows: all
       terminate: deny
 "#,
-        );
+            executable = serde_json::to_string(&fixture_executable()).unwrap()
+        ));
         let result = registry
             .invoke_with_context(
                 "get_window_state",
@@ -3225,15 +3251,18 @@ resources:
             let registry = attested_registry("get_window_state", None, allowed_hits.clone(), false);
             let allowed = manifest_context(
                 mode,
-                r#"
+                &format!(
+                    r#"
 version: 3
 allow:
   tools: [get_window_state]
 resources:
   apps:
-    - executable: /synthetic/fixture
+    - executable: {executable}
       windows: all
 "#,
+                    executable = serde_json::to_string(&fixture_executable()).unwrap()
+                ),
             );
             let result = registry
                 .invoke_with_context(
@@ -3249,15 +3278,22 @@ resources:
             let registry = attested_registry("get_window_state", None, denied_hits.clone(), false);
             let denied = manifest_context(
                 mode,
-                r#"
+                &format!(
+                    r#"
 version: 3
 allow:
   tools: [get_window_state]
 resources:
   apps:
-    - executable: /another/application
+    - executable: {executable}
       windows: all
 "#,
+                    executable = serde_json::to_string(
+                        &std::path::Path::new(&fixture_executable())
+                            .with_file_name("another-application.exe")
+                    )
+                    .unwrap()
+                ),
             );
             let result = registry
                 .invoke_with_context(
@@ -3560,6 +3596,74 @@ resources:
         }
         assert_eq!(hits.load(Ordering::SeqCst), 3);
         assert_eq!(provider.requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn background_input_rechecks_manifest_before_every_adapter_dispatch() {
+        // The adapter may retain a native connection after a successful call.
+        // Reusing its public session label must not reuse resource authority.
+        for mode in [
+            PermissionMode::Standard,
+            PermissionMode::Bounded,
+            PermissionMode::Unrestricted,
+        ] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let registry = input_registry(None, hits.clone());
+            let context = manifest_context(
+                mode,
+                r#"
+version: 3
+expires_after: 1h
+idle_timeout: 30m
+allow:
+  tools: [click]
+resources:
+  desktop:
+    windows:
+      - pid: 42
+        window_id: 7
+"#,
+            );
+            for (window, expected_calls) in [(7, 1), (8, 1), (7, 2), (9, 2)] {
+                let result = registry.invoke_with_context("click", serde_json::json!({
+                    "pid": 42, "window_id": window, "x": 10, "y": 20,
+                    "delivery_mode": "background", "session": "persistent-native-connection",
+                    "_session_id": "forged-authority", "_lane": 0,
+                }), context.clone()).await;
+                assert_eq!(
+                    result.is_error == Some(true),
+                    window != 7,
+                    "{mode:?}: window {window}"
+                );
+                assert_eq!(
+                    hits.load(Ordering::SeqCst),
+                    expected_calls,
+                    "denied input must never enter the adapter"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn background_input_without_manifest_uses_existing_promptless_modes() {
+        for context in [standard_context(), unrestricted_context()] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let registry = input_registry(None, hits.clone());
+            for window in [7, 8] {
+                let result = registry
+                    .invoke_with_context(
+                        "click",
+                        serde_json::json!({
+                            "pid": 42, "window_id": window, "x": 10, "y": 20,
+                            "delivery_mode": "background", "session": "ordinary-desktop-input",
+                        }),
+                        context.clone(),
+                    )
+                    .await;
+                assert_ne!(result.is_error, Some(true));
+            }
+            assert_eq!(hits.load(Ordering::SeqCst), 2);
+        }
     }
 
     #[tokio::test]
@@ -3873,7 +3977,7 @@ resources:
                 crate::browser::ProcessFingerprint {
                     pid: 424242,
                     start_time: Some(7),
-                    executable: Some("/synthetic/fixture".to_owned()),
+                    executable: Some(fixture_executable()),
                 },
             );
 
@@ -3901,7 +4005,7 @@ resources:
                 crate::browser::ProcessFingerprint {
                     pid: 424242,
                     start_time: Some(7),
-                    executable: Some("/synthetic/fixture".to_owned()),
+                    executable: Some(fixture_executable()),
                 },
             );
 
@@ -3931,7 +4035,7 @@ resources:
                 crate::browser::ProcessFingerprint {
                     pid: 424242,
                     start_time: Some(7),
-                    executable: Some("/synthetic/fixture".to_owned()),
+                    executable: Some(fixture_executable()),
                 },
             );
 
@@ -4034,7 +4138,7 @@ resources:
                 crate::browser::ProcessFingerprint {
                     pid: 424242,
                     start_time: Some(7),
-                    executable: Some("/synthetic/fixture".to_owned()),
+                    executable: Some(fixture_executable()),
                 },
             );
 

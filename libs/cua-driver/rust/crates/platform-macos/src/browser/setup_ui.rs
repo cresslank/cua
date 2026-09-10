@@ -13,7 +13,7 @@ use cua_driver_core::browser::{
 };
 
 use crate::ax::bindings::{
-    copy_number_attr, copy_string_attr, element_screen_center, focused_element_of_pid,
+    copy_binary_attr, copy_string_attr, element_screen_center, focused_element_of_pid,
     kAXErrorSuccess, perform_action, set_bool_attr_true, set_string_attr, AXUIElementRef,
 };
 use crate::ax::tree::{walk_tree, AXNode, TreeWalkResult};
@@ -869,17 +869,18 @@ fn press_pixel_checkbox(
             window_id,
             1,
             &[],
+            crate::input::mouse::WindowClickDelivery::Foreground,
         )?;
         std::thread::sleep(Duration::from_millis(100));
         Ok(())
     })
 }
 
-fn checkbox_state(value: Option<f64>) -> Result<CheckboxState, BrowserRefusal> {
+fn checkbox_state(value: Option<bool>) -> Result<CheckboxState, BrowserRefusal> {
     match value {
-        Some(value) if value.abs() < f64::EPSILON => Ok(CheckboxState::Off),
-        Some(value) if (value - 1.0).abs() < f64::EPSILON => Ok(CheckboxState::On),
-        _ => Err(refusal(
+        Some(false) => Ok(CheckboxState::Off),
+        Some(true) => Ok(CheckboxState::On),
+        None => Err(refusal(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             "the exact remote-debugging checkbox had an unknown checked state",
         )),
@@ -967,7 +968,7 @@ impl SetupUiHandle {
             let checkbox = exact_setup_checkbox(&tree, self.descriptor);
             let result = match checkbox {
                 Ok(Some(element)) => {
-                    let value = unsafe { copy_number_attr(element as AXUIElementRef, "AXValue") };
+                    let value = unsafe { copy_binary_attr(element as AXUIElementRef, "AXValue") };
                     match checkbox_state(value) {
                         Ok(CheckboxState::Off) => Some(true),
                         Ok(CheckboxState::On) => {
@@ -1619,7 +1620,7 @@ fn set_remote_debugging(
         let checkbox = exact_setup_checkbox(&tree, descriptor);
         match checkbox {
             Ok(Some(element)) => {
-                let value = unsafe { copy_number_attr(element as AXUIElementRef, "AXValue") };
+                let value = unsafe { copy_binary_attr(element as AXUIElementRef, "AXValue") };
                 match checkbox_state(value) {
                     Ok(state) if (state == CheckboxState::On) == desired_enabled => {
                         if desired_enabled
@@ -1825,7 +1826,7 @@ pub fn disable(
     window_id: u32,
     descriptor: &'static BrowserSetupDescriptor,
 ) -> Result<bool, BrowserRefusal> {
-    let handle = set_remote_debugging(pid, window_id, descriptor, false)?;
+    let mut handle = set_remote_debugging(pid, window_id, descriptor, false)?;
     Ok(handle.close().unwrap_or(false))
 }
 
@@ -2497,14 +2498,10 @@ mod tests {
 
     #[test]
     fn unknown_checkbox_values_refuse() {
-        assert_eq!(checkbox_state(Some(0.0)).unwrap(), CheckboxState::Off);
-        assert_eq!(checkbox_state(Some(1.0)).unwrap(), CheckboxState::On);
+        assert_eq!(checkbox_state(Some(false)).unwrap(), CheckboxState::Off);
+        assert_eq!(checkbox_state(Some(true)).unwrap(), CheckboxState::On);
         assert_eq!(
             checkbox_state(None).unwrap_err().code,
-            BrowserRefusalCode::BrowserWrongTargetRefused
-        );
-        assert_eq!(
-            checkbox_state(Some(0.5)).unwrap_err().code,
             BrowserRefusalCode::BrowserWrongTargetRefused
         );
     }
