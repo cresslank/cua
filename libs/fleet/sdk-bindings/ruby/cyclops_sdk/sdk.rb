@@ -350,6 +350,7 @@ private_constant :UniffiHandleMap
     RustBuffer.check_lower_SequenceTypeHttpHeader(v.headers)
     RustBuffer.check_lower_Optionalbytes(v.body)
     RustBuffer.check_lower_Optionalu64(v.timeout_secs)
+    RustBuffer.check_lower_Optionalu64(v.max_response_bytes)
   end
 
   def self.alloc_from_TypeHttpRequest(v)
@@ -1117,7 +1118,8 @@ class RustBufferStream
       url: readString,
       headers: readSequenceTypeHttpHeader,
       body: readOptionalbytes,
-      timeout_secs: readOptionalu64
+      timeout_secs: readOptionalu64,
+      max_response_bytes: readOptionalu64
     )
   end
 
@@ -1798,6 +1800,7 @@ class RustBufferBuilder
     self.write_SequenceTypeHttpHeader(v.headers)
     self.write_Optionalbytes(v.body)
     self.write_Optionalu64(v.timeout_secs)
+    self.write_Optionalu64(v.max_response_bytes)
   end
 
   # The Record type HttpResponse.
@@ -2806,6 +2809,9 @@ module UniFFILib
   attach_function :uniffi_cyclops_sdk_fn_method_httprequestbuilder_headers,
     [:uint64, RustBuffer.by_value, RustCallStatus.by_ref],
     :uint64
+  attach_function :uniffi_cyclops_sdk_fn_method_httprequestbuilder_max_response_bytes,
+    [:uint64, :uint64, RustCallStatus.by_ref],
+    :uint64
   attach_function :uniffi_cyclops_sdk_fn_method_httprequestbuilder_method,
     [:uint64, RustBuffer.by_value, RustCallStatus.by_ref],
     :uint64
@@ -3002,6 +3008,9 @@ module UniFFILib
     [RustCallStatus.by_ref],
     :uint16
   attach_function :uniffi_cyclops_sdk_checksum_method_httprequestbuilder_headers,
+    [RustCallStatus.by_ref],
+    :uint16
+  attach_function :uniffi_cyclops_sdk_checksum_method_httprequestbuilder_max_response_bytes,
     [RustCallStatus.by_ref],
     :uint16
   attach_function :uniffi_cyclops_sdk_checksum_method_httprequestbuilder_method,
@@ -3308,14 +3317,15 @@ end
 
   # Record type HttpRequest
 class HttpRequest
-  attr_reader :method, :url, :headers, :body, :timeout_secs
+  attr_reader :method, :url, :headers, :body, :timeout_secs, :max_response_bytes
 
-  def initialize(method:, url:, headers:, body:, timeout_secs: nil)
+  def initialize(method:, url:, headers:, body:, timeout_secs: nil, max_response_bytes: nil)
     @method = method
     @url = url
     @headers = headers
     @body = body
     @timeout_secs = timeout_secs
+    @max_response_bytes = max_response_bytes
   end
 
   def ==(other)
@@ -3332,6 +3342,9 @@ class HttpRequest
       return false
     end
     if @timeout_secs != other.timeout_secs
+      return false
+    end
+    if @max_response_bytes != other.max_response_bytes
       return false
     end
 
@@ -4623,6 +4636,12 @@ end
         value = value
         RustBuffer.check_lower_SequenceTypeHttpHeader(value)
     result = FleetSdk.rust_call(:uniffi_cyclops_sdk_fn_method_httprequestbuilder_headers,uniffi_clone_handle(),RustBuffer.alloc_from_SequenceTypeHttpHeader(value))
+    return HttpRequestBuilder.uniffi_allocate(result)
+  end
+  def max_response_bytes(value)
+        value = FleetSdk::uniffi_in_range(value, "u64", 0, 2**64)
+
+    result = FleetSdk.rust_call(:uniffi_cyclops_sdk_fn_method_httprequestbuilder_max_response_bytes,uniffi_clone_handle(),value)
     return HttpRequestBuilder.uniffi_allocate(result)
   end
   def method(value)

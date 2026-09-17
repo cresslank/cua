@@ -679,7 +679,17 @@ export type HttpRequest = {
     url: string,
     headers: Array<HttpHeader>,
     body?: ArrayBuffer,
-    timeoutSecs?: bigint
+    /**
+     * Per-request timeout. Defaults to absent so callers written against the
+     * pre-timeout record shape keep constructing requests unchanged; absent
+     * falls back to the native client's 30-second default.
+     */
+    timeoutSecs?: bigint,
+    /**
+     * Maximum bytes delivered in the response body. Absent preserves the
+     * historical unbounded response behavior.
+     */
+    maxResponseBytes?: bigint
 }
 
 /**
@@ -687,6 +697,8 @@ export type HttpRequest = {
  */
 export const HttpRequest = (() => {
     const defaults = () => ({
+        timeoutSecs: undefined,
+        maxResponseBytes: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<HttpRequest, ReturnType<typeof defaults>>(defaults);
@@ -703,11 +715,12 @@ const FfiConverterTypeHttpRequest = (() => {
     class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
         read(from: RustBuffer): TypeName {
             return {
-                method: FfiConverterString.read(from), 
-                url: FfiConverterString.read(from), 
-                headers: FfiConverterSequenceTypeHttpHeader.read(from), 
+                method: FfiConverterString.read(from),
+                url: FfiConverterString.read(from),
+                headers: FfiConverterSequenceTypeHttpHeader.read(from),
                 body: FfiConverterOptionalBytes.read(from),
-                timeoutSecs: FfiConverterOptionalUInt64.read(from)
+                timeoutSecs: FfiConverterOptionalUInt64.read(from),
+                maxResponseBytes: FfiConverterOptionalUInt64.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -716,14 +729,16 @@ const FfiConverterTypeHttpRequest = (() => {
             FfiConverterSequenceTypeHttpHeader.write(value.headers, into);
             FfiConverterOptionalBytes.write(value.body, into);
             FfiConverterOptionalUInt64.write(value.timeoutSecs, into);
+            FfiConverterOptionalUInt64.write(value.maxResponseBytes, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterString.allocationSize(value.method) +
              FfiConverterString.allocationSize(value.url) +
              FfiConverterSequenceTypeHttpHeader.allocationSize(value.headers) +
              FfiConverterOptionalBytes.allocationSize(value.body) +
-             FfiConverterOptionalUInt64.allocationSize(value.timeoutSecs);
-            
+             FfiConverterOptionalUInt64.allocationSize(value.timeoutSecs) +
+             FfiConverterOptionalUInt64.allocationSize(value.maxResponseBytes);
+
         }
     };
     return new FFIConverter();
@@ -3326,7 +3341,7 @@ function uniffiEnsureInitialized() {
     if (nativeModule().uniffi_cyclops_sdk_checksum_constructor_cyclopscredentials_new() !== 25746) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cyclops_sdk_checksum_constructor_cyclopscredentials_new");
     }
-    if (nativeModule().uniffi_cyclops_sdk_checksum_method_httpclient_execute() !== 38803) {
+    if (nativeModule().uniffi_cyclops_sdk_checksum_method_httpclient_execute() !== 33213) {
         throw new UniffiInternalError.ApiChecksumMismatch("uniffi_cyclops_sdk_checksum_method_httpclient_execute");
     }
 

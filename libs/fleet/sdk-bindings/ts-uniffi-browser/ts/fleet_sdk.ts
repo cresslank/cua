@@ -786,13 +786,21 @@ export type HttpRequest = {
   headers: Array<HttpHeader>;
   body?: ArrayBuffer;
   timeoutSecs?: bigint;
+  /**
+   * Maximum bytes delivered in the response body. Absent preserves the
+   * historical unbounded response behavior.
+   */
+  maxResponseBytes?: bigint;
 };
 
 /**
  * Generated factory for {@link HttpRequest} record objects.
  */
 export const HttpRequest = (() => {
-  const defaults = () => ({});
+  const defaults = () => ({
+    timeoutSecs: undefined,
+    maxResponseBytes: undefined,
+  });
   const create = (() => {
     return uniffiCreateRecord<HttpRequest, ReturnType<typeof defaults>>(
       defaults,
@@ -815,6 +823,7 @@ const FfiConverterTypeHttpRequest = (() => {
         headers: FfiConverterSequenceTypeHttpHeader.read(from),
         body: FfiConverterOptionalBytes.read(from),
         timeoutSecs: FfiConverterOptionalUInt64.read(from),
+        maxResponseBytes: FfiConverterOptionalUInt64.read(from),
       };
     }
     write(value: TypeName, into: RustBuffer): void {
@@ -823,6 +832,7 @@ const FfiConverterTypeHttpRequest = (() => {
       FfiConverterSequenceTypeHttpHeader.write(value.headers, into);
       FfiConverterOptionalBytes.write(value.body, into);
       FfiConverterOptionalUInt64.write(value.timeoutSecs, into);
+      FfiConverterOptionalUInt64.write(value.maxResponseBytes, into);
     }
     allocationSize(value: TypeName): number {
       return (
@@ -830,7 +840,8 @@ const FfiConverterTypeHttpRequest = (() => {
         FfiConverterString.allocationSize(value.url) +
         FfiConverterSequenceTypeHttpHeader.allocationSize(value.headers) +
         FfiConverterOptionalBytes.allocationSize(value.body) +
-        FfiConverterOptionalUInt64.allocationSize(value.timeoutSecs)
+        FfiConverterOptionalUInt64.allocationSize(value.timeoutSecs) +
+        FfiConverterOptionalUInt64.allocationSize(value.maxResponseBytes)
       );
     }
   }
@@ -4778,6 +4789,10 @@ const FfiConverterTypeCyclopsTokenProviderConfigurationBuilder =
   );
 
 export interface HttpClient {
+  /**
+   * Executes an HTTP request. Foreign implementations must enforce
+   * `request.max_response_bytes` while streaming the response body.
+   */
   execute(
     request: HttpRequest,
     asyncOpts_?: { signal: AbortSignal },
@@ -4796,6 +4811,10 @@ export class HttpClientImpl extends UniffiAbstractObject implements HttpClient {
       uniffiTypeHttpClientImplObjectFactory.bless(pointer);
   }
 
+  /**
+   * Executes an HTTP request. Foreign implementations must enforce
+   * `request.max_response_bytes` while streaming the response body.
+   */
   async execute(
     request: HttpRequest,
     asyncOpts_?: { signal: AbortSignal },
@@ -5791,7 +5810,7 @@ function uniffiEnsureInitialized() {
   }
   if (
     nativeModule().ubrn_uniffi_cyclops_sdk_checksum_method_httpclient_execute() !==
-    38803
+    33213
   ) {
     throw new UniffiInternalError.ApiChecksumMismatch(
       "uniffi_cyclops_sdk_checksum_method_httpclient_execute",

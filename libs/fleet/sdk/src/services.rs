@@ -30,6 +30,7 @@ impl CyclopsClient {
             headers: filtered_headers(request.headers),
             body: request.body,
             timeout_secs: request.timeout_secs,
+            max_response_bytes: request.max_response_bytes,
         };
         self.execute_authenticated_service(request).await
     }

@@ -2347,6 +2347,10 @@ public func FfiConverterTypeCyclopsTokenProviderConfigurationBuilder_lower(_ val
 
 public protocol HttpClient: AnyObject, Sendable {
 
+    /**
+     * Executes an HTTP request. Foreign implementations must enforce
+     * `request.max_response_bytes` while streaming the response body.
+     */
     func execute(request: HttpRequest) async throws  -> HttpResponse
 
 }
@@ -2403,6 +2407,10 @@ open class HttpClientImpl: HttpClient, @unchecked Sendable {
 
 
 
+    /**
+     * Executes an HTTP request. Foreign implementations must enforce
+     * `request.max_response_bytes` while streaming the response body.
+     */
 open func execute(request: HttpRequest)async throws  -> HttpResponse  {
     return
         try  await uniffiRustCallAsync(
@@ -2567,6 +2575,8 @@ public protocol HttpRequestBuilderProtocol: AnyObject, Sendable {
 
     func headers(value: [HttpHeader])  -> HttpRequestBuilder
 
+    func maxResponseBytes(value: UInt64)  -> HttpRequestBuilder
+
     func method(value: String)  -> HttpRequestBuilder
 
     func timeoutSecs(value: UInt64)  -> HttpRequestBuilder
@@ -2656,6 +2666,15 @@ open func headers(value: [HttpHeader]) -> HttpRequestBuilder  {
     uniffi_cyclops_sdk_fn_method_httprequestbuilder_headers(
             self.uniffiCloneHandle(),
         FfiConverterSequenceTypeHttpHeader.lower(value),$0
+    )
+})
+}
+
+open func maxResponseBytes(value: UInt64) -> HttpRequestBuilder  {
+    return try!  FfiConverterTypeHttpRequestBuilder_lift(try! rustCall() {
+    uniffi_cyclops_sdk_fn_method_httprequestbuilder_max_response_bytes(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(value),$0
     )
 })
 }
@@ -3407,6 +3426,11 @@ public struct HttpRequest: Equatable, Hashable {
      * falls back to the native client's 30-second default.
      */
     public var timeoutSecs: UInt64?
+    /**
+     * Maximum bytes delivered in the response body. Absent preserves the
+     * historical unbounded response behavior.
+     */
+    public var maxResponseBytes: UInt64?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -3415,12 +3439,17 @@ public struct HttpRequest: Equatable, Hashable {
          * Per-request timeout. Defaults to absent so callers written against the
          * pre-timeout record shape keep constructing requests unchanged; absent
          * falls back to the native client's 30-second default.
-         */timeoutSecs: UInt64? = nil) {
+         */timeoutSecs: UInt64? = nil,
+        /**
+         * Maximum bytes delivered in the response body. Absent preserves the
+         * historical unbounded response behavior.
+         */maxResponseBytes: UInt64? = nil) {
         self.method = method
         self.url = url
         self.headers = headers
         self.body = body
         self.timeoutSecs = timeoutSecs
+        self.maxResponseBytes = maxResponseBytes
     }
 
 
@@ -3443,7 +3472,8 @@ public struct FfiConverterTypeHttpRequest: FfiConverterRustBuffer {
                 url: FfiConverterString.read(from: &buf),
                 headers: FfiConverterSequenceTypeHttpHeader.read(from: &buf),
                 body: FfiConverterOptionData.read(from: &buf),
-                timeoutSecs: FfiConverterOptionUInt64.read(from: &buf)
+                timeoutSecs: FfiConverterOptionUInt64.read(from: &buf),
+                maxResponseBytes: FfiConverterOptionUInt64.read(from: &buf)
         )
     }
 
@@ -3453,6 +3483,7 @@ public struct FfiConverterTypeHttpRequest: FfiConverterRustBuffer {
         FfiConverterSequenceTypeHttpHeader.write(value.headers, into: &buf)
         FfiConverterOptionData.write(value.body, into: &buf)
         FfiConverterOptionUInt64.write(value.timeoutSecs, into: &buf)
+        FfiConverterOptionUInt64.write(value.maxResponseBytes, into: &buf)
     }
 }
 
@@ -4999,7 +5030,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cyclops_sdk_checksum_method_accesstokenprovider_get_access_token() != 1180) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cyclops_sdk_checksum_method_httpclient_execute() != 38803) {
+    if (uniffi_cyclops_sdk_checksum_method_httpclient_execute() != 33213) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cyclops_sdk_checksum_method_createclaimrequestbuilder_build() != 10518) {
@@ -5069,6 +5100,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cyclops_sdk_checksum_method_httprequestbuilder_headers() != 19982) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cyclops_sdk_checksum_method_httprequestbuilder_max_response_bytes() != 42011) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cyclops_sdk_checksum_method_httprequestbuilder_method() != 4078) {
