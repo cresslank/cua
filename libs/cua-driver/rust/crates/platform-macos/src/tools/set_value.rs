@@ -110,7 +110,7 @@ impl Tool for SetValueTool {
         let element_token_arg = args.opt_str("element_token");
         let window_id_arg = args.opt_u64("window_id");
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
-        let resolved = match cua_driver_core::element_token::resolve_element_args(
+        let resolved = match self.state.element_cache.resolve_element_args(
             pid,
             element_index_arg,
             element_token_arg.as_deref(),
@@ -121,7 +121,7 @@ impl Tool for SetValueTool {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (element_index, window_id) = match resolved {
+        let (element_index, window_id, element_guard) = match resolved {
             cua_driver_core::element_token::ResolvedElement::None => {
                 return ToolResult::error(
                     "set_value requires element_index (+ window_id) or element_token to \
@@ -131,9 +131,9 @@ impl Tool for SetValueTool {
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: Some(wid),
                 element_index: idx,
-                via_token: _,
+                element,
                 ..
-            } => (idx, wid),
+            } => (idx, wid, element),
             cua_driver_core::element_token::ResolvedElement::Element {
                 window_id: None, ..
             } => {
@@ -151,22 +151,6 @@ impl Tool for SetValueTool {
             Err(error) => return error,
         };
 
-        // Retain out of the cache so a concurrent get_window_state can't free
-        // the element mid-action (use-after-free → daemon crash). Guard lives
-        // to the end of this method, past the AX write below.
-        let element_guard =
-            match self
-                .state
-                .element_cache
-                .get_element_retained(pid, window_id, element_index)
-            {
-                Some(e) => e,
-                None => {
-                    return ToolResult::error(format!(
-                        "Element index {element_index} not found. Call get_window_state first."
-                    ))
-                }
-            };
         let element_ptr = element_guard.as_ptr();
 
         // set_value is an always-background semantic AX mutation. Re-prove
@@ -186,9 +170,9 @@ impl Tool for SetValueTool {
         };
 
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
-        let center_ptr = element_ptr as usize;
-        if let Ok(Some((screen_x, screen_y))) = tokio::task::spawn_blocking(move || unsafe {
-            crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
+        let center_guard = element_guard.clone();
+        if let Ok(Some((screen_x, screen_y))) = cua_driver_core::blocking::spawn(move || unsafe {
+            crate::ax::bindings::element_screen_center(center_guard.as_ptr() as AXUIElementRef)
         })
         .await
         {
@@ -225,7 +209,7 @@ impl Tool for SetValueTool {
             "set_value.AXValue",
             || async move {
                 cua_driver_core::blocking::spawn(move || {
-                    set_value_blocking(element_ptr, element_index, pid, &value)
+                    set_value_blocking(element_guard.as_ptr(), element_index, pid, &value)
                 })
                 .await
             },

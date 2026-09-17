@@ -14,7 +14,7 @@
 //! when an entry is replaced or removed.
 
 use super::UiaNode;
-use cua_driver_core::element_cache::ElementCacheCore;
+use cua_driver_core::legacy_element_cache::LegacyElementCacheCore as ElementCacheCore;
 use windows::core::Interface;
 use windows::Win32::UI::Accessibility::{IAccessible, IUIAutomationElement};
 

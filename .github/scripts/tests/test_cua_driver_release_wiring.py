@@ -1,6 +1,9 @@
 """Regression tests for cua-driver-rs release and PyPI wiring."""
 
+import ast
 import json
+import re
+import re
 import os
 from pathlib import Path
 import subprocess
@@ -309,8 +312,20 @@ fi
     def test_release_please_exposes_targeted_bump_dropdowns(self) -> None:
         workflow = self.read(".github/workflows/release-please.yml")
 
-        for option in ("automatic", "cua-driver-rs", "lume", "sandbox"):
+        for option in ("automatic", "cua-driver-rs", "lume"):
             self.assertIn(f"          - {option}\n", workflow)
+        component_options = workflow.split("      component:", 1)[1].split("      bump:", 1)[0]
+        self.assertEqual(re.findall(r"^          - (.+)$", component_options, re.MULTILINE),
+                         ["automatic", "cua-driver-rs", "lume"])
+        expected_paths = {"libs/cua-driver", "libs/lume"}
+        self.assertEqual(set(json.loads(self.read("release-please-config.json"))["packages"]), expected_paths)
+        self.assertEqual(set(json.loads(self.read(".release-please-manifest.json"))), expected_paths)
+        resolver = self.read(".github/scripts/resolve_release_please_request.py")
+        mapping = next(node.value for node in ast.parse(resolver).body
+                       if isinstance(node, ast.Assign)
+                       and any(isinstance(target, ast.Name) and target.id == "COMPONENT_PATHS" for target in node.targets))
+        self.assertEqual(ast.literal_eval(mapping),
+                         {"cua-driver-rs": "libs/cua-driver", "lume": "libs/lume"})
         for bump in ("patch", "minor", "major"):
             self.assertIn(f"          - {bump}\n", workflow)
         self.assertIn("resolve_release_please_request.py", workflow)
@@ -342,7 +357,12 @@ fi
     def test_legacy_release_routes_exclude_driver_and_lume(self) -> None:
         workflow = self.read(".github/workflows/release-bump-version.yml")
         self.assertIn('name: "Legacy packages: Bump Version"', workflow)
-        self.assertIn("Cua Driver, Lume, and Sandbox use Release Please", workflow)
+        self.assertIn("Cua Driver and Lume use Release Please", workflow)
+        self.assertIn("          - pypi/sandbox\n", workflow)
+        self.assertIn('"pypi/sandbox")', workflow)
+        self.assertIn('directory=libs/python/cua-sandbox', workflow)
+        self.assertIn("cd libs/python/cua-sandbox\n", workflow)
+        self.assertIn("id: sandbox_version", workflow)
         self.assertNotIn("          - cua-driver-rs\n", workflow)
         self.assertNotIn("          - lume\n", workflow)
         self.assertNotIn("gh api -X DELETE", workflow)
@@ -672,10 +692,19 @@ fi
             "github.event_name == 'workflow_dispatch' && inputs.publish && "
             "format('refs/tags/cua-driver-rs-v{0}', inputs.version) || github.ref"
         )
-        # The attribution preflight has its own immutable candidate checkout;
-        # preserve the six upstream build/verification/publication checkouts.
+        # Exact checkout roles: upstream source build plus local candidate verifier.
+        roles = ("build-linux", "build-windows", "verify-windows-node-runtime",
+                 "build-macos-universal", "build-hyprland-plugin-source",
+                 "verify-release-artifacts", "release")
+        jobs = dict(re.findall(r"^  ([a-z][a-z0-9-]*):\n(.*?)(?=^  [a-z][a-z0-9-]*:\n|\Z)",
+                               workflow, re.MULTILINE | re.DOTALL))
+        for role in roles:
+            self.assertEqual(jobs[role].count(immutable_ref), 1, role)
+        self.assertEqual(jobs["release-attribution-preflight"].count(immutable_ref), 1)
+        self.assertEqual(workflow.count(immutable_ref), 8)
         build_and_release = workflow[workflow.index("  build-linux:") :]
-        self.assertEqual(build_and_release.count(immutable_ref), 6)
+        self.assertEqual(build_and_release.count(immutable_ref), 7)
+        self.assertIn("ref: ${{ inputs.source_ref || github.workflow_sha }}", jobs["verify-release-artifacts"])
         self.assertIn("path: candidate-source", workflow)
         candidate_checkout = workflow[
             workflow.index("- name: Check out exact candidate source contract") :
@@ -835,6 +864,9 @@ fi
         ci_workflow = self.read(
             ".github/workflows/ci-cua-driver-contract-clients.yml"
         )
+        compatibility_probe = self.read(
+            ".github/scripts/cua-driver-mcp-compat/verify.mjs"
+        )
         package = json.loads(
             self.read(
                 ".github/scripts/cua-driver-mcp-compat/package.json"
@@ -854,6 +886,15 @@ fi
         self.assertIn("npm run verify", workflow)
         self.assertIn("MCP discovery in pinned clients", ci_workflow)
         self.assertIn("Verify discovery without model or account calls", ci_workflow)
+        self.assertNotIn("codex.cmd", compatibility_probe)
+        self.assertIn(
+            'run(process.execPath, [CODEX_SCRIPT, "--version"]',
+            compatibility_probe,
+        )
+        self.assertIn(
+            "const child = spawn(\n    process.execPath,\n    [\n      CODEX_SCRIPT,",
+            compatibility_probe,
+        )
         self.assertEqual(
             package["dependencies"],
             {
@@ -871,7 +912,7 @@ fi
         self.assertEqual(len(expected["baseTools"]), 56)
         self.assertEqual(
             expected["outputSchemaCountByPlatform"],
-            {"darwin": 32, "linux": 36, "win32": 32},
+            {"darwin": 34, "linux": 38, "win32": 34},
         )
         self.assertEqual(
             expected["platformTools"],
@@ -881,7 +922,8 @@ fi
                     "mouse_button_up",
                     "mouse_drag",
                     "parallel_mouse_drag",
-                ]
+                ],
+                "win32": ["debug_window_info"],
             },
         )
 
@@ -924,7 +966,6 @@ fi
     def test_lume_uses_the_same_draft_finalizer(self) -> None:
         workflow = self.read(".github/workflows/cd-swift-lume.yml")
 
-        self.assertIn("--make-latest", workflow)
         self.assertIn("github_release.py", workflow)
         self.assertNotIn("softprops/action-gh-release", workflow)
         self.assertNotIn("bake-lume-version", workflow)

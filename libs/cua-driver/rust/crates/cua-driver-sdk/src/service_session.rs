@@ -1305,14 +1305,36 @@ mod tests {
         let socket = directory.path().join("resume-then-stalled-end.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let accept_deadline = Instant::now() + Duration::from_secs(2);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < accept_deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("bounded fixture accept: {error}"),
+                }
+            };
+            // macOS inherits O_NONBLOCK from the bounded accept listener.
+            // The fixture uses blocking reads with explicit socket deadlines.
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut writer = stream;
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let resume: DaemonRequest = serde_json::from_str(&line).unwrap();
             assert_eq!(resume.method, "trusted_session_resume");
-            std::thread::sleep(Duration::from_millis(60));
+            std::thread::sleep(Duration::from_millis(250));
             writeln!(
                 writer,
                 "{}",
@@ -1326,7 +1348,7 @@ mod tests {
             reader.read_line(&mut line).unwrap();
             let end: DaemonRequest = serde_json::from_str(&line).unwrap();
             assert_eq!(end.method, "trusted_session_end");
-            std::thread::sleep(Duration::from_millis(300));
+            std::thread::sleep(Duration::from_millis(700));
         });
         let (stream, _peer) = ServiceStream::pair().unwrap();
         let client = connected_test_client(
@@ -1337,11 +1359,11 @@ mod tests {
         );
         let started = Instant::now();
         let error = client
-            .close_until(Instant::now() + Duration::from_millis(120))
+            .close_until(Instant::now() + Duration::from_millis(500))
             .expect_err("resume and close must share one absolute deadline");
         let elapsed = started.elapsed();
-        assert!(elapsed >= Duration::from_millis(60));
-        assert!(elapsed < Duration::from_millis(500));
+        assert!(elapsed >= Duration::from_millis(450));
+        assert!(elapsed < Duration::from_millis(700));
         assert!(matches!(error, DriverError::Transport { .. }));
         server.join().unwrap();
     }

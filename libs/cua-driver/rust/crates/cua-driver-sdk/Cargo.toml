@@ -47,6 +47,9 @@ windows = { version = "0.58", features = [
 libc = "0.2"
 platform-linux = { path = "../platform-linux" }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+oo7 = { version = "=0.6.0", default-features = false, features = ["async-std", "native_crypto"] }
+
 [features]
 default = []
 portal-input = ["platform-linux/portal-input"]

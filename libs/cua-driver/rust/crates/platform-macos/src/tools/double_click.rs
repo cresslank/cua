@@ -89,7 +89,7 @@ impl Tool for DoubleClickTool {
         let element_token_arg = args.opt_str("element_token");
         let window_id_arg = args.opt_u64("window_id");
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
-        let resolved = match cua_driver_core::element_token::resolve_element_args(
+        let resolved = match self.state.element_cache.resolve_element_args(
             pid,
             element_index_arg,
             element_token_arg.as_deref(),
@@ -100,15 +100,7 @@ impl Tool for DoubleClickTool {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (element_index, window_id) = match resolved {
-            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg),
-            cua_driver_core::element_token::ResolvedElement::Element {
-                window_id: wid,
-                element_index: idx,
-                via_token: _,
-                ..
-            } => (Some(idx), wid),
-        };
+        let (element_index, window_id, element_guard) = resolved.into_parts(window_id_arg);
         let window_id = match cua_driver_core::element_token::checked_optional_native_window_id(
             window_id,
             "double_click",
@@ -118,25 +110,18 @@ impl Tool for DoubleClickTool {
         };
 
         // ── AX element path ──────────────────────────────────────────────────
-        if let (Some(idx), Some(wid)) = (element_index, window_id) {
-            // Retain out of the cache so a concurrent get_window_state can't
-            // free the element mid-action (use-after-free → daemon crash).
-            let element_guard = match self.state.element_cache.get_element_retained(pid, wid, idx) {
-                Some(e) => e,
-                None => {
-                    return ToolResult::error(format!(
-                        "Element index {idx} not found. Call get_window_state first."
-                    ))
-                }
-            };
+        if let (Some(idx), Some(wid), Some(element_guard)) =
+            (element_index, window_id, element_guard)
+        {
             let element_ptr = element_guard.as_ptr();
 
             // Choose one background actuator before dispatch. An element that
             // advertises AXOpen uses the exact semantic route; all other
             // elements require the stricter routed-pointer proof. Do not let a
             // failed AXOpen silently cross into an ungated pointer fallback.
-            let has_ax_open = tokio::task::spawn_blocking(move || unsafe {
-                copy_action_names(element_ptr as AXUIElementRef)
+            let probe_guard = element_guard.clone();
+            let has_ax_open = cua_driver_core::blocking::spawn(move || unsafe {
+                copy_action_names(probe_guard.as_ptr() as AXUIElementRef)
                     .iter()
                     .any(|action| action == "AXOpen")
             })
@@ -157,11 +142,11 @@ impl Tool for DoubleClickTool {
             // Thread the resolved session cursor key into the blocking AX path
             // so its ClickPulse lands on THIS session's cursor, not "default".
             let ck = cursor_key.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            let result = cua_driver_core::blocking::spawn(move || {
                 ax_double_click(
                     pid,
                     wid,
-                    element_ptr,
+                    element_guard.as_ptr(),
                     idx,
                     &ck,
                     has_ax_open,
@@ -263,7 +248,7 @@ impl Tool for DoubleClickTool {
         );
 
         let fg = delivery_mode.is_foreground() && window_id.is_some();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<()> {
             let do_click = move || -> anyhow::Result<()> {
                 if let Some(wid) = window_id {
                     crate::input::mouse::click_at_xy_with_window_local(

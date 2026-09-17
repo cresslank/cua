@@ -4,6 +4,7 @@
 //! a process-local lookup key; authoritative identity includes runtime nonce,
 //! checked sequence, owner scope, PID incarnation, and full-width window ID.
 
+use crate::protocol::ToolResult;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -873,6 +874,55 @@ impl TokenRegistry {
         drop(state);
         true
     }
+    /// Retire only the exact generation owned by a cache; never a replacement.
+    pub fn contains_generation(&self, identity: SnapshotIdentity) -> bool {
+        self.inner.state.lock().unwrap().lanes.values().any(|lane| {
+            lane.inner
+                .lock()
+                .unwrap()
+                .current
+                .as_ref()
+                .is_some_and(|g| g.identity == identity)
+        })
+    }
+    pub fn retire_generation(&self, identity: SnapshotIdentity) -> bool {
+        {
+            let state = self.inner.state.lock().unwrap();
+            for lane in state.lanes.values() {
+                let mut inner = lane.inner.lock().unwrap();
+                if inner
+                    .current
+                    .as_ref()
+                    .is_some_and(|g| g.identity == identity)
+                {
+                    inner.state = GenerationState::Stale;
+                    lane.drained.notify_all();
+                    break;
+                }
+            }
+        }
+        self.reap_stale_generation(identity)
+    }
+    pub fn reap_stale_generation(&self, identity: SnapshotIdentity) -> bool {
+        let mut deferred = Vec::new();
+        let removed = {
+            let mut state = self.inner.state.lock().unwrap();
+            let key = state.lanes.iter().find_map(|(key, lane)| {
+                let inner = lane.inner.lock().unwrap();
+                (inner
+                    .current
+                    .as_ref()
+                    .is_some_and(|g| g.identity == identity)
+                    && matches!(inner.state, GenerationState::Stale)
+                    && inner.admitted == 0
+                    && inner.candidates == 0)
+                    .then(|| key.clone())
+            });
+            key.is_some_and(|key| remove_lane_locked(&self.inner, &mut state, &key, &mut deferred))
+        };
+        drop(deferred);
+        removed
+    }
     pub fn clear_runtime_scope(&self, runtime_scope: &str) -> usize {
         self.cleanup_where(|key| key.runtime_owner == runtime_scope)
     }
@@ -1209,12 +1259,13 @@ pub fn checked_optional_native_window_id(
 }
 
 #[derive(Debug, Clone)]
-pub enum ResolvedElement {
+pub enum ResolvedElement<T = ()> {
     None,
     Element {
         window_id: Option<u64>,
         element_index: usize,
         snapshot_identity: SnapshotIdentity,
+        element: T,
         via_token: bool,
     },
 }
@@ -1279,7 +1330,7 @@ pub fn resolve_element_args_wide(
                     generation.lane.window_id, args_window_id.unwrap())));
             }
             Ok(ResolvedElement::Element { window_id: Some(generation.lane.window_id),
-                element_index: resolved_index, snapshot_identity: generation.identity, via_token: false })
+                element_index: resolved_index, snapshot_identity: generation.identity, element: (), via_token: false })
         }
         (index_arg, Some(token), handle_arg) => {
             let (generation, index) = resolve_token(token)?;
@@ -1291,9 +1342,32 @@ pub fn resolve_element_args_wide(
                     "{tool_name}: element_token conflicts with element_index, snapshot_id, or window_id")));
             }
             Ok(ResolvedElement::Element { window_id: Some(generation.lane.window_id),
-                element_index: index, snapshot_identity: generation.identity, via_token: true })
+                element_index: index, snapshot_identity: generation.identity, element: (), via_token: true })
         }
     }
+}
+
+impl<T> ResolvedElement<T> {
+    pub fn into_parts(
+        self,
+        fallback_window: Option<u64>,
+    ) -> (Option<usize>, Option<u64>, Option<T>) {
+        match self {
+            Self::None => (None, fallback_window, None),
+            Self::Element {
+                window_id,
+                element_index,
+                element,
+                ..
+            } => (Some(element_index), window_id, Some(element)),
+        }
+    }
+}
+
+pub(crate) fn refusal(code: &str, message: String) -> ToolResult {
+    ToolResult::error(message.clone()).with_structured(
+        serde_json::json!({"status":"refused","refusal":{"code":code,"message":message}}),
+    )
 }
 
 #[cfg(test)]

@@ -164,8 +164,23 @@ fn arm_parent_watchdog(_binding_nonce: &str) -> anyhow::Result<()> {
 }
 
 fn environment_attestation_matches(expected: &[WorkerEnvironmentVariable]) -> bool {
+    environment_attestation_matches_observed(expected, std::env::vars_os())
+}
+
+fn environment_attestation_matches_observed(
+    expected: &[WorkerEnvironmentVariable],
+    observed: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> bool {
     let mut expected_by_name = HashMap::new();
     for variable in expected {
+        // CoreFoundation owns this process-local value; it is never a caller override.
+        #[cfg(target_os = "macos")]
+        if variable
+            .name
+            .eq_ignore_ascii_case("__CF_USER_TEXT_ENCODING")
+        {
+            return false;
+        }
         let normalized = variable.name.to_ascii_uppercase();
         if expected_by_name
             .insert(normalized, variable.value.clone())
@@ -176,10 +191,14 @@ fn environment_attestation_matches(expected: &[WorkerEnvironmentVariable]) -> bo
     }
 
     let mut actual_by_name = HashMap::new();
-    for (name, value) in std::env::vars_os() {
+    for (name, value) in observed {
         let (Some(name), Some(value)) = (name.to_str(), value.to_str()) else {
             return false;
         };
+        #[cfg(target_os = "macos")]
+        if name == "__CF_USER_TEXT_ENCODING" {
+            continue;
+        }
         if actual_by_name
             .insert(name.to_ascii_uppercase(), value.to_owned())
             .is_some()
@@ -746,5 +765,58 @@ mod tests {
                 libc::close(descriptor);
             }
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod environment_attestation_tests {
+    use super::*;
+    fn observed(values: &[(&str, &str)]) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        values
+            .iter()
+            .map(|(k, v)| ((*k).into(), (*v).into()))
+            .collect()
+    }
+    #[test]
+    fn only_exact_os_owned_encoding_key_is_ignored() {
+        assert!(environment_attestation_matches_observed(
+            &[],
+            observed(&[("__CF_USER_TEXT_ENCODING", "0x1:0:0")])
+        ));
+        assert!(!environment_attestation_matches_observed(
+            &[],
+            observed(&[("__CF_OTHER", "1")])
+        ));
+        assert!(!environment_attestation_matches_observed(
+            &[],
+            observed(&[("__cf_user_text_encoding", "1")])
+        ));
+        let forbidden = [WorkerEnvironmentVariable {
+            name: "__CF_USER_TEXT_ENCODING".into(),
+            value: "0x1:0:0".into(),
+        }];
+        assert!(!environment_attestation_matches_observed(
+            &forbidden,
+            observed(&[("__CF_USER_TEXT_ENCODING", "0x1:0:0")])
+        ));
+    }
+    #[test]
+    fn declared_environment_still_requires_exact_values_and_no_extras() {
+        let expected = [WorkerEnvironmentVariable {
+            name: "HOME".into(),
+            value: "/isolated".into(),
+        }];
+        assert!(environment_attestation_matches_observed(
+            &expected,
+            observed(&[("HOME", "/isolated")])
+        ));
+        assert!(!environment_attestation_matches_observed(
+            &expected,
+            observed(&[("HOME", "/other")])
+        ));
+        assert!(!environment_attestation_matches_observed(
+            &expected,
+            observed(&[("HOME", "/isolated"), ("EXTRA", "1")])
+        ));
     }
 }

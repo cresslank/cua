@@ -14,11 +14,11 @@
 //!   to full-window space using the most recent `zoom` context stored per-pid.
 
 use async_trait::async_trait;
-use cua_driver_contract::{ClickButton, ClickInput};
+use cua_driver_contract::ClickButton;
 use cua_driver_core::{
     protocol::ToolResult,
     tool::{Tool, ToolDef},
-    tool_args::parse_typed_projection,
+    tool_args::parse_legacy_click_input,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -245,7 +245,7 @@ impl Tool for ClickTool {
                     "suggestion": "pass scope=\"desktop\"",
                 }));
             }
-            let input = match parse_typed_projection::<ClickInput>("click", &args) {
+            let input = match parse_legacy_click_input(&args) {
                 Ok(input) => input,
                 Err(result) => return result,
             };
@@ -266,7 +266,7 @@ impl Tool for ClickTool {
             // screenshot width / logical screen width. This is robust even when
             // CGDisplayPixelsWide under-reports the backing scale (it returns the
             // scaled-mode point width on some Retina configs → a bogus 1.0).
-            let desktop_ratio = tokio::task::spawn_blocking(|| {
+            let desktop_ratio = cua_driver_core::blocking::spawn(|| {
                 let logical_w =
                     super::get_screen_size::main_screen_size().map(|(w, _, _)| w as f64);
                 let shot_w = crate::capture::screenshot_display_bytes()
@@ -302,7 +302,7 @@ impl Tool for ClickTool {
 
             let btn = button.clone();
             let desktop_modifiers: Vec<String> = args.str_array("modifier");
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<()> {
                 // Desktop scope is explicitly foreground and vision-driven: post
                 // at the global HID tap so WindowServer delivers to the window
                 // actually visible at this point. PID-posting here would silently
@@ -350,7 +350,7 @@ impl Tool for ClickTool {
         let element_token_arg = args.opt_str("element_token");
         let window_id_arg = args.opt_u64("window_id");
         let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
-        let resolved = match cua_driver_core::element_token::resolve_element_args(
+        let resolved = match self.state.element_cache.resolve_element_args(
             pid,
             element_index_arg,
             element_token_arg.as_deref(),
@@ -361,15 +361,7 @@ impl Tool for ClickTool {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (element_index, window_id, _via_token) = match resolved {
-            cua_driver_core::element_token::ResolvedElement::None => (None, window_id_arg, false),
-            cua_driver_core::element_token::ResolvedElement::Element {
-                window_id: wid,
-                element_index: idx,
-                via_token,
-                ..
-            } => (Some(idx), wid, via_token),
-        };
+        let (element_index, window_id, element_guard) = resolved.into_parts(window_id_arg);
         let window_id = match cua_driver_core::element_token::checked_optional_native_window_id(
             window_id, "click",
         ) {
@@ -428,21 +420,9 @@ impl Tool for ClickTool {
             }));
         }
 
-        if let (Some(idx), Some(wid)) = (element_index, window_id) {
-            // ── AX element path ────────────────────────────────────────────
-            // Retain the element out of the cache so it can't be freed by a
-            // concurrent get_window_state on the same (pid, window_id) while
-            // this click is mid-flight (use-after-free → daemon crash). The
-            // guard lives to the end of this method, past the AX action below.
-            let element_guard = match self.state.element_cache.get_element_retained(pid, wid, idx) {
-                Some(e) => e,
-                None => {
-                    return ToolResult::error(format!(
-                        "Element index {idx} not found in cache for pid={pid} window_id={wid}. \
-                     Call get_window_state first."
-                    ))
-                }
-            };
+        if let (Some(idx), Some(wid), Some(element_guard)) =
+            (element_index, window_id, element_guard)
+        {
             let element_ptr = element_guard.as_ptr();
 
             // ── Exact-target background gate (macOS background input v1) ──
@@ -478,9 +458,9 @@ impl Tool for ClickTool {
 
             // Animate cursor to element center BEFORE firing AX action,
             // mirroring Swift's `performElementClick` → `animateAndWait(to:)`.
-            let center_ptr = element_ptr;
-            let center = tokio::task::spawn_blocking(move || unsafe {
-                crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
+            let center_guard = element_guard.clone();
+            let center = cua_driver_core::blocking::spawn(move || unsafe {
+                crate::ax::bindings::element_screen_center(center_guard.as_ptr() as AXUIElementRef)
             })
             .await
             .ok()
@@ -512,7 +492,7 @@ impl Tool for ClickTool {
 
                 let mods_owned = modifiers.clone();
                 let foreground = delivery_mode.is_foreground();
-                let result = tokio::task::spawn_blocking(move || {
+                let result = cua_driver_core::blocking::spawn(move || {
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                     if foreground && !m.is_empty() {
                         crate::input::skylight::with_foreground_hid_activation(
@@ -561,9 +541,12 @@ impl Tool for ClickTool {
             // elements so perform_ax_click can cross that one failed semantic
             // rung internally and confirm the result by AX read-back.
             let selection_candidate = if effective_action == "press" {
-                tokio::task::spawn_blocking(move || {
-                    crate::input::ax_actions::nearest_container_selection_state(element_ptr)
-                        .is_some()
+                let selection_guard = element_guard.clone();
+                cua_driver_core::blocking::spawn(move || {
+                    crate::input::ax_actions::nearest_container_selection_state(
+                        selection_guard.as_ptr(),
+                    )
+                    .is_some()
                 })
                 .await
                 .unwrap_or(false)
@@ -636,7 +619,8 @@ impl Tool for ClickTool {
                 prior_front,
                 "click.AXPress",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    cua_driver_core::blocking::spawn(move || {
+                        let element_ptr = element_guard.as_ptr();
                         if foreground {
                             let mut outcome = None;
                             let has_modifiers = !selection_modifiers.is_empty();
@@ -782,7 +766,7 @@ impl Tool for ClickTool {
                             &self.state.config.read().unwrap(),
                         );
                         let dbg_path_c = dbg_path.clone();
-                        let dbg_result = tokio::task::spawn_blocking(move || {
+                        let dbg_result = cua_driver_core::blocking::spawn(move || {
                             let png = crate::capture::screenshot_window_bytes(wid)?;
                             let png = crate::capture::resize_png_if_needed(&png, max_dim)?;
                             crate::capture::write_crosshair_png(&png, cx, cy, &dbg_path_c)
@@ -906,7 +890,7 @@ impl Tool for ClickTool {
             {
                 let focus_only = action == "focus";
                 let hit_test_wid = window_id.expect("guarded by window_id.is_some() above");
-                let ax_result = tokio::task::spawn_blocking(move || unsafe {
+                let ax_result = cua_driver_core::blocking::spawn(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                         return Ok::<bool, anyhow::Error>(false);
                     };
@@ -1008,7 +992,7 @@ impl Tool for ClickTool {
             let focus_without_raise =
                 if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise {
                     let wid = window_id.expect("activation policy requires window_id");
-                    match tokio::task::spawn_blocking(move || {
+                    match cua_driver_core::blocking::spawn(move || {
                         crate::input::mouse::prepare_background_pixel_click(pid, wid)
                     })
                     .await
@@ -1054,7 +1038,7 @@ impl Tool for ClickTool {
                 prior_front,
                 "click.pixel",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    cua_driver_core::blocking::spawn(move || {
                         let has_modifiers = !mods_owned.is_empty();
                         let do_click = move || -> anyhow::Result<()> {
                             let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
