@@ -2329,7 +2329,7 @@ impl MacosWorkerTerminationEndpoint {
         generation: &str,
         expected_worker_pid: u32,
     ) -> io::Result<Arc<MacosWorkerTermination>> {
-        let (mut stream, _) = loop {
+        let (stream, _) = loop {
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -2372,13 +2372,18 @@ impl MacosWorkerTerminationEndpoint {
             }
         };
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "private-worker termination capability attestation timed out",
-            ));
-        }
+        Self::attest_stream(stream, deadline, generation)
+    }
+
+    fn attest_stream(
+        mut stream: UnixStream,
+        deadline: Instant,
+        generation: &str,
+    ) -> io::Result<Arc<MacosWorkerTermination>> {
+        // Darwin accept() inherits the listener's O_NONBLOCK flag. SO_RCVTIMEO
+        // only bounds blocking reads; keep accept nonblocking but normalize the
+        // authenticated stream before receiving a possibly fragmented nonce.
+        stream.set_nonblocking(false)?;
         let mut attestation = Vec::with_capacity(generation.len() + 1);
         loop {
             if attestation.len() > generation.len() {
@@ -4187,7 +4192,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     const WEDGE_TERMINATION_SOCKET_ENV: &str = "CUA_DRIVER_SDK_WEDGE_TERMINATION_SOCKET";
     #[cfg(target_os = "macos")]
-    const WEDGE_GENERATION: &str = "shutdown-timeout-test";
+    const WEDGE_GENERATION_ENV: &str = "CUA_DRIVER_SDK_WEDGE_GENERATION";
     const WEDGE_HELPER_READY: &str = "private-worker-wedge-ready";
     const WEDGE_HELPER_REQUEST: &str = "private-worker-wedge-request";
     #[cfg(target_os = "linux")]
@@ -4202,6 +4207,143 @@ mod tests {
     const LOW_FD_REUSE_HELPER_ENV: &str = "CUA_DRIVER_SDK_LOW_FD_REUSE_HELPER";
     #[cfg(target_os = "linux")]
     const HIGH_FD_HELPER_ENV: &str = "CUA_DRIVER_SDK_HIGH_FD_HELPER";
+
+    #[cfg(target_os = "macos")]
+    mod macos_termination_tests {
+        use super::super::MacosWorkerTerminationEndpoint as Endpoint;
+        use super::*;
+        use std::io::{ErrorKind, Read};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        #[test]
+        fn nonblocking_attestation_waits_for_fragmented_nonce_and_closes_capability() {
+            let (receiver, mut peer) = UnixStream::pair().unwrap();
+            receiver.set_nonblocking(true).unwrap();
+            let observed = receiver.try_clone().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let writer = std::thread::spawn(move || {
+                // A clone shares the accepted stream's file-status flags. Do not
+                // send anything until the receiver has normalized O_NONBLOCK.
+                loop {
+                    // SAFETY: F_GETFL inspects a live, owned descriptor.
+                    let flags = unsafe { libc::fcntl(observed.as_raw_fd(), libc::F_GETFL) };
+                    assert!(flags >= 0);
+                    if flags & libc::O_NONBLOCK == 0 {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "attestation did not normalize O_NONBLOCK"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                drop(observed);
+                peer.write_all(b"nonce").unwrap();
+                std::thread::sleep(Duration::from_millis(30));
+                peer.write_all(b"\n").unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut byte = [0];
+                assert_eq!(peer.read(&mut byte).unwrap(), 0);
+            });
+            let result = Endpoint::attest_stream(receiver, deadline, "nonce");
+            if let Ok(termination) = &result {
+                termination.terminate();
+            }
+            let joined = writer.join();
+            assert!(
+                result.is_ok(),
+                "fragmented attestation failed: {:?}",
+                result.err()
+            );
+            joined.unwrap();
+        }
+
+        #[test]
+        fn attestation_refuses_wrong_nonce_oversize_and_eof() {
+            for payload in [b"wrong\n".as_slice(), b"nonce-extra\n", b"non"] {
+                let (receiver, mut peer) = UnixStream::pair().unwrap();
+                peer.write_all(payload).unwrap();
+                peer.shutdown(std::net::Shutdown::Write).unwrap();
+                let result = Endpoint::attest_stream(
+                    receiver,
+                    Instant::now() + Duration::from_secs(1),
+                    "nonce",
+                );
+                let error = result.err().expect("invalid attestation was accepted");
+                assert!(matches!(
+                    error.kind(),
+                    ErrorKind::PermissionDenied | ErrorKind::UnexpectedEof
+                ));
+            }
+        }
+
+        #[test]
+        fn attestation_bounds_silent_and_trickling_peers() {
+            for trickle in [false, true] {
+                let (receiver, mut peer) = UnixStream::pair().unwrap();
+                let started = Instant::now();
+                let deadline = started + Duration::from_millis(120);
+                let writer = std::thread::spawn(move || {
+                    for _ in 0..10 {
+                        if trickle && peer.write_all(b"n").is_err() {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(30));
+                    }
+                });
+                let result = Endpoint::attest_stream(receiver, deadline, "nnnnnnnnnnnnnnnnnnnn");
+                let elapsed = started.elapsed();
+                writer.join().unwrap();
+                let error = result.err().expect("incomplete attestation was accepted");
+                assert!(matches!(
+                    error.kind(),
+                    ErrorKind::TimedOut | ErrorKind::WouldBlock
+                ));
+                assert!(elapsed >= Duration::from_millis(60));
+                assert!(
+                    elapsed < Duration::from_millis(300),
+                    "peer extended absolute budget: {elapsed:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn listener_enforces_peer_identity_and_cleans_endpoint() {
+            for accept_peer in [false, true] {
+                let generation = uuid::Uuid::new_v4().to_string();
+                let endpoint = Endpoint::bind(&generation).unwrap();
+                let directory = endpoint.directory.clone();
+                let mut peer = UnixStream::connect(endpoint.socket_path()).unwrap();
+                writeln!(peer, "{generation}").unwrap();
+                let result = endpoint.accept_until(
+                    Instant::now() + Duration::from_millis(100),
+                    &generation,
+                    if accept_peer { std::process::id() } else { 1 },
+                );
+                assert_eq!(result.is_ok(), accept_peer);
+                assert!(!directory.exists());
+                if let Ok(termination) = result {
+                    termination.terminate();
+                }
+            }
+        }
+
+        #[test]
+        fn readiness_marker_is_bounded_and_handles_serial_libtest_prefix() {
+            let (mut receiver, mut writer) = UnixStream::pair().unwrap();
+            write!(
+                writer,
+                "test worker::tests::private_worker_wedge_helper ... \n{WEDGE_HELPER_READY}\n"
+            )
+            .unwrap();
+            read_wedge_ready_until(&mut receiver, Instant::now() + Duration::from_secs(1)).unwrap();
+            let error =
+                read_wedge_ready_until(&mut receiver, Instant::now() + Duration::from_millis(50))
+                    .unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::TimedOut);
+        }
+    }
 
     #[test]
     fn startup_error_identity_is_accepted_only_for_initialization_failures() {
@@ -4388,15 +4530,82 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    fn read_wedge_ready_until<R: std::io::Read + std::os::fd::AsRawFd>(
+        stdout: &mut R,
+        deadline: Instant,
+    ) -> std::io::Result<()> {
+        let mut line = Vec::new();
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "wedge helper did not become ready",
+                ));
+            }
+            let mut pollfd = libc::pollfd {
+                fd: stdout.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: poll borrows one live descriptor entry for this call only.
+            let ready =
+                unsafe { libc::poll(&mut pollfd, 1, remaining.as_millis().clamp(1, 50) as i32) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            if ready == 0 {
+                continue;
+            }
+            let mut byte = [0];
+            stdout.read_exact(&mut byte)?;
+            if byte[0] == b'\n' {
+                if line == WEDGE_HELPER_READY.as_bytes() {
+                    return Ok(());
+                }
+                line.clear();
+            } else {
+                line.push(byte[0]);
+                if line.len() > 4096 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "wedge helper readiness line was too long",
+                    ));
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn reap_failed_wedge_helper(mut child: std::process::Child) {
+        child.stdin.take();
+        child.stdout.take();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while child.try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "wedge helper did not exit after capability closure"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     fn spawn_wedged_client(shutdown_timeout: Duration) -> (Arc<PrivateWorkerClient>, WedgeStderr) {
+        let generation = uuid::Uuid::new_v4().to_string();
         let termination_endpoint =
-            super::MacosWorkerTerminationEndpoint::bind(WEDGE_GENERATION).unwrap();
+            super::MacosWorkerTerminationEndpoint::bind(&generation).unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .arg("--exact")
             .arg("worker::tests::private_worker_wedge_helper")
             .arg("--nocapture")
             .env(WEDGE_HELPER_ENV, "1")
+            .env(WEDGE_GENERATION_ENV, &generation)
             .env(
                 WEDGE_TERMINATION_SOCKET_ENV,
                 termination_endpoint.socket_path(),
@@ -4405,24 +4614,24 @@ mod tests {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let mut child = command.spawn().unwrap();
-        let worker_termination = termination_endpoint
-            .accept_until(
-                Instant::now() + Duration::from_secs(2),
-                WEDGE_GENERATION,
-                child.id(),
-            )
-            .unwrap();
-        let stdin = child.stdin.take().unwrap();
-        let mut stdout = BufReader::new(child.stdout.take().unwrap());
-        let stderr = BufReader::new(child.stderr.take().unwrap());
-        let mut line = String::new();
-        loop {
-            line.clear();
-            assert_ne!(stdout.read_line(&mut line).unwrap(), 0);
-            if line.trim() == WEDGE_HELPER_READY {
-                break;
-            }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let worker_termination =
+            match termination_endpoint.accept_until(deadline, &generation, child.id()) {
+                Ok(termination) => termination,
+                Err(error) => {
+                    reap_failed_wedge_helper(child);
+                    panic!("wedge helper termination handshake failed: {error}");
+                }
+            };
+        let mut stdout = child.stdout.take().unwrap();
+        if let Err(error) = read_wedge_ready_until(&mut stdout, deadline) {
+            worker_termination.terminate();
+            reap_failed_wedge_helper(child);
+            panic!("wedge helper readiness failed: {error}");
         }
+        let stdin = child.stdin.take().unwrap();
+        let stdout = BufReader::new(stdout);
+        let stderr = BufReader::new(child.stderr.take().unwrap());
         let process = Arc::new(Mutex::new(WorkerProcess {
             child: Some(child),
             stdin: Some(stdin),
@@ -4438,7 +4647,7 @@ mod tests {
         });
         (
             Arc::new(PrivateWorkerClient {
-                generation: WEDGE_GENERATION.into(),
+                generation,
                 worker_termination,
                 host_death_guard: Mutex::new(None),
                 next_request_id: AtomicU64::new(2),
@@ -5370,7 +5579,9 @@ mod tests {
                 std::env::var(WEDGE_TERMINATION_SOCKET_ENV).unwrap(),
             )
             .unwrap();
-            stream.write_all(WEDGE_GENERATION.as_bytes()).unwrap();
+            stream
+                .write_all(std::env::var(WEDGE_GENERATION_ENV).unwrap().as_bytes())
+                .unwrap();
             stream.write_all(b"\n").unwrap();
             stream.flush().unwrap();
             std::thread::spawn(move || {
@@ -5380,7 +5591,8 @@ mod tests {
             });
         }
 
-        println!("{WEDGE_HELPER_READY}");
+        // Serial libtest leaves its test-name prefix on stdout without a newline.
+        println!("\n{WEDGE_HELPER_READY}");
         std::io::stdout().flush().unwrap();
         let mut request = String::new();
         std::io::stdin().read_line(&mut request).unwrap();

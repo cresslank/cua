@@ -3368,7 +3368,7 @@ mod tests {
         let permissions = driver
             .call_tool(
                 "check_permissions".into(),
-                serde_json::json!({"prompt": true}).to_string(),
+                serde_json::json!({"prompt": false}).to_string(),
             )
             .await
             .unwrap();
@@ -3376,8 +3376,9 @@ mod tests {
             serde_json::from_str(permissions.structured_json.as_deref().unwrap()).unwrap();
         assert_eq!(structured["direct_capture_status"], "not_checked");
         assert_eq!(structured["screen_recording_capturable"], Value::Null);
-        assert_eq!(structured["source"]["attribution"], "host");
-        assert_eq!(structured["source"]["direct_runtime"], true);
+        assert!(!permissions.is_error);
+        assert_eq!(structured["source"]["attribution"], "caller");
+        assert!(structured["source"].get("direct_runtime").is_none());
         driver.shutdown().await.unwrap();
     }
 
