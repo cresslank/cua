@@ -12,37 +12,16 @@
 use anyhow::Result;
 
 pub mod cache;
+mod identity;
 pub mod native;
 pub use cache::ElementCache;
-pub use native::ensure_listener_active;
+pub use native::{ensure_listener_active, resolve_observed_click_target, ObservedClickTarget};
 
-#[derive(Clone, Debug)]
-pub struct AtspiNode {
-    pub element_index: Option<usize>,
-    pub role: String,
-    pub name: Option<String>,
-    pub value: Option<String>,
-    /// Checked state when the accessibility backend exposes one for a toggle.
-    pub checked: Option<bool>,
-    /// Enabled state when the accessibility backend returned a state set.
-    pub enabled: Option<bool>,
-    /// Toggle/selection state for selectable controls.
-    pub selected: Option<bool>,
-    pub description: Option<String>,
-    pub actions: Vec<String>,
-    /// For AT-SPI: element_key = element_index as u64.
-    /// For X11 fallback: element_key = xid.
-    pub element_key: u64,
-    /// Depth in the markdown tree (0 = top-level window child).
-    /// Defaults to 0 when not tracked (e.g. X11 fallback path).
-    pub depth: usize,
-    /// `element_index` of the nearest actionable ancestor, if any.
-    /// Mirrors what the markdown indent shows.
-    pub parent_element_index: Option<usize>,
-    /// True when the native AT-SPI walker observed this node below renderer
-    /// web content. Browser-owned consent UI must never match such nodes.
-    pub in_web_content: bool,
-}
+mod types;
+pub(crate) use types::{
+    click_error_allows_pointer_fallback, ClickActionUnavailable, ElementClickNeedsForeground,
+};
+pub use types::{AtspiIdentity, AtspiNode};
 
 pub struct AtspiTreeResult {
     pub tree_markdown: String,
@@ -288,6 +267,14 @@ pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> 
     native::get_element_bounds(pid, idx)
 }
 
+pub fn get_element_bounds_for_window(
+    pid: u32,
+    xid: u64,
+    idx: usize,
+) -> Result<(i32, i32, u32, u32)> {
+    native::get_element_bounds_for_window(pid, xid, idx)
+}
+
 pub fn get_verified_element_bounds_by_key(
     pid: u32,
     window_id: u64,
@@ -358,6 +345,7 @@ fn walk_via_x11_properties(xid: u64, query: Option<&str>) -> AtspiTreeResult {
         },
         actions: vec!["activate".into()],
         element_key: xid,
+        identity: None,
         depth: 0,
         parent_element_index: None,
         in_web_content: false,

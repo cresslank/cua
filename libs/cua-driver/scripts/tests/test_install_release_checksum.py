@@ -16,6 +16,13 @@ def test_release_checksum_mismatch_fails_before_extraction(tmp_path: Path) -> No
     fake_bin.mkdir()
     tar_marker = tmp_path / "tar-called"
 
+    # The checksum fixture describes a Linux x86_64 asset, regardless of the
+    # host running this test. Otherwise Darwin refuses a missing entry before
+    # reaching the checksum-mismatch boundary this regression must exercise.
+    _write_executable(
+        fake_bin / "uname",
+        'case "$1" in -s) printf "Linux\\n" ;; -m) printf "x86_64\\n" ;; *) exit 2 ;; esac\n',
+    )
     _write_executable(
         fake_bin / "curl",
         r'''

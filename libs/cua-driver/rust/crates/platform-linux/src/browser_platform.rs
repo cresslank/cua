@@ -42,6 +42,22 @@ fn run_existing_profile_cleanup<T: Send + 'static>(
     )
 }
 
+fn hyprland_identity_matches(pid: u32, window_id: u64, owner_pid: u32, address: u64) -> bool {
+    pid != 0 && window_id != 0 && owner_pid == pid && address == window_id
+}
+
+fn hyprland_is_only_owned_window(
+    pid: u32,
+    window_id: u64,
+    identities: impl IntoIterator<Item = (u32, u64)>,
+) -> bool {
+    let mut owned = identities.into_iter().filter(|(owner, _)| *owner == pid);
+    let Some((owner, address)) = owned.next() else {
+        return false;
+    };
+    hyprland_identity_matches(pid, window_id, owner, address) && owned.next().is_none()
+}
+
 fn is_chromium(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     let products = [

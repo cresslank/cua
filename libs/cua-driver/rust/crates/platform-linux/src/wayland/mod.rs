@@ -1209,6 +1209,14 @@ fn screenshot_window_bytes_with_dispatch(
 /// surface is currently rendered; otherwise it fails closed. Output-level
 /// capture remains available through [`screenshot_display_dispatch`].
 pub fn screenshot_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
+    screenshot_dispatch_for_pid(xid, None)
+}
+
+pub fn screenshot_dispatch_with_pid(xid: u64, pid: u32) -> anyhow::Result<Vec<u8>> {
+    screenshot_dispatch_for_pid(xid, Some(pid))
+}
+
+fn screenshot_dispatch_for_pid(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec<u8>> {
     if !is_wayland() {
         return crate::capture::screenshot_window_bytes(xid);
     }
@@ -1225,6 +1233,18 @@ pub fn screenshot_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
             screenshot_display_dispatch,
             private_window_geometry,
         );
+    }
+
+    // Keep private-compositor capture above this host-Hyprland route. Never
+    // downgrade an unproven Hyprland target to an output crop.
+    if hyprland::is_session() {
+        return hyprland::capture(xid, pid).map_err(|error| {
+            tracing::debug!("Hyprland target capture refused: {error:#}");
+            surface_identity_unproven(
+                xid,
+                "Hyprland target identity or toplevel export could not be verified",
+            )
+        });
     }
 
     // On GNOME, prefer the helper's atomic target-bound capture. A present but

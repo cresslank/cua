@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from io import BytesIO
 from pathlib import Path
+import os
 import shutil
 import stat
 import subprocess
@@ -114,6 +115,9 @@ def _write_linux_archives_like_workflow(
     subprocess.run(
         ["tar", "-czf", f"{stage_name}.tar.gz", stage_name],
         cwd=release,
+        # Emulate the Linux producer without BSD tar adding macOS AppleDouble
+        # metadata. Keep the verifier's exact-member rejection unchanged.
+        env={**os.environ, "COPYFILE_DISABLE": "1"},
         check=True,
     )
     subprocess.run(
@@ -131,6 +135,9 @@ def _write_linux_archives_like_workflow(
             "wayland-helper",
         ],
         cwd=release,
+        # Emulate the Linux producer without BSD tar adding macOS AppleDouble
+        # metadata. Keep the verifier's exact-member rejection unchanged.
+        env={**os.environ, "COPYFILE_DISABLE": "1"},
         check=True,
     )
     return tuple(

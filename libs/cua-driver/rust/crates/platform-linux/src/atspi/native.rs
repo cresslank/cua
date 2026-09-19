@@ -15,13 +15,17 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use atspi::proxy::accessible::AccessibleProxy;
 use atspi::proxy::proxy_ext::ProxyExt;
 use atspi::{CoordType, Interface, State, StateSet};
 use atspi_connection::AccessibilityConnection;
 
-use super::AtspiNode;
+use super::identity::{
+    exact_window_element_index, unique_observed_identity_position, verify_observed_frame_ancestry,
+    ObjectAddress, ObservedIdentityCandidate,
+};
+use super::{AtspiIdentity, AtspiNode};
 
 /// Per-call D-Bus timeout: a single unresponsive accessible (common in large,
 /// lazily-built trees like Chromium's) must not stall the whole walk.
@@ -131,9 +135,10 @@ async fn invoke_exact_live_activation(
     exact_window_element_index(&indexed_elements, scoped_frame, element_key, window_id)?;
 
     if let Some((screen_x, screen_y, coord, ox, oy)) = point {
-        let web_document_origin = web_document_origin_for_visited(&visited, pid)
-            .await
-            .unwrap_or((0, 0));
+        let web_document_origin =
+            web_document_origin_for_visited(&visited, pid, window_id, Some(scoped_frame))
+                .await
+                .unwrap_or((0, 0));
         let action_nodes = visited
             .iter()
             .filter(|node| node.frame_ordinal == scoped_frame && is_indexable(node))
@@ -420,6 +425,7 @@ struct Visited<'a> {
     top_level_key: u64,
     /// Position of that frame/window in application child order.
     frame_ordinal: usize,
+    identity: Option<AtspiIdentity>,
     acc: AccessibleProxy<'a>,
 }
 
@@ -511,6 +517,38 @@ impl RawObjectRef {
             path: oref.path_as_str().to_owned(),
         })
     }
+}
+
+/// Pin well-known names to their current unique owner. A missing owner is
+/// discovery-only: indexed clicks cannot use an unproven persistent identity.
+async fn identity_ref(
+    conn: &AccessibilityConnection,
+    raw: &RawObjectRef,
+    owners: &mut std::collections::HashMap<String, Option<String>>,
+) -> Option<RawObjectRef> {
+    let owner = if raw.name.starts_with(':') {
+        raw.name.clone()
+    } else if let Some(owner) = owners.get(&raw.name) {
+        owner.clone()?
+    } else {
+        let owner = async {
+            let bus = atspi::zbus::fdo::DBusProxy::new(conn.connection())
+                .await
+                .ok()?;
+            let name = atspi::zbus::names::BusName::try_from(raw.name.as_str()).ok()?;
+            call(bus.get_name_owner(name))
+                .await?
+                .ok()
+                .map(|name| name.to_string())
+        }
+        .await;
+        owners.insert(raw.name.clone(), owner.clone());
+        owner?
+    };
+    Some(RawObjectRef {
+        name: owner,
+        path: raw.path.clone(),
+    })
 }
 
 /// Read Accessible.GetChildren without deserializing the bus-name field as a
@@ -884,9 +922,10 @@ async fn collect_visited_bounded<'a>(
         resolve_window_frame(conn, pid, xid, &seeds).await
     };
 
-    // Retain stable top-level identity and frame ordinal through the walk.
+    // Keep seed identities for X11 and stable keys for exact Wayland actions.
     let mut stack: Vec<(RawObjectRef, usize, bool, u64, usize)> = seeds
-        .into_iter()
+        .iter()
+        .cloned()
         .enumerate()
         .map(|(frame_ordinal, root)| {
             let top_level_key = element_key_for_object(&root);
@@ -896,6 +935,7 @@ async fn collect_visited_bounded<'a>(
         .collect();
 
     let mut visited: Vec<Visited<'a>> = Vec::new();
+    let mut identity_owners = std::collections::HashMap::new();
     // Guard against pathological/looping trees. Defaults to 5 000 (the
     // historical hard-coded budget); callers can override via max_elements.
     let mut budget = max_elements.unwrap_or(5000usize);
@@ -937,7 +977,14 @@ async fn collect_visited_bounded<'a>(
         // otherwise the loop never returns to the deadline check at the top and
         // the walk stalls past OP_TIMEOUT for callers without an outer guard
         // (snapshot bounds, insert_text). That was the residual #1936 hang.
-        let acc = match call(accessible_for(conn, &oref)).await {
+        let object_identity = identity_ref(conn, &oref, &mut identity_owners).await;
+        let frame_identity = identity_ref(conn, &seeds[frame_ordinal], &mut identity_owners).await;
+        let acc = match call(accessible_for(
+            conn,
+            object_identity.as_ref().unwrap_or(&oref),
+        ))
+        .await
+        {
             Some(Ok(a)) => a,
             Some(Err(error)) => {
                 dlog!("  accessible_for failed: {error:#}");
@@ -1132,6 +1179,14 @@ async fn collect_visited_bounded<'a>(
             element_key: element_key_for_object(&oref),
             top_level_key,
             frame_ordinal,
+            identity: object_identity
+                .zip(frame_identity)
+                .map(|(object, frame)| AtspiIdentity {
+                    bus_name: object.name,
+                    path: object.path,
+                    frame_bus_name: frame.name,
+                    frame_path: frame.path,
+                }),
             acc,
         });
     }
@@ -1217,6 +1272,7 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
                 description: None,
                 actions: v.actions.clone(),
                 element_key: v.element_key,
+                identity: v.identity.clone(),
                 depth: v.depth,
                 parent_element_index,
                 in_web_content: v.in_web_doc,
@@ -2145,69 +2201,6 @@ pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
     )
 }
 
-fn exact_window_element_index(
-    indexed_elements: &[(usize, u64)],
-    scoped_frame: usize,
-    element_key: u64,
-    window_id: u64,
-) -> Result<usize> {
-    let matches = indexed_elements
-        .iter()
-        .enumerate()
-        .filter(|(_, (_, key))| *key == element_key)
-        .map(|(index, (frame, _))| (index, *frame))
-        .collect::<Vec<_>>();
-    let (index, frame) = match matches.as_slice() {
-        [(index, frame)] => (*index, *frame),
-        [] => {
-            return Err(anyhow!(
-                "AT-SPI element key {element_key:#x} is stale for exact window {window_id}"
-            ))
-        }
-        _ => {
-            anyhow::bail!("AT-SPI element key {element_key:#x} is ambiguous across pid toplevels")
-        }
-    };
-    if frame != scoped_frame {
-        anyhow::bail!(
-            "AT-SPI element key {element_key:#x} belongs to a same-process sibling, not exact window {window_id}"
-        );
-    }
-    Ok(index)
-}
-
-#[cfg(test)]
-mod exact_window_element_tests {
-    use super::exact_window_element_index;
-
-    #[test]
-    fn stable_key_survives_process_wide_ordinal_reordering() {
-        let reordered = [(0, 0x99), (1, 0x41), (1, 0x42)];
-        assert_eq!(
-            exact_window_element_index(&reordered, 1, 0x41, 7).unwrap(),
-            1
-        );
-    }
-
-    #[test]
-    fn same_key_in_another_window_cannot_retarget() {
-        let records = [(0, 0x41), (1, 0x42)];
-        assert!(exact_window_element_index(&records, 1, 0x41, 7).is_err());
-    }
-
-    #[test]
-    fn duplicate_key_in_exact_window_fails_closed() {
-        let records = [(1, 0x41), (1, 0x41)];
-        assert!(exact_window_element_index(&records, 1, 0x41, 7).is_err());
-    }
-
-    #[test]
-    fn duplicate_key_in_same_pid_sibling_fails_before_frame_filter() {
-        let records = [(0, 0x41), (1, 0x41), (1, 0x42)];
-        assert!(exact_window_element_index(&records, 1, 0x41, 7).is_err());
-    }
-}
-
 /// Actuate an application-wide element index only when the action-time AT-SPI
 /// walk proves that the indexed object belongs to the carried exact window.
 /// The retained proxy is mutated directly; never hand the ordinal back to a
@@ -2428,6 +2421,212 @@ pub fn perform_verified_action_by_key(
         || {
             Err(anyhow!(
                 "perform_verified_action_by_key timed out for pid {pid} window {window_id} (app unresponsive to AT-SPI)"
+            ))
+        },
+    )
+}
+
+/// A click target resolved from the object address observed in the snapshot.
+/// The public integer index remains an address within that snapshot only.
+pub struct ObservedClickTarget {
+    pid: u32,
+    xid: u64,
+    index: usize,
+    bounds_index: usize,
+    target_position: usize,
+    frame_ordinal: usize,
+    visited: Vec<Visited<'static>>,
+}
+
+/// Read an uncached Parent edge at the mutation boundary. Decode the bus name
+/// as a string for WebKit's well-known names, then resolve its current unique
+/// owner; a missing owner, malformed reply or timeout is never ancestry proof.
+async fn live_parent_address(
+    conn: &AccessibilityConnection,
+    (name, path): ObjectAddress,
+) -> Result<Option<ObjectAddress>> {
+    call(async {
+        let acc = accessible_for(conn, &RawObjectRef { name, path }).await?;
+        let (name, path): (String, atspi::zbus::zvariant::OwnedObjectPath) =
+            acc.inner().get_property("Parent").await?;
+        if name.is_empty() || path.as_str() == "/org/a11y/atspi/null" {
+            return Ok(None);
+        }
+        // No name-owner cache survives a boundary check (or even a Parent edge).
+        let raw = RawObjectRef {
+            name,
+            path: path.to_string(),
+        };
+        let parent = identity_ref(conn, &raw, &mut std::collections::HashMap::new())
+            .await
+            .context("stale_element_token: Parent unique owner is unavailable")?;
+        Ok::<_, anyhow::Error>(Some((parent.name, parent.path)))
+    })
+    .await
+    .context("stale_element_token: Parent lookup timed out")?
+    .context("stale_element_token: Parent lookup failed")
+}
+
+impl ObservedClickTarget {
+    /// Async half is also called after action-name lookups, without nesting the
+    /// private runtime. Always keep the original proxy and snapshot identity.
+    async fn verify_live_at_mutation(&self) -> Result<()> {
+        let target = &self.visited[self.target_position];
+        let identity = target
+            .identity
+            .as_ref()
+            .context("stale_element_token: observed object identity is unavailable")?;
+        let state = call(target.acc.get_state())
+            .await
+            .and_then(|reply| reply.ok())
+            .context("stale_element_token: observed object no longer responds")?;
+        if state.contains(State::Defunct) || !is_enabled_state(&state) {
+            anyhow::bail!("stale_element_token: observed object is defunct or disabled");
+        }
+        let conn = shared_connection().await?;
+        verify_observed_frame_ancestry(identity, |address| live_parent_address(conn, address))
+            .await?;
+        // Recheck ownership AFTER the ancestry round trips as well. No further
+        // AX lookup may intervene between this gate and DoAction/pointer input.
+        if !crate::x11::window_belongs_to_pid(self.xid, self.pid) {
+            anyhow::bail!("stale_element_token: window ownership changed");
+        }
+        Ok(())
+    }
+
+    pub fn verify_live(&self) -> Result<()> {
+        bounded(self.verify_live_at_mutation(), || {
+            Err(anyhow!(
+                "stale_element_token: observed object liveness check timed out"
+            ))
+        })
+    }
+
+    pub fn screen_bounds(&self) -> Result<(i32, i32, u32, u32)> {
+        bounded(
+            async {
+                element_bounds_for_visited(
+                    &self.visited,
+                    self.pid,
+                    self.xid,
+                    Some(self.frame_ordinal),
+                )
+                .await
+                .into_iter()
+                .find(|(index, _, _, _, _)| *index == self.bounds_index)
+                .map(|(_, x, y, width, height)| (x, y, width, height))
+                .ok_or_else(|| anyhow!("element {} has no usable Component bounds", self.index))
+            },
+            || {
+                Err(anyhow!(
+                    "indexed click bounds timed out for pid {}",
+                    self.pid
+                ))
+            },
+        )
+    }
+
+    pub fn needs_foreground_pointer(&self) -> bool {
+        let target = &self.visited[self.target_position];
+        target.has_editable || target.role == "table cell"
+    }
+
+    pub fn perform_action(&self, allow_activation: bool) -> Result<(String, bool)> {
+        let target = &self.visited[self.target_position];
+        if self.needs_foreground_pointer() {
+            return Err(super::ElementClickNeedsForeground.into());
+        }
+        if !allow_activation {
+            return Err(super::ClickActionUnavailable(
+                "modified click requires pointer delivery".into(),
+            )
+            .into());
+        }
+        let suspected_noop = is_passive_role(&target.role);
+        bounded(
+            async {
+                // A known absence is safe to fall back from; lookup errors and
+                // indeterminate DoAction results must never replay as pixels.
+                if target.actions.is_empty() {
+                    return Err(super::ClickActionUnavailable(format!(
+                        "element {} has no advertised Action interface",
+                        self.index
+                    ))
+                    .into());
+                }
+                let action = target.acc.proxies().await?.action().await?;
+                let names = live_action_names(&action).await?;
+                let chosen = activation_index(&target.role, &names).ok_or_else(|| {
+                    super::ClickActionUnavailable(format!(
+                        "element {} has no live safe activation action",
+                        self.index,
+                    ))
+                })?;
+                // Action-vector round trips can reparent the still-live object.
+                // An ancestry failure is NOT a typed no-input fallback outcome.
+                self.verify_live_at_mutation().await?;
+                let accepted = action.do_action(chosen as i32).await?;
+                require_affirmative_ack(accepted, &format!("element {}", self.index))?;
+                Ok((names[chosen].clone(), suspected_noop))
+            },
+            || {
+                Err(anyhow!(
+                    "indexed click action timed out for pid {}",
+                    self.pid
+                ))
+            },
+        )
+    }
+}
+
+/// Match a fresh walk against the object and owning frame observed in a
+/// snapshot. A reordered ordinal must refuse rather than retarget the action.
+pub fn resolve_observed_click_target(
+    pid: u32,
+    index: usize,
+    xid: u64,
+    identity: &AtspiIdentity,
+) -> Result<ObservedClickTarget> {
+    bounded(
+        async {
+            let conn = shared_connection().await?;
+            let (visited, scoped_frame) = collect_visited_bounded(conn, pid, xid, None, None)
+                .await?
+                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+            let frame_ordinal = scoped_frame
+                .ok_or_else(|| anyhow!("stale_element_token: target window frame is unproven"))?;
+            let target_position = unique_observed_identity_position(
+                visited
+                    .iter()
+                    .enumerate()
+                    .map(|(position, node)| ObservedIdentityCandidate {
+                        position,
+                        bus_name: node.acc.inner().destination().as_str(),
+                        path: node.acc.inner().path().as_str(),
+                        identity: node.identity.as_ref(),
+                        frame_ordinal: node.frame_ordinal,
+                        indexable: is_indexable(node),
+                    }),
+                identity,
+                frame_ordinal,
+            )?;
+            let bounds_index = visited[..target_position]
+                .iter()
+                .filter(|node| is_indexable(node))
+                .count();
+            Ok(ObservedClickTarget {
+                pid,
+                xid,
+                index,
+                bounds_index,
+                target_position,
+                frame_ordinal,
+                visited,
+            })
+        },
+        || {
+            Err(anyhow!(
+                "stale_element_token: indexed click resolution timed out"
             ))
         },
     )
@@ -3135,9 +3334,10 @@ pub fn perform_action_at_screen_point(
             let scoped_frame = scoped_frame.ok_or_else(|| {
                 anyhow!("could not scope AT-SPI screen-point action to exact window {xid}")
             })?;
-            let web_document_origin = web_document_origin_for_visited(&visited, pid)
-                .await
-                .unwrap_or((0, 0));
+            let web_document_origin =
+                web_document_origin_for_visited(&visited, pid, xid, Some(scoped_frame))
+                    .await
+                    .unwrap_or((0, 0));
 
             // Reconstruct each indexable element's SCREEN frame the same way
             // get_window_state does: WINDOW-relative extents (GTK4 reports these
@@ -3584,6 +3784,41 @@ pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> 
     )
 }
 
+pub fn get_element_bounds_for_window(
+    pid: u32,
+    xid: u64,
+    idx: usize,
+) -> Result<(i32, i32, u32, u32)> {
+    if !crate::wayland::is_wayland() || !crate::wayland::hyprland::is_session() {
+        return get_element_bounds(pid, idx);
+    }
+    bounded(
+        async {
+            let conn = shared_connection().await?;
+            let (visited, scoped_frame) = collect_visited_bounded(conn, pid, xid, None, None)
+                .await?
+                .context("no AT-SPI application")?;
+            let scope =
+                scoped_frame.context("Hyprland accessibility window identity is unproven")?;
+            let target = visited
+                .iter()
+                .filter(|v| is_indexable(v))
+                .nth(idx)
+                .context("element no longer exists")?;
+            if target.frame_ordinal != scope {
+                return Err(anyhow!("element does not belong to the requested window"));
+            }
+            element_bounds_for_visited(&visited, pid, xid, Some(scope))
+                .await
+                .into_iter()
+                .find(|(index, ..)| *index == idx)
+                .map(|(_, x, y, w, h)| (x, y, w, h))
+                .context("element has no compositor-attested screen bounds")
+        },
+        || Err(anyhow!("Hyprland element bounds timed out")),
+    )
+}
+
 pub fn get_verified_element_bounds_by_key(
     pid: u32,
     window_id: u64,
@@ -3599,9 +3834,10 @@ pub fn get_verified_element_bounds_by_key(
             let visited = collect_visited(conn, pid)
                 .await?
                 .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
-            let web_document_origin = web_document_origin_for_visited(&visited, pid)
-                .await
-                .unwrap_or((0, 0));
+            let web_document_origin =
+                web_document_origin_for_visited(&visited, pid, window_id, None)
+                    .await
+                    .unwrap_or((0, 0));
             let mut matches = visited
                 .iter()
                 .filter(|node| is_indexable(node) && node.element_key == element_key);
@@ -4331,7 +4567,6 @@ mod frame_correlation_tests {
 
 #[cfg(test)]
 mod coord_tests {
-    use super::parse_gtk_frame_extents;
     use super::{
         activation_index, before_snapshot_deadline, combine_wayland_content_offsets,
         ensure_element_descends_from_exact_window, exact_window_top_level_key, is_enabled_state,
@@ -4341,6 +4576,10 @@ mod coord_tests {
         ApplicationSelection,
     };
     use super::{element_key_for_object, RawObjectRef};
+    use super::{
+        hyprland_document_top_inset, parse_gtk_frame_extents, project_screen_extents,
+        scoped_component_nodes, select_web_document,
+    };
     use atspi::{State, StateSet};
     use std::time::Duration;
 
