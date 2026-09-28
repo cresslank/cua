@@ -2,6 +2,37 @@ use cua_driver_sdk::worker::{
     read_private_worker_message, ActionCompletion, ChannelResponse,
     PRIVATE_WORKER_STARTUP_ERROR_REQUEST_ID,
 };
+use cua_driver_testkit::IsolatedStateRoot;
+
+/// Private workers intentionally ignore caller HOME overrides. Isolate the
+/// trusted host process instead, without mutating the parallel test runner's
+/// environment. The parent retains this root until the host and worker stop.
+fn run_in_isolated_host(test: &str) -> bool {
+    if std::env::var("CUA_TEST_PRIVATE_ISOLATED_HOST").as_deref() == Ok(test) {
+        return false;
+    }
+    let state = IsolatedStateRoot::new().unwrap();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--test-threads=1", "--nocapture"])
+        .envs(state.env())
+        .env("CUA_TEST_PRIVATE_ISOLATED_HOST", test)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "isolated worker host failed: {status}");
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("isolated worker host exceeded its deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 use cua_driver_sdk::{
     ConfiguredDriverOptions, DriverError, DriverExecutionMode, EmbeddedDriverHostOptions,
     EmbeddedEnvironmentVariable, EmbeddedPermissionMode, PrivateWorkerOptions,
@@ -14,7 +45,23 @@ use cua_driver_sdk::worker::{
     PRIVATE_WORKER_INITIALIZATION_REQUEST_ID, PRIVATE_WORKER_PROTOCOL_VERSION,
 };
 
-fn worker_options() -> PrivateWorkerOptions {
+/// Per-user state variables for a source-built driver, isolated from the
+/// developer's installed product (#4094).
+fn isolated_environment(state: &IsolatedStateRoot) -> Vec<EmbeddedEnvironmentVariable> {
+    state
+        .env()
+        .into_iter()
+        // The SDK forwards only its safe allowlist; without XDG overrides the
+        // driver derives its XDG state from the isolated HOME.
+        .filter(|(name, _)| matches!(*name, "HOME" | "APPDATA" | "LOCALAPPDATA"))
+        .map(|(name, value)| EmbeddedEnvironmentVariable {
+            name: name.into(),
+            value: value.to_string_lossy().into_owned(),
+        })
+        .collect()
+}
+
+fn worker_options(state: &IsolatedStateRoot) -> PrivateWorkerOptions {
     PrivateWorkerOptions {
         binary_path: env!("CARGO_BIN_EXE_cua-driver").to_owned(),
         host_bundle_id: "com.trycua.private-worker-test".into(),
@@ -35,7 +82,7 @@ fn worker_options() -> PrivateWorkerOptions {
                 max_idle_ttl_seconds: 30,
             },
         },
-        environment: Vec::new(),
+        environment: isolated_environment(state),
         inherit_stderr: true,
     }
 }
@@ -68,7 +115,8 @@ fn child_reports_a_structured_error_before_runtime_creation() {
 
 #[test]
 fn private_worker_constructor_rejects_an_unbounded_environment() {
-    let mut options = worker_options();
+    let state = IsolatedStateRoot::new().unwrap();
+    let mut options = worker_options(&state);
     options.startup_timeout_ms = Some(1);
     options.environment = (0..4_097)
         .map(|_| EmbeddedEnvironmentVariable {
@@ -86,6 +134,7 @@ fn private_worker_constructor_rejects_an_unbounded_environment() {
 #[cfg(target_os = "linux")]
 #[test]
 fn child_reports_a_structured_error_when_the_attested_atspi_route_is_missing() {
+    let state = IsolatedStateRoot::new().unwrap();
     use std::io::{BufReader, Write as _};
     use std::process::{Command, Stdio};
 
@@ -119,7 +168,7 @@ fn child_reports_a_structured_error_when_the_attested_atspi_route_is_missing() {
         name: None,
         arguments: Some(
             serde_json::to_value(WorkerInitialization {
-                configured_driver: worker_options().configured_driver,
+                configured_driver: worker_options(&state).configured_driver,
                 host_bundle_id: "com.trycua.structured-startup-error".into(),
                 environment_attestation: Vec::new(),
             })
@@ -166,7 +215,11 @@ fn child_reports_a_structured_error_when_the_attested_atspi_route_is_missing() {
 
 #[tokio::test]
 async fn private_worker_owns_one_runtime_without_a_reconnect_endpoint() {
-    let driver = cua_driver_sdk::CuaDriver::create_private_worker(worker_options()).unwrap();
+    if run_in_isolated_host("private_worker_owns_one_runtime_without_a_reconnect_endpoint") {
+        return;
+    }
+    let state = IsolatedStateRoot::new().unwrap();
+    let driver = cua_driver_sdk::CuaDriver::create_private_worker(worker_options(&state)).unwrap();
     assert_eq!(driver.execution_mode(), DriverExecutionMode::PrivateWorker);
     assert!(driver.socket_path().is_empty());
     assert!(driver.is_available());
@@ -212,6 +265,9 @@ async fn private_worker_owns_one_runtime_without_a_reconnect_endpoint() {
 #[cfg(target_os = "linux")]
 #[test]
 fn private_worker_constructor_does_not_mutate_session_bus_environment() {
+    if run_in_isolated_host("private_worker_constructor_does_not_mutate_session_bus_environment") {
+        return;
+    }
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--ignored",
@@ -233,27 +289,35 @@ fn private_worker_constructor_does_not_mutate_session_bus_environment() {
 #[tokio::test]
 #[ignore = "subprocess-only process-environment isolation probe"]
 async fn private_worker_session_bus_environment_probe() {
+    let state = IsolatedStateRoot::new().unwrap();
     assert!(std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none());
-    let driver = cua_driver_sdk::CuaDriver::create_private_worker(worker_options()).unwrap();
+    let driver = cua_driver_sdk::CuaDriver::create_private_worker(worker_options(&state)).unwrap();
     assert!(std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_none());
     driver.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn concurrent_private_workers_initialize_independently() {
+    if run_in_isolated_host("concurrent_private_workers_initialize_independently") {
+        return;
+    }
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
     let spawn = |barrier: std::sync::Arc<std::sync::Barrier>| {
         std::thread::spawn(move || {
+            let state = IsolatedStateRoot::new().unwrap();
             barrier.wait();
-            cua_driver_sdk::CuaDriver::create_private_worker(worker_options())
+            let driver = cua_driver_sdk::CuaDriver::create_private_worker(worker_options(&state));
+            (state, driver)
         })
     };
     let first = spawn(barrier.clone());
     let second = spawn(barrier.clone());
     barrier.wait();
 
-    let first = first.join().unwrap().unwrap();
-    let second = second.join().unwrap().unwrap();
+    let (_first_state, first) = first.join().unwrap();
+    let (_second_state, second) = second.join().unwrap();
+    let first = first.unwrap();
+    let second = second.unwrap();
     let (first_metadata, second_metadata) = tokio::join!(first.metadata(), second.metadata());
     assert_ne!(first_metadata.unwrap().pid, second_metadata.unwrap().pid);
     let (first_shutdown, second_shutdown) = tokio::join!(first.shutdown(), second.shutdown());
@@ -263,7 +327,11 @@ async fn concurrent_private_workers_initialize_independently() {
 
 #[tokio::test]
 async fn private_worker_attests_the_post_policy_child_environment() {
-    let mut options = worker_options();
+    if run_in_isolated_host("private_worker_attests_the_post_policy_child_environment") {
+        return;
+    }
+    let state = IsolatedStateRoot::new().unwrap();
+    let mut options = worker_options(&state);
     options.environment = vec![EmbeddedEnvironmentVariable {
         name: "LANG".into(),
         value: "C.UTF-8".into(),
@@ -277,10 +345,14 @@ async fn private_worker_attests_the_post_policy_child_environment() {
     // Successful readiness proves the resulting env-cleared child received the
     // post-policy values attested by the parent/child handshake.
     for ignored_private_override in ["HOME", "home"] {
-        let mut options = worker_options();
+        let mut options = worker_options(&state);
         options.environment = vec![EmbeddedEnvironmentVariable {
             name: ignored_private_override.into(),
-            value: "/tmp/forged-private-worker-route".into(),
+            value: state
+                .path()
+                .join("forged-private-worker-route")
+                .to_string_lossy()
+                .into_owned(),
         }];
         let driver = cua_driver_sdk::CuaDriver::create_private_worker(options).unwrap();
         driver.shutdown().await.unwrap();
@@ -291,10 +363,14 @@ async fn private_worker_attests_the_post_policy_child_environment() {
         "CUA_DRIVER_PRIVATE_AT_SPI_BUS_ADDRESS",
         "CUA_DRIVER_RS_SESSION_IDLE_TTL_SECS",
     ] {
-        let mut options = worker_options();
+        let mut options = worker_options(&state);
         options.environment = vec![EmbeddedEnvironmentVariable {
             name: reserved_name.into(),
-            value: "/tmp/forged-private-worker-route".into(),
+            value: state
+                .path()
+                .join("forged-private-worker-route")
+                .to_string_lossy()
+                .into_owned(),
         }];
         assert!(cua_driver_sdk::CuaDriver::create_private_worker(options).is_err());
     }
@@ -303,7 +379,11 @@ async fn private_worker_attests_the_post_policy_child_environment() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn private_worker_owns_the_macos_cursor_overlay_facility() {
-    let driver = cua_driver_sdk::CuaDriver::create_private_worker(worker_options()).unwrap();
+    if run_in_isolated_host("private_worker_owns_the_macos_cursor_overlay_facility") {
+        return;
+    }
+    let state = IsolatedStateRoot::new().unwrap();
+    let driver = cua_driver_sdk::CuaDriver::create_private_worker(worker_options(&state)).unwrap();
     let result = driver
         .call_tool(
             "get_agent_cursor_state".into(),
@@ -337,6 +417,9 @@ async fn private_worker_owns_the_macos_cursor_overlay_facility() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn private_worker_inherits_the_interactive_linux_display_scope() {
+    if run_in_isolated_host("private_worker_inherits_the_interactive_linux_display_scope") {
+        return;
+    }
     if std::env::var("CUA_REQUIRE_GUI").as_deref() != Ok("1") {
         return;
     }
@@ -347,7 +430,8 @@ async fn private_worker_inherits_the_interactive_linux_display_scope() {
         "canonical GUI E2E requires DISPLAY or WAYLAND_DISPLAY"
     );
 
-    let driver = cua_driver_sdk::CuaDriver::create_private_worker(worker_options()).unwrap();
+    let state = IsolatedStateRoot::new().unwrap();
+    let driver = cua_driver_sdk::CuaDriver::create_private_worker(worker_options(&state)).unwrap();
     let standard = driver
         .create_trusted_session(TrustedSessionOptions {
             public_session: "worker-standard-display-scope".into(),
@@ -444,6 +528,7 @@ async fn private_worker_inherits_the_interactive_linux_display_scope() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn private_worker_descriptor_boundary_helper() {
+    let state = IsolatedStateRoot::new().unwrap();
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
     if std::env::var_os("CUA_DRIVER_TEST_DESCRIPTOR_BOUNDARY_HELPER").is_none() {
@@ -483,7 +568,7 @@ async fn private_worker_descriptor_boundary_helper() {
         0
     );
 
-    let driver = cua_driver_sdk::CuaDriver::create_private_worker(worker_options()).unwrap();
+    let driver = cua_driver_sdk::CuaDriver::create_private_worker(worker_options(&state)).unwrap();
     assert_eq!(
         unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &original_limit) },
         0
@@ -526,6 +611,9 @@ async fn private_worker_descriptor_boundary_helper() {
 #[cfg(target_os = "linux")]
 #[test]
 fn private_worker_closes_ambient_host_descriptors() {
+    if run_in_isolated_host("private_worker_closes_ambient_host_descriptors") {
+        return;
+    }
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
@@ -540,7 +628,11 @@ fn private_worker_closes_ambient_host_descriptors() {
 
 #[tokio::test]
 async fn dropping_the_host_closes_and_terminates_the_private_worker() {
-    let driver = cua_driver_sdk::CuaDriver::create_private_worker(worker_options()).unwrap();
+    if run_in_isolated_host("dropping_the_host_closes_and_terminates_the_private_worker") {
+        return;
+    }
+    let state = IsolatedStateRoot::new().unwrap();
+    let driver = cua_driver_sdk::CuaDriver::create_private_worker(worker_options(&state)).unwrap();
     let pid = driver.metadata().await.unwrap().pid;
     drop(driver);
 
@@ -560,6 +652,10 @@ async fn dropping_the_host_closes_and_terminates_the_private_worker() {
 
 #[tokio::test]
 async fn embedded_service_binds_authority_to_the_original_host_connection() {
+    if run_in_isolated_host("embedded_service_binds_authority_to_the_original_host_connection") {
+        return;
+    }
+    let state = IsolatedStateRoot::new().unwrap();
     let host = cua_driver_sdk::EmbeddedCuaDriverHost::with_options(EmbeddedDriverHostOptions {
         binary_path: env!("CARGO_BIN_EXE_cua-driver").to_owned(),
         host_bundle_id: "com.trycua.trusted-service-test".into(),
@@ -572,7 +668,7 @@ async fn embedded_service_binds_authority_to_the_original_host_connection() {
         session_policy_path: None,
         approve_session_policy: false,
         dangerously_bypass_approvals: false,
-        environment: Vec::<EmbeddedEnvironmentVariable>::new(),
+        environment: isolated_environment(&state),
         inherit_stderr: true,
         no_overlay: false,
     })

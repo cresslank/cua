@@ -31,7 +31,6 @@ pub const PROTOCOL_VERSION: u32 = 1;
 // provide mutation identity: its numeric tokens recycle across effect reloads.
 const IMMUTABLE_INSTALL_PAYLOAD_AVAILABLE: bool = false;
 const CALL_TIMEOUT: Duration = Duration::from_secs(3);
-const GEOMETRY_DELTA_PX: i32 = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KwinWindow {
@@ -47,25 +46,6 @@ pub struct KwinWindow {
     pub minimized: bool,
     pub stacking: usize,
 }
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CorrelationError {
-    NoMatch,
-    Ambiguous,
-    WrongActiveTarget,
-}
-
-impl std::fmt::Display for CorrelationError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoMatch => f.write_str("no exact KWin window matches the AT-SPI target"),
-            Self::Ambiguous => f.write_str("multiple KWin windows match the AT-SPI target"),
-            Self::WrongActiveTarget => f.write_str("KWin reports a different active target"),
-        }
-    }
-}
-
-impl std::error::Error for CorrelationError {}
 
 /// Whether KWin currently offers a target-bound raw-input capability that can
 /// safely authorize portal/libei foreground mutations.
@@ -129,33 +109,6 @@ pub fn trusted_window_for_id(pid: u32, token: u64) -> Option<KwinWindow> {
         .find(|window| window.pid == pid && window.token == token)
 }
 
-pub fn correlate_atspi_window(
-    atspi: &WindowInfo,
-    windows: &[KwinWindow],
-) -> Result<KwinWindow, CorrelationError> {
-    let pid = atspi.pid.ok_or(CorrelationError::NoMatch)?;
-    let matches: Vec<_> = windows
-        .iter()
-        .filter(|window| window.pid == pid && !window.minimized)
-        .filter(|window| geometry_matches(atspi, window))
-        .cloned()
-        .collect();
-    match matches.as_slice() {
-        [window] => Ok(window.clone()),
-        [] => Err(CorrelationError::NoMatch),
-        _ => Err(CorrelationError::Ambiguous),
-    }
-}
-
-pub fn require_active_target(windows: &[KwinWindow], token: u64) -> Result<(), CorrelationError> {
-    windows
-        .iter()
-        .find(|window| window.active)
-        .filter(|window| window.token == token)
-        .map(|_| ())
-        .ok_or(CorrelationError::WrongActiveTarget)
-}
-
 /// Refuse a focus-bound KWin foreground transaction.
 ///
 /// `body` is deliberately never invoked. The current helper can identify an
@@ -172,25 +125,6 @@ pub fn with_focused_window<T>(
          focus-bound portal/libei input is available; refusing raw input until a target-bound \
          KWin input path is implemented"
     )
-}
-
-fn geometry_matches(atspi: &WindowInfo, kwin: &KwinWindow) -> bool {
-    let right = atspi
-        .x
-        .saturating_add(atspi.width.min(i32::MAX as u32) as i32);
-    let bottom = atspi
-        .y
-        .saturating_add(atspi.height.min(i32::MAX as u32) as i32);
-    let kwin_right = kwin
-        .x
-        .saturating_add(kwin.width.min(i32::MAX as u32) as i32);
-    let kwin_bottom = kwin
-        .y
-        .saturating_add(kwin.height.min(i32::MAX as u32) as i32);
-    (atspi.x - kwin.x).abs() <= GEOMETRY_DELTA_PX
-        && (atspi.y - kwin.y).abs() <= GEOMETRY_DELTA_PX
-        && (right - kwin_right).abs() <= GEOMETRY_DELTA_PX
-        && (bottom - kwin_bottom).abs() <= GEOMETRY_DELTA_PX
 }
 
 fn helper_owner() -> Option<String> {

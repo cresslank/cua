@@ -5,6 +5,7 @@
 //! map and therefore cannot expose a token/cache split.
 
 use super::{AtspiIdentity, AtspiNode};
+use cua_driver_core::element_cache::{ElementCacheCore, SnapshotPayload};
 use cua_driver_core::element_token::{
     MutationPermit, RegistryError, SnapshotCandidate, SnapshotIdentity,
 };
@@ -14,7 +15,7 @@ use std::time::Duration;
 
 /// Both native addressing forms belong to the same immutable generation.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct CachedElement {
+pub struct CachedElement {
     key: u64,
     identity: Option<AtspiIdentity>,
 }
@@ -29,6 +30,7 @@ fn collect_unique_elements<'a>(
     nodes: impl Iterator<Item = &'a AtspiNode>,
 ) -> Result<HashMap<usize, CachedElement>, RegistryError> {
     let mut keys = HashSet::new();
+    let mut identities = HashSet::new();
     let mut elements = HashMap::new();
     for node in nodes {
         let Some(index) = node.element_index else {
@@ -36,6 +38,11 @@ fn collect_unique_elements<'a>(
         };
         if !keys.insert(node.element_key) || elements.contains_key(&index) {
             return Err(RegistryError::Collision);
+        }
+        if let Some(native) = &node.identity {
+            if !identities.insert((native.bus_name.clone(), native.path.clone())) {
+                return Err(RegistryError::Collision);
+            }
         }
         elements.insert(
             index,
@@ -48,11 +55,40 @@ fn collect_unique_elements<'a>(
     Ok(elements)
 }
 
-pub struct ElementCache;
+impl CachedSnapshot {
+    pub fn try_from_nodes(nodes: &[AtspiNode]) -> Result<Self, RegistryError> {
+        let elements = collect_unique_elements(nodes.iter())?;
+        if elements.keys().max() == Some(&usize::MAX) {
+            return Err(RegistryError::Collision);
+        }
+        Ok(Self { elements })
+    }
+}
+impl SnapshotPayload for CachedSnapshot {
+    type Element = CachedElement;
+    fn len(&self) -> usize {
+        self.elements.keys().max().map_or(0, |i| i + 1)
+    }
+    fn retain(&self, index: usize) -> Option<CachedElement> {
+        self.elements.get(&index).cloned()
+    }
+}
+
+pub struct ElementCache {
+    pub core: Arc<ElementCacheCore<CachedSnapshot>>,
+}
+impl std::ops::Deref for ElementCache {
+    type Target = ElementCacheCore<CachedSnapshot>;
+    fn deref(&self) -> &Self::Target {
+        &self.core
+    }
+}
 
 impl ElementCache {
     pub fn new() -> Self {
-        Self
+        let core = Arc::new(ElementCacheCore::new());
+        cua_driver_core::element_cache::register_runtime_cache(&core);
+        Self { core }
     }
 
     /// Build the complete immutable Linux payload before taking any registry
@@ -63,6 +99,8 @@ impl ElementCache {
         xid: u64,
         nodes: &[AtspiNode],
     ) -> Result<SnapshotCandidate, RegistryError> {
+        let pid =
+            i32::try_from(pid).map_err(|_| RegistryError::ProcessIncarnationUnavailable(-1))?;
         let elements = collect_unique_elements(nodes.iter())?;
         // Core validates the index envelope. Exact sparse membership is checked
         // below, both at argument resolution and at mutation admission.
@@ -71,7 +109,7 @@ impl ElementCache {
             None => 0,
         };
         cua_driver_core::element_token::global().prepare_current(
-            pid as i32,
+            pid,
             xid,
             count,
             Arc::new(CachedSnapshot { elements }),
@@ -140,6 +178,18 @@ impl ElementCache {
                         }}),
                     )
                 })?;
+            // These routes still focus or scroll a newly walked ordinal. Until
+            // they carry one retained native object through every dispatch, do
+            // not let a valid token authorize that different addressing model.
+            if !matches!(tool, "click" | "set_value") {
+                return Err(cua_driver_core::protocol::ToolResult::error(format!(
+                    "{tool}: snapshot-bound element delivery is not qualified on Linux"
+                ))
+                .with_structured(serde_json::json!({
+                    "code": "element_route_unqualified", "effect": "refused",
+                    "refusal": {"code": "element_route_unqualified"}
+                })));
+            }
         }
         Ok(resolved)
     }
@@ -177,6 +227,29 @@ impl ElementCache {
         Ok(cua_driver_core::blocking::spawn(move || {
             let _permit = permit;
             mutation(key)
+        }))
+    }
+
+    /// Keep both addressing forms and the permit in the native task. The key
+    /// is for exact-window proof; the full identity prevents hash/ordinal reuse.
+    pub fn spawn_observed_mutation<F, R>(
+        &self,
+        identity: SnapshotIdentity,
+        idx: usize,
+        mutation: F,
+    ) -> Result<tokio::task::JoinHandle<R>, RegistryError>
+    where
+        F: FnOnce(u64, Option<AtspiIdentity>) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let permit = cua_driver_core::element_token::global().try_acquire_mutation(identity)?;
+        let element = permit
+            .payload::<CachedSnapshot>()
+            .and_then(|snapshot| snapshot.elements.get(&idx).cloned())
+            .ok_or(RegistryError::Stale)?;
+        Ok(cua_driver_core::blocking::spawn(move || {
+            let _permit = permit;
+            mutation(element.key, element.identity)
         }))
     }
 
@@ -218,7 +291,115 @@ mod tests {
             depth: 0,
             parent_element_index: None,
             in_web_content: false,
+            #[cfg(target_os = "linux")]
+            object_ref: None,
         }
+    }
+
+    #[test]
+    fn duplicate_native_identity_with_distinct_keys_refuses() {
+        let a = node(1, 41);
+        let mut b = node(2, 42);
+        b.identity = a.identity.clone();
+        assert_eq!(
+            collect_unique_elements([a, b].iter()),
+            Err(RegistryError::Collision)
+        );
+    }
+
+    #[test]
+    fn metadata_and_sparse_native_payload_share_retirement() {
+        cua_driver_core::tool::with_runtime_scope(
+            "linux-metadata_and_sparse_native_payload_share_retirement".into(),
+            || {
+                let cache = ElementCache::new();
+                let pid = std::process::id();
+                let window = 0x7f30_0100;
+                let owner = "linux-sparse-metadata-owner";
+                let id = cache
+                    .try_publish_for_session(
+                        pid as i32,
+                        window,
+                        CachedSnapshot::try_from_nodes(&[node(7, 41)]).unwrap(),
+                        Some(owner),
+                        Some(2.0),
+                    )
+                    .unwrap()
+                    .unwrap();
+                let identity = cache.identity_for_snapshot(pid as i32, id).unwrap();
+                assert_eq!(
+                    cache
+                        .screenshot_scale(pid as i32, Some(window), Some(owner))
+                        .unwrap(),
+                    Some(2.0)
+                );
+                assert_eq!(
+                    cache.acquire_observed_mutation(identity, 7).unwrap().1.path,
+                    "/node/41"
+                );
+                assert!(matches!(
+                    cache.acquire_observed_mutation(identity, 0),
+                    Err(RegistryError::Stale)
+                ));
+                cache.retire_session_screenshots(owner);
+                assert!(cache.identity_for_snapshot(pid as i32, id).is_none());
+                assert!(matches!(
+                    cache.acquire_observed_mutation(identity, 7),
+                    Err(RegistryError::Stale | RegistryError::NotCurrent)
+                ));
+                assert_eq!(
+                    cache
+                        .try_publish_for_session(
+                            pid as i32,
+                            window,
+                            CachedSnapshot::try_from_nodes(&[]).unwrap(),
+                            Some(owner),
+                            Some(1.0),
+                        )
+                        .unwrap(),
+                    None
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn unqualified_indexed_routes_refuse_with_exact_code() {
+        cua_driver_core::tool::with_runtime_scope(
+            "linux-unqualified_indexed_routes_refuse_with_exact_code".into(),
+            || {
+                let cache = ElementCache::new();
+                let pid = std::process::id();
+                let window = 0x7f30_0101;
+                let id = cache
+                    .publish(cache.prepare(pid, window, &[node(7, 41)]).unwrap())
+                    .unwrap();
+                let token = cua_driver_core::element_token::token_for(id, 7);
+                for tool in [
+                    "type_text",
+                    "press_key",
+                    "hotkey",
+                    "scroll",
+                    "double_click",
+                    "right_click",
+                ] {
+                    let error = cache
+                        .resolve_element_args(
+                            pid as i32,
+                            None,
+                            Some(&token),
+                            None,
+                            Some(window),
+                            tool,
+                        )
+                        .unwrap_err();
+                    assert_eq!(
+                        error.structured_content.unwrap()["refusal"]["code"],
+                        "element_route_unqualified"
+                    );
+                }
+            },
+        );
     }
 
     #[test]
@@ -464,7 +645,8 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let active_in_a = active.clone();
         let task_a = cache
-            .spawn_element_mutation(first_identity, 0, move |key| {
+            .spawn_observed_mutation(first_identity, 0, move |key, identity| {
+                assert_eq!(identity.unwrap().path, "/node/41");
                 assert_eq!(key, 41);
                 active_in_a.store(true, Ordering::SeqCst);
                 started_tx.send(()).unwrap();
@@ -501,7 +683,8 @@ mod tests {
 
         let active_in_b = active.clone();
         cache
-            .spawn_element_mutation(second_identity, 0, move |key| {
+            .spawn_observed_mutation(second_identity, 0, move |key, identity| {
+                assert_eq!(identity.unwrap().path, "/node/99");
                 assert_eq!(key, 99);
                 assert!(!active_in_b.load(Ordering::SeqCst));
             })

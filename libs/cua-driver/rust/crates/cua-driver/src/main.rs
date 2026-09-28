@@ -18,14 +18,17 @@
 //! platform tool registry.
 
 mod autostart;
+mod broken_pipe;
 mod bundle;
 mod check_update_tool;
 mod cli;
 mod doctor;
 mod driver_service_http;
+mod extension_manager;
 mod history_runtime;
 mod mcp_envelope;
 mod mcp_http;
+mod perception_cli;
 mod private_worker;
 mod proxy;
 mod release_channel;
@@ -129,7 +132,7 @@ fn maybe_wrap_finite_command() {
     let Ok(status) = status else {
         return;
     };
-    let exit_code = status.code().unwrap_or(1);
+    let exit_code = broken_pipe::shell_exit_code(status);
     telemetry::spawn_cli_completion_worker(
         command_name,
         tool_name.as_deref(),
@@ -280,6 +283,11 @@ fn maybe_init_pip() {
 
 // ── Public SDK runtime host ──────────────────────────────────────────────
 
+fn register_host_tools(registry: &mut cua_driver_core::tool::ToolRegistry) {
+    history_runtime::register_host_tools(registry);
+    extension_manager::register_host_tools(registry);
+}
+
 /// Construct the canonical SDK-owned runtime for the CLI or daemon host.
 /// The private socket and MCP layers consume this object downstream.
 fn build_driver(
@@ -305,7 +313,7 @@ fn build_driver(
             // Xauthority, session-bus, and accessibility behavior without the old
             // initialization deadlock.
             prepare_desktop_environment: true,
-            register_host_tools: Some(history_runtime::register_host_tools),
+            register_host_tools: Some(register_host_tools),
             authorization_host: None,
             activity_observer: None,
         },
@@ -346,7 +354,7 @@ fn inspect_tools_without_runtime() -> serde_json::Value {
         host_bundle_id: None,
         claude_code_compatibility: false,
         prepare_desktop_environment: false,
-        register_host_tools: Some(history_runtime::register_host_tools),
+        register_host_tools: Some(register_host_tools),
         authorization_host: None,
         activity_observer: None,
     })
@@ -482,6 +490,9 @@ mod mcp_runtime_selection_tests {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    cua_driver_sdk::configure_perception_client_resolver(
+        extension_manager::perception_client_resolver(),
+    );
     if let Some(code) = platform_macos::permissions::gate::run_permission_probe_if_requested() {
         std::process::exit(code);
     }
@@ -536,6 +547,7 @@ fn main() {
     if telemetry::run_update_event_worker_if_requested() {
         return;
     }
+    broken_pipe::install_for_finite_command_from_argv();
     maybe_wrap_finite_command();
 
     // ── CLI subcommand dispatch ──────────────────────────────────────────────
@@ -575,6 +587,7 @@ fn main() {
         }
         cli::Command::Serve {
             socket,
+            pid_file,
             permission_mode,
             dangerously_bypass_approvals,
             capability_manifest,
@@ -666,7 +679,7 @@ fn main() {
                 }
             };
             let sp = socket.unwrap_or_else(serve::default_socket_path);
-            let pid_path = serve::default_pid_file_path();
+            let pid_path = pid_file.unwrap_or_else(serve::default_pid_file_path);
 
             // Bind the Unix socket FIRST, on a background thread, BEFORE
             // running the (blocking) permissions gate (#1761).
@@ -849,6 +862,12 @@ fn main() {
         cli::Command::Skills { subcommand, flags } => {
             skills::run(&subcommand, &flags);
         }
+        cli::Command::Extension { args } => {
+            extension_manager::run(&args);
+        }
+        cli::Command::Perception { args } => {
+            perception_cli::run(&args);
+        }
         cli::Command::CursorTheme { args } => {
             run_cursor_theme_command(&args);
         }
@@ -920,6 +939,18 @@ fn main() {
 
 #[cfg(not(target_os = "macos"))]
 fn main() -> anyhow::Result<()> {
+    // An elevated Driver runs shell launches through this executable with a
+    // standard-user token (#3607). Checked first so the helper does no other
+    // Driver work.
+    #[cfg(target_os = "windows")]
+    if let Some(code) =
+        platform_windows::standard_user_launch::run_shell_launch_helper_if_requested()
+    {
+        std::process::exit(code);
+    }
+    cua_driver_sdk::configure_perception_client_resolver(
+        extension_manager::perception_client_resolver(),
+    );
     if let Some(code) = history_runtime::run_offline_purge_if_requested() {
         std::process::exit(code);
     }
@@ -936,6 +967,7 @@ fn main() -> anyhow::Result<()> {
     if telemetry::run_update_event_worker_if_requested() {
         return Ok(());
     }
+    broken_pipe::install_for_finite_command_from_argv();
     maybe_wrap_finite_command();
 
     // ── CLI subcommand dispatch ──────────────────────────────────────────────
@@ -982,6 +1014,7 @@ fn main() -> anyhow::Result<()> {
         }
         cli::Command::Serve {
             socket,
+            pid_file,
             permission_mode,
             dangerously_bypass_approvals,
             capability_manifest,
@@ -1034,7 +1067,7 @@ fn main() -> anyhow::Result<()> {
             )?;
             maybe_init_pip();
             let sp = socket.unwrap_or_else(serve::default_socket_path);
-            let pid_path = serve::default_pid_file_path();
+            let pid_path = pid_file.unwrap_or_else(serve::default_pid_file_path);
             // run_serve_cmd builds its own runtime; must run on a fresh thread.
             std::thread::spawn(move || {
                 serve::run_serve_cmd(driver, &sp, Some(&pid_path));
@@ -1137,6 +1170,14 @@ fn main() -> anyhow::Result<()> {
         }
         cli::Command::Skills { subcommand, flags } => {
             skills::run(&subcommand, &flags);
+            return Ok(());
+        }
+        cli::Command::Extension { args } => {
+            extension_manager::run(&args);
+            return Ok(());
+        }
+        cli::Command::Perception { args } => {
+            perception_cli::run(&args);
             return Ok(());
         }
         cli::Command::CursorTheme { args } => {

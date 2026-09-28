@@ -35,6 +35,9 @@ pub struct AtspiNode {
     /// True when the native AT-SPI walker observed this node below renderer
     /// web content. Browser-owned consent UI must never match such nodes.
     pub in_web_content: bool,
+    /// Observation only; mutations still require the retained identity and permit.
+    #[cfg(target_os = "linux")]
+    pub object_ref: Option<super::native::ObjectRef>,
 }
 
 /// No input has been delivered; this control needs a real pointer click.

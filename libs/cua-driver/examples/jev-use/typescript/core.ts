@@ -1,15 +1,33 @@
-export type Outcome = 'verified' | 'refuted' | 'unknown' | 'abstained' | 'budget_exhausted';
+/**
+ * Runner primitives shared by every jev-use task: visual-region parsing,
+ * candidate validation, and the mock chooser. Candidate sources are in
+ * sources.ts and task specs in tasks.ts; the names re-exported below keep
+ * existing imports from core.ts working.
+ */
+import type { Candidate } from './sources.js';
 
-export type Candidate = Readonly<{
-  id: string;
-  description: string;
-  tool: string | null;
-  arguments: Readonly<Record<string, unknown>>;
-  captureId?: string;
-  screenshotReference?: string;
-}>;
+export type { Candidate } from './sources.js';
+export {
+  FIELD_NAME,
+  HISTORY_OUTCOMES,
+  REDACTED_TOKEN,
+  SUBMIT_IDS,
+  SUBMIT_NAME,
+  buildCandidates,
+  classify,
+  formState,
+  historyEntry,
+  redactToken,
+  visualSubmitRegion,
+  type FormState,
+  type HistoryEntry,
+  type Outcome,
+  type SubmitButtonState,
+} from './tasks.js';
 
-type PageRef = {
+export type VisualDelivery = 'background' | 'foreground';
+
+export type PageRef = {
   role?: string;
   name?: string | null;
   ref?: string;
@@ -52,6 +70,16 @@ export type VisualObservation = Readonly<{
   regions: readonly VisualRegion[];
 }>;
 
+export class VisualObservationError extends Error {
+  constructor(
+    message: string,
+    readonly code: string = 'invalid_visual_result'
+  ) {
+    super(message);
+    this.name = 'VisualObservationError';
+  }
+}
+
 function record(value: unknown, message: string): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error(message);
   return value as Record<string, unknown>;
@@ -78,10 +106,6 @@ function pixelInt(value: unknown): number {
   return Number(value);
 }
 
-function immutableCandidate(candidate: Candidate): Candidate {
-  return Object.freeze({ ...candidate, arguments: Object.freeze({ ...candidate.arguments }) });
-}
-
 export function parseVisualRegions(
   payload: unknown,
   expectedCaptureId: string,
@@ -92,7 +116,10 @@ export function parseVisualRegions(
   if (root.schema !== 'cua.visual_regions_v1') throw new Error('unsupported visual region schema');
   const capture = record(root.capture, 'visual result has no capture provenance');
   if (capture.capture_id !== expectedCaptureId) {
-    throw new Error('visual result is stale or capture-mismatched');
+    throw new VisualObservationError(
+      'visual result is stale or capture-mismatched',
+      'capture_mismatch'
+    );
   }
   const source = record(capture.source, 'visual result has no capture source');
   if (
@@ -100,7 +127,10 @@ export function parseVisualRegions(
     source.pid !== expectedPid ||
     source.window_id !== expectedWindowId
   ) {
-    throw new Error('visual result has a mismatched window target');
+    throw new VisualObservationError(
+      'visual result has a mismatched window target',
+      'capture_mismatch'
+    );
   }
   const screenshot = record(capture.screenshot, 'visual result has no screenshot provenance');
   if (screenshot.mime_type !== 'image/png') {
@@ -191,95 +221,8 @@ export function parseVisualRegions(
   });
 }
 
-function reservedCandidates(): Candidate[] {
-  return [
-    immutableCandidate({
-      id: 'reobserve',
-      description: 'Discard this decision set and obtain a fresh Driver observation.',
-      tool: null,
-      arguments: {},
-    }),
-    immutableCandidate({
-      id: 'abstain',
-      description: 'Stop without acting if none of the proposed actions is safe for the observed state.',
-      tool: null,
-      arguments: {},
-    }),
-  ];
-}
-
-export function buildCandidates(
-  snapshot: BrowserSnapshot,
-  token: string,
-  visual?: VisualObservation,
-  captureBoundClick = false
-): Candidate[] {
-  const common = { target_id: snapshot.target_id, tab_id: snapshot.tab_id };
-  const refs = snapshot.refs ?? [];
-  const field = refs.find(
-    (item) => item.role === 'textbox' && item.name === 'verification value' && item.ref
-  );
-  const button = refs.find((item) => item.role === 'button' && item.name === 'Submit' && item.ref);
-  const candidates: Candidate[] = [];
-  if (field?.value !== token && field?.ref) {
-    candidates.push(
-      immutableCandidate({
-        id: 'type-verification-value',
-        description: 'Replace the verification field with the required token.',
-        tool: 'browser_type',
-        arguments: { ...common, ref: field.ref, text: token, replace: true },
-      })
-    );
-  } else if (field?.value === token && button?.ref) {
-    candidates.push(
-      immutableCandidate({
-        id: 'submit-form',
-        description: 'Submit the form now that the verification field contains the token.',
-        tool: 'browser_click',
-        arguments: { ...common, ref: button.ref, input_route: 'dom_event' },
-      })
-    );
-  } else if (
-    field?.value === token &&
-    visual &&
-    captureBoundClick
-  ) {
-    const matches = visual.regions.filter(
-      (region) =>
-        region.interactive &&
-        region.confidence >= 0.8 &&
-        asciiLower(region.text ?? region.label ?? '') === 'submit'
-    );
-    if (matches.length === 1) {
-      const region = matches[0];
-      const x = region.x + region.width / 2;
-      const y = region.y + region.height / 2;
-      candidates.push(
-        immutableCandidate({
-          id: 'submit-form',
-          description: 'Submit the form using the unique validated visual Submit region.',
-          tool: 'click',
-          arguments: {
-            pid: visual.pid,
-            window_id: visual.windowId,
-            x,
-            y,
-            capture_id: visual.captureId,
-            delivery_mode: 'background',
-          },
-          captureId: visual.captureId,
-          screenshotReference: visual.screenshotReference,
-        })
-      );
-    }
-  }
-  return [...candidates, ...reservedCandidates()];
-}
-
-function asciiLower(value: string): string {
-  return value.replace(/[A-Z]/g, (character) =>
-    String.fromCharCode(character.charCodeAt(0) + 32)
-  );
+export function hasExecutableCandidate(candidates: readonly Candidate[]): boolean {
+  return candidates.some((candidate) => candidate.tool !== null);
 }
 
 export function chooseMock(candidates: Candidate[]) {
@@ -288,9 +231,11 @@ export function chooseMock(candidates: Candidate[]) {
     ? 'type-verification-value'
     : ids.has('submit-form')
       ? 'submit-form'
-      : ids.has('reobserve')
-        ? 'reobserve'
-        : null;
+      : ids.has('submit-form-foreground')
+        ? 'submit-form-foreground'
+        : ids.has('reobserve')
+          ? 'reobserve'
+          : null;
   return {
     choice: selected,
     confidence: selected ? 1 : 0,
@@ -314,16 +259,4 @@ export function validateChoice(
     throw new Error('provider selected a stale or capture-mismatched candidate');
   }
   return candidate;
-}
-
-export function classify(
-  submitted: string | null,
-  token: string,
-  steps: number,
-  maxSteps: number
-): Outcome {
-  if (submitted === token) return 'verified';
-  if (submitted !== null) return 'refuted';
-  if (steps >= maxSteps) return 'budget_exhausted';
-  return 'unknown';
 }

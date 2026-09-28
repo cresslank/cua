@@ -553,11 +553,10 @@ fn post_key_inner(
 /// which we mitigate by saving the previous foreground HWND and restoring it
 /// after the keystrokes are flushed.
 ///
-/// UIAccess constraint: `SetForegroundWindow` is restricted from non-UIAccess
-/// processes when not driven by user input. The `cua-driver-uia` worker runs
-/// at UIAccess integrity precisely so this restriction is lifted; outside the
-/// worker, the foreground swap may silently fail and SendInput land on the
-/// wrong window. Callers should funnel hotkey calls through the uia worker.
+/// Windows may refuse the foreground swap (`SetForegroundWindow` is
+/// restricted when not driven by user input), and UIPI drops input sent to a
+/// higher-integrity target. Both are detected and reported as errors; no
+/// input is sent to an unconfirmed window.
 pub fn send_key_synthesized(hwnd: u64, key: &str, modifiers: &[&str]) -> Result<()> {
     send_key_synthesized_after_focus_for_pid(hwnd, None, key, modifiers, || Ok(()))
 }
@@ -631,10 +630,9 @@ pub fn send_key_synthesized_after_focus_for_pid(
                     0
                 };
                 bail!(
-                    "SendInput inserted only {sent} of {} events. Likely cause: \
-                 the daemon is not at UIAccess integrity, so SetForegroundWindow \
-                 was rejected and the events landed on the wrong window. Run \
-                 hotkey through the cua-driver-uia worker. Release-only cleanup \
+                    "SendInput inserted only {sent} of {} events. Windows blocked the rest: the target may run at a higher integrity \
+                 level (UIPI), or the input desktop may be locked or showing a secure \
+                 prompt. To drive an elevated app, run the Driver elevated. Release-only cleanup \
                  was {} and inserted {cleanup_sent}/{} events.",
                     events.len(),
                     if cleanup_authorized {
@@ -657,7 +655,7 @@ pub fn send_key_synthesized_after_focus_for_pid(
 /// foreground. This is only reached on the explicit `delivery_mode:"foreground"`
 /// rung (background never fronts); it does NOT silently fall back to
 /// PostMessage: if the foreground swap is rejected
-/// (daemon not at UIAccess integrity) it bails with the same diagnostic
+/// or the input is blocked, it bails with the same diagnostic
 /// `send_key_synthesized` returns, so the caller gets an honest error instead
 /// of a false success. Required for VCL/LibreOffice document grids and other
 /// targets where PostMessage WM_CHAR is silently dropped.
@@ -739,9 +737,9 @@ pub fn send_text_synthesized_after_focus_for_pid(
                     0
                 };
                 bail!(
-                    "SendInput inserted only {sent} of {} key events. Likely cause: \
-                 the daemon is not at UIAccess integrity, so SetForegroundWindow \
-                 was rejected and the events landed on the wrong window. Release-only \
+                    "SendInput inserted only {sent} of {} key events. Windows blocked the rest: the target may run at a higher integrity \
+                 level (UIPI), or the input desktop may be locked or showing a secure \
+                 prompt. To drive an elevated app, run the Driver elevated. Release-only \
                  cleanup was {} and inserted {cleanup_sent}/{} events.",
                     events.len(),
                     if cleanup_authorized {
@@ -817,8 +815,9 @@ fn with_confirmed_foreground<T>(
         });
         bail!(
             "foreground_unavailable: Windows did not confirm exact target HWND {:?} for {operation} \
-             within 500 ms (actual foreground HWND {:?}). Route the request through the \
-             UIAccess-manifested cua-driver-uia worker; no input was sent.{}",
+             within 500 ms (actual foreground HWND {:?}). Windows refused the foreground \
+             change, usually because another window holds the foreground lock; no input \
+             was sent. Retry, or use background delivery where the target accepts it.{}",
             target.0,
             actual.0,
             if restore_failed {
@@ -1032,6 +1031,7 @@ fn is_extended(vk: VIRTUAL_KEY) -> bool {
             | VK_RIGHT
             | VK_RCONTROL
             | VK_RMENU
+            | VK_LWIN
             | VK_RWIN
             | VK_NUMLOCK
             | VK_SNAPSHOT
@@ -1139,5 +1139,23 @@ mod cleanup_tests {
         assert_eq!(cleanup.len(), 1);
         assert!(is_up(&cleanup[0]));
         assert_eq!(unsafe { cleanup[0].Anonymous.ki.wScan }, 'x' as u16);
+    }
+}
+
+#[cfg(test)]
+mod extended_key_tests {
+    use super::*;
+
+    #[test]
+    fn windows_key_presses_and_releases_carry_the_extended_key_flag() {
+        // The left Windows key's scan code is 0xE05B; without the extended
+        // flag, Windows treats it as an unrelated key and shortcuts such as
+        // Win+S do nothing.
+        let (downs, ups) = modifier_hold_inputs(&["win"]);
+        assert_eq!((downs.len(), ups.len()), (1, 1));
+        for input in downs.iter().chain(&ups) {
+            let flags = unsafe { input.Anonymous.ki.dwFlags };
+            assert_ne!(flags.0 & KEYEVENTF_EXTENDEDKEY.0, 0, "{flags:?}");
+        }
     }
 }

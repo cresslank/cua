@@ -62,7 +62,9 @@ DPKG_QUERY_BIN=/usr/bin/dpkg-query
 SORT_BIN=/usr/bin/sort
 UNAME_BIN=/usr/bin/uname
 
-SCRIPT_DIR="$(cd "$(/usr/bin/dirname "$0")" && /usr/bin/pwd)"
+# `pwd` is resolved from the root-owned /bin, the only location POSIX hosts
+# share (macOS has no /usr/bin/pwd; merged-/usr Linux links /bin to /usr/bin).
+SCRIPT_DIR="$(cd "$(/usr/bin/dirname "$0")" && /bin/pwd)"
 INSTALL_TRANSACTION_LOCK_HELPER="$SCRIPT_DIR/_install-transaction-lock.py"
 LOCK_PYTHON="$PYTHON_BIN"
 if [ -z "$LOCK_PYTHON" ] || [ ! -f "$INSTALL_TRANSACTION_LOCK_HELPER" ]; then

@@ -12,6 +12,9 @@
 
 let
   rustSrc = if sourceSubdir == null then src else "${src}/${sourceSubdir}";
+  pythonClosure = pkgs.closureInfo {
+    rootPaths = [ pkgs.python3 ];
+  };
 in
 pkgs.rustPlatform.buildRustPackage {
   pname = "cua-driver-rust-unit-tests";
@@ -25,6 +28,8 @@ pkgs.rustPlatform.buildRustPackage {
   cargoTestFlags = [
     "-p"
     "cua-driver"
+    "-p"
+    "cua-driver-e2e"
     "-p"
     "cua-driver-core"
     "-p"
@@ -108,7 +113,14 @@ pkgs.rustPlatform.buildRustPackage {
     rustPlatform.bindgenHook
     clang
     dbus
+    python3
   ];
+  CUA_TEST_PYTHON = "${pkgs.python3}/bin/python3";
+  CUA_TEST_PYTHON_DYNAMIC_LINKER = pkgs.stdenv.cc.bintools.dynamicLinker;
+  CUA_TEST_GLIBC_STATIC_LIB = "${pkgs.glibc.static}/lib";
+  preCheck = ''
+    export CUA_TEST_PYTHON_READ_ROOTS="$(paste -sd: ${pythonClosure}/store-paths)"
+  '';
   buildInputs = with pkgs; [
     libx11
     libxi

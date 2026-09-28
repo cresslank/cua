@@ -1,18 +1,29 @@
 //! Application-state snapshots used by trajectory recording on Linux.
 
+/// Per-turn application state for trajectory recording, walked under the
+/// shared `get_window_state` budget. The walk reports the shared walk fields so
+/// the turn evidence says when the tree is partial.
 #[cfg(target_os = "linux")]
-pub fn app_state_json_for(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
+pub fn app_state_json_for(
+    window_id: Option<u64>,
+    pid: Option<i64>,
+    budget: cua_driver_core::recording::StateCaptureBudget,
+) -> Option<Vec<u8>> {
     if tokio::runtime::Handle::try_current().is_ok() {
-        return std::thread::spawn(move || app_state_json_for_blocking(window_id, pid))
+        return std::thread::spawn(move || app_state_json_for_blocking(window_id, pid, budget))
             .join()
             .ok()
             .flatten();
     }
-    app_state_json_for_blocking(window_id, pid)
+    app_state_json_for_blocking(window_id, pid, budget)
 }
 
 #[cfg(target_os = "linux")]
-fn app_state_json_for_blocking(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
+fn app_state_json_for_blocking(
+    window_id: Option<u64>,
+    pid: Option<i64>,
+    budget: cua_driver_core::recording::StateCaptureBudget,
+) -> Option<Vec<u8>> {
     let pid = u32::try_from(pid?).ok()?;
     let window_id = if crate::wayland::is_inject_mode() {
         // Most injected actions already carry the protocol-verified window id.
@@ -26,12 +37,13 @@ fn app_state_json_for_blocking(window_id: Option<u64>, pid: Option<i64>) -> Opti
     } else {
         resolve_window_for_recording(pid, window_id)?.xid
     };
+    let timeout = std::time::Duration::from_millis(budget.timeout_ms);
     let result = if crate::wayland::is_inject_mode() {
-        // Evidence capture runs inside the daemon call. Keep it below the
-        // transport deadline so an unresponsive renderer cannot block input.
-        crate::atspi::walk_tree_for_recording(pid, window_id, std::time::Duration::from_secs(2))
+        // Evidence capture runs inside the daemon call. One attempt only, so
+        // an unresponsive renderer cannot block input past the budget.
+        crate::atspi::walk_tree_for_recording(pid, window_id, timeout)
     } else {
-        crate::atspi::walk_tree(pid, window_id, None)
+        crate::atspi::walk_tree_bounded_within(pid, window_id, None, None, None, timeout)
     };
     if result.nodes.is_empty() || result.tree_markdown.trim().is_empty() {
         return None;
@@ -41,12 +53,21 @@ fn app_state_json_for_blocking(window_id: Option<u64>, pid: Option<i64>) -> Opti
         .iter()
         .filter(|node| node.element_index.is_some())
         .count();
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "pid": pid,
         "window_id": window_id,
         "element_count": element_count,
         "tree_markdown": result.tree_markdown,
+        // The shared walk fields (see cua_driver_core::walk_budget).
+        "truncated": result.truncated,
+        "nodes_visited": result.nodes_visited,
+        "nodes_pending": result.nodes_pending,
+        "walk_elapsed_ms": result.elapsed_ms as u64,
+        "timeout_ms": budget.timeout_ms,
     });
+    if let Some(reason) = result.truncation_reason {
+        payload["truncation_reason"] = serde_json::json!(reason);
+    }
     serde_json::to_vec_pretty(&payload).ok()
 }
 
@@ -71,41 +92,51 @@ pub fn screenshot_for_recording(window_id: Option<u64>, pid: Option<i64>) -> Opt
 }
 
 #[cfg(target_os = "linux")]
-pub fn element_window_local_xy(window_id: u64, pid: i64, element_index: u32) -> Option<(f64, f64)> {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        return std::thread::spawn(move || {
-            element_window_local_xy_blocking(window_id, pid, element_index)
-        })
-        .join()
-        .ok()
-        .flatten();
-    }
-    element_window_local_xy_blocking(window_id, pid, element_index)
-}
-
-#[cfg(target_os = "linux")]
-fn element_window_local_xy_blocking(
-    window_id: u64,
+pub fn element_window_local_xy(
     pid: i64,
-    element_index: u32,
-) -> Option<(f64, f64)> {
-    let pid = u32::try_from(pid).ok()?;
-    let (screen_x, screen_y, width, height) =
-        crate::atspi::get_element_bounds_for_window(pid, window_id, element_index as usize).ok()?;
-    let window = resolve_window_for_recording(pid, Some(window_id))?;
-    if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
-        let (display_width, display_height, _) = crate::wayland::hyprland::screen_size().ok()?;
-        // This hook retains the whole output, not the window-local tool image.
-        return hyprland_recording_point(
-            (screen_x, screen_y, width, height),
-            (window.x, window.y, window.width, window.height),
-            (display_width, display_height),
+    args: &serde_json::Value,
+    capture_point: bool,
+) -> Option<(u64, Option<(f64, f64)>)> {
+    use cua_driver_core::element_cache::current_runtime_cache;
+    use cua_driver_core::element_token::ResolvedElement;
+    use cua_driver_core::tool_args::ArgsExt;
+    let cache = current_runtime_cache::<crate::atspi::cache::CachedSnapshot>()?;
+    let index = args
+        .opt_u64("element_index")
+        .map(usize::try_from)
+        .transpose()
+        .ok()?;
+    let resolved = match cache.resolve_element_args(
+        i32::try_from(pid).ok()?,
+        index,
+        args.get("element_token")
+            .and_then(serde_json::Value::as_str),
+        args.get("snapshot_id").and_then(serde_json::Value::as_str),
+        args.opt_u64("window_id"),
+        "recording",
+    ) {
+        Ok(resolved) => resolved,
+        Err(refusal) => {
+            tracing::debug!(?refusal, "recording element target refused");
+            return None;
+        }
+    };
+    let ResolvedElement::Element {
+        window_id: Some(window_id),
+        ..
+    } = resolved
+    else {
+        return None;
+    };
+    // The snapshot supplies target identity, not live geometry. An ordinal
+    // re-walk could mark a different object after a tree change. Defer the
+    // optional marker until a retained-native-object geometry reader exists.
+    if capture_point {
+        tracing::warn!(
+            "snapshot-bound recording element geometry is unqualified on Linux; omitting marker"
         );
     }
-    Some((
-        f64::from(screen_x) - f64::from(window.x) + f64::from(width) / 2.0,
-        f64::from(screen_y) - f64::from(window.y) + f64::from(height) / 2.0,
-    ))
+    Some((window_id, None))
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -190,7 +221,11 @@ fn resolve_window_for_recording(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn app_state_json_for(_window_id: Option<u64>, _pid: Option<i64>) -> Option<Vec<u8>> {
+pub fn app_state_json_for(
+    _window_id: Option<u64>,
+    _pid: Option<i64>,
+    _budget: cua_driver_core::recording::StateCaptureBudget,
+) -> Option<Vec<u8>> {
     None
 }
 
@@ -201,16 +236,75 @@ pub fn screenshot_for_recording(_window_id: Option<u64>, _pid: Option<i64>) -> O
 
 #[cfg(not(target_os = "linux"))]
 pub fn element_window_local_xy(
-    _window_id: u64,
     _pid: i64,
-    _element_index: u32,
-) -> Option<(f64, f64)> {
+    _args: &serde_json::Value,
+    _capture_point: bool,
+) -> Option<(u64, Option<(f64, f64)>)> {
     None
 }
 
 #[cfg(test)]
 mod tests {
     use super::{hyprland_output_point, hyprland_recording_point};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn element_metadata_uses_the_live_snapshot_and_never_rewalks_an_index() {
+        use crate::atspi::cache::{CachedSnapshot, ElementCache};
+        use crate::atspi::AtspiNode;
+        use cua_driver_core::element_token::token_for;
+        cua_driver_core::tool::with_runtime_scope("linux-element-marker-metadata".into(), || {
+            let cache = ElementCache::new();
+            let pid = std::process::id() as i32;
+            let window = u64::from(u32::MAX) + 71;
+            let node = AtspiNode {
+                element_index: Some(7),
+                element_key: 41,
+                role: "push button".into(),
+                name: None,
+                value: None,
+                checked: None,
+                enabled: Some(true),
+                selected: None,
+                description: None,
+                actions: Vec::new(),
+                identity: None,
+                depth: 0,
+                parent_element_index: None,
+                in_web_content: false,
+                object_ref: None,
+            };
+            let id = cache
+                .try_publish_for_session(
+                    pid,
+                    window,
+                    CachedSnapshot::try_from_nodes(&[node]).unwrap(),
+                    Some("marker-owner"),
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            let args = serde_json::json!({"element_token": token_for(id, 7)});
+            assert_eq!(
+                super::element_window_local_xy(i64::from(pid), &args, false),
+                Some((window, None))
+            );
+            assert_eq!(
+                super::element_window_local_xy(i64::from(pid), &args, true),
+                Some((window, None))
+            );
+            let hole = serde_json::json!({"element_token": token_for(id, 0)});
+            assert_eq!(
+                super::element_window_local_xy(i64::from(pid), &hole, true),
+                None
+            );
+            cache.retire_session_screenshots("marker-owner");
+            assert_eq!(
+                super::element_window_local_xy(i64::from(pid), &args, true),
+                None
+            );
+        });
+    }
 
     #[test]
     fn hyprland_marker_uses_retained_output_coordinates() {

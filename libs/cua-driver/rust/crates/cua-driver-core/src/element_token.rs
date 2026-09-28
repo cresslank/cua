@@ -564,6 +564,16 @@ impl TokenRegistry {
                 _ => {}
             }
             while inner.admitted != 0 {
+                // Poisoning notifies waiters before the mutation permit is
+                // released. Preserve the terminal refusal even when that wake
+                // precedes drain completion or coincides with the deadline.
+                match &inner.state {
+                    GenerationState::Poisoned { reason } => {
+                        return Err(RegistryError::Poisoned(reason.clone()))
+                    }
+                    GenerationState::Stale => return Err(RegistryError::Stale),
+                    _ => {}
+                }
                 if !matches!(inner.state, GenerationState::Closing { ticket } if ticket == candidate.ticket)
                     || candidate.ticket != inner.latest_ticket
                 {
@@ -581,17 +591,10 @@ impl TokenRegistry {
                 if let Some(hook) = self.inner.before_drain_wait.lock().unwrap().clone() {
                     hook();
                 }
-                let (next, result) = lane.drained.wait_timeout(inner, deadline - now).unwrap();
+                let (next, _) = lane.drained.wait_timeout(inner, deadline - now).unwrap();
                 inner = next;
-                if result.timed_out() && inner.admitted != 0 {
-                    if matches!(inner.state, GenerationState::Closing { ticket } if ticket == candidate.ticket)
-                        && candidate.ticket == inner.latest_ticket
-                    {
-                        inner.abandoned_ticket = Some(candidate.ticket);
-                        return Err(RegistryError::PublicationTimeout);
-                    }
-                    return Err(RegistryError::Superseded);
-                }
+                // Recheck terminal state and ticket ownership before the
+                // absolute deadline on every wake, including a timed-out wait.
             }
             if candidate.ticket != inner.latest_ticket {
                 return Err(RegistryError::Superseded);
@@ -874,6 +877,31 @@ impl TokenRegistry {
         drop(state);
         true
     }
+    /// Validate metadata without retaining or releasing a native payload. Empty
+    /// generations are valid screenshot contexts but never valid element tokens.
+    pub fn is_current_generation(
+        &self,
+        pid: i32,
+        window_id: u64,
+        identity: SnapshotIdentity,
+    ) -> bool {
+        let Ok(key) = self.lane_key_for_current_runtime(pid, window_id) else {
+            return false;
+        };
+        let valid = {
+            let state = self.inner.state.lock().unwrap();
+            state.lanes.get(&key).is_some_and(|lane| {
+                let inner = lane.inner.lock().unwrap();
+                matches!(inner.state, GenerationState::Open)
+                    && inner
+                        .current
+                        .as_ref()
+                        .is_some_and(|generation| generation.identity == identity)
+            })
+        };
+        valid && self.live_incarnation(pid).ok() == Some(key.process_incarnation)
+    }
+
     /// Retire only the exact generation owned by a cache; never a replacement.
     pub fn contains_generation(&self, identity: SnapshotIdentity) -> bool {
         self.inner.state.lock().unwrap().lanes.values().any(|lane| {
@@ -1221,14 +1249,16 @@ pub fn format_token(snapshot_id: u32, element_index: usize) -> String {
     format!("s{snapshot_id:08x}:{element_index}")
 }
 pub fn token_for(snapshot_id: u32, element_index: usize) -> String {
-    format_token(snapshot_id, element_index)
+    format!("s{snapshot_id:08x}:{element_index}")
 }
 fn parse_token(token: &str) -> Option<(u32, usize)> {
     let (hex, index) = token.strip_prefix('s')?.split_once(':')?;
     (hex.len() == 8).then_some(())?;
     Some((u32::from_str_radix(hex, 16).ok()?, index.parse().ok()?))
 }
-fn parse_snapshot_handle(snapshot_id: &str) -> Option<u32> {
+/// Decode a public snapshot handle for metadata lookup. Parsing alone grants no
+/// authority: callers must still validate the generation through the registry.
+pub fn parse_snapshot_handle(snapshot_id: &str) -> Option<u32> {
     let hex = snapshot_id.strip_prefix('s')?;
     (hex.len() == 8 && !hex.contains(':')).then_some(())?;
     u32::from_str_radix(hex, 16).ok()
@@ -1377,6 +1407,21 @@ mod tests {
     use std::sync::{mpsc, Barrier};
     use std::thread;
 
+    #[test]
+    fn snapshot_metadata_handle_requires_the_complete_public_format() {
+        assert_eq!(parse_snapshot_handle("s0000002a"), Some(42));
+        for invalid in [
+            "0000002a",
+            "s2a",
+            "s00000002a",
+            "s0000002a:0",
+            "s0000002g",
+            " s0000002a",
+        ] {
+            assert_eq!(parse_snapshot_handle(invalid), None, "{invalid}");
+        }
+    }
+
     struct FakeProcess {
         values: Mutex<HashMap<i32, u64>>,
     }
@@ -1519,8 +1564,11 @@ mod tests {
         let p = FakeProcess::new(7, 1);
         let r = registry(RegistryCapacities::default(), p.clone());
         let c = r.prepare_current(7, 12, 1, Arc::new(())).unwrap();
+        let identity = c.identity();
         let h = r.publish(c, Duration::ZERO).unwrap();
+        assert!(r.is_current_generation(7, 12, identity));
         p.set(7, 2);
+        assert!(!r.is_current_generation(7, 12, identity));
         assert_eq!(
             r.resolve_generation(7, &format_token(h, 0)).unwrap_err(),
             STALE_TOKEN_ERROR
@@ -1664,6 +1712,31 @@ mod tests {
         assert!(t2.join().unwrap().is_ok());
     }
     #[test]
+    fn publication_timeout_keeps_closing_until_the_admitted_permit_drains() {
+        let p = FakeProcess::new(7, 1);
+        let r = registry(RegistryCapacities::default(), p);
+        let lane = key(19, 1);
+        let current = publish_value(&r, lane.clone(), 1);
+        let permit = r.try_acquire_mutation(current.identity).unwrap();
+        let candidate = r.prepare(lane.clone(), 1, Arc::new(2_u64)).unwrap();
+        let ticket = candidate.ticket();
+        assert_eq!(
+            r.publish(candidate, Duration::from_millis(10)),
+            Err(RegistryError::PublicationTimeout)
+        );
+        assert_eq!(r.state(&lane), Some(GenerationState::Closing { ticket }));
+        assert_eq!(
+            r.try_acquire_mutation(current.identity).unwrap_err(),
+            RegistryError::Closing
+        );
+        drop(permit);
+        assert_eq!(r.state(&lane), Some(GenerationState::Open));
+        assert_eq!(r.counts().4, 0);
+        let candidate = r.prepare(lane, 1, Arc::new(3_u64)).unwrap();
+        let handle = candidate.public_handle();
+        assert_eq!(r.publish(candidate, Duration::ZERO), Ok(handle));
+    }
+    #[test]
     fn poison_capacity_reserved_before_permit_and_closing_poison_wins() {
         let caps = RegistryCapacities {
             poison_records: 1,
@@ -1681,17 +1754,49 @@ mod tests {
             }
         );
         let c = r.prepare(key(17, 1), 1, Arc::new(2_u64)).unwrap();
+        let candidate_handle = c.public_handle();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        r.set_before_drain_wait(Some(Arc::new(move || {
+            waiting_tx.send(()).unwrap();
+        })));
+        let (result_tx, result_rx) = mpsc::channel();
         let rr = r.clone();
-        let worker = thread::spawn(move || rr.publish(c, Duration::from_secs(2)));
-        while !matches!(r.state(&key(17, 1)), Some(GenerationState::Closing { .. })) {
-            thread::yield_now();
-        }
+        let worker = thread::spawn(move || {
+            result_tx
+                .send(rr.publish(c, Duration::from_secs(5)))
+                .unwrap();
+        });
+        waiting_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        r.set_before_drain_wait(None);
         permit.poison_before_release("unknown").unwrap();
+        // Keep the permit admitted until the publisher observes the poison.
+        // Releasing it first hides the wake-before-drain race.
+        let result = result_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
         drop(permit);
-        assert!(matches!(
-            worker.join().unwrap(),
-            Err(RegistryError::Poisoned(_))
-        ));
+        assert_eq!(result, Err(RegistryError::Poisoned("unknown".into())));
+        assert_eq!(
+            r.state(&key(17, 1)),
+            Some(GenerationState::Poisoned {
+                reason: "unknown".into()
+            })
+        );
+        // Resolution can retain the old immutable payload; only a mutation
+        // permit grants action authority, and poison must deny that admission.
+        let (resolved, _) = r
+            .resolve_generation(7, &format_token(a.public_handle(), 0))
+            .unwrap();
+        assert_eq!(resolved.identity(), a.identity());
+        assert_eq!(
+            r.try_acquire_mutation(resolved.identity()).unwrap_err(),
+            RegistryError::Poisoned("unknown".into())
+        );
+        assert_eq!(
+            r.resolve_generation(7, &format_token(candidate_handle, 0))
+                .unwrap_err(),
+            STALE_TOKEN_ERROR
+        );
+        assert_eq!(r.counts().4, 1);
         assert_eq!(r.clear_exact_owner_process("legacy", 7, 1), 2);
         assert_eq!(r.counts().4, 0);
     }
