@@ -8,17 +8,22 @@
 //! any menu the click just opened and would move keyboard focus away from the
 //! widget a following `type_text` needs.
 //!
-//! Everything here is bounded: the activation/confirmation phase and the
-//! post-check run on watchdog threads with hard deadlines, so a wedged X
+//! The activation/confirmation phase and post-check use workers with bounded
+//! admission and waiter deadlines, so a wedged X
 //! server, a client holding a server grab, or a window that never takes focus
 //! yields a structured `foreground_timeout` / `foreground_unavailable` error
 //! instead of a hung tool call. Only x11rb (a pure-Rust, thread-safe client)
 //! is used: protocol errors come back as `Result`s rather than going through
 //! Xlib's process-wide error handler.
+//! An X11 call already in progress cannot be interrupted. Its worker keeps
+//! admission and any generation permit until it exits; cancellation prevents
+//! subsequent activation requests once that call returns.
 
 use anyhow::{anyhow, Result};
+use cua_driver_core::blocking::{run_native_with_deadline, NativeDeadline};
+use cua_driver_core::element_token::MutationPermit;
 use cua_driver_core::window_observation::WindowObservationBounds;
-use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto::{
@@ -319,35 +324,20 @@ pub fn error_code(error: &anyhow::Error) -> Option<&'static str> {
     }
 }
 
-/// Run `f` on a detached thread and wait at most `deadline` for its result.
-///
-/// All current callers (`confirm_phase`, `wait_for_window_change`,
-/// `post_check`) already bound themselves cooperatively with their own
-/// internal deadline loop, so in the common case the worker returns well
-/// inside `deadline` and this wrapper's timeout never fires. The residual
-/// leak this guards against is a single blocking X11 socket call (connect,
-/// or a request/reply round trip inside `X11::open`/`activate`) hanging past
-/// `deadline` because the X server itself has stopped answering — a
-/// synchronous X11 read cannot be interrupted or polled from the outside
-/// without switching the whole call chain to non-blocking I/O, which is out
-/// of scope here. In that rare case the thread is intentionally leaked: it
-/// is bounded (it exits as soon as the stalled X call returns, or the
-/// process exits), and its completion is harmless because `tx.send` below
-/// ignores a disconnected receiver (`let _ =`) rather than panicking, so a
-/// late result from a leaked thread is silently dropped instead of crashing
-/// the caller that already moved on.
+/// The native worker owns its own process-wide admission and a share of the
+/// caller's exact-generation mutation permit until it exits, even on timeout.
 fn run_with_deadline<T: Send + 'static>(
-    deadline: Duration,
-    f: impl FnOnce() -> T + Send + 'static,
-) -> Option<T> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::Builder::new()
-        .name("cua-x11-foreground".into())
-        .spawn(move || {
-            let _ = tx.send(f());
-        })
-        .ok()?;
-    rx.recv_timeout(deadline).ok()
+    timeout: Duration,
+    permit: Option<Arc<MutationPermit>>,
+    f: impl FnOnce(&NativeDeadline) -> T + Send + 'static,
+) -> Result<T> {
+    run_native_with_deadline(timeout, permit, f).map_err(|error| anyhow!("{CODE_TIMEOUT}: {error}"))
+}
+
+fn check_deadline(deadline: &NativeDeadline) -> Result<()> {
+    deadline
+        .check()
+        .map_err(|error| anyhow!("{CODE_TIMEOUT}: {error}"))
 }
 
 struct X11 {
@@ -494,8 +484,12 @@ impl X11 {
         time
     }
 
-    fn activate(&self, target: Window, prior: Window) -> Result<()> {
+    fn activate(&self, target: Window, prior: Window, deadline: &NativeDeadline) -> Result<()> {
+        check_deadline(deadline)?;
         let time = self.server_time();
+        // Timestamp acquisition may block. Do not activate after the waiter
+        // timed out while the X server was stalled.
+        check_deadline(deadline)?;
         let event =
             ClientMessageEvent::new(32, target, self.net_active_window, [2, time, prior, 0, 0]);
         debug_assert_eq!(event.response_type, CLIENT_MESSAGE_EVENT);
@@ -509,12 +503,14 @@ impl X11 {
         // does): WMs with focus-stealing prevention honour `_NET_ACTIVE_WINDOW`
         // as raise-only. BadMatch on a not-yet-viewable window is expected and
         // ignored; the confirmation loop decides.
+        check_deadline(deadline)?;
         if let Ok(cookie) =
             self.conn
                 .set_input_focus(InputFocus::PARENT, target, x11rb::CURRENT_TIME)
         {
             let _ = cookie.check();
         }
+        check_deadline(deadline)?;
         self.conn.flush()?;
         Ok(())
     }
@@ -617,7 +613,12 @@ struct ConfirmOutcome {
     focus_holder: Option<String>,
 }
 
-fn confirm_phase(target: Window, settle: Duration) -> Result<ConfirmOutcome> {
+fn confirm_phase(
+    target: Window,
+    settle: Duration,
+    worker_deadline: &NativeDeadline,
+) -> Result<ConfirmOutcome> {
+    check_deadline(worker_deadline)?;
     let x = X11::open()?;
     let start = Instant::now();
     let prior = x.active_window().unwrap_or(0);
@@ -635,13 +636,16 @@ fn confirm_phase(target: Window, settle: Duration) -> Result<ConfirmOutcome> {
             focus_holder: None,
         });
     }
-    x.activate(target, prior)?;
+    check_deadline(worker_deadline)?;
+    x.activate(target, prior, worker_deadline)?;
     let deadline = start + settle;
     let retry_at = start + settle.mul_f32(0.4);
     let mut retry_pending = true;
     loop {
+        check_deadline(worker_deadline)?;
         let active = x.active_window() == Some(target);
         let focus_within = x.focus_is_within(target);
+        check_deadline(worker_deadline)?;
         if active && focus_within {
             return Ok(ConfirmOutcome {
                 confirmed: true,
@@ -668,7 +672,9 @@ fn confirm_phase(target: Window, settle: Duration) -> Result<ConfirmOutcome> {
         if retry_pending && now >= retry_at {
             retry_pending = false;
             retried = true;
-            x.activate(target, x.active_window().unwrap_or(0))?;
+            let prior = x.active_window().unwrap_or(0);
+            check_deadline(worker_deadline)?;
+            x.activate(target, prior, worker_deadline)?;
         }
         std::thread::sleep(Duration::from_millis(15));
     }
@@ -741,15 +747,23 @@ pub fn with_x11_foreground_opts<T>(
     opts: ForegroundOptions,
     body: impl FnOnce() -> Result<T>,
 ) -> Result<(T, ForegroundReport)> {
-    let target = xid as Window;
+    with_x11_foreground_permit(xid, opts, None, body)
+}
+
+/// Indexed actions share their admitted mutation permit with every native
+/// continuation. A timeout must not retire its payload while X11 still uses it.
+pub fn with_x11_foreground_permit<T>(
+    xid: u64,
+    opts: ForegroundOptions,
+    permit: Option<Arc<MutationPermit>>,
+    body: impl FnOnce() -> Result<T>,
+) -> Result<(T, ForegroundReport)> {
+    let target = Window::try_from(xid)
+        .map_err(|_| anyhow!("{CODE_UNAVAILABLE}: X11 window id is out of range"))?;
     let phase_budget = opts.settle + Duration::from_millis(1500);
-    let outcome = run_with_deadline(phase_budget, move || confirm_phase(target, opts.settle))
-        .ok_or_else(|| {
-            anyhow!(
-                "{CODE_TIMEOUT}: the X server did not answer the activation of window \
-                 0x{xid:x} within {phase_budget:?}; no input was sent"
-            )
-        })??;
+    let outcome = run_with_deadline(phase_budget, permit.clone(), move |deadline| {
+        confirm_phase(target, opts.settle, deadline)
+    })??;
     if !outcome.confirmed {
         let holder = outcome.focus_holder.as_deref().unwrap_or("unknown");
         let cause = if outcome.active_after == 0 {
@@ -780,10 +794,11 @@ pub fn with_x11_foreground_opts<T>(
     let bounds = window_change_bounds();
     let (windows_after, window_change) = run_with_deadline(
         bounds.timeout + bounds.poll + WINDOW_CHANGE_TITLE_GRACE + Duration::from_millis(1500),
-        move || wait_for_window_change(target_pid, &windows_before, bounds),
+        permit.clone(),
+        move |_| wait_for_window_change(target_pid, &windows_before, bounds),
     )
     .unwrap_or((Vec::new(), None));
-    let focus_after = run_with_deadline(Duration::from_millis(1500), move || {
+    let focus_after = run_with_deadline(Duration::from_millis(1500), permit, move |_| {
         post_check(target, target_pid, &windows_after)
     })
     .unwrap_or(FocusAfter::Unknown);
@@ -862,13 +877,13 @@ mod tests {
     }
 
     #[test]
-    fn deadline_returns_none_when_work_hangs() {
+    fn deadline_returns_timeout_when_work_hangs() {
         let started = Instant::now();
-        let result = run_with_deadline(Duration::from_millis(50), || {
+        let result = run_with_deadline(Duration::from_millis(50), None, |_| {
             std::thread::sleep(Duration::from_secs(5));
             1
         });
-        assert!(result.is_none());
+        assert_eq!(error_code(&result.unwrap_err()), Some(CODE_TIMEOUT));
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
@@ -967,7 +982,10 @@ mod tests {
 
     #[test]
     fn deadline_returns_value_when_work_finishes() {
-        assert_eq!(run_with_deadline(Duration::from_secs(2), || 7), Some(7));
+        assert_eq!(
+            run_with_deadline(Duration::from_secs(2), None, |_| 7).unwrap(),
+            7
+        );
     }
 
     #[test]

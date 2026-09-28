@@ -85,12 +85,13 @@ fn pointer_delivery_revalidates_after_overlay_geometry_and_foreground_activation
             "resolve_observed_click_target",
             "Ok((permit, target, center))",
             "reveal_pointer_action_for",
-            "let _permit = permit",
+            "let permit = std::sync::Arc::new(permit)",
             "target.verify_live()?",
             "target.perform_action(",
             "click_error_allows_pointer_fallback",
             "target.screen_bounds()?",
-            "with_x11_foreground(xid, 80, ||",
+            "with_x11_foreground_permit(",
+            "Some(permit.clone())",
             "let (lx, ly) = local_center()?",
             "window_local_to_screen(xid, lx, ly)?",
             "target.verify_live()?",
@@ -106,6 +107,57 @@ fn pointer_delivery_revalidates_after_overlay_geometry_and_foreground_activation
     assert!(!route.contains("tokio::task::spawn_blocking"));
     assert!(!route.contains("resolve_element_local_coords("));
     assert!(!route.contains("element_screen_center("));
+
+    let foreground = include_str!("../src/input/foreground.rs");
+    let worker = section(foreground, "fn run_with_deadline", "struct X11");
+    assert!(worker.contains("run_native_with_deadline(timeout, permit, f)"));
+    assert!(!foreground.contains("std::thread::Builder"));
+    let activate = section(foreground, "fn activate(", "fn focused(");
+    ordered(
+        activate,
+        &[
+            "check_deadline(deadline)?",
+            "self.server_time()",
+            "check_deadline(deadline)?",
+            "self.conn.send_event(",
+            "check_deadline(deadline)?",
+            ".set_input_focus(",
+            "check_deadline(deadline)?",
+            "self.conn.flush()?",
+        ],
+    );
+    let confirm = section(
+        foreground,
+        "fn confirm_phase(",
+        "fn await_focus_destination(",
+    );
+    ordered(
+        confirm,
+        &[
+            "check_deadline(worker_deadline)?",
+            "x.activate(target, prior, worker_deadline)?",
+            "let prior = x.active_window().unwrap_or(0)",
+            "check_deadline(worker_deadline)?",
+            "x.activate(target, prior, worker_deadline)?",
+        ],
+    );
+    let continuation = section(
+        foreground,
+        "pub fn with_x11_foreground_permit",
+        "fn describe_focus_holder",
+    );
+    ordered(
+        continuation,
+        &[
+            "run_with_deadline(phase_budget, permit.clone()",
+            "confirm_phase(target, opts.settle, deadline)",
+            "let value = body()?",
+            "permit.clone()",
+            "wait_for_window_change(",
+            "run_with_deadline(Duration::from_millis(1500), permit,",
+            "post_check(",
+        ],
+    );
 }
 
 #[test]

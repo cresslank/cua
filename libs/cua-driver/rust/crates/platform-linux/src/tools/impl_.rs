@@ -5176,7 +5176,7 @@ impl ClickTool {
             reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, true).await;
         }
         let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<ToolResult> {
-            let _permit = permit;
+            let permit = std::sync::Arc::new(permit);
             target.verify_live()?;
             let action = target.perform_action(modifiers.is_empty() && button == 1 && count == 1);
             let (path, suspected_noop) = match action {
@@ -5201,19 +5201,24 @@ impl ClickTool {
                             crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
                         ));
                     } else if delivery.is_foreground() {
-                        crate::input::with_x11_foreground(xid, 80, || {
-                            let (lx, ly) = local_center()?;
-                            let (sx, sy) = window_local_to_screen(xid, lx, ly)?;
-                            // Activation and coordinate reads may reparent the object.
-                            target.verify_live()?;
-                            crate::input::send_click_xtest_desktop_with_modifiers(
-                                sx.round() as i32,
-                                sy.round() as i32,
-                                button,
-                                count,
-                                &modifier_refs,
-                            )
-                        })?;
+                        crate::input::foreground::with_x11_foreground_permit(
+                            xid,
+                            crate::input::ForegroundOptions::from_settle_hint(80),
+                            Some(permit.clone()),
+                            || {
+                                let (lx, ly) = local_center()?;
+                                let (sx, sy) = window_local_to_screen(xid, lx, ly)?;
+                                // Activation and coordinate reads may reparent the object.
+                                target.verify_live()?;
+                                crate::input::send_click_xtest_desktop_with_modifiers(
+                                    sx.round() as i32,
+                                    sy.round() as i32,
+                                    button,
+                                    count,
+                                    &modifier_refs,
+                                )
+                            },
+                        )?;
                         "x11_xtest_fg"
                     } else {
                         target.verify_live()?;
