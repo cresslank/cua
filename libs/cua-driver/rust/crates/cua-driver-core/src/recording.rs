@@ -160,25 +160,45 @@ pub fn set_budgeted_ax_snapshot_fn(
     let _ = AX_SNAPSHOT_FN.set(Arc::new(f));
 }
 
-/// Hooks abandoned at their backstop and still running, per target pid. While
-/// one is outstanding the recorder does not start another walk of the same
-/// application, so a hung accessibility provider cannot accumulate threads.
-static ABANDONED_STATE_CAPTURES: OnceLock<Mutex<HashMap<i64, usize>>> = OnceLock::new();
+/// Target pids with an application-state walk in flight, including walks
+/// abandoned at their backstop that are still inside the platform provider.
+/// A pid is reserved atomically *before* its worker starts and released only
+/// when that worker exits, so concurrent turns cannot start a second walk of
+/// the same application and a hung provider cannot accumulate threads. The
+/// worker additionally holds one slot of the process-wide native-call
+/// admission limit ([`crate::blocking`]), which bounds walks across pids.
+static STATE_CAPTURE_RESERVATIONS: OnceLock<Mutex<std::collections::HashSet<i64>>> =
+    OnceLock::new();
 
-fn abandoned_state_captures() -> std::sync::MutexGuard<'static, HashMap<i64, usize>> {
-    ABANDONED_STATE_CAPTURES
+fn state_capture_reservations() -> std::sync::MutexGuard<'static, std::collections::HashSet<i64>> {
+    STATE_CAPTURE_RESERVATIONS
         .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn release_abandoned_state_capture(key: i64) {
-    let mut abandoned = abandoned_state_captures();
-    if let Some(count) = abandoned.get_mut(&key) {
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            abandoned.remove(&key);
+/// Exclusive, per-pid right to run one application-state walk. Moved into the
+/// native worker as its keepalive, so it is dropped when the worker exits,
+/// not when the recorder stops waiting.
+struct StateCaptureReservation(i64);
+
+impl StateCaptureReservation {
+    fn try_acquire(key: i64) -> Option<Self> {
+        // Construct the guard only after the insert succeeded and the table
+        // lock is released: a refused candidate must never run `Drop`, which
+        // would re-lock the table and remove the holder's reservation.
+        let inserted = state_capture_reservations().insert(key);
+        if inserted {
+            Some(Self(key))
+        } else {
+            None
         }
+    }
+}
+
+impl Drop for StateCaptureReservation {
+    fn drop(&mut self) {
+        state_capture_reservations().remove(&self.0);
     }
 }
 
@@ -243,63 +263,65 @@ fn walk_fields(bytes: &[u8]) -> Option<serde_json::Map<String, Value>> {
     (!fields.is_empty()).then_some(fields)
 }
 
-/// Run a state hook with a hard deadline. The hook runs on its own thread; if
-/// it has not answered by `budget.backstop()` the turn proceeds without state
-/// (classified `state_capture_timeout`) and the thread is left to finish on
-/// its own. Its late result is discarded.
+/// Run a state hook with a hard deadline. The hook runs on a native worker
+/// admitted by the process-wide native-call limit and holding the target
+/// pid's reservation; if it has not answered by `budget.backstop()` the turn
+/// proceeds without state (classified `state_capture_timeout`). An abandoned
+/// worker keeps both its admission slot and its pid reservation until the
+/// provider really returns, and its late result is discarded.
 fn run_state_hook(
     hook: AxSnapshotFn,
     window_id: Option<u64>,
     pid: Option<i64>,
     budget: StateCaptureBudget,
 ) -> StateCapture {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    run_state_hook_with_limit(
+        crate::blocking::native_call_limit(),
+        hook,
+        window_id,
+        pid,
+        budget,
+    )
+}
+
+fn run_state_hook_with_limit(
+    limit: Arc<tokio::sync::Semaphore>,
+    hook: AxSnapshotFn,
+    window_id: Option<u64>,
+    pid: Option<i64>,
+    budget: StateCaptureBudget,
+) -> StateCapture {
+    use crate::blocking::NativeDeadlineError;
     let key = pid.unwrap_or(-1);
-    if abandoned_state_captures()
-        .get(&key)
-        .is_some_and(|count| *count > 0)
-    {
+    // Reserve the pid before any worker exists, so two concurrent turns
+    // cannot both pass the check and walk the same application.
+    let Some(reservation) = StateCaptureReservation::try_acquire(key) else {
         return StateCapture::unavailable("state_capture_busy");
-    }
-    let abandoned = Arc::new(AtomicBool::new(false));
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let worker_abandoned = abandoned.clone();
-    let spawned = std::thread::Builder::new()
-        .name("cua-recording-state".into())
-        .spawn(move || {
-            let result = hook(window_id, pid, budget);
-            if worker_abandoned.swap(true, Ordering::SeqCst) {
-                release_abandoned_state_capture(key);
-            } else {
-                let _ = sender.send(result);
-            }
-        });
-    if spawned.is_err() {
-        return StateCapture::unavailable("capture_failed");
-    }
-    let received = match receiver.recv_timeout(budget.backstop()) {
-        Ok(result) => Some(result),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            *abandoned_state_captures().entry(key).or_insert(0) += 1;
-            if abandoned.swap(true, Ordering::SeqCst) {
-                // The worker finished between the timeout and the mark.
-                release_abandoned_state_capture(key);
-                receiver.try_recv().ok()
-            } else {
-                tracing::warn!(
-                    target: "recording",
-                    "application-state capture for pid {key} exceeded its {} ms budget; \
-                     recording the turn without state",
-                    budget.timeout_ms
-                );
-                return StateCapture::unavailable("state_capture_timeout");
-            }
-        }
     };
-    match received.flatten() {
-        Some(bytes) => StateCapture::captured(bytes),
-        None => StateCapture::unavailable("capture_failed"),
+    let outcome = crate::blocking::run_native_with_limit(
+        limit,
+        budget.backstop(),
+        reservation,
+        move |_deadline| hook(window_id, pid, budget),
+    );
+    match outcome {
+        Ok(Some(bytes)) => StateCapture::captured(bytes),
+        Ok(None) => StateCapture::unavailable("capture_failed"),
+        // Every native slot is held (possibly by hung providers of other
+        // applications): skip the walk instead of adding another thread.
+        Err(NativeDeadlineError::Busy) => StateCapture::unavailable("state_capture_busy"),
+        Err(NativeDeadlineError::TimedOut) => {
+            tracing::warn!(
+                target: "recording",
+                "application-state capture for pid {key} exceeded its {} ms budget; \
+                 recording the turn without state",
+                budget.timeout_ms
+            );
+            StateCapture::unavailable("state_capture_timeout")
+        }
+        Err(NativeDeadlineError::Spawn(_) | NativeDeadlineError::Panicked) => {
+            StateCapture::unavailable("capture_failed")
+        }
     }
 }
 
@@ -2551,7 +2573,7 @@ mod tests {
 
         release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while abandoned_state_captures().contains_key(&PID) {
+        while state_capture_reservations().contains(&PID) {
             assert!(Instant::now() < deadline, "abandoned walk never released");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -2561,6 +2583,126 @@ mod tests {
             serde_json::json!(50),
             "the hook receives the configured budget"
         );
+    }
+
+    #[test]
+    fn concurrent_state_captures_of_one_pid_start_exactly_one_walk() {
+        // Distinct pid: the reservation table is process-global.
+        const PID: i64 = 990_101;
+        const CALLERS: usize = 8;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Arc::new(Mutex::new(gate));
+        let hook_calls = calls.clone();
+        let hook_gate = gate.clone();
+        let blocking: AxSnapshotFn = Arc::new(move |_, _, _| {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = hook_gate.lock().unwrap().recv();
+            Some(b"{}".to_vec())
+        });
+        // A generous budget: the one admitted walk must still be running
+        // while every other caller races the reservation.
+        let budget = StateCaptureBudget { timeout_ms: 4_000 };
+        let limit = Arc::new(tokio::sync::Semaphore::new(CALLERS));
+        let start = Arc::new(std::sync::Barrier::new(CALLERS));
+        let callers: Vec<_> = (0..CALLERS)
+            .map(|_| {
+                let (hook, limit, start) = (blocking.clone(), limit.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    run_state_hook_with_limit(limit, hook, None, Some(PID), budget)
+                })
+            })
+            .collect();
+        // Every loser returns immediately; wait for them before releasing.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while callers.iter().filter(|caller| caller.is_finished()).count() < CALLERS - 1 {
+            assert!(Instant::now() < deadline, "busy callers must not wait");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one walk per pid");
+        assert_eq!(limit.available_permits(), CALLERS - 1);
+        release.send(()).unwrap();
+        let outcomes: Vec<_> = callers
+            .into_iter()
+            .map(|caller| caller.join().unwrap().classification)
+            .collect();
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|class| **class == Some("state_capture_busy"))
+                .count(),
+            CALLERS - 1,
+            "{outcomes:?}"
+        );
+        assert_eq!(outcomes.iter().filter(|class| class.is_none()).count(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!state_capture_reservations().contains(&PID));
+        assert_eq!(limit.available_permits(), CALLERS);
+    }
+
+    #[test]
+    fn hung_state_captures_across_pids_share_the_native_admission_bound() {
+        // Distinct pids: the reservation table is process-global. A private
+        // two-slot limit stands in for the process-wide native-call limit.
+        const PIDS: [i64; 4] = [990_201, 990_202, 990_203, 990_204];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Arc::new(Mutex::new(gate));
+        let hook_calls = calls.clone();
+        let hung: AxSnapshotFn = Arc::new(move |_, _, _| {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = gate.lock().unwrap().recv();
+            Some(b"{}".to_vec())
+        });
+        let budget = StateCaptureBudget { timeout_ms: 20 };
+        let limit = Arc::new(tokio::sync::Semaphore::new(2));
+        for pid in &PIDS[..2] {
+            let timed_out =
+                run_state_hook_with_limit(limit.clone(), hung.clone(), None, Some(*pid), budget);
+            assert_eq!(timed_out.classification, Some("state_capture_timeout"));
+        }
+        // Both abandoned walks still hold their slots and reservations.
+        assert_eq!(limit.available_permits(), 0);
+        assert!(state_capture_reservations().contains(&PIDS[0]));
+        assert!(state_capture_reservations().contains(&PIDS[1]));
+        // Further applications are refused without starting a worker, and a
+        // refused admission does not leak its pid reservation.
+        for pid in &PIDS[2..] {
+            for _ in 0..16 {
+                let saturated = run_state_hook_with_limit(
+                    limit.clone(),
+                    hung.clone(),
+                    None,
+                    Some(*pid),
+                    budget,
+                );
+                assert_eq!(saturated.classification, Some("state_capture_busy"));
+                assert!(!state_capture_reservations().contains(pid));
+            }
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "no thread per refused walk"
+        );
+
+        // Hung providers returning release both bounds; captures resume.
+        release.send(()).unwrap();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while limit.available_permits() != 2
+            || PIDS[..2]
+                .iter()
+                .any(|pid| state_capture_reservations().contains(pid))
+        {
+            assert!(Instant::now() < deadline, "abandoned walks never released");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let fast: AxSnapshotFn = Arc::new(|_, _, _| Some(b"{}".to_vec()));
+        let recovered = run_state_hook_with_limit(limit, fast, None, Some(PIDS[2]), budget);
+        assert!(recovered.bytes.is_some());
+        assert!(!state_capture_reservations().contains(&PIDS[2]));
     }
 
     #[test]

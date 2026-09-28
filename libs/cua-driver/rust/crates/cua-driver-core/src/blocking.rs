@@ -70,7 +70,7 @@ where
     run_native_with_limit(native_call_limit(), timeout, keepalive, function)
 }
 
-fn run_native_with_limit<K, F, R>(
+pub(crate) fn run_native_with_limit<K, F, R>(
     limit: Arc<tokio::sync::Semaphore>,
     timeout: std::time::Duration,
     keepalive: K,
@@ -122,7 +122,7 @@ where
     }
 }
 
-fn native_call_limit() -> Arc<tokio::sync::Semaphore> {
+pub(crate) fn native_call_limit() -> Arc<tokio::sync::Semaphore> {
     static LIMIT: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     LIMIT
         .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_NATIVE_CALLS)))
