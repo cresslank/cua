@@ -35,7 +35,7 @@
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cua_driver_core::single_flight::SingleFlight;
 

@@ -149,6 +149,7 @@ portal-capture = [
 portal-libei = ["portal-input", "portal-capture"]
 
 [dev-dependencies]
+libc = "0.2"
 tokio = { workspace = true, features = ["test-util"] }
 uuid = { workspace = true }
 tempfile = "3"

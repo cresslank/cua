@@ -26,6 +26,9 @@ use std::time::{Duration, Instant};
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto::{Format, ImageOrder, Setup, VisualClass, Visualtype};
 
+#[path = "capture_process.rs"]
+mod process;
+
 /// Max edge length accepted for a single SHM/XGetImage capture (px).
 const MAX_CAPTURE_DIM: u32 = 16_384;
 /// Max SHM segment size (1 GiB).
@@ -98,26 +101,15 @@ fn capture_via_import(xid: u64) -> Result<Vec<u8>> {
     if !crate::x11::window_exists(xid) {
         bail!("window {xid} no longer exists");
     }
-    let child = Command::new("import")
+    let mut child = Command::new("import")
         .args(["-window", &xid.to_string(), "png:-"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| anyhow!("failed to launch ImageMagick import: {e}"))?;
-    let pid = child.id();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
-    });
-    let out = match rx.recv_timeout(IMPORT_TIMEOUT) {
-        Ok(out) => out.map_err(|e| anyhow!("failed to wait for ImageMagick import: {e}"))?,
-        Err(_) => {
-            // SAFETY: plain libc call on a pid this process spawned and has not reaped.
-            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-            bail!("ImageMagick import did not exit within {IMPORT_TIMEOUT:?} and was killed");
-        }
-    };
+    let out = process::wait_with_output(&mut child, IMPORT_TIMEOUT)
+        .map_err(|e| anyhow!("failed to wait for ImageMagick import: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let detail = stderr.trim().chars().take(512).collect::<String>();

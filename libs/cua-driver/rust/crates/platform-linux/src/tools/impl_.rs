@@ -2048,11 +2048,11 @@ impl Tool for GetWindowStateTool {
                         }
                     };
                     structured["element_count"] = json!(count);
-                    // `elements_complete` is a real claim now: a native walk that
-                    // finished without hitting the deadline / node budget saw
-                    // every node the application publishes. Truncated or
-                    // fallback trees keep negative existence unknown.
-                    structured["elements_complete"] = json!(tr.trusted && !tr.truncated);
+                    // Neither trust nor an unspent budget proves exhaustion:
+                    // depth caps and individual AT-SPI/child-enumeration failures
+                    // can omit subtrees without setting `truncated`. Keep absence
+                    // unknown until the walker explicitly proves full traversal.
+                    structured["elements_complete"] = json!(false);
                     structured["truncated"] = json!(tr.truncated);
                     if let Some(reason) = &tr.truncation_reason {
                         structured["truncation_reason"] = json!(reason);
