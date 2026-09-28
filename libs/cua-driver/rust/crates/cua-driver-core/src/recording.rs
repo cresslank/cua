@@ -2593,10 +2593,12 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (release, gate) = std::sync::mpsc::channel::<()>();
         let gate = Arc::new(Mutex::new(gate));
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
         let hook_calls = calls.clone();
         let hook_gate = gate.clone();
         let blocking: AxSnapshotFn = Arc::new(move |_, _, _| {
             hook_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = entered_tx.send(());
             let _ = hook_gate.lock().unwrap().recv();
             Some(b"{}".to_vec())
         });
@@ -2620,6 +2622,11 @@ mod tests {
             assert!(Instant::now() < deadline, "busy callers must not wait");
             std::thread::sleep(Duration::from_millis(5));
         }
+        // The losers finishing does not mean the admitted worker has been
+        // scheduled; wait for it to enter the hook before counting.
+        entered
+            .recv_timeout(Duration::from_secs(3))
+            .expect("the admitted walk must start");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "one walk per pid");
         assert_eq!(limit.available_permits(), CALLERS - 1);
         release.send(()).unwrap();
@@ -2649,9 +2656,11 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let (release, gate) = std::sync::mpsc::channel::<()>();
         let gate = Arc::new(Mutex::new(gate));
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
         let hook_calls = calls.clone();
         let hung: AxSnapshotFn = Arc::new(move |_, _, _| {
             hook_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = entered_tx.send(());
             let _ = gate.lock().unwrap().recv();
             Some(b"{}".to_vec())
         });
@@ -2661,6 +2670,13 @@ mod tests {
             let timed_out =
                 run_state_hook_with_limit(limit.clone(), hung.clone(), None, Some(*pid), budget);
             assert_eq!(timed_out.classification, Some("state_capture_timeout"));
+        }
+        // A timeout does not prove the worker was scheduled; wait for both
+        // admitted walks to enter the hook before counting.
+        for _ in &PIDS[..2] {
+            entered
+                .recv_timeout(Duration::from_secs(3))
+                .expect("each admitted walk must start");
         }
         // Both abandoned walks still hold their slots and reservations.
         assert_eq!(limit.available_permits(), 0);

@@ -864,6 +864,18 @@ mod tests {
     use crate::snapshot_test_support::Payload;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// This fork binds snapshot metadata to the process-global
+    /// `TokenRegistry`, keyed by runtime scope, pid, and window. Tests carried
+    /// from upstream reuse this process's pid and fixed window ids, so under
+    /// the default parallel runner one test's publication would legitimately
+    /// retire another's generation. Each runs in its own runtime scope.
+    fn isolated(test: impl FnOnce()) {
+        crate::tool::with_runtime_scope(
+            format!("element-cache-test-{}", uuid::Uuid::new_v4()),
+            test,
+        )
+    }
+
     fn resolve(
         cache: &ElementCacheCore<Payload>,
         pid: i32,
@@ -1092,342 +1104,362 @@ mod tests {
 
     #[test]
     fn screenshot_coordinates_never_borrow_another_sessions_latest_transform() {
-        let cache = ElementCacheCore::new();
-        cache.publish_for_session(
-            std::process::id() as i32,
-            20,
-            Payload(vec![]),
-            Some("client-a"),
-            Some(7.35),
-        );
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-a")),
-            Ok(Some(7.35))
-        );
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            cache.publish_for_session(
+                std::process::id() as i32,
+                20,
+                Payload(vec![]),
+                Some("client-a"),
+                Some(7.35),
+            );
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-a")),
+                Ok(Some(7.35))
+            );
 
-        cache.publish_for_session(
-            std::process::id() as i32,
-            20,
-            Payload(vec![]),
-            Some("client-b"),
-            Some(1.0),
-        );
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-b")),
-            Ok(Some(1.0))
-        );
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-a")),
-            Err(ScreenshotContextError::ReplacedOrUnavailable)
-        );
-        let refusal = cache
-            .screenshot_scale_or_refusal(std::process::id() as i32, Some(20), Some("client-a"))
-            .expect_err("stale image coordinates must be refused");
-        assert_eq!(
-            refusal.structured_content.as_ref().unwrap()["code"],
-            "screenshot_context_missing"
-        );
+            cache.publish_for_session(
+                std::process::id() as i32,
+                20,
+                Payload(vec![]),
+                Some("client-b"),
+                Some(1.0),
+            );
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-b")),
+                Ok(Some(1.0))
+            );
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-a")),
+                Err(ScreenshotContextError::ReplacedOrUnavailable)
+            );
+            let refusal = cache
+                .screenshot_scale_or_refusal(std::process::id() as i32, Some(20), Some("client-a"))
+                .expect_err("stale image coordinates must be refused");
+            assert_eq!(
+                refusal.structured_content.as_ref().unwrap()["code"],
+                "screenshot_context_missing"
+            );
+        });
     }
 
     #[test]
     fn screenshot_transforms_are_independent_across_windows() {
-        let cache = ElementCacheCore::new();
-        cache.publish_for_session(
-            std::process::id() as i32,
-            20,
-            Payload(vec![]),
-            Some("client-a"),
-            Some(7.35),
-        );
-        cache.publish_for_session(
-            std::process::id() as i32,
-            21,
-            Payload(vec![]),
-            Some("client-b"),
-            Some(2.0),
-        );
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-a")),
-            Ok(Some(7.35))
-        );
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(21), Some("client-b")),
-            Ok(Some(2.0))
-        );
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            cache.publish_for_session(
+                std::process::id() as i32,
+                20,
+                Payload(vec![]),
+                Some("client-a"),
+                Some(7.35),
+            );
+            cache.publish_for_session(
+                std::process::id() as i32,
+                21,
+                Payload(vec![]),
+                Some("client-b"),
+                Some(2.0),
+            );
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-a")),
+                Ok(Some(7.35))
+            );
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(21), Some("client-b")),
+                Ok(Some(2.0))
+            );
+        });
     }
 
     #[test]
     fn same_session_latest_snapshot_replaces_or_refuses_older_image_context() {
-        let cache = ElementCacheCore::new();
-        cache.publish_for_session(
-            std::process::id() as i32,
-            20,
-            Payload(vec![]),
-            Some("client-a"),
-            Some(7.35),
-        );
-        cache.publish_for_session(
-            std::process::id() as i32,
-            20,
-            Payload(vec![]),
-            Some("client-a"),
-            Some(1.0),
-        );
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-a")),
-            Ok(Some(1.0)),
-            "a newer native capture replaces the older resized frame"
-        );
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            cache.publish_for_session(
+                std::process::id() as i32,
+                20,
+                Payload(vec![]),
+                Some("client-a"),
+                Some(7.35),
+            );
+            cache.publish_for_session(
+                std::process::id() as i32,
+                20,
+                Payload(vec![]),
+                Some("client-a"),
+                Some(1.0),
+            );
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-a")),
+                Ok(Some(1.0)),
+                "a newer native capture replaces the older resized frame"
+            );
 
-        cache.publish_for_session(
-            std::process::id() as i32,
-            20,
-            Payload(vec![]),
-            Some("client-a"),
-            None,
-        );
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-a")),
-            Err(ScreenshotContextError::ReplacedOrUnavailable),
-            "a newer tree-only observation retires the older image frame"
-        );
+            cache.publish_for_session(
+                std::process::id() as i32,
+                20,
+                Payload(vec![]),
+                Some("client-a"),
+                None,
+            );
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-a")),
+                Err(ScreenshotContextError::ReplacedOrUnavailable),
+                "a newer tree-only observation retires the older image frame"
+            );
+        });
     }
 
     #[test]
     fn recreating_an_idle_reclaimed_implicit_session_keeps_its_old_tokens_stale() {
-        use crate::session::{
-            begin_session_dispatch, evict_idle_with_prefix, register_scoped_session_end_hook,
-            SessionClientKind, SessionTransport,
-        };
-        let session = format!("element-cache-idle-implicit-{}", std::process::id());
-        let cache = Arc::new(ElementCacheCore::<Payload>::new());
-        let retiring = cache.clone();
-        let _hook = register_scoped_session_end_hook(move |ended| {
-            retiring.retire_session_screenshots(ended);
+        isolated(|| {
+            use crate::session::{
+                begin_session_dispatch, evict_idle_with_prefix, register_scoped_session_end_hook,
+                SessionClientKind, SessionTransport,
+            };
+            let session = format!("element-cache-idle-implicit-{}", std::process::id());
+            let cache = Arc::new(ElementCacheCore::<Payload>::new());
+            let retiring = cache.clone();
+            let _hook = register_scoped_session_end_hook(move |ended| {
+                retiring.retire_session_screenshots(ended);
+            });
+            let begin = || {
+                begin_session_dispatch(
+                    &session,
+                    None,
+                    &session,
+                    true,
+                    SessionTransport::McpStdio,
+                    SessionClientKind::Mcp,
+                )
+            };
+
+            let guard = begin().expect("first unnamed call starts the session");
+            let snapshot = cache
+                .publish_for_session(
+                    std::process::id() as i32,
+                    20,
+                    Payload(vec![0, 1]),
+                    Some(&session),
+                    Some(1.0),
+                )
+                .expect("live session publishes");
+            let token = token_for(snapshot, 1);
+            drop(guard);
+            assert_eq!(
+                evict_idle_with_prefix(std::time::Duration::ZERO, &session),
+                [session.clone()]
+            );
+
+            let guard = begin().expect("next unnamed call recreates the session");
+            assert_eq!(
+                resolve(&cache, std::process::id() as i32, &token),
+                Err(STALE_TOKEN_ERROR.into())
+            );
+            let fresh = cache
+                .publish_for_session(
+                    std::process::id() as i32,
+                    20,
+                    Payload(vec![0, 1]),
+                    Some(&session),
+                    Some(1.0),
+                )
+                .expect("recreated session publishes again");
+            assert_eq!(
+                resolve(&cache, std::process::id() as i32, &token_for(fresh, 1)),
+                Ok((20, 1))
+            );
+            drop(guard);
+            crate::session::end_session(&session);
+            crate::session::revive_session(&session);
         });
-        let begin = || {
-            begin_session_dispatch(
-                &session,
-                None,
-                &session,
-                true,
-                SessionTransport::McpStdio,
-                SessionClientKind::Mcp,
-            )
-        };
-
-        let guard = begin().expect("first unnamed call starts the session");
-        let snapshot = cache
-            .publish_for_session(
-                std::process::id() as i32,
-                20,
-                Payload(vec![0, 1]),
-                Some(&session),
-                Some(1.0),
-            )
-            .expect("live session publishes");
-        let token = token_for(snapshot, 1);
-        drop(guard);
-        assert_eq!(
-            evict_idle_with_prefix(std::time::Duration::ZERO, &session),
-            [session.clone()]
-        );
-
-        let guard = begin().expect("next unnamed call recreates the session");
-        assert_eq!(
-            resolve(&cache, std::process::id() as i32, &token),
-            Err(STALE_TOKEN_ERROR.into())
-        );
-        let fresh = cache
-            .publish_for_session(
-                std::process::id() as i32,
-                20,
-                Payload(vec![0, 1]),
-                Some(&session),
-                Some(1.0),
-            )
-            .expect("recreated session publishes again");
-        assert_eq!(
-            resolve(&cache, std::process::id() as i32, &token_for(fresh, 1)),
-            Ok((20, 1))
-        );
-        drop(guard);
-        crate::session::end_session(&session);
-        crate::session::revive_session(&session);
     }
 
     #[test]
     fn session_retirement_removes_only_snapshots_owned_by_that_session() {
-        let cache = ElementCacheCore::new();
-        cache.publish_for_session(
-            std::process::id() as i32,
-            20,
-            Payload(vec![]),
-            Some("ending"),
-            Some(7.35),
-        );
-        cache.publish_for_session(
-            std::process::id() as i32,
-            21,
-            Payload(vec![]),
-            Some("survivor"),
-            Some(2.0),
-        );
-        assert_eq!(cache.retire_session_screenshots("ending"), 1);
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(20), Some("ending")),
-            Err(ScreenshotContextError::ReplacedOrUnavailable)
-        );
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(21), Some("survivor")),
-            Ok(Some(2.0))
-        );
-    }
-
-    #[test]
-    fn retired_screenshot_refuses_cross_session_and_anonymous_replay_until_republished() {
-        let cache = ElementCacheCore::new();
-        cache.publish_for_session(
-            std::process::id() as i32,
-            20,
-            Payload(vec![]),
-            Some("ending"),
-            Some(7.35),
-        );
-        assert_eq!(cache.retire_session_screenshots("ending"), 1);
-
-        for session in [Some("ending"), Some("other"), None] {
-            assert_eq!(
-                cache.screenshot_scale(std::process::id() as i32, Some(20), session),
-                Err(ScreenshotContextError::ReplacedOrUnavailable),
-                "a retired screenshot must not become native-pixel fallback"
-            );
-        }
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, None, Some("other")),
-            Err(ScreenshotContextError::ReplacedOrUnavailable)
-        );
-
-        cache.publish_for_session(
-            std::process::id() as i32,
-            20,
-            Payload(vec![]),
-            Some("other"),
-            Some(2.0),
-        );
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(20), Some("other")),
-            Ok(Some(2.0)),
-            "a fresh snapshot clears the lightweight retirement tombstone"
-        );
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(20), None),
-            Err(ScreenshotContextError::ReplacedOrUnavailable)
-        );
-
-        cache.publish_for_session(
-            std::process::id() as i32,
-            20,
-            Payload(vec![]),
-            None,
-            Some(1.5),
-        );
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(20), None),
-            Ok(Some(1.5)),
-            "a fresh anonymous snapshot also recovers the coordinate context"
-        );
-    }
-
-    #[test]
-    fn lru_eviction_retires_only_the_evicted_screenshot_key() {
-        let cache = ElementCacheCore::new();
-        for window_id in 0..LRU_CAP_PER_PID as u64 {
-            cache.publish_for_session(
-                std::process::id() as i32,
-                window_id,
-                Payload(vec![]),
-                Some("client-a"),
-                Some(2.0),
-            );
-        }
-        cache.publish_for_session(
-            std::process::id() as i32,
-            LRU_CAP_PER_PID as u64,
-            Payload(vec![]),
-            Some("client-a"),
-            Some(2.0),
-        );
-
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(0), Some("client-a")),
-            Err(ScreenshotContextError::ReplacedOrUnavailable),
-            "evicting an observed window must not restore native-pixel fallback"
-        );
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(1), Some("client-a")),
-            Ok(Some(2.0))
-        );
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(9999), Some("client-a")),
-            Ok(None),
-            "a never-observed key keeps the legacy fallback"
-        );
-    }
-
-    #[test]
-    fn explicit_remove_retires_only_a_snapshot_that_existed() {
-        let cache = ElementCacheCore::new();
-        cache.publish_for_session(
-            std::process::id() as i32,
-            20,
-            Payload(vec![]),
-            Some("client-a"),
-            Some(2.0),
-        );
-        cache.remove(std::process::id() as i32, 20);
-
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-a")),
-            Err(ScreenshotContextError::ReplacedOrUnavailable),
-            "removing an observed window must not restore native-pixel fallback"
-        );
-        cache.remove(std::process::id() as i32, 21);
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(21), Some("client-a")),
-            Ok(None),
-            "removing an absent key must not retire a never-observed window"
-        );
-    }
-
-    #[test]
-    fn capture_completing_after_session_end_is_not_published() {
-        let cache = ElementCacheCore::new();
-        let session = format!("snapshot-late-capture-{}", uuid::Uuid::new_v4());
-        assert!(crate::session::fire_session_end(&session));
-        assert_eq!(
+        isolated(|| {
+            let cache = ElementCacheCore::new();
             cache.publish_for_session(
                 std::process::id() as i32,
                 20,
                 Payload(vec![]),
-                Some(&session),
-                Some(7.35)
-            ),
-            None
-        );
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(20), Some(&session)),
-            Err(ScreenshotContextError::ReplacedOrUnavailable)
-        );
+                Some("ending"),
+                Some(7.35),
+            );
+            cache.publish_for_session(
+                std::process::id() as i32,
+                21,
+                Payload(vec![]),
+                Some("survivor"),
+                Some(2.0),
+            );
+            assert_eq!(cache.retire_session_screenshots("ending"), 1);
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(20), Some("ending")),
+                Err(ScreenshotContextError::ReplacedOrUnavailable)
+            );
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(21), Some("survivor")),
+                Ok(Some(2.0))
+            );
+        });
+    }
+
+    #[test]
+    fn retired_screenshot_refuses_cross_session_and_anonymous_replay_until_republished() {
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            cache.publish_for_session(
+                std::process::id() as i32,
+                20,
+                Payload(vec![]),
+                Some("ending"),
+                Some(7.35),
+            );
+            assert_eq!(cache.retire_session_screenshots("ending"), 1);
+
+            for session in [Some("ending"), Some("other"), None] {
+                assert_eq!(
+                    cache.screenshot_scale(std::process::id() as i32, Some(20), session),
+                    Err(ScreenshotContextError::ReplacedOrUnavailable),
+                    "a retired screenshot must not become native-pixel fallback"
+                );
+            }
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, None, Some("other")),
+                Err(ScreenshotContextError::ReplacedOrUnavailable)
+            );
+
+            cache.publish_for_session(
+                std::process::id() as i32,
+                20,
+                Payload(vec![]),
+                Some("other"),
+                Some(2.0),
+            );
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(20), Some("other")),
+                Ok(Some(2.0)),
+                "a fresh snapshot clears the lightweight retirement tombstone"
+            );
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(20), None),
+                Err(ScreenshotContextError::ReplacedOrUnavailable)
+            );
+
+            cache.publish_for_session(
+                std::process::id() as i32,
+                20,
+                Payload(vec![]),
+                None,
+                Some(1.5),
+            );
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(20), None),
+                Ok(Some(1.5)),
+                "a fresh anonymous snapshot also recovers the coordinate context"
+            );
+        });
+    }
+
+    #[test]
+    fn lru_eviction_retires_only_the_evicted_screenshot_key() {
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            for window_id in 0..LRU_CAP_PER_PID as u64 {
+                cache.publish_for_session(
+                    std::process::id() as i32,
+                    window_id,
+                    Payload(vec![]),
+                    Some("client-a"),
+                    Some(2.0),
+                );
+            }
+            cache.publish_for_session(
+                std::process::id() as i32,
+                LRU_CAP_PER_PID as u64,
+                Payload(vec![]),
+                Some("client-a"),
+                Some(2.0),
+            );
+
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(0), Some("client-a")),
+                Err(ScreenshotContextError::ReplacedOrUnavailable),
+                "evicting an observed window must not restore native-pixel fallback"
+            );
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(1), Some("client-a")),
+                Ok(Some(2.0))
+            );
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(9999), Some("client-a")),
+                Ok(None),
+                "a never-observed key keeps the legacy fallback"
+            );
+        });
+    }
+
+    #[test]
+    fn explicit_remove_retires_only_a_snapshot_that_existed() {
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            cache.publish_for_session(
+                std::process::id() as i32,
+                20,
+                Payload(vec![]),
+                Some("client-a"),
+                Some(2.0),
+            );
+            cache.remove(std::process::id() as i32, 20);
+
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-a")),
+                Err(ScreenshotContextError::ReplacedOrUnavailable),
+                "removing an observed window must not restore native-pixel fallback"
+            );
+            cache.remove(std::process::id() as i32, 21);
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(21), Some("client-a")),
+                Ok(None),
+                "removing an absent key must not retire a never-observed window"
+            );
+        });
+    }
+
+    #[test]
+    fn capture_completing_after_session_end_is_not_published() {
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            let session = format!("snapshot-late-capture-{}", uuid::Uuid::new_v4());
+            assert!(crate::session::fire_session_end(&session));
+            assert_eq!(
+                cache.publish_for_session(
+                    std::process::id() as i32,
+                    20,
+                    Payload(vec![]),
+                    Some(&session),
+                    Some(7.35)
+                ),
+                None
+            );
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(20), Some(&session)),
+                Err(ScreenshotContextError::ReplacedOrUnavailable)
+            );
+        });
     }
 
     #[test]
     fn no_snapshot_keeps_legacy_native_pixel_fallback() {
-        let cache = ElementCacheCore::<Payload>::new();
-        assert_eq!(
-            cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-a")),
-            Ok(None)
-        );
+        isolated(|| {
+            let cache = ElementCacheCore::<Payload>::new();
+            assert_eq!(
+                cache.screenshot_scale(std::process::id() as i32, Some(20), Some("client-a")),
+                Ok(None)
+            );
+        });
     }
 
     #[test]
@@ -1473,384 +1505,404 @@ mod tests {
 
     #[test]
     fn retired_screenshot_overflow_refuses_unrecorded_and_unseen_replay() {
-        let cache = ElementCacheCore::new();
-        let overflow_key = overflow_retired_screenshots(&cache);
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            let overflow_key = overflow_retired_screenshots(&cache);
 
-        let inner = cache.inner.lock().unwrap();
-        assert!(inner.retired_screenshot_overflowed);
-        assert_eq!(inner.retired_screenshots.len(), RETIRED_SCREENSHOT_CAPACITY);
-        assert_eq!(
-            inner.retired_screenshot_order.len(),
-            RETIRED_SCREENSHOT_CAPACITY
-        );
-        assert!(!inner.retired_screenshots.contains(&overflow_key));
-        drop(inner);
+            let inner = cache.inner.lock().unwrap();
+            assert!(inner.retired_screenshot_overflowed);
+            assert_eq!(inner.retired_screenshots.len(), RETIRED_SCREENSHOT_CAPACITY);
+            assert_eq!(
+                inner.retired_screenshot_order.len(),
+                RETIRED_SCREENSHOT_CAPACITY
+            );
+            assert!(!inner.retired_screenshots.contains(&overflow_key));
+            drop(inner);
 
-        assert_eq!(
-            cache.screenshot_scale(overflow_key.0, Some(overflow_key.1), None),
-            Err(ScreenshotContextError::ReplacedOrUnavailable)
-        );
-        assert_eq!(
-            cache.screenshot_scale(9999, Some(9999), None),
-            Err(ScreenshotContextError::ReplacedOrUnavailable)
-        );
+            assert_eq!(
+                cache.screenshot_scale(overflow_key.0, Some(overflow_key.1), None),
+                Err(ScreenshotContextError::ReplacedOrUnavailable)
+            );
+            assert_eq!(
+                cache.screenshot_scale(9999, Some(9999), None),
+                Err(ScreenshotContextError::ReplacedOrUnavailable)
+            );
+        });
     }
 
     #[test]
     fn fresh_snapshot_resolves_while_retirement_index_is_overflowed() {
-        let cache = ElementCacheCore::new();
-        let overflow_key = overflow_retired_screenshots(&cache);
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            let overflow_key = overflow_retired_screenshots(&cache);
 
-        cache.publish_for_session(
-            overflow_key.0,
-            overflow_key.1,
-            Payload(vec![]),
-            Some("fresh"),
-            Some(3.0),
-        );
-        assert_eq!(
-            cache.screenshot_scale(overflow_key.0, Some(overflow_key.1), Some("fresh")),
-            Ok(Some(3.0))
-        );
-        assert_eq!(
-            cache.screenshot_scale(overflow_key.0, Some(overflow_key.1), Some("other")),
-            Err(ScreenshotContextError::ReplacedOrUnavailable)
-        );
-        assert_eq!(
-            cache.screenshot_scale(9999, Some(9999), Some("fresh")),
-            Err(ScreenshotContextError::ReplacedOrUnavailable)
-        );
+            cache.publish_for_session(
+                overflow_key.0,
+                overflow_key.1,
+                Payload(vec![]),
+                Some("fresh"),
+                Some(3.0),
+            );
+            assert_eq!(
+                cache.screenshot_scale(overflow_key.0, Some(overflow_key.1), Some("fresh")),
+                Ok(Some(3.0))
+            );
+            assert_eq!(
+                cache.screenshot_scale(overflow_key.0, Some(overflow_key.1), Some("other")),
+                Err(ScreenshotContextError::ReplacedOrUnavailable)
+            );
+            assert_eq!(
+                cache.screenshot_scale(9999, Some(9999), Some("fresh")),
+                Err(ScreenshotContextError::ReplacedOrUnavailable)
+            );
+        });
     }
 
     #[test]
     fn clear_resets_retired_screenshot_overflow() {
-        let cache = ElementCacheCore::new();
-        overflow_retired_screenshots(&cache);
-        cache.clear();
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            overflow_retired_screenshots(&cache);
+            cache.clear();
 
-        let inner = cache.inner.lock().unwrap();
-        assert!(inner.retired_screenshots.is_empty());
-        assert!(inner.retired_screenshot_order.is_empty());
-        assert!(!inner.retired_screenshot_overflowed);
-        drop(inner);
-        assert_eq!(cache.screenshot_scale(9999, Some(9999), None), Ok(None));
+            let inner = cache.inner.lock().unwrap();
+            assert!(inner.retired_screenshots.is_empty());
+            assert!(inner.retired_screenshot_order.is_empty());
+            assert!(!inner.retired_screenshot_overflowed);
+            drop(inner);
+            assert_eq!(cache.screenshot_scale(9999, Some(9999), None), Ok(None));
+        });
     }
 
     #[test]
     fn zoom_context_is_bound_to_snapshot_session_and_window() {
-        let cache = ElementCacheCore::new();
-        let zooms = SnapshotBoundZoomRegistry::new();
-        let snapshot = cache
-            .publish_for_session(
-                std::process::id() as i32,
-                20,
-                Payload(vec![]),
-                Some("client-a"),
-                Some(7.35),
-            )
-            .unwrap();
-        let context = SnapshotBoundZoomContext {
-            screenshot: ScreenshotContext {
-                snapshot_id: snapshot,
-                window_id: 20,
-                scale: 7.35,
-            },
-            origin_x: 100.0,
-            origin_y: 50.0,
-            scale_inv: 2.0,
-        };
-        zooms
-            .set_if_current(&cache, std::process::id() as i32, Some("client-a"), context)
-            .unwrap();
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            let zooms = SnapshotBoundZoomRegistry::new();
+            let snapshot = cache
+                .publish_for_session(
+                    std::process::id() as i32,
+                    20,
+                    Payload(vec![]),
+                    Some("client-a"),
+                    Some(7.35),
+                )
+                .unwrap();
+            let context = SnapshotBoundZoomContext {
+                screenshot: ScreenshotContext {
+                    snapshot_id: snapshot,
+                    window_id: 20,
+                    scale: 7.35,
+                },
+                origin_x: 100.0,
+                origin_y: 50.0,
+                scale_inv: 2.0,
+            };
+            zooms
+                .set_if_current(&cache, std::process::id() as i32, Some("client-a"), context)
+                .unwrap();
 
-        assert_eq!(
-            zooms
-                .resolve(
-                    &cache,
-                    std::process::id() as i32,
-                    Some(20),
-                    Some("client-a")
-                )
-                .unwrap(),
-            context
-        );
-        assert_eq!(context.zoom_to_window(3.0, 4.0), (106.0, 58.0));
-        assert_eq!(
-            zooms
-                .resolve(
-                    &cache,
-                    std::process::id() as i32,
-                    Some(20),
-                    Some("client-b")
-                )
-                .unwrap_err()
-                .structured_content
-                .as_ref()
-                .unwrap()["code"],
-            "zoom_context_missing"
-        );
-        assert_eq!(
-            zooms
-                .resolve(
-                    &cache,
-                    std::process::id() as i32,
-                    Some(21),
-                    Some("client-a")
-                )
-                .unwrap_err()
-                .structured_content
-                .as_ref()
-                .unwrap()["code"],
-            "zoom_context_missing"
-        );
+            assert_eq!(
+                zooms
+                    .resolve(
+                        &cache,
+                        std::process::id() as i32,
+                        Some(20),
+                        Some("client-a")
+                    )
+                    .unwrap(),
+                context
+            );
+            assert_eq!(context.zoom_to_window(3.0, 4.0), (106.0, 58.0));
+            assert_eq!(
+                zooms
+                    .resolve(
+                        &cache,
+                        std::process::id() as i32,
+                        Some(20),
+                        Some("client-b")
+                    )
+                    .unwrap_err()
+                    .structured_content
+                    .as_ref()
+                    .unwrap()["code"],
+                "zoom_context_missing"
+            );
+            assert_eq!(
+                zooms
+                    .resolve(
+                        &cache,
+                        std::process::id() as i32,
+                        Some(21),
+                        Some("client-a")
+                    )
+                    .unwrap_err()
+                    .structured_content
+                    .as_ref()
+                    .unwrap()["code"],
+                "zoom_context_missing"
+            );
+        });
     }
 
     #[cfg(unix)]
     #[test]
     fn window_only_screenshot_lookup_requires_one_current_owned_snapshot() {
-        let cache = ElementCacheCore::new();
-        let first = cache
-            .publish_for_session(
-                std::process::id() as i32,
-                20,
-                Payload(vec![]),
-                Some("client-a"),
-                Some(2.0),
-            )
-            .unwrap();
-        assert_eq!(
-            cache
-                .screenshot_context_for_zoom(None, 20, Some("client-a"))
-                .unwrap(),
-            (
-                std::process::id() as i32,
-                ScreenshotContext {
-                    snapshot_id: first,
-                    window_id: 20,
-                    scale: 2.0,
-                }
-            )
-        );
-        assert_eq!(
-            cache
-                .screenshot_context_for_zoom(Some(std::process::id() as i32), 20, Some("client-a"))
-                .unwrap()
-                .0,
-            std::process::id() as i32
-        );
-        assert!(cache
-            .unique_screenshot_context_for_window(20, Some("client-b"))
-            .is_err());
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            let first = cache
+                .publish_for_session(
+                    std::process::id() as i32,
+                    20,
+                    Payload(vec![]),
+                    Some("client-a"),
+                    Some(2.0),
+                )
+                .unwrap();
+            assert_eq!(
+                cache
+                    .screenshot_context_for_zoom(None, 20, Some("client-a"))
+                    .unwrap(),
+                (
+                    std::process::id() as i32,
+                    ScreenshotContext {
+                        snapshot_id: first,
+                        window_id: 20,
+                        scale: 2.0,
+                    }
+                )
+            );
+            assert_eq!(
+                cache
+                    .screenshot_context_for_zoom(
+                        Some(std::process::id() as i32),
+                        20,
+                        Some("client-a")
+                    )
+                    .unwrap()
+                    .0,
+                std::process::id() as i32
+            );
+            assert!(cache
+                .unique_screenshot_context_for_window(20, Some("client-b"))
+                .is_err());
 
-        cache.publish_for_session(
-            unsafe { libc::getppid() },
-            20,
-            Payload(vec![]),
-            Some("client-a"),
-            Some(1.0),
-        );
-        assert!(cache
-            .unique_screenshot_context_for_window(20, Some("client-a"))
-            .is_err());
-    }
-
-    #[test]
-    fn late_zoom_completion_cannot_replace_newer_valid_context() {
-        let cache = ElementCacheCore::new();
-        let zooms = SnapshotBoundZoomRegistry::new();
-        let snapshot_a = cache
-            .publish_for_session(
-                std::process::id() as i32,
-                20,
-                Payload(vec![]),
-                Some("client-a"),
-                Some(2.0),
-            )
-            .unwrap();
-        let slow_a = SnapshotBoundZoomContext {
-            screenshot: ScreenshotContext {
-                snapshot_id: snapshot_a,
-                window_id: 20,
-                scale: 2.0,
-            },
-            origin_x: 10.0,
-            origin_y: 20.0,
-            scale_inv: 2.0,
-        };
-
-        let snapshot_b = cache
-            .publish_for_session(
-                std::process::id() as i32,
+            cache.publish_for_session(
+                unsafe { libc::getppid() },
                 20,
                 Payload(vec![]),
                 Some("client-a"),
                 Some(1.0),
-            )
-            .unwrap();
-        let valid_b = SnapshotBoundZoomContext {
-            screenshot: ScreenshotContext {
-                snapshot_id: snapshot_b,
-                window_id: 20,
-                scale: 1.0,
-            },
-            origin_x: 30.0,
-            origin_y: 40.0,
-            scale_inv: 1.0,
-        };
-        zooms
-            .set_if_current(&cache, std::process::id() as i32, Some("client-a"), valid_b)
-            .unwrap();
-        assert!(zooms
-            .set_if_current(&cache, std::process::id() as i32, Some("client-a"), slow_a)
-            .is_err());
-        assert_eq!(
+            );
+            assert!(cache
+                .unique_screenshot_context_for_window(20, Some("client-a"))
+                .is_err());
+        });
+    }
+
+    #[test]
+    fn late_zoom_completion_cannot_replace_newer_valid_context() {
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            let zooms = SnapshotBoundZoomRegistry::new();
+            let snapshot_a = cache
+                .publish_for_session(
+                    std::process::id() as i32,
+                    20,
+                    Payload(vec![]),
+                    Some("client-a"),
+                    Some(2.0),
+                )
+                .unwrap();
+            let slow_a = SnapshotBoundZoomContext {
+                screenshot: ScreenshotContext {
+                    snapshot_id: snapshot_a,
+                    window_id: 20,
+                    scale: 2.0,
+                },
+                origin_x: 10.0,
+                origin_y: 20.0,
+                scale_inv: 2.0,
+            };
+
+            let snapshot_b = cache
+                .publish_for_session(
+                    std::process::id() as i32,
+                    20,
+                    Payload(vec![]),
+                    Some("client-a"),
+                    Some(1.0),
+                )
+                .unwrap();
+            let valid_b = SnapshotBoundZoomContext {
+                screenshot: ScreenshotContext {
+                    snapshot_id: snapshot_b,
+                    window_id: 20,
+                    scale: 1.0,
+                },
+                origin_x: 30.0,
+                origin_y: 40.0,
+                scale_inv: 1.0,
+            };
             zooms
+                .set_if_current(&cache, std::process::id() as i32, Some("client-a"), valid_b)
+                .unwrap();
+            assert!(zooms
+                .set_if_current(&cache, std::process::id() as i32, Some("client-a"), slow_a)
+                .is_err());
+            assert_eq!(
+                zooms
+                    .resolve(
+                        &cache,
+                        std::process::id() as i32,
+                        Some(20),
+                        Some("client-a")
+                    )
+                    .unwrap(),
+                valid_b
+            );
+        });
+    }
+
+    #[test]
+    fn newer_snapshot_retires_zoom_for_click_drag_and_held_pointer_coordinates() {
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            let zooms = SnapshotBoundZoomRegistry::new();
+            let snapshot = cache
+                .publish_for_session(
+                    std::process::id() as i32,
+                    20,
+                    Payload(vec![]),
+                    Some("client-a"),
+                    Some(7.35),
+                )
+                .unwrap();
+            let context = SnapshotBoundZoomContext {
+                screenshot: ScreenshotContext {
+                    snapshot_id: snapshot,
+                    window_id: 20,
+                    scale: 7.35,
+                },
+                origin_x: 100.0,
+                origin_y: 50.0,
+                scale_inv: 2.0,
+            };
+            zooms
+                .set_if_current(&cache, std::process::id() as i32, Some("client-a"), context)
+                .unwrap();
+
+            let click = context.zoom_to_window(1.0, 2.0);
+            let drag_from = context.zoom_to_window(3.0, 4.0);
+            let held_pointer_to = context.zoom_to_window(5.0, 6.0);
+            assert_eq!(
+                (click, drag_from, held_pointer_to),
+                ((102.0, 54.0), (106.0, 58.0), (110.0, 62.0))
+            );
+
+            let replacement = cache
+                .publish_for_session(
+                    std::process::id() as i32,
+                    20,
+                    Payload(vec![]),
+                    Some("client-b"),
+                    Some(1.0),
+                )
+                .unwrap();
+            assert!(zooms.retire_replaced(std::process::id() as i32, 20, replacement));
+            let refusal = zooms
+                .resolve(
+                    &cache,
+                    std::process::id() as i32,
+                    Some(20),
+                    Some("client-a"),
+                )
+                .expect_err("all uses of the old zoom image must become stale together");
+            assert_eq!(
+                refusal.structured_content.as_ref().unwrap()["code"],
+                "zoom_context_missing"
+            );
+        });
+    }
+
+    #[test]
+    fn zoom_context_retires_on_same_session_replacement_and_session_end() {
+        isolated(|| {
+            let cache = ElementCacheCore::new();
+            let zooms = SnapshotBoundZoomRegistry::new();
+            let snapshot = cache
+                .publish_for_session(
+                    std::process::id() as i32,
+                    20,
+                    Payload(vec![]),
+                    Some("client-a"),
+                    Some(7.35),
+                )
+                .unwrap();
+            zooms
+                .set_if_current(
+                    &cache,
+                    std::process::id() as i32,
+                    Some("client-a"),
+                    SnapshotBoundZoomContext {
+                        screenshot: ScreenshotContext {
+                            snapshot_id: snapshot,
+                            window_id: 20,
+                            scale: 7.35,
+                        },
+                        origin_x: 0.0,
+                        origin_y: 0.0,
+                        scale_inv: 1.0,
+                    },
+                )
+                .unwrap();
+
+            let replacement = cache
+                .publish_for_session(
+                    std::process::id() as i32,
+                    20,
+                    Payload(vec![]),
+                    Some("client-a"),
+                    Some(1.0),
+                )
+                .unwrap();
+            assert!(zooms.retire_replaced(std::process::id() as i32, 20, replacement));
+            assert!(zooms
                 .resolve(
                     &cache,
                     std::process::id() as i32,
                     Some(20),
                     Some("client-a")
                 )
-                .unwrap(),
-            valid_b
-        );
-    }
+                .is_err());
 
-    #[test]
-    fn newer_snapshot_retires_zoom_for_click_drag_and_held_pointer_coordinates() {
-        let cache = ElementCacheCore::new();
-        let zooms = SnapshotBoundZoomRegistry::new();
-        let snapshot = cache
-            .publish_for_session(
-                std::process::id() as i32,
-                20,
-                Payload(vec![]),
-                Some("client-a"),
-                Some(7.35),
-            )
-            .unwrap();
-        let context = SnapshotBoundZoomContext {
-            screenshot: ScreenshotContext {
-                snapshot_id: snapshot,
-                window_id: 20,
-                scale: 7.35,
-            },
-            origin_x: 100.0,
-            origin_y: 50.0,
-            scale_inv: 2.0,
-        };
-        zooms
-            .set_if_current(&cache, std::process::id() as i32, Some("client-a"), context)
-            .unwrap();
-
-        let click = context.zoom_to_window(1.0, 2.0);
-        let drag_from = context.zoom_to_window(3.0, 4.0);
-        let held_pointer_to = context.zoom_to_window(5.0, 6.0);
-        assert_eq!(
-            (click, drag_from, held_pointer_to),
-            ((102.0, 54.0), (106.0, 58.0), (110.0, 62.0))
-        );
-
-        let replacement = cache
-            .publish_for_session(
-                std::process::id() as i32,
-                20,
-                Payload(vec![]),
-                Some("client-b"),
-                Some(1.0),
-            )
-            .unwrap();
-        assert!(zooms.retire_replaced(std::process::id() as i32, 20, replacement));
-        let refusal = zooms
-            .resolve(
-                &cache,
-                std::process::id() as i32,
-                Some(20),
-                Some("client-a"),
-            )
-            .expect_err("all uses of the old zoom image must become stale together");
-        assert_eq!(
-            refusal.structured_content.as_ref().unwrap()["code"],
-            "zoom_context_missing"
-        );
-    }
-
-    #[test]
-    fn zoom_context_retires_on_same_session_replacement_and_session_end() {
-        let cache = ElementCacheCore::new();
-        let zooms = SnapshotBoundZoomRegistry::new();
-        let snapshot = cache
-            .publish_for_session(
-                std::process::id() as i32,
-                20,
-                Payload(vec![]),
-                Some("client-a"),
-                Some(7.35),
-            )
-            .unwrap();
-        zooms
-            .set_if_current(
-                &cache,
-                std::process::id() as i32,
-                Some("client-a"),
-                SnapshotBoundZoomContext {
-                    screenshot: ScreenshotContext {
-                        snapshot_id: snapshot,
-                        window_id: 20,
-                        scale: 7.35,
+            let latest = cache
+                .screenshot_context(std::process::id() as i32, Some(20), Some("client-a"))
+                .unwrap()
+                .unwrap();
+            zooms
+                .set_if_current(
+                    &cache,
+                    std::process::id() as i32,
+                    Some("client-a"),
+                    SnapshotBoundZoomContext {
+                        screenshot: latest,
+                        origin_x: 0.0,
+                        origin_y: 0.0,
+                        scale_inv: 1.0,
                     },
-                    origin_x: 0.0,
-                    origin_y: 0.0,
-                    scale_inv: 1.0,
-                },
-            )
-            .unwrap();
-
-        let replacement = cache
-            .publish_for_session(
-                std::process::id() as i32,
-                20,
-                Payload(vec![]),
-                Some("client-a"),
-                Some(1.0),
-            )
-            .unwrap();
-        assert!(zooms.retire_replaced(std::process::id() as i32, 20, replacement));
-        assert!(zooms
-            .resolve(
-                &cache,
-                std::process::id() as i32,
-                Some(20),
-                Some("client-a")
-            )
-            .is_err());
-
-        let latest = cache
-            .screenshot_context(std::process::id() as i32, Some(20), Some("client-a"))
-            .unwrap()
-            .unwrap();
-        zooms
-            .set_if_current(
-                &cache,
-                std::process::id() as i32,
-                Some("client-a"),
-                SnapshotBoundZoomContext {
-                    screenshot: latest,
-                    origin_x: 0.0,
-                    origin_y: 0.0,
-                    scale_inv: 1.0,
-                },
-            )
-            .unwrap();
-        assert_eq!(zooms.retire_session("client-a"), 1);
-        assert!(zooms
-            .resolve(
-                &cache,
-                std::process::id() as i32,
-                Some(20),
-                Some("client-a")
-            )
-            .is_err());
+                )
+                .unwrap();
+            assert_eq!(zooms.retire_session("client-a"), 1);
+            assert!(zooms
+                .resolve(
+                    &cache,
+                    std::process::id() as i32,
+                    Some(20),
+                    Some("client-a")
+                )
+                .is_err());
+        });
     }
 
     struct DropCounter {
@@ -1869,10 +1921,17 @@ mod tests {
     impl Drop for DropCounter {
         fn drop(&mut self) {
             if let Some(owner) = self.owner.upgrade() {
-                assert!(
-                    owner.inner.try_lock().is_ok(),
-                    "native cleanup ran under the storage lock"
-                );
+                // Another thread (a session revive hook fanning out over every
+                // cache) may hold the lock briefly; only a lock that stays
+                // held, as it would by this very thread, is a violation.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while owner.inner.try_lock().is_err() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "native cleanup ran under the storage lock"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             }
             self.drops.fetch_add(1, Ordering::SeqCst);
         }
