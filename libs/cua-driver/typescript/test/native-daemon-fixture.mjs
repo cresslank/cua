@@ -43,7 +43,9 @@ const server = net.createServer((connection) => {
         : {
             effect: "unverifiable",
             route: "global_input",
-            delivery: { mode: "not_applicable" },
+            delivery: { mode: "not_applicable", delivered_count: 3, ax_readback_ms: 27, ax_readback: "notification" },
+            evidence: [{ kind: "value_readback", detail: "after delivery" }],
+            summary: "round trip",
           }
     let isError = false
     if (request.name === "list_apps") structuredContent = { apps: [{ pid: 42, name: "Editor", running: true, active: false }] }

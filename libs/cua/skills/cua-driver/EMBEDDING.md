@@ -302,7 +302,7 @@ the same environment as the window-observation variables above.
 | `CUA_DRIVER_RS_MULTI_CLICK_GAP_MS` | Gap between the down/up pairs of a double or triple click.           | 80      | 20 to 300      |
 | `CUA_DRIVER_RS_WEBKIT_SETTLE_MS`   | Wait after an AX press on a WebKit text input. `0` skips it.         | 800     | 0 to 2000      |
 | `CUA_DRIVER_RS_TYPE_TEXT_DELAY_MS` | `type_text` default `delay_ms` when the caller omits it.             | 30      | 0 to 200       |
-| `CUA_DRIVER_RS_AX_READBACK_TIMEOUT_MS` | Background AX insertion read-back bound; `0` disables the wait. | 250 | 0 to 2000 |
+| `CUA_DRIVER_RS_AX_READBACK_TIMEOUT_MS` | Background AX insertion read-back bound (including native reads); `0` disables waiting, retaining one immediate read capped at 5ms. | 250 | 0 to 2000 |
 
 Unset, empty, or unparsable values keep the default, and out-of-range values
 are clamped. No tool argument can change them. An explicit `type_text`

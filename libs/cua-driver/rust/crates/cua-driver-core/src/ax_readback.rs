@@ -9,6 +9,16 @@ use std::time::Duration;
 /// Backstop cadence only; notifications wake the observer immediately.
 pub const READBACK_SLICE: Duration = Duration::from_millis(5);
 
+/// Disabling asynchronous waiting preserves one immediate read, capped at one
+/// polling slice. Callers must reserve this allowance in synthesis preflight.
+pub fn readback_budget(timeout: Duration) -> Duration {
+    if timeout.is_zero() {
+        READBACK_SLICE
+    } else {
+        timeout
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReadbackEvent {
     Notified,
@@ -31,12 +41,15 @@ impl Default for AxReadbackMeasurement {
 }
 
 /// `elapsed` starts when the write returns. `wait` must wait no longer than its
-/// argument, returning early on a notification. `settled` accepts both complete
+/// argument, returning early on a notification. `read` must cap native work to
+/// its remaining-budget argument. Zero disables waiting, but keeps a single
+/// immediate read bounded by `readback_budget`.
+/// `settled` accepts both complete
 /// and partial delivery: either must stop the ladder before any replay.
 pub fn await_readback<T>(
     write_succeeded: bool,
     timeout: Duration,
-    mut read: impl FnMut() -> T,
+    mut read: impl FnMut(Duration) -> T,
     settled: impl Fn(&T) -> bool,
     elapsed: impl Fn() -> Duration,
     mut wait: impl FnMut(Duration) -> ReadbackEvent,
@@ -44,33 +57,44 @@ pub fn await_readback<T>(
     if !write_succeeded {
         return (None, AxReadbackMeasurement::default());
     }
-    let mut value = read();
+    let budget = readback_budget(timeout);
+    let mut value = None;
     let mut cause = AxReadback::Immediate;
     loop {
         let duration = elapsed();
-        let outcome = if settled(&value) {
-            Some(cause)
-        } else if timeout.is_zero() {
-            Some(AxReadback::Skipped)
-        } else if duration >= timeout {
-            Some(AxReadback::TimedOut)
-        } else {
-            None
-        };
-        if let Some(outcome) = outcome {
+        if duration >= budget || (timeout.is_zero() && value.is_some()) {
             return (
-                Some(value),
+                value,
                 AxReadbackMeasurement {
                     elapsed_ms: duration.as_millis().min(u64::MAX as u128) as u64,
-                    outcome,
+                    outcome: if timeout.is_zero() {
+                        AxReadback::Skipped
+                    } else {
+                        AxReadback::TimedOut
+                    },
                 },
             );
         }
-        cause = match wait(READBACK_SLICE.min(timeout.saturating_sub(duration))) {
-            ReadbackEvent::Notified => AxReadback::Notification,
-            ReadbackEvent::Tick => AxReadback::Poll,
-        };
-        value = read();
+        value = Some(read(budget - duration));
+        let duration = elapsed();
+        // Keep even a late positive/partial observation: losing it could cause
+        // the non-idempotent typing ladder to replay text already delivered.
+        if value.as_ref().is_some_and(&settled) {
+            return (
+                value,
+                AxReadbackMeasurement {
+                    elapsed_ms: duration.as_millis().min(u64::MAX as u128) as u64,
+                    outcome: cause,
+                },
+            );
+        }
+        if !timeout.is_zero() && duration < budget {
+            cause = match wait(READBACK_SLICE.min(budget - duration)) {
+                ReadbackEvent::Notified => AxReadback::Notification,
+                ReadbackEvent::Tick => AxReadback::Poll,
+            };
+        }
+        // Recheck expiry after every read and wait, before admitting more work.
     }
 }
 
@@ -93,7 +117,7 @@ mod tests {
         let result = await_readback(
             true,
             Duration::from_millis(12),
-            || {
+            |_| {
                 reads += 1;
                 if clock.get().is_zero() {
                     Progress::Unchanged
@@ -188,7 +212,7 @@ mod tests {
         let result = await_readback::<Progress>(
             false,
             Duration::from_millis(250),
-            || panic!("read after rejected write"),
+            |_| panic!("read after rejected write"),
             |_| false,
             || panic!("clock after rejected write"),
             |_| panic!("wait after rejected write"),
@@ -201,7 +225,10 @@ mod tests {
         let result = await_readback(
             true,
             Duration::ZERO,
-            || Progress::Unchanged,
+            |remaining| {
+                assert_eq!(remaining, Duration::from_millis(4));
+                Progress::Unchanged
+            },
             |_| false,
             || Duration::from_millis(1),
             |_| panic!("disabled wait"),
@@ -223,7 +250,7 @@ mod tests {
         let result = await_readback(
             true,
             Duration::from_millis(250),
-            || Progress::Complete,
+            |_| Progress::Complete,
             |_| true,
             || Duration::from_millis(3),
             |_| panic!("already settled"),
@@ -235,5 +262,69 @@ mod tests {
                 outcome: AxReadback::Immediate
             }
         );
+    }
+
+    #[test]
+    fn slow_reads_receive_only_the_remaining_budget() {
+        let clock = Cell::new(Duration::ZERO);
+        let mut budgets = Vec::new();
+        let result = await_readback(
+            true,
+            Duration::from_millis(250),
+            |remaining| {
+                budgets.push(remaining);
+                clock.set(clock.get() + remaining.min(Duration::from_millis(200)));
+                Progress::Unreadable
+            },
+            |_| false,
+            || clock.get(),
+            |slice| {
+                clock.set(clock.get() + slice);
+                ReadbackEvent::Tick
+            },
+        );
+        assert_eq!(
+            budgets,
+            [Duration::from_millis(250), Duration::from_millis(45)]
+        );
+        assert_eq!(result.0, Some(Progress::Unreadable));
+        assert_eq!(
+            result.1,
+            AxReadbackMeasurement {
+                elapsed_ms: 250,
+                outcome: AxReadback::TimedOut
+            }
+        );
+    }
+
+    #[test]
+    fn expiry_before_first_read_or_after_wait_never_admits_another_read() {
+        for initially_expired in [false, true] {
+            let timeout = Duration::from_millis(5);
+            let clock = Cell::new(if initially_expired {
+                timeout
+            } else {
+                Duration::ZERO
+            });
+            let mut reads = 0;
+            let result = await_readback(
+                true,
+                timeout,
+                |remaining| {
+                    assert_eq!(remaining, timeout);
+                    reads += 1;
+                    Progress::Unchanged
+                },
+                |_| false,
+                || clock.get(),
+                |slice| {
+                    clock.set(clock.get() + slice);
+                    ReadbackEvent::Notified
+                },
+            );
+            assert_eq!(reads, usize::from(!initially_expired));
+            assert_eq!(result.1.outcome, AxReadback::TimedOut);
+            assert_eq!(result.1.elapsed_ms, 5);
+        }
     }
 }

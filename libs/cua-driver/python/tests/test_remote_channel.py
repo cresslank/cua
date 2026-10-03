@@ -367,6 +367,8 @@ class NativeWindowTests(unittest.IsolatedAsyncioTestCase):
             action = await driver.click(click)
             self.assertIsInstance(action, sdk.ActionResult)
             self.assertEqual(action.effect, sdk.ActionEffect.UNVERIFIABLE)
+            self.assertIsNone(action.delivery.ax_readback)
+            self.assertIsNone(action.delivery.ax_readback_ms)
             self.assertEqual(
                 json.loads(carrier.requests[-1].arguments_json),
                 {
@@ -376,6 +378,26 @@ class NativeWindowTests(unittest.IsolatedAsyncioTestCase):
                     "session": "native-window",
                 },
             )
+
+            # Exercise Rust JSON projection and the UniFFI binary record, with
+            # trailing fields that expose a shifted ActionDelivery layout.
+            for outcome in sdk.AxReadback:
+                respond({
+                    "effect": "unverifiable",
+                    "route": "accessibility",
+                    "delivery": {
+                        "mode": "background", "delivered_count": 3,
+                        "ax_readback_ms": 27, "ax_readback": outcome.name.lower(),
+                    },
+                    "evidence": [{"kind": "value_readback", "detail": "after delivery"}],
+                    "summary": "round trip",
+                })
+                action = await driver.click(click)
+                self.assertEqual(action.delivery.ax_readback, outcome)
+                self.assertEqual(action.delivery.ax_readback_ms, 27)
+                self.assertEqual(action.delivery.delivered_count, 3)
+                self.assertEqual(action.evidence[0].detail, "after delivery")
+                self.assertEqual(action.summary, "round trip")
 
             # These service refusals test SDK error propagation, not native token validation.
             for token, window_id, code in [

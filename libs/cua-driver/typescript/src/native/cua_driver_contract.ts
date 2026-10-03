@@ -54,9 +54,55 @@ const FfiConverterTypeActionDeliveryMode = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * How the background AX insertion read-back settled; not renderer verification.
+ */
+export enum AxReadback {
+    Immediate,
+    Notification,
+    Poll,
+    TimedOut,
+    Skipped
+}
+
+const FfiConverterTypeAxReadback = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = AxReadback;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return AxReadback.Immediate;
+                case 2: return AxReadback.Notification;
+                case 3: return AxReadback.Poll;
+                case 4: return AxReadback.TimedOut;
+                case 5: return AxReadback.Skipped;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case AxReadback.Immediate: return ordinalConverter.write(1, into);
+                case AxReadback.Notification: return ordinalConverter.write(2, into);
+                case AxReadback.Poll: return ordinalConverter.write(3, into);
+                case AxReadback.TimedOut: return ordinalConverter.write(4, into);
+                case AxReadback.Skipped: return ordinalConverter.write(5, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
 export type ActionDelivery = {
     mode: ActionDeliveryMode,
-    deliveredCount?: number
+    deliveredCount?: number,
+    /**
+     * Milliseconds since the AX write returned, excluding observer setup.
+     */
+    axReadbackMs?: bigint,
+    axReadback?: AxReadback
 }
 
 /**
@@ -81,16 +127,22 @@ const FfiConverterTypeActionDelivery = (() => {
         read(from: RustBuffer): TypeName {
             return {
                 mode: FfiConverterTypeActionDeliveryMode.read(from),
-                deliveredCount: FfiConverterOptionalUInt32.read(from)
+                deliveredCount: FfiConverterOptionalUInt32.read(from),
+                axReadbackMs: FfiConverterOptionalUInt64.read(from),
+                axReadback: FfiConverterOptionalTypeAxReadback.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterTypeActionDeliveryMode.write(value.mode, into);
             FfiConverterOptionalUInt32.write(value.deliveredCount, into);
+            FfiConverterOptionalUInt64.write(value.axReadbackMs, into);
+            FfiConverterOptionalTypeAxReadback.write(value.axReadback, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterTypeActionDeliveryMode.allocationSize(value.mode) +
-             FfiConverterOptionalUInt32.allocationSize(value.deliveredCount);
+             FfiConverterOptionalUInt32.allocationSize(value.deliveredCount) +
+             FfiConverterOptionalUInt64.allocationSize(value.axReadbackMs) +
+             FfiConverterOptionalTypeAxReadback.allocationSize(value.axReadback);
 
         }
     };
@@ -6019,6 +6071,12 @@ const FfiConverterTypePlatform = (() => {
 // FfiConverter for number | undefined
 const FfiConverterOptionalUInt32 = new FfiConverterOptional(FfiConverterUInt32);
 
+// FfiConverter for bigint | undefined
+const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
+
+// FfiConverter for AxReadback | undefined
+const FfiConverterOptionalTypeAxReadback = new FfiConverterOptional(FfiConverterTypeAxReadback);
+
 // FfiConverter for string | undefined
 const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
 
@@ -6051,9 +6109,6 @@ const FfiConverterOptionalTypeActionTarget = new FfiConverterOptional(FfiConvert
 
 // FfiConverter for DesktopScope | undefined
 const FfiConverterOptionalTypeDesktopScope = new FfiConverterOptional(FfiConverterTypeDesktopScope);
-
-// FfiConverter for bigint | undefined
-const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
 
 // FfiConverter for Array<string> | undefined
 const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverterSequenceString);
@@ -6180,6 +6235,7 @@ export default Object.freeze({
     FfiConverterTypeActionRoute,
     FfiConverterTypeActionTarget,
     FfiConverterTypeAppInfo,
+    FfiConverterTypeAxReadback,
     FfiConverterTypeBoundsExpectation,
     FfiConverterTypeCaptureScope,
     FfiConverterTypeClickButton,

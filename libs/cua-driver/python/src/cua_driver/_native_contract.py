@@ -848,21 +848,157 @@ class _UniffiFfiConverterOptionalUInt32(_UniffiConverterRustBuffer):
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
+class _UniffiFfiConverterUInt64(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "u64"
+    VALUE_MIN = 0
+    VALUE_MAX = 2**64
+
+    @staticmethod
+    def read(buf):
+        return buf.read_u64()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_u64(value)
+
+class _UniffiFfiConverterOptionalUInt64(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterUInt64.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterUInt64.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterUInt64.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+
+
+
+
+
+class AxReadback(enum.Enum):
+    """
+    How the background AX insertion read-back settled; not renderer verification.
+"""
+
+    IMMEDIATE = 0
+
+    NOTIFICATION = 1
+
+    POLL = 2
+
+    TIMED_OUT = 3
+
+    SKIPPED = 4
+
+
+
+class _UniffiFfiConverterTypeAxReadback(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return AxReadback.IMMEDIATE
+        if variant == 2:
+            return AxReadback.NOTIFICATION
+        if variant == 3:
+            return AxReadback.POLL
+        if variant == 4:
+            return AxReadback.TIMED_OUT
+        if variant == 5:
+            return AxReadback.SKIPPED
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == AxReadback.IMMEDIATE:
+            return
+        if value == AxReadback.NOTIFICATION:
+            return
+        if value == AxReadback.POLL:
+            return
+        if value == AxReadback.TIMED_OUT:
+            return
+        if value == AxReadback.SKIPPED:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == AxReadback.IMMEDIATE:
+            buf.write_i32(1)
+        if value == AxReadback.NOTIFICATION:
+            buf.write_i32(2)
+        if value == AxReadback.POLL:
+            buf.write_i32(3)
+        if value == AxReadback.TIMED_OUT:
+            buf.write_i32(4)
+        if value == AxReadback.SKIPPED:
+            buf.write_i32(5)
+
+
+
+class _UniffiFfiConverterOptionalTypeAxReadback(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeAxReadback.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeAxReadback.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeAxReadback.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 @dataclass
 class ActionDelivery:
-    def __init__(self, *, mode:ActionDeliveryMode, delivered_count:typing.Optional[int]):
+    def __init__(self, *, mode:ActionDeliveryMode, delivered_count:typing.Optional[int], ax_readback_ms:typing.Optional[int], ax_readback:typing.Optional[AxReadback]):
         self.mode = mode
         self.delivered_count = delivered_count
+        self.ax_readback_ms = ax_readback_ms
+        self.ax_readback = ax_readback
 
 
 
 
     def __str__(self):
-        return "ActionDelivery(mode={}, delivered_count={})".format(self.mode, self.delivered_count)
+        return "ActionDelivery(mode={}, delivered_count={}, ax_readback_ms={}, ax_readback={})".format(self.mode, self.delivered_count, self.ax_readback_ms, self.ax_readback)
     def __eq__(self, other):
         if self.mode != other.mode:
             return False
         if self.delivered_count != other.delivered_count:
+            return False
+        if self.ax_readback_ms != other.ax_readback_ms:
+            return False
+        if self.ax_readback != other.ax_readback:
             return False
         return True
 
@@ -872,17 +1008,23 @@ class _UniffiFfiConverterTypeActionDelivery(_UniffiConverterRustBuffer):
         return ActionDelivery(
             mode=_UniffiFfiConverterTypeActionDeliveryMode.read(buf),
             delivered_count=_UniffiFfiConverterOptionalUInt32.read(buf),
+            ax_readback_ms=_UniffiFfiConverterOptionalUInt64.read(buf),
+            ax_readback=_UniffiFfiConverterOptionalTypeAxReadback.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
         _UniffiFfiConverterTypeActionDeliveryMode.check_lower(value.mode)
         _UniffiFfiConverterOptionalUInt32.check_lower(value.delivered_count)
+        _UniffiFfiConverterOptionalUInt64.check_lower(value.ax_readback_ms)
+        _UniffiFfiConverterOptionalTypeAxReadback.check_lower(value.ax_readback)
 
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterTypeActionDeliveryMode.write(value.mode, buf)
         _UniffiFfiConverterOptionalUInt32.write(value.delivered_count, buf)
+        _UniffiFfiConverterOptionalUInt64.write(value.ax_readback_ms, buf)
+        _UniffiFfiConverterOptionalTypeAxReadback.write(value.ax_readback, buf)
 
 class _UniffiFfiConverterString:
     @staticmethod
@@ -1717,19 +1859,6 @@ class _UniffiFfiConverterTypeBoundsExpectation(_UniffiConverterRustBuffer):
         _UniffiFfiConverterFloat64.write(value.width, buf)
         _UniffiFfiConverterFloat64.write(value.height, buf)
         _UniffiFfiConverterOptionalFloat64.write(value.tolerance_px, buf)
-
-class _UniffiFfiConverterUInt64(_UniffiConverterPrimitiveInt):
-    CLASS_NAME = "u64"
-    VALUE_MIN = 0
-    VALUE_MAX = 2**64
-
-    @staticmethod
-    def read(buf):
-        return buf.read_u64()
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_u64(value)
 
 
 
@@ -2940,31 +3069,6 @@ class _UniffiFfiConverterOptionalTypeDesktopScope(_UniffiConverterRustBuffer):
             return None
         elif flag == 1:
             return _UniffiFfiConverterTypeDesktopScope.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
-
-class _UniffiFfiConverterOptionalUInt64(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterUInt64.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterUInt64.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterUInt64.read(buf)
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
@@ -7920,6 +8024,7 @@ class _UniffiFfiConverterUInt8(_UniffiConverterPrimitiveInt):
 __all__ = [
     "InternalError",
     "ActionDeliveryMode",
+    "AxReadback",
     "ActionEscalationTarget",
     "ActionEscalationReason",
     "ActionEvidenceKind",

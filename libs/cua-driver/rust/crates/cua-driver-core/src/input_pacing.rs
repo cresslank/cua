@@ -19,7 +19,8 @@
 //! - [`TYPE_TEXT_DELAY`] (`CUA_DRIVER_RS_TYPE_TEXT_DELAY_MS`): `type_text`'s
 //!   default `delay_ms` when the caller omits it.
 //! - [`AX_READBACK_TIMEOUT`] (`CUA_DRIVER_RS_AX_READBACK_TIMEOUT_MS`): bound for
-//!   asynchronous AX insertion read-back. `0` disables waiting.
+//!   asynchronous AX insertion read-back. `0` disables waiting, retaining a single
+//!   immediate read capped at 5ms.
 //!
 //! Unset, empty, or unparsable values keep each adapter default, so a daemon
 //! launched without these variables behaves exactly as before. Values outside

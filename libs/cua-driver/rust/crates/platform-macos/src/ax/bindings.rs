@@ -138,6 +138,10 @@ extern "C" {
     pub fn _AXUIElementCreateWithRemoteToken(
         token: core_foundation::data::CFDataRef,
     ) -> AXUIElementRef;
+    /// Private SPI: serializes this exact AX identity without messaging its app.
+    pub fn _AXUIElementRemoteTokenCreate(
+        element: AXUIElementRef,
+    ) -> core_foundation::data::CFDataRef;
 }
 
 /// Hit-test one process's accessibility tree at a screen point. The returned

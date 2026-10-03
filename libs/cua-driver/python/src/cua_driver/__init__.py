@@ -80,6 +80,7 @@ from ._native_contract import (
     WindowInfo,
     WindowStateOutput,
 
+    AxReadback,
     ActionDelivery,
     ActionDeliveryMode,
     ActionEffect,
@@ -233,6 +234,7 @@ __all__ = [
     "WindowStateOutput",
 
     "ActionCompletion",
+    "AxReadback",
     "ActionDelivery",
     "ActionDeliveryMode",
     "ActionEffect",

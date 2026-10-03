@@ -24,7 +24,7 @@
 use async_trait::async_trait;
 use cua_driver_contract::TypeTextInput;
 use cua_driver_core::{
-    ax_readback::{await_readback, AxReadbackMeasurement, ReadbackEvent},
+    ax_readback::{await_readback, readback_budget, AxReadbackMeasurement, ReadbackEvent},
     protocol::ToolResult,
     tool::{Tool, ToolDef},
     tool_args::parse_typed_projection,
@@ -1401,6 +1401,8 @@ fn type_text_blocking(
         } else {
             unsafe { crate::ax::readback_observer::ReadbackObserver::new(pid, element) }
         };
+        let readback_element =
+            unsafe { crate::ax::readback_observer::ReadbackElement::new(element) };
         let err = unsafe { set_string_attr(element, "AXSelectedText", text) };
         let returned_at = std::time::Instant::now();
         // Gecko updates AXValue asynchronously after an AXSelectedText write.
@@ -1409,8 +1411,8 @@ fn type_text_blocking(
         let (ax_progress, measurement) = await_readback(
             err == kAXErrorSuccess,
             ax_readback_timeout,
-            || {
-                let after = unsafe { copy_string_attr(element, "AXValue") };
+            |remaining| {
+                let after = readback_element.as_ref().and_then(|el| el.value(remaining));
                 typed_progress(before.as_deref(), after.as_deref(), text)
             },
             |progress| {
@@ -1482,7 +1484,7 @@ fn type_text_blocking(
         TextDeliveryRoute::UnicodeSynthesis,
         text.chars().count(),
         delay_ms,
-        ax_readback_timeout.as_millis() as u64,
+        readback_budget(ax_readback_timeout).as_millis() as u64,
     ) {
         return Ok(TypeTextDelivery::SynthesisRefused {
             path: PATH_KEY_EVENTS,
@@ -1550,6 +1552,9 @@ mod tests {
         assert_eq!(refusal.max_chunk_chars, 6_109);
         assert!(synthesis_preflight_with_ax_wait(route, refusal.max_chunk_chars, 0, 250).is_none());
         assert!(synthesis_preflight_with_ax_wait(route, 6_125, 0, 0).is_none());
+        let immediate_ms = readback_budget(std::time::Duration::ZERO).as_millis() as u64;
+        let refusal = synthesis_preflight_with_ax_wait(route, 6_125, 0, immediate_ms).unwrap();
+        assert_eq!(refusal.estimated_duration_ms, 100_005);
     }
 
     /// A semantic-only policy must refuse the terminal short-circuit before
