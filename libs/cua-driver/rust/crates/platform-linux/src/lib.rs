@@ -233,11 +233,19 @@ pub fn register_tools_with_cursor(cfg: cursor_overlay::CursorConfig, compat: boo
 
 pub fn register_tools_with_cursor_and_provider(
     provider: Option<std::sync::Arc<dyn cua_driver_core::consent::ProtectedConsentProvider>>,
-    cfg: cursor_overlay::CursorConfig,
+    mut cfg: cursor_overlay::CursorConfig,
     compat: bool,
 ) -> ToolRegistry {
     #[cfg(target_os = "linux")]
     wayland::ensure_nested_session();
+    if !cfg.motion.glide_duration_explicit {
+        cfg.motion.glide_duration_ms = pip_preview::read_config_value(
+            cua_driver_core::agent_cursor::GLIDE_DURATION_CONFIG_KEY,
+        )
+        .as_ref()
+        .and_then(|v| cua_driver_core::agent_cursor::parse_glide_duration(v).ok())
+        .unwrap_or(0.0);
+    }
     #[cfg(target_os = "linux")]
     wayland::overlay::set_config(cfg.clone());
     if cfg.enabled {

@@ -7410,9 +7410,7 @@ impl Tool for PressKeyTool {
                 && is_enter_key(&key_for_task)
                 && inject_terminal_input(pid, xid, "\n")?
             {
-                if inject_terminal_input(pid, xid, "\n")? {
-                    return Ok(());
-                }
+                return Ok(());
             }
             let m: Vec<&str> = mods.iter().map(String::as_str).collect();
             // foreground: activate the window first, then inject a REAL key via
@@ -11655,6 +11653,11 @@ impl Tool for SetConfigTool {
         let mut cfg = self.state.config.write().unwrap();
         let mut parts = Vec::new();
         if let Some(glide) = glide {
+            if let Err(error) = crate::overlay::set_default_glide_duration(None, glide) {
+                return ToolResult::error(error.to_string()).with_structured(json!({
+                    "code": "cursor_overlay_unavailable",
+                }));
+            }
             cfg.agent_cursor_glide_duration_ms = glide;
             if let Err(e) = pip_preview::write_config_key(
                 cua_driver_core::agent_cursor::GLIDE_DURATION_CONFIG_KEY,
@@ -11662,7 +11665,6 @@ impl Tool for SetConfigTool {
             ) {
                 tracing::warn!("set_config: failed to persist agent_cursor_glide_duration_ms: {e}");
             }
-            crate::overlay::set_default_glide_duration(None, glide);
             parts.push(format!("agent_cursor_glide_duration_ms={glide}"));
         }
         // {key, value} shape (what the Swift/macOS and Windows callers send).

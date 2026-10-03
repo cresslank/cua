@@ -201,8 +201,9 @@ fn unknown_argument(def: &ToolDef, args: &Value) -> Option<String> {
     args.as_object()?
         .keys()
         .find(|name| {
-            // Fork compatibility shim: Hermes sends both fields; shared token
-            // resolution cross-checks the legacy index against the token.
+            // Fork compatibility shim: Hermes sends both fields. Dispatch
+            // validates the pair before any platform can take a pixel path;
+            // snapshot resolution still proves the token's live identity.
             let paired_index = name.as_str() == "element_index"
                 && properties.is_some_and(|p| p.contains_key("element_token"))
                 && args.get("element_token").and_then(Value::as_str).is_some();
@@ -1448,6 +1449,37 @@ impl ToolRegistry {
                 } else {
                     format!("{resolved_name}: unknown argument {name}")
                 },
+            );
+        }
+
+        if args.get("element_index").is_some()
+            && tool.def().input_schema["properties"]
+                .get("element_token")
+                .is_some()
+        {
+            let Some((_, index)) = args
+                .get("element_token")
+                .and_then(Value::as_str)
+                .and_then(crate::element_token::parse_token)
+            else {
+                return crate::element_token::refusal(
+                    "invalid_element_token",
+                    "element_token has invalid format".into(),
+                );
+            };
+            if let Err(refusal) = crate::element_token::cross_check_legacy_index(&args, index) {
+                return refusal;
+            }
+        }
+        // A desktop target has no snapshot-owning process/window. Refuse
+        // element fields rather than letting a pixel branch ignore them.
+        if crate::action_target::supports_typed_target(resolved_name)
+            && args.get("scope").and_then(Value::as_str) == Some("desktop")
+            && (args.get("element_token").is_some() || args.get("element_index").is_some())
+        {
+            return crate::element_token::refusal(
+                "conflicting_element_target",
+                "desktop targets cannot resolve element_token; use a window target".into(),
             );
         }
 

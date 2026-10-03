@@ -292,15 +292,7 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
     outcome.applied_key().cloned()
 }
 
-pub fn init(mut cfg: CursorConfig) {
-    if !cfg.motion.glide_duration_explicit {
-        cfg.motion.glide_duration_ms = pip_preview::read_config_value(
-            cua_driver_core::agent_cursor::GLIDE_DURATION_CONFIG_KEY,
-        )
-        .as_ref()
-        .and_then(|v| cua_driver_core::agent_cursor::parse_glide_duration(v).ok())
-        .unwrap_or(0.0);
-    }
+pub fn init(cfg: CursorConfig) {
     static INITIALIZED: OnceLock<()> = OnceLock::new();
     INITIALIZED.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel(4096);
@@ -783,10 +775,15 @@ pub fn current_motion_for(key: &str) -> cursor_overlay::MotionConfig {
 }
 
 /// Update config defaults without overriding explicit per-session motion.
-pub fn set_default_glide_duration(session: Option<&str>, value: f64) {
+pub fn set_default_glide_duration(session: Option<&str>, value: f64) -> anyhow::Result<()> {
+    #[cfg(target_os = "linux")]
+    if crate::wayland::is_wayland() {
+        crate::wayland::overlay::set_default_glide_duration(session, value)?;
+    }
     if let Some(map) = RENDER.lock().unwrap().as_mut() {
         map.set_default_glide_duration(session, value);
     }
+    Ok(())
 }
 
 pub fn current_theme_state_for(

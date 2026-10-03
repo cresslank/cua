@@ -165,40 +165,41 @@ fn clearing_one_runtime_preserves_other_runtime_same_window() {
 
 #[test]
 fn token_resolution_cannot_be_retargeted_by_cache_replacement() {
-    with_runtime_scope(
-        format!("snapshot-invariant-{}", uuid::Uuid::new_v4()),
-        || {
-            let cache = SnapshotStore::new();
-            let snapshot = cache.publish(
-                std::process::id() as i32,
-                7,
-                payload(vec!["original-target"]),
-            );
-            let (resolved_tx, resolved_rx) = mpsc::channel();
-            let (replaced_tx, replaced_rx) = mpsc::channel();
-            let observed = std::thread::scope(|threads| {
-                let cache = &cache;
-                let action = threads.spawn(move || {
-                    let target = resolve(cache, snapshot, 0);
+    let scope = format!("snapshot-invariant-{}", uuid::Uuid::new_v4());
+    with_runtime_scope(scope.clone(), || {
+        let cache = SnapshotStore::new();
+        let snapshot = cache.publish(
+            std::process::id() as i32,
+            7,
+            payload(vec!["original-target"]),
+        );
+        let (resolved_tx, resolved_rx) = mpsc::channel();
+        let (replaced_tx, replaced_rx) = mpsc::channel();
+        let observed = std::thread::scope(|threads| {
+            let cache = &cache;
+            let action = threads.spawn(move || {
+                with_runtime_scope(scope, || {
+                    let (_, _, target) = resolve(cache, snapshot, 0)
+                        .expect("original target must resolve before replacement");
                     resolved_tx.send(()).unwrap();
                     replaced_rx.recv().unwrap();
-                    target.ok().map(|(_, _, element)| element)
-                });
-                resolved_rx.recv().unwrap();
-                cache.publish(
-                    std::process::id() as i32,
-                    7,
-                    payload(vec!["replacement-target"]),
-                );
-                replaced_tx.send(()).unwrap();
-                action.join().unwrap()
+                    target
+                })
             });
-            assert!(
-                observed.is_none() || observed == Some("original-target"),
-                "resolved identity was combined with another payload: {observed:?}"
+            resolved_rx.recv().unwrap();
+            cache.publish(
+                std::process::id() as i32,
+                7,
+                payload(vec!["replacement-target"]),
             );
-        },
-    );
+            replaced_tx.send(()).unwrap();
+            action.join().unwrap()
+        });
+        assert_eq!(
+            observed, "original-target",
+            "resolved identity was combined with another payload: {observed:?}"
+        );
+    });
 }
 
 #[test]

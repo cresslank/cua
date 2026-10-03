@@ -242,6 +242,95 @@ impl Tool for ConfigCall {
 }
 
 #[tokio::test]
+async fn element_fields_are_refused_before_a_platform_can_bypass_resolution() {
+    let seen = Arc::new(std::sync::Mutex::new(Value::Null));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(ConfigCall {
+        def: ToolDef {
+            name: "click".into(),
+            description: "pixel branch that does not resolve tokens".into(),
+            input_schema: json!({"type":"object", "properties": {
+                "element_token": {"type":"string"},
+                "scope": {"type":"string"},
+                "x": {"type":"number"}, "y": {"type":"number"},
+                "delivery_mode": {"type":"string"}
+            }, "additionalProperties":false}),
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+        },
+        seen: seen.clone(),
+    }));
+    let registry = Arc::new(registry);
+    registry.init_self_weak();
+    let context = unrestricted_context();
+    for target in [
+        json!({}),
+        json!({"scope":"desktop"}),
+        json!({"target":{"kind":"desktop", "display_id":"primary"}}),
+    ] {
+        for (fields, expected) in [
+            (
+                json!({"element_token":"s00000001:1", "element_index":0}),
+                "stale_element_token",
+            ),
+            (
+                json!({"element_token":"s00000001:1", "element_index":"1"}),
+                "stale_element_token",
+            ),
+            (
+                json!({"element_token":"malformed", "element_index":1}),
+                "invalid_element_token",
+            ),
+            (
+                json!({"element_token":"s00000001:1", "element_index":1}),
+                "conflicting_element_target",
+            ),
+            (
+                json!({"element_token":"s00000001:1"}),
+                "conflicting_element_target",
+            ),
+        ] {
+            if target == json!({}) && expected == "conflicting_element_target" {
+                continue; // Window actions resolve current identity in the snapshot store.
+            }
+            let mut args = json!({"x":10, "y":20, "delivery_mode":"foreground"});
+            args.as_object_mut()
+                .unwrap()
+                .extend(target.as_object().unwrap().clone());
+            args.as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let result = registry
+                .invoke_with_context("click", args.clone(), context.clone())
+                .await;
+            assert_eq!(result.is_error, Some(true), "{args}: {result:?}");
+            assert_eq!(
+                result.structured_content.unwrap()["refusal"]["code"],
+                expected,
+                "{args}"
+            );
+            assert_eq!(
+                *seen.lock().unwrap(),
+                Value::Null,
+                "refused call reached platform"
+            );
+        }
+    }
+    // Ordinary desktop pixels still reach the implementation.
+    let result = registry
+        .invoke_with_context(
+            "click",
+            json!({"scope":"desktop", "x":10, "y":20, "delivery_mode":"foreground"}),
+            context,
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_ne!(*seen.lock().unwrap(), Value::Null);
+}
+
+#[tokio::test]
 async fn anonymous_config_scope_survives_lifecycle_stamping_but_cannot_be_forged() {
     use cua_driver_core::tool::TrustedInvocationEvidence;
     let seen = Arc::new(std::sync::Mutex::new(json!({})));

@@ -3711,8 +3711,9 @@ impl ClickTool {
                         if !retained.is_uia() {
                             anyhow::bail!("element [{idx}] is not a UIA element");
                         }
-                        let element =
-                            unsafe { IUIAutomationElement::from_raw(retained.as_ptr() as *mut _) };
+                        let element = std::mem::ManuallyDrop::new(unsafe {
+                            IUIAutomationElement::from_raw(retained.as_ptr() as *mut _)
+                        });
                         let pattern = unsafe {
                             element
                                 .GetCurrentPattern(UIA_ExpandCollapsePatternId)
@@ -3731,7 +3732,6 @@ impl ClickTool {
                                 unsafe { pattern.Expand() }.map_err(anyhow::Error::from)
                             },
                         );
-                        std::mem::forget(element);
                         result.map_err(|error| {
                             anyhow::anyhow!("ExpandCollapse.Expand failed: {error}")
                         })
@@ -6210,8 +6210,9 @@ impl Tool for SetValueTool {
                 use windows::Win32::UI::Accessibility::{
                     IUIAutomationElement, IUIAutomationValuePattern, UIA_ValuePatternId,
                 };
-                let elem: IUIAutomationElement =
-                    unsafe { IUIAutomationElement::from_raw(ptr as *mut _) };
+                let elem = std::mem::ManuallyDrop::new(unsafe {
+                    IUIAutomationElement::from_raw(ptr as *mut _)
+                });
                 // Try ValuePattern first (text inputs, editable combos, etc).
                 // The SetValue is shielded by the EnableWindow bypass: a
                 // Chromium/Electron (or XAML) SetValue handler self-foregrounds via
@@ -6230,7 +6231,6 @@ impl Tool for SetValueTool {
                             },
                         );
                         if set.is_ok() {
-                            std::mem::forget(elem);
                             return Ok("ValuePattern".to_string());
                         }
                     }
@@ -6258,11 +6258,9 @@ impl Tool for SetValueTool {
                                 unsafe { rv.SetValue(parsed) }.map_err(anyhow::Error::from)
                             },
                         )?;
-                        std::mem::forget(elem);
                         return Ok("RangeValuePattern".to_string());
                     }
                 }
-                std::mem::forget(elem);
                 anyhow::bail!(
                     "set_value: element [{idx}] does not implement ValuePattern or \
                  RangeValuePattern. For controls with TogglePattern (CheckBox) or \

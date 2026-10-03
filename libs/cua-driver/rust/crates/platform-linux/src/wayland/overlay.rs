@@ -58,7 +58,14 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 /// SetPressed) are forwarded as-is so the layer-shell overlay matches the
 /// X11 visual: bloom + animated arrow + click pulse + press ring.
 enum WlOverlayCmd {
-    Cmd { key: CursorKey, cmd: OverlayCommand },
+    Cmd {
+        key: CursorKey,
+        cmd: OverlayCommand,
+    },
+    SetDefaultGlideDuration {
+        session: Option<CursorKey>,
+        value: f64,
+    },
     Remove(CursorKey),
     Revive(CursorKey),
     Shutdown,
@@ -107,6 +114,24 @@ pub fn available() -> bool {
 pub fn set_config(config: CursorConfig) {
     CONFIG_ENABLED.store(config.enabled, Ordering::Release);
     let _ = CONFIG_TEMPLATE.set(config);
+}
+
+/// Queue defaults with cursor/lifecycle commands, including before the first
+/// positioned cursor starts the compositor connection. The shared render map
+/// preserves explicit motion overrides and remembers defaults for future keys.
+pub fn set_default_glide_duration(session: Option<&str>, value: f64) -> anyhow::Result<()> {
+    if ensure_started() {
+        if let Some(tx) = tx() {
+            // A stalled compositor must not block a config call. Report
+            // failed admission instead of silently losing the new default.
+            tx.try_send(WlOverlayCmd::SetDefaultGlideDuration {
+                session: session.map(str::to_owned),
+                value,
+            })
+            .map_err(|error| anyhow::anyhow!("Wayland cursor config queue unavailable: {error}"))?;
+        }
+    }
+    Ok(())
 }
 
 fn tx() -> Option<&'static Sender<WlOverlayCmd>> {
@@ -556,6 +581,11 @@ fn wait_for_renderer_command(
     while let Ok(command) = rx.recv() {
         match command {
             WlOverlayCmd::Shutdown => return None,
+            WlOverlayCmd::SetDefaultGlideDuration { session, value } => {
+                state
+                    .render
+                    .set_default_glide_duration(session.as_deref(), value);
+            }
             WlOverlayCmd::Remove(key) => {
                 remove_keyed_core(&mut state.render, key);
             }
@@ -680,6 +710,11 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
                 Ok(WlOverlayCmd::Shutdown) => {
                     shutdown = true;
                     break;
+                }
+                Ok(WlOverlayCmd::SetDefaultGlideDuration { session, value }) => {
+                    state
+                        .render
+                        .set_default_glide_duration(session.as_deref(), value);
                 }
                 Ok(WlOverlayCmd::Cmd { key, cmd }) => {
                     dirty |= apply_keyed_command(&mut state.render, frame, key, cmd);
@@ -1717,6 +1752,53 @@ mod tests {
                 heading_radians: None,
             },
         }
+    }
+
+    #[test]
+    fn cold_glide_defaults_reach_the_owner_without_connecting_to_the_compositor() {
+        let (tx, rx) = bounded(8);
+        let mut cfg = CursorConfig::default();
+        cfg.motion.glide_duration_ms = 120.0;
+        let mut state = OverlayState::new(cfg);
+        assert_eq!(
+            state.render.motion_for_key("future").glide_duration_ms,
+            120.0
+        );
+        state.render.cursor_mut("existing").unwrap();
+        let mut explicit = state.render.motion_for_key("explicit");
+        explicit.glide_duration_explicit = true;
+        explicit.glide_duration_ms = 40.0;
+        tx.send(WlOverlayCmd::Cmd {
+            key: "explicit".into(),
+            cmd: OverlayCommand::SetMotion(explicit),
+        })
+        .unwrap();
+        for (session, value) in [(Some("scoped"), 250.0), (None, 300.0)] {
+            tx.send(WlOverlayCmd::SetDefaultGlideDuration {
+                session: session.map(str::to_owned),
+                value,
+            })
+            .unwrap();
+        }
+        tx.send(WlOverlayCmd::Shutdown).unwrap();
+        assert!(wait_for_renderer_command(&rx, &mut state).is_none());
+        assert_eq!(
+            state.render.motion_for_key("existing").glide_duration_ms,
+            300.0
+        );
+        assert_eq!(
+            state.render.motion_for_key("future").glide_duration_ms,
+            300.0
+        );
+        assert_eq!(
+            state.render.motion_for_key("scoped").glide_duration_ms,
+            250.0
+        );
+        assert_eq!(
+            state.render.motion_for_key("explicit").glide_duration_ms,
+            40.0
+        );
+        assert!(state.outputs.is_empty());
     }
 
     #[test]
