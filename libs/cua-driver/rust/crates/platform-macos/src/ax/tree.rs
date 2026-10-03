@@ -17,6 +17,7 @@
 
 use super::bindings::*;
 use super::launch::{is_still_launching, LaunchStep, LaunchWait};
+use super::row_collapse::collapse_offscreen_rows;
 use super::window_scope::{decide_window_scope, ScopeDecision, TopLevelCandidate, WindowScope};
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef, TCFType};
 use cua_driver_core::walk_budget::{WalkBudget, WalkOutcome};
@@ -146,6 +147,8 @@ pub struct TreeWalkResult {
     pub truncated: bool,
     /// Why and where the walk stopped (see [`cua_driver_core::walk_budget`]).
     pub walk: WalkOutcome,
+    /// Rows reported as neither visible nor selected, left unread.
+    pub collapsed_rows: usize,
     /// Whether the requested `window_id` actually resolved to an AX surface,
     /// and if not, why. `None` when no `window_id` was requested.
     ///
@@ -219,6 +222,7 @@ pub fn walk_tree_budgeted(
     let mut nodes: Vec<AXNode> = Vec::new();
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
     let mut index_counter = 0usize;
+    let mut collapsed_rows = 0usize;
     let mut window_scope: Option<WindowScope> = None;
 
     unsafe {
@@ -229,6 +233,7 @@ pub fn walk_tree_budgeted(
                 nodes,
                 truncated: false,
                 walk: budget.outcome(),
+                collapsed_rows: 0,
                 // No application AX element at all, so a requested window
                 // certainly did not resolve.
                 window_scope: window_id.map(|_| WindowScope::AxUnresolved { ax_window_count: 0 }),
@@ -300,6 +305,7 @@ pub fn walk_tree_budgeted(
                 &mut lines,
                 &mut index_counter,
                 &mut budget,
+                &mut collapsed_rows,
                 max_depth,
             );
         }
@@ -323,11 +329,21 @@ pub fn walk_tree_budgeted(
         tree_markdown.push_str(&note);
     }
 
+    if collapsed_rows > 0 {
+        tree_markdown.push_str(&format!(
+            "\n{} row(s) are scrolled out of view and were not read. \
+             Scroll, or use the window's own search, to bring a row into view \
+             before acting on it.",
+            collapsed_rows
+        ));
+    }
+
     TreeWalkResult {
         tree_markdown,
         nodes,
         truncated: walk.truncated(),
         walk,
+        collapsed_rows,
         window_scope,
     }
 }
@@ -397,10 +413,64 @@ unsafe fn scope_top_level(top_level: &[AXUIElementRef], pid: i32, wid: u32) -> S
     })
 }
 
-/// Release elements retained by [`copy_top_level`].
-unsafe fn release_all(elements: Vec<AXUIElementRef>) {
-    for element in elements {
-        CFRelease(element as CFTypeRef);
+// Adapted from #3787 (Will Bogusz): filter before any child attribute read.
+// Keep the fork's batch-owned child retains and snapshot-local index assignment;
+// never project or compact an already indexed snapshot here.
+#[allow(clippy::too_many_arguments)]
+unsafe fn walk_children(
+    element: AXUIElementRef,
+    role: &str,
+    reader: NodeAttributeReader,
+    mut attrs: NodeAttrs,
+    child_depth: usize,
+    parent_index: Option<usize>,
+    in_web_content: bool,
+    nodes: &mut Vec<AXNode>,
+    lines: &mut Vec<(usize, String)>,
+    counter: &mut usize,
+    budget: &mut WalkBudget,
+    collapsed_rows: &mut usize,
+    max_depth: usize,
+) {
+    if child_depth > max_depth {
+        return;
+    }
+    let collapsed = collapse_offscreen_rows(element, role, budget);
+    if budget.expired() {
+        budget.stop_for_timeout();
+        return;
+    }
+    reader.read(&mut attrs, NodeRead::Children);
+    let children = std::mem::take(&mut attrs.children);
+    drop(reader); // Children own their retains, independently of the batch.
+    for child in children {
+        let child_ptr = child.as_CFTypeRef() as AXUIElementRef;
+        if collapsed.as_ref().is_some_and(|rows| rows.hides(child_ptr)) {
+            continue;
+        }
+        walk_element(
+            child_ptr,
+            child_depth,
+            parent_index,
+            in_web_content,
+            nodes,
+            lines,
+            counter,
+            budget,
+            collapsed_rows,
+            max_depth,
+        );
+    }
+    if let Some(rows) = collapsed {
+        *collapsed_rows += rows.count();
+        lines.push((
+            child_depth,
+            format!(
+                "- {} of {} rows are scrolled out of view and were not read",
+                rows.count(),
+                rows.total()
+            ),
+        ));
     }
 }
 
@@ -414,6 +484,7 @@ unsafe fn walk_element(
     lines: &mut Vec<(usize, String)>,
     counter: &mut usize,
     budget: &mut WalkBudget,
+    collapsed_rows: &mut usize,
     max_depth: usize,
 ) {
     if depth > max_depth {
@@ -441,22 +512,21 @@ unsafe fn walk_element(
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
-        reader.read(&mut attrs, NodeRead::Children);
-        let children = std::mem::take(&mut attrs.children);
-        drop(reader); // Children own their retains; release the prefetched slots.
-        for child in children {
-            walk_element(
-                child.as_CFTypeRef() as AXUIElementRef,
-                depth,
-                parent_index,
-                in_web_content,
-                nodes,
-                lines,
-                counter,
-                budget,
-                max_depth,
-            );
-        }
+        walk_children(
+            element,
+            &role,
+            reader,
+            attrs,
+            depth,
+            parent_index,
+            in_web_content,
+            nodes,
+            lines,
+            counter,
+            budget,
+            collapsed_rows,
+            max_depth,
+        );
         return;
     }
 
@@ -502,22 +572,21 @@ unsafe fn walk_element(
     let is_actionable = is_addressable(!actions.is_empty(), value_settable, enabled);
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
-        reader.read(&mut attrs, NodeRead::Children);
-        let children = std::mem::take(&mut attrs.children);
-        drop(reader); // Children own their retains; release the prefetched slots.
-        for child in children {
-            walk_element(
-                child.as_CFTypeRef() as AXUIElementRef,
-                depth + 1,
-                parent_index,
-                in_web_content,
-                nodes,
-                lines,
-                counter,
-                budget,
-                max_depth,
-            );
-        }
+        walk_children(
+            element,
+            &role,
+            reader,
+            attrs,
+            depth + 1,
+            parent_index,
+            in_web_content,
+            nodes,
+            lines,
+            counter,
+            budget,
+            collapsed_rows,
+            max_depth,
+        );
         return;
     }
 
@@ -626,22 +695,21 @@ unsafe fn walk_element(
     lines.push((depth, line));
     nodes.push(node);
 
-    reader.read(&mut attrs, NodeRead::Children);
-    let children = std::mem::take(&mut attrs.children);
-    drop(reader);
-    for child in children {
-        walk_element(
-            child.as_CFTypeRef() as AXUIElementRef,
-            depth + 1,
-            next_parent,
-            in_web_content,
-            nodes,
-            lines,
-            counter,
-            budget,
-            max_depth,
-        );
-    }
+    walk_children(
+        element,
+        &role,
+        reader,
+        attrs,
+        depth + 1,
+        next_parent,
+        in_web_content,
+        nodes,
+        lines,
+        counter,
+        budget,
+        collapsed_rows,
+        max_depth,
+    );
 }
 
 fn is_web_content_role(role: &str) -> bool {

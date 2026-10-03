@@ -296,6 +296,8 @@ pub struct WindowStateOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elements_complete: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collapsed_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub degraded_reason: Option<String>,
@@ -413,6 +415,42 @@ mod tests {
             assert!(output.elements.is_some());
             output.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn collapsed_rows_is_optional_and_round_trips_without_changing_other_counts() {
+        let old: WindowStateOutput =
+            serde_json::from_value(json!({"pid":7,"window_id":9})).unwrap();
+        let schema = WindowStateOutput::output_schema();
+        assert_eq!(
+            schema["properties"]["collapsed_rows"],
+            json!({
+                "minimum": 0, "type": ["integer", "null"]
+            })
+        );
+        assert!(!schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("collapsed_rows")));
+        assert_eq!(old.collapsed_rows, None);
+        assert!(serde_json::to_value(old)
+            .unwrap()
+            .get("collapsed_rows")
+            .is_none());
+        for count in [0, 648] {
+            let value = json!({
+                "pid":7,"window_id":9,"collapsed_rows":count,
+                "elements_complete":false,"total_element_count":19,
+                "returned_element_count":3
+            });
+            let output: WindowStateOutput = serde_json::from_value(value.clone()).unwrap();
+            output.validate().unwrap();
+            assert_eq!(serde_json::to_value(output).unwrap(), value);
+        }
+        assert!(serde_json::from_value::<WindowStateOutput>(
+            json!({"pid":7,"window_id":9,"collapsed_rows":-1})
+        )
+        .is_err());
     }
 
     #[test]
