@@ -1329,36 +1329,41 @@ impl Tool for GetWindowStateTool {
                 );
             }
         };
-        // Validate window belongs to pid — Swift's hard error.
-        let windows_for_pid =
-            cua_driver_core::blocking::spawn(move || crate::win32::list_windows(Some(pid)))
-                .await
-                .unwrap_or_default();
-        if !windows_for_pid.iter().any(|w| w.hwnd == hwnd) {
-            // Check if the window exists under a different pid.
-            let all = cua_driver_core::blocking::spawn(|| crate::win32::list_windows(None))
-                .await
-                .unwrap_or_default();
-            if let Some(w) = all.iter().find(|w| w.hwnd == hwnd) {
+        // Validate window belongs to pid — Swift's hard error. The exact HWND is
+        // probed through Win32 first; the desktop-wide UIA union (2 s deadline)
+        // is consulted only on a miss (upstream PR #4505). Keep native admission bounded.
+        use crate::win32::PidWindowLookup;
+        let lookup = cua_driver_core::blocking::spawn(move || {
+            crate::win32::lookup_window_for_pid(pid, hwnd)
+        })
+        .await
+        .unwrap_or(PidWindowLookup::Missing);
+        let window = match lookup {
+            PidWindowLookup::Found(window) => window,
+            PidWindowLookup::OtherPid(owner) => {
                 return ToolResult::error(format!(
-                    "window_id {hwnd} belongs to pid {}, not pid {pid}. Call \
-                     `list_windows({{\"pid\": {pid}}})` to get this pid's own windows.",
-                    w.pid
+                    "window_id {hwnd} belongs to pid {owner}, not pid {pid}. Call \
+                     `list_windows({{\"pid\": {pid}}})` to get this pid's own windows."
                 ));
             }
-            return ToolResult::error(format!(
-                "No window with window_id {hwnd} exists. Call `list_windows({{\"pid\": \
-                 {pid}}})` for candidates."
-            ));
-        }
+            PidWindowLookup::Missing => {
+                return ToolResult::error(format!(
+                    "No window with window_id {hwnd} exists. Call `list_windows({{\"pid\": \
+                     {pid}}})` for candidates."
+                ));
+            }
+        };
         // Window identity metadata (additive): title + on-screen rectangle from
-        // the enumeration we already did, plus the owning process's executable
+        // the lookup we already did, plus the owning process's executable
         // name. Names the surface on the capture-only path, where no UIA tree
         // identifies it.
-        let win_geom = windows_for_pid
-            .iter()
-            .find(|w| w.hwnd == hwnd)
-            .map(|w| (w.title.clone(), w.x, w.y, w.width, w.height));
+        let win_geom = Some((
+            window.title.clone(),
+            window.x,
+            window.y,
+            window.width,
+            window.height,
+        ));
         let app_name = cua_driver_core::blocking::spawn(move || {
             crate::win32::list_processes()
                 .into_iter()
@@ -2785,10 +2790,11 @@ impl Tool for LaunchAppTool {
             if !windows_json.is_empty() {
                 break;
             }
-            let wins =
-                cua_driver_core::blocking::spawn(move || crate::win32::list_windows(Some(pid)))
-                    .await
-                    .unwrap_or_default();
+            let wins = cua_driver_core::blocking::spawn(move || {
+                crate::win32::list_windows_win32_first(pid)
+            })
+            .await
+            .unwrap_or_default();
             if !wins.is_empty() {
                 let window_count = wins.len();
                 windows_json = wins.iter().enumerate().map(|(position, w)| json!({
@@ -2846,7 +2852,7 @@ impl Tool for LaunchAppTool {
                     for _ in 0..max_candidate_attempts {
                         total_attempts += 1;
                         let wins = cua_driver_core::blocking::spawn(move || {
-                            crate::win32::list_windows(Some(candidate_pid))
+                            crate::win32::list_windows_win32_first(candidate_pid)
                         })
                         .await
                         .unwrap_or_default();

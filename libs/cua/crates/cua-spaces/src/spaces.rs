@@ -527,6 +527,13 @@ pub(crate) fn relay_info(m: &crate::relay::RelayMachine) -> SpaceInfo {
             .cloned()
             .unwrap_or_default(),
         cloud_delete: String::new(),
+        status: if !m.online {
+            "offline".into()
+        } else if !m.sharing {
+            "not sharing".into()
+        } else {
+            String::new()
+        },
     }
 }
 
@@ -610,7 +617,7 @@ pub(crate) struct Inner {
     #[cfg(feature = "spaces-agents")]
     relay: std::sync::RwLock<Option<crate::relay::RelayAccount>>,
     /// The last directory listing (so `list` and `resolve` stay sync).
-    relay_cache: std::sync::Mutex<Vec<crate::relay::RelayMachine>>,
+    pub(crate) relay_cache: std::sync::Mutex<Vec<crate::relay::RelayMachine>>,
     /// The Keyvault broker `request_site_login` signs in through (the
     /// daemon sets it once its Keyvault is up).
     site_login: std::sync::RwLock<Option<Arc<dyn crate::site_login::SiteLoginBroker>>>,
@@ -757,6 +764,18 @@ impl Spaces {
     }
 
     // --------------------------------------------------------------- relay
+
+    /// This install's relay machine id (`cua host setup` in relay mode),
+    /// when it has one: the relay listing's entry for this machine itself
+    /// (apps show it in its own place, not among "your machines").
+    pub fn this_relay_machine_id(&self) -> Option<String> {
+        cua_host::Host::new(self.home_dir())
+            .config()
+            .ok()
+            .flatten()
+            .and_then(|c| c.machine_id)
+            .filter(|id| !id.is_empty())
+    }
 
     /// The relay account, when configured.
     pub fn relay_account(&self) -> Option<crate::relay::RelayAccount> {
@@ -963,6 +982,23 @@ impl Spaces {
         let id = self.resolve(space)?;
         let info = self.info(&id).ok();
         self.drop_connection(&id).await;
+        // A Space that registered itself on the relay and is gone (its
+        // machine is not connected) leaves the relay directory: otherwise
+        // its stale record would list again on the next refresh. Only its
+        // owner can remove it; anything else is only dropped here.
+        if let SpaceId::Relay { machine_id } = &id
+            && self.relay_account().is_some()
+            && let Some(m) = self
+                .relay_machines()
+                .await
+                .ok()
+                .and_then(|all| all.into_iter().find(|m| &m.id == machine_id))
+            && m.role == "owner"
+            && !m.online
+            && crate::relay::is_registered_space(&m)
+        {
+            self.forget_relay_machine(machine_id).await?;
+        }
         // A direct host, or a Space one created, leaves the direct-host list.
         if matches!(id, SpaceId::Direct { .. }) {
             let _ = self.inner.registry.forget_direct(&id.to_string());
@@ -993,6 +1029,7 @@ impl Spaces {
             cloud: String::new(),
             cloud_place: String::new(),
             cloud_delete: String::new(),
+            status: String::new(),
         }))
     }
 
@@ -1332,6 +1369,24 @@ impl Spaces {
                 Err(cua_spacesd_client::Error::SpacesdNotAvailable { reason, .. }) => {
                     let generic_ok = matches!(id, SpaceId::Local { .. } | SpaceId::Cloud { .. })
                         || !services.is_empty();
+                    if let SpaceId::Relay { machine_id } = &id
+                        && crate::host_spaces::is_stopped_sharing(&reason)
+                    {
+                        // Not a missing driver: its owner stopped sharing it.
+                        let named = name.filter(|n| !n.is_empty()).map(str::to_string);
+                        let label = named.or_else(|| {
+                            self.inner
+                                .relay_cache
+                                .lock()
+                                .expect("relay cache")
+                                .iter()
+                                .find(|m| &m.id == machine_id && !m.name.is_empty())
+                                .map(|m| m.name.clone())
+                        });
+                        return Err(crate::host_spaces::stopped_sharing(
+                            label.as_deref().unwrap_or(&id.to_string()),
+                        ));
+                    }
                     if !generic_ok {
                         return Err(Error::SpacesdNotAvailable {
                             space: id.to_string(),
@@ -2299,9 +2354,32 @@ impl Spaces {
     /// Deletes a Space's sandbox and forgets it: a cloud Space's sandbox is
     /// deleted (metering stops), a local one's instance is deleted. A Space
     /// added by address (`direct:`, `relay:`) is only forgotten: cua did not
-    /// create it. Hotspots on it stop.
+    /// create it. Hotspots on it stop. A Space that registered itself on
+    /// the relay (`relay_register`, or a share) leaves the relay directory
+    /// with it, and deleting such a Space's `relay:<machine>` removes that
+    /// record (as its owner) even when the Space itself is already gone.
     pub async fn delete(&self, space: &str) -> Result<String> {
         let id = self.resolve(space)?;
+        // A Space added by address keeps running: if it is attached to the
+        // relay, its driver is asked to leave while it is still reachable.
+        #[cfg(feature = "spaces-agents")]
+        if matches!(id, SpaceId::Direct { .. }) {
+            self.detach_attached_space(&id.to_string()).await;
+        }
+        let message = self.delete_space(&id).await?;
+        // A Space this device attached to the relay as a machine of its own
+        // takes that machine with it.
+        #[cfg(feature = "spaces-agents")]
+        if !matches!(id, SpaceId::Relay { .. })
+            && let Some(note) = self.release_attached(&id.to_string()).await
+        {
+            return Ok(format!("{message} Note: {note}."));
+        }
+        Ok(message)
+    }
+
+    async fn delete_space(&self, id: &SpaceId) -> Result<String> {
+        let id = id.clone();
         self.drop_connection(&id).await;
         self.inner.thumbnails.remove(&id.to_string());
         // A Space in your cloud: its sandbox goes, with everything the
@@ -2378,9 +2456,24 @@ impl Spaces {
                         let _ = self.relay_machines().await;
                         return Ok(message);
                     }
-                    None => format!(
-                        "Removed {id} (disconnected; the machine stays in your relay directory)."
-                    ),
+                    // A Space that registered itself as a machine of yours:
+                    // its record leaves the relay directory.
+                    None => match row {
+                        Some(m) if m.role == "owner" && crate::relay::is_registered_space(&m) => {
+                            self.forget_relay_machine(machine_id).await?;
+                            format!("Removed {id} from your relay directory.")
+                        }
+                        Some(m) if m.role != "owner" => format!(
+                            "Removed {id} (disconnected; it is shared with you, so only its \
+                             owner can remove it from the relay directory)."
+                        ),
+                        Some(_) => format!(
+                            "Removed {id} (disconnected; it is one of your machines, so it stays \
+                             in your relay directory: run `cua host remove` on it, or if that \
+                             machine is gone, `cua spaces relay-unregister {id}`)."
+                        ),
+                        None => format!("Removed {id} (disconnected)."),
+                    },
                 }
             }
         };
@@ -2390,7 +2483,7 @@ impl Spaces {
 
     /// The relay directory row of `machine_id` (cached, else refreshed);
     /// `None` without a relay account or when the relay does not list it.
-    async fn relay_row(&self, machine_id: &str) -> Option<crate::relay::RelayMachine> {
+    pub(crate) async fn relay_row(&self, machine_id: &str) -> Option<crate::relay::RelayMachine> {
         self.relay_account()?;
         let cached = self
             .inner
@@ -2437,14 +2530,37 @@ impl Spaces {
         {
             return Ok(t.clone());
         }
+        // A Space whose capture failed is not asked again until its
+        // backoff passes (a host that does not share its desktop refuses
+        // every capture; asking each refresh only fills its access log).
+        if let Some(f) = cache.backing_off(&id, std::time::Instant::now()) {
+            return cached.ok_or_else(|| thumbnail_failure(&f));
+        }
         match self.capture_thumbnail(&id).await {
             Ok(t) => Ok(t),
             Err(e) => cached.ok_or(e),
         }
     }
 
-    /// Captures and caches the Space's thumbnail now.
+    /// Captures and caches the Space's thumbnail now; a failure starts the
+    /// Space's backoff ([`crate::thumbnails::ThumbnailCache::fail`]).
     async fn capture_thumbnail(&self, id: &str) -> Result<crate::thumbnails::Thumbnail> {
+        let result = self.capture_thumbnail_once(id).await;
+        if let Err(e) = &result {
+            let denied = matches!(
+                e,
+                Error::Env(cua_spacesd_client::Error::PermissionDenied(_))
+                    | Error::Env(cua_spacesd_client::Error::FeatureUnsupported { .. })
+                    | Error::CapabilityMissing { .. }
+            );
+            self.inner
+                .thumbnails
+                .fail(id, std::time::Instant::now(), denied, e.to_string());
+        }
+        result
+    }
+
+    async fn capture_thumbnail_once(&self, id: &str) -> Result<crate::thumbnails::Thumbnail> {
         use crate::thumbnails::{MAX_DIMENSION, QUALITY, Thumbnail};
         let space = self.space(id).await?;
         let shot = space
@@ -2489,7 +2605,13 @@ impl Spaces {
         let mut captured = 0;
         for info in spaces {
             let off = matches!(info.power_state.as_str(), "suspended" | "stopped");
-            if off || info.spacesd_version.is_empty() || !cache.due(&info.id, now) {
+            if off
+                || info.spacesd_version.is_empty()
+                || !cache.due(&info.id, now)
+                || cache
+                    .backing_off(&info.id, std::time::Instant::now())
+                    .is_some()
+            {
                 continue;
             }
             match tokio::time::timeout(Duration::from_secs(10), self.capture_thumbnail(&info.id))
@@ -2782,6 +2904,21 @@ pub fn sized_pool_key(
         key["memory_mb"] = m.into();
     }
     format!("{image}\n{key}")
+}
+
+/// The error a thumbnail request gets while the Space's capture backs off
+/// (and nothing is cached).
+fn thumbnail_failure(f: &crate::thumbnails::CaptureFailure) -> Error {
+    let details = cua_spacesd_client::ErrorDetails {
+        code: if f.denied { 7 } else { 14 },
+        message: format!("{} (not retried for a while)", f.message),
+        metadata: Default::default(),
+    };
+    if f.denied {
+        Error::Env(cua_spacesd_client::Error::PermissionDenied(details))
+    } else {
+        Error::Env(cua_spacesd_client::Error::Transport(details.message))
+    }
 }
 
 #[cfg(test)]

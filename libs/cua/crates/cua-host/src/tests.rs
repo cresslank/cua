@@ -117,6 +117,45 @@ async fn relay_setup_registers_writes_policy_and_installs_the_service() {
     assert_eq!(status.online, Some(true));
     assert_eq!(status.clients.len(), 1);
 
+    // A relay client this machine logged only background probes and
+    // thumbnails from (an app polling it) is not connected now; one that
+    // opened something is.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let log = host.paths().access_log();
+    std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+    crate::access::write_log(
+        &log,
+        &[
+            (
+                now - 2_000,
+                "relay",
+                "friend@example.com (user-2)",
+                "SystemService/Health (background)",
+            ),
+            (
+                now - 1_000,
+                "relay",
+                "friend@example.com (user-2)",
+                "ComputerService/Screenshot (thumbnail)",
+            ),
+        ],
+    );
+    assert!(host.status().await.unwrap().clients.is_empty());
+    crate::access::write_log(
+        &log,
+        &[(
+            now - 1_000,
+            "relay",
+            "friend@example.com (user-2)",
+            "StreamService",
+        )],
+    );
+    assert_eq!(host.status().await.unwrap().clients.len(), 1);
+    std::fs::remove_file(&log).unwrap();
+
     // Stop sharing: relay cuts clients, policy refuses, service keeps running.
     let status = host.stop_sharing().await.unwrap();
     assert!(!status.sharing);
@@ -333,6 +372,35 @@ async fn status_shows_recent_access_and_who_is_connected_in_direct_mode() {
     let text = std::fs::read_to_string(host.paths().access_log()).unwrap();
     std::fs::write(host.paths().access_log(), text.replace("Bob", "Eve")).unwrap();
     assert!(host.status().await.unwrap().access_log_error.is_some());
+
+    // Background probes and thumbnails, however recent, are not a
+    // connection; they stay in the log.
+    crate::access::write_log(
+        &host.paths().access_log(),
+        &[
+            (
+                now - 9_000,
+                "relay",
+                "Mac mini (acct-1)",
+                "SystemService/Health (background)",
+            ),
+            (
+                now - 8_000,
+                "relay",
+                "Mac mini (acct-1)",
+                "ComputerService/Screenshot (thumbnail)",
+            ),
+            (
+                now - 7_000,
+                "token",
+                "token",
+                "SystemService/GetCapabilities (background)",
+            ),
+        ],
+    );
+    let status = host.status().await.unwrap();
+    assert!(status.clients.is_empty(), "{:?}", status.clients);
+    assert_eq!(status.recent_access.len(), 3);
 }
 
 /// Every file under `dir`, recursively.
@@ -994,7 +1062,7 @@ async fn a_fresh_sign_in_enrolls_and_re_keys_this_machine() {
     assert!(r.superseded.is_empty());
     // After a fresh sign-in it enrolls, replacing the old key's record.
     relay.fresh_sign_in("user-1");
-    let r = signed.enroll_after_sign_in().await.unwrap().unwrap();
+    let r = signed.enroll_after_sign_in().await.unwrap();
     assert_eq!(r.device.state, DeviceState::Enrolled);
     assert_eq!(r.superseded, vec![old.clone()]);
     // The name the relay knows stays.
@@ -1004,10 +1072,14 @@ async fn a_fresh_sign_in_enrolls_and_re_keys_this_machine() {
     assert_eq!(list.len(), 1, "{list:?}");
     assert!(unsigned.session().await.is_err());
 
-    // A device that never enrolled creates nothing on sign-in.
+    // A device that never enrolled gets its key on sign-in and the fresh
+    // sign-in enrolls it under this device's name.
     let (fresh_device, slot) = device(&relay, "acct", "new");
-    assert!(fresh_device.enroll_after_sign_in().await.unwrap().is_none());
-    assert!(slot.load().unwrap().is_none());
+    let r = fresh_device.enroll_after_sign_in().await.unwrap();
+    assert_eq!(r.device.state, DeviceState::Enrolled);
+    assert_eq!(r.device.name, "new");
+    assert!(slot.load().unwrap().is_some());
+    assert!(fresh_device.session().await.is_ok());
 
     // An older relay enrolls only an account's first device by sign-in:
     // the next one still gets its approval code.
@@ -1289,4 +1361,80 @@ async fn status_lists_only_the_permissions_still_missing() {
         ["accessibility"]
     );
     assert!(ids(with(Some((true, true))).status().await.unwrap()).is_empty());
+
+    // A machine that only provides Spaces keeps its desktop private: it
+    // asks for neither permission.
+    let path = f.host().paths().config();
+    let mut config: HostConfig = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config.share_desktop = false;
+    config.provide_spaces = true;
+    std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert!(ids(with(None).status().await.unwrap()).is_empty());
+}
+
+/// A pending device remembers its code: `enroll` shows the same code again
+/// instead of registering anew (which would invalidate it), and forgets it
+/// once enrolled.
+#[tokio::test]
+async fn a_pending_device_reuses_its_remembered_code() {
+    let relay = FakeRelay::start().await;
+    relay.add_account("acct", "user-1", Some("ada@example.com"));
+    relay.require_devices(true);
+    relay.fresh_sign_in("user-1");
+    let (laptop, _) = device(&relay, "acct", "laptop");
+    laptop.enroll().await.unwrap();
+    relay.stale_sign_in("user-1");
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("device-pending.json");
+    let phone = on_machine(
+        &relay,
+        Arc::new(MemoryKeySlot::default()),
+        "phone",
+        "phone-1",
+    )
+    .with_pending_file(&file);
+    assert!(phone.pending_code().is_none());
+    let first = phone.enroll().await.unwrap();
+    let code = first.code.clone().unwrap();
+    assert_eq!(phone.pending_code().unwrap().code, code);
+    let again = phone.enroll().await.unwrap();
+    assert_eq!(again.device.state, DeviceState::Pending);
+    assert_eq!(again.code.as_deref(), Some(code.as_str()));
+    // The relay still takes the first code.
+    let approved = laptop.approve(Some(&code), None).await.unwrap();
+    assert_eq!(approved.state, DeviceState::Enrolled);
+    // Enrolled: the next enroll registers (and forgets the code).
+    let r = phone.enroll().await.unwrap();
+    assert_eq!(r.device.state, DeviceState::Enrolled);
+    assert!(phone.pending_code().is_none());
+    assert!(!file.exists());
+}
+
+/// The flag wins; without it (and without `CUA_RELAY_URL`) the relay this
+/// machine is set up with, else the default.
+#[test]
+fn relay_url_for_prefers_flag_then_env_then_host_config() {
+    let home = tempfile::tempdir().unwrap();
+    assert_eq!(
+        crate::relay_url_for(Some(" https://flag.example "), home.path()),
+        "https://flag.example"
+    );
+    let env = std::env::var("CUA_RELAY_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty());
+    let expected_default = env
+        .clone()
+        .unwrap_or_else(|| crate::DEFAULT_RELAY_URL.into());
+    assert_eq!(crate::relay_url_for(None, home.path()), expected_default);
+    let host = Host::new(home.path());
+    std::fs::create_dir_all(host.paths().config().parent().unwrap()).unwrap();
+    let config = crate::HostConfig {
+        relay_url: Some("https://host.example".into()),
+        ..Default::default()
+    };
+    std::fs::write(host.paths().config(), serde_json::to_vec(&config).unwrap()).unwrap();
+    assert_eq!(
+        crate::relay_url_for(Some("  "), home.path()),
+        env.unwrap_or_else(|| "https://host.example".into())
+    );
 }

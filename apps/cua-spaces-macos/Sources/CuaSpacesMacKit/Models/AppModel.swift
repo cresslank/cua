@@ -202,6 +202,10 @@ public final class AppModel {
             if case .failed = self.signIn { return false }
             return self.identity != nil
         }
+        // Onboarding's This machine step has its own HostModel: give it the
+        // same inline sign-in, or a skipped sign-in fails setup with "Not
+        // signed in" instead of opening the browser and carrying on.
+        self.onboarding.host.signIn = self.host.signIn
         // A row takes a window drop by the core's rule (the notch tiles' too).
         dropTargets.isDropTarget = { [weak self] id in
             self?.spaces.first { $0.id == id }.map { appSpaceAcceptsDrop(space: $0) } ?? false
@@ -235,7 +239,7 @@ public final class AppModel {
 
     /// The Spaces that can stream now (running and reachable).
     public var streamableSpaceIds: [String] {
-        spaces.filter { appSpaceDetail(space: $0).canStream }.map(\.id)
+        spaces.filter { detail($0).canStream }.map(\.id)
     }
 
     /// What the Space's preview card shows over (or instead of) its live
@@ -243,14 +247,22 @@ public final class AppModel {
     public func cover(_ detail: AppSpaceDetail, requested: Bool, stream: AppStreamPhase) -> AppDesktopCover {
         appDesktopCover(input: AppDesktopCoverInput(
             canStream: detail.canStream, previewText: detail.previewText,
-            autoConnect: settings.autoConnect, connectRequested: requested, stream: stream))
+            autoConnect: settings.autoConnect, connectRequested: requested, stream: stream,
+            access: detail.access))
     }
 
     /// The detail without what Settings, Experiments hides (Share while
-    /// Sharing is off).
+    /// Sharing is off), as this Mac sees it: a machine reached through the
+    /// relay has its Connect greyed out while this Mac is not enrolled, and
+    /// one that does not share its desktop shows why in its place.
     public func detail(_ space: AppSpace) -> AppSpaceDetail {
-        appSpaceDetailWith(space: space, usage: usage[space.id], hostArch: Self.hostArch,
-                           experiments: settings.experiments)
+        appSpaceDetailFor(space: space, usage: usage[space.id], hostArch: Self.hostArch,
+                          experiments: settings.experiments, access: devices.accessNotice)
+    }
+
+    /// The Spaces one of your machines provides (its detail lists them).
+    public func hostedRows(_ machineId: String) -> [AppSidebarRow] {
+        appHostedRows(spaces: spaces, machineSpaceId: machineId, selectedId: sidebar.selectedId ?? "")
     }
 
 
@@ -299,8 +311,10 @@ public final class AppModel {
     /// the registry's Spaces.
     func recompose() {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
-        let spaces = host.host == nil ? registrySpaces
-            : appWithThisMachine(spaces: registrySpaces, status: host.summaryInput, nowMs: now)
+        // This Mac's own relay entry is "This machine", not one of "My machines".
+        let listed = appWithoutThisRelayMachine(spaces: registrySpaces, thisMachineId: host.machineId)
+        let spaces = host.host == nil ? listed
+            : appWithThisMachine(spaces: listed, status: host.summaryInput, nowMs: now)
         send(.syncSpaces(spaces: appCreatesCompose(spaces: spaces, state: creates)))
     }
 
@@ -374,6 +388,13 @@ public final class AppModel {
     }
 
     // MARK: - New Space
+
+    /// New Space with "Run on" set to `on` (`host:<machine>`): a machine's
+    /// "New Space on <name>…".
+    public func openNewSpace(on: String) async {
+        await openNewSpace()
+        wizard.send(.choosePlacement(on: on))
+    }
 
     public func openNewSpace() async {
         async let runtimesProbe = backend.localRuntimes()
@@ -666,6 +687,7 @@ public final class AppModel {
             guard case .waiting = signIn else { return }
             identity = who ?? account.identity()
             host.identity = identity
+            onboarding.host.identity = identity
             devices.signedIn = identity != nil
             // Activation funnel: the first run records `signed_in` on its
             // sign-in page; a sign-in from the main window (first run done or
@@ -687,6 +709,7 @@ public final class AppModel {
         try? await account?.signOut()
         identity = nil
         host.identity = nil
+        onboarding.host.identity = nil
         devices.signedIn = false
         await devices.refresh()
         signIn = .idle

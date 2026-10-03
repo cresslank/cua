@@ -307,7 +307,8 @@ pub enum SpacesCmd {
         space: String,
     },
     /// Forget a registered Space and its stored token. The sandbox keeps
-    /// running.
+    /// running. The `relay:<machine>` record of a Space that registered
+    /// itself and is gone (not connected) also leaves your relay directory.
     #[command(
         visible_alias = "remove",
         after_help = "Examples:
@@ -372,11 +373,15 @@ pub enum SpacesCmd {
         /// Space id, address or display name.
         space: String,
     },
-    /// Take a Space off the relay (every share with it ends).
+    /// Take a Space off the relay (every share with it ends). With a
+    /// `relay:<machine>` id, removes that machine's record from your relay
+    /// directory: a Space that registered itself (also after it was
+    /// deleted), or a machine of yours that is gone. Only its owner can.
     #[command(
         name = "relay-unregister",
         after_help = "Examples:
-  cua spaces relay-unregister local:studio"
+  cua spaces relay-unregister local:studio
+  cua spaces relay-unregister relay:space-0123abcd4567ef89"
     )]
     RelayUnregister {
         /// Space id, address or display name.
@@ -1122,11 +1127,25 @@ fn render_access(s: &HostStatus, now_ms: u64, out: &mut dyn Write) {
             format!("  access log: does not verify ({e}); it may have been altered"),
         );
     }
-    if s.recent_access.is_empty() {
+    // Background probes and the owner's own thumbnails stay in the log
+    // (and `--json`), not in this list.
+    use cua_host::access::AccessKind;
+    let shown: Vec<_> = s
+        .recent_access
+        .iter()
+        .filter(|r| {
+            !matches!(
+                r.kind(),
+                AccessKind::Background | AccessKind::OwnerThumbnail
+            )
+        })
+        .take(8)
+        .collect();
+    if shown.is_empty() {
         return;
     }
     line(out, "  recent access:");
-    for r in s.recent_access.iter().take(8) {
+    for r in shown {
         line(
             out,
             format!(
@@ -1441,14 +1460,7 @@ pub fn attach_relay_account(
 /// `--relay`, else `CUA_RELAY_URL`, else the relay this machine is set up
 /// with, else the default relay.
 pub fn relay_url(flag: Option<String>, home: &Path) -> String {
-    flag.filter(|u| !u.trim().is_empty())
-        .or_else(|| {
-            std::env::var("CUA_RELAY_URL")
-                .ok()
-                .filter(|u| !u.trim().is_empty())
-        })
-        .or_else(|| Host::new(home).config().ok().flatten()?.relay_url)
-        .unwrap_or_else(cua_host::relay_url_from_env)
+    cua_host::relay_url_for(flag.as_deref(), home)
 }
 
 /// `cua spaces ls` rows: every Space, with the Spaces a machine provides
@@ -1464,9 +1476,11 @@ fn grouped_lines(list: &[cua_spaces::SpaceInfo]) -> Vec<String> {
             s.spacesd_version,
             width = 48usize.saturating_sub(indent.len()),
         );
-        // A Space turned off says so (`cua spaces start` turns it on).
-        match s.power_state.as_str() {
-            "suspended" | "stopped" => format!("{} ({})", line.trim_end(), s.power_state),
+        // A Space turned off says so (`cua spaces start` turns it on), as
+        // does a machine the relay cannot reach now (offline, not sharing).
+        match (s.power_state.as_str(), s.status.as_str()) {
+            ("suspended" | "stopped", _) => format!("{} ({})", line.trim_end(), s.power_state),
+            (_, status) if !status.is_empty() => format!("{} ({status})", line.trim_end()),
             _ => line,
         }
     };
@@ -1784,6 +1798,7 @@ mod tests {
             cloud: String::new(),
             cloud_place: String::new(),
             cloud_delete: String::new(),
+            status: String::new(),
         };
         let lines = grouped_lines(&[
             space("relay:space-1", "mini1234"),
@@ -1814,6 +1829,14 @@ mod tests {
             "{lines:?}"
         );
         assert_eq!(lines.len(), 2, "{lines:?}");
+        // A machine the relay cannot reach now says why.
+        let mut stopped = space("relay:mini1234", "");
+        stopped.status = "not sharing".into();
+        let mut off = space("relay:studio99", "");
+        off.status = "offline".into();
+        let lines = grouped_lines(&[stopped, off]);
+        assert!(lines[0].ends_with("(not sharing)"), "{lines:?}");
+        assert!(lines[1].ends_with("(offline)"), "{lines:?}");
     }
 
     #[test]

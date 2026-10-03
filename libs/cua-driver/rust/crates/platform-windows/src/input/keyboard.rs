@@ -768,6 +768,8 @@ fn wait_for_exact_foreground(target: HWND, timeout: Duration) -> bool {
     }
 }
 
+/// Foreground drain adapted from upstream PR #4500; retain identity-checked restoration.
+///
 /// Run one system-queue input transaction while `target`, or a live visible
 /// same-process window whose owner chain reaches `target`, is foreground.
 /// Foreground and optional child focus are checked against
@@ -850,6 +852,7 @@ fn with_confirmed_foreground<T>(
         );
     };
 
+    let mut attachment: Option<InputQueueAttachment> = None;
     let result = (|| {
         focus()?;
         let deadline = Instant::now() + Duration::from_millis(250);
@@ -878,14 +881,30 @@ fn with_confirmed_foreground<T>(
                 actual.0
             );
         }
+        // Attach before inserting anything: attaching resets the shared key
+        // state, which must not race with modifiers the body is about to send.
+        attachment = InputQueueAttachment::attach(actual);
+        // Attaching may take time. Re-prove foreground authority immediately
+        // before dispatch, just as the release-only cleanup does.
+        if !crate::win32::foreground_matches_target_or_owned_window(
+            foreground_target,
+            unsafe { GetForegroundWindow() }.0 as usize as u64,
+        ) {
+            bail!("foreground_unavailable: target authority was lost while attaching the input queue; no input was sent");
+        }
         body(foreground_target)
     })();
 
-    // Give the target message loop a bounded opportunity to consume the
-    // inserted sequence before restoring the user's prior foreground.
-    if result.is_ok() {
-        sleep(Duration::from_millis(40));
+    // Keep the target foreground until its thread has read every inserted
+    // event; restoring earlier hands the unread tail to another window (#4477).
+    match (&result, attachment.as_ref()) {
+        (Ok(_), Some(attachment)) => {
+            attachment.wait_for_drain(foreground_target, Duration::from_secs(2));
+        }
+        (Ok(_), None) => sleep(Duration::from_millis(40)),
+        _ => {}
     }
+    drop(attachment);
     let mut result = result;
     if let Some(previous_target) = previous_target {
         let restored = crate::win32::restore_foreground_target_if_still_displaced(
@@ -905,6 +924,98 @@ fn with_confirmed_foreground<T>(
         }
     }
     result
+}
+
+/// Unassigned virtual key used as a harmless input-drain sentinel (the same
+/// "mask key" convention AutoHotkey uses): applications do not bind it and it
+/// produces no character.
+const DRAIN_SENTINEL_VK: VIRTUAL_KEY = VIRTUAL_KEY(0xE8);
+
+/// The caller's thread attached to the foreground thread's input queue for
+/// the duration of one foreground input transaction; detaches on drop.
+struct InputQueueAttachment {
+    own_thread: u32,
+    target_thread: u32,
+}
+
+impl InputQueueAttachment {
+    fn attach(foreground: HWND) -> Option<Self> {
+        use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+        let target_thread = unsafe { GetWindowThreadProcessId(foreground, None) };
+        let own_thread = unsafe { GetCurrentThreadId() };
+        if target_thread == 0 || target_thread == own_thread {
+            return None;
+        }
+        unsafe { AttachThreadInput(own_thread, target_thread, true) }
+            .as_bool()
+            .then_some(Self {
+                own_thread,
+                target_thread,
+            })
+    }
+
+    /// Block until the foreground thread has retrieved all input inserted so
+    /// far, bounded by `timeout`. A sentinel key press is appended behind the
+    /// caller's events; while attached, `GetKeyState` reflects the shared
+    /// queue's synchronous key state, whose toggle bit flips only when the
+    /// target thread reads the sentinel key-down.
+    fn wait_for_drain(&self, approved: crate::win32::ForegroundTarget, timeout: Duration) -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
+        let toggled = || unsafe { GetKeyState(DRAIN_SENTINEL_VK.0 as i32) } & 1;
+        let before = toggled();
+        let sentinel = [sentinel_key_input(false), sentinel_key_input(true)];
+        // The sentinel is system-queue input too; never send it to an app
+        // that displaced the approved target while the body was running.
+        let actual = unsafe { GetForegroundWindow() }.0 as usize as u64;
+        if !crate::win32::foreground_matches_target_or_owned_window(approved, actual) {
+            return false;
+        }
+        let sent = unsafe { SendInput(&sentinel, std::mem::size_of::<INPUT>() as i32) };
+        if sent as usize != sentinel.len() {
+            sleep(Duration::from_millis(40));
+            return false;
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            if toggled() != before {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    "foreground input drain: target thread did not consume the sentinel within {} ms",
+                    timeout.as_millis()
+                );
+                return false;
+            }
+            sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+impl Drop for InputQueueAttachment {
+    fn drop(&mut self) {
+        use windows::Win32::System::Threading::AttachThreadInput;
+        let _ = unsafe { AttachThreadInput(self.own_thread, self.target_thread, false) };
+    }
+}
+
+fn sentinel_key_input(up: bool) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: DRAIN_SENTINEL_VK,
+                wScan: 0,
+                dwFlags: if up {
+                    KEYEVENTF_KEYUP
+                } else {
+                    KEYBD_EVENT_FLAGS(0)
+                },
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
 }
 
 /// Build a single Unicode keyboard INPUT struct for one UTF-16 code unit,
