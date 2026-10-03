@@ -2,6 +2,12 @@
 //!
 //! We call the C-level AX API directly rather than using a crate wrapper,
 //! because most available crates are incomplete or unmaintained.
+//!
+//! Node batching adapts Francesco Bonacci's upstream PR #1757, Evan
+//! Gabrielson's fuller prototype (e0fb050), and injaneity's conservative
+//! adaptation (85af7c7): typed values, conditional consumption, and fallback
+//! for failed or malformed batches, without the original PR's child cap.
+//! `CUA_DRIVER_AX_BATCH=0` selects individual reads, sampled once per process.
 
 #![allow(
     non_upper_case_globals,
@@ -45,6 +51,7 @@ pub const kAXValueCGPointType: AXValueType = 1;
 pub const kAXValueCGSizeType: AXValueType = 2;
 pub const kAXValueCGRectType: AXValueType = 3;
 pub const kAXValueCFRangeType: AXValueType = 4;
+pub const kAXValueAXErrorType: AXValueType = 5;
 pub const kAXValueIllegalType: AXValueType = 1_000;
 
 // ── Link to AXUIElement functions ────────────────────────────────────────────
@@ -55,6 +62,12 @@ extern "C" {
         element: AXUIElementRef,
         attribute: CFStringRef,
         value: *mut CFTypeRef,
+    ) -> AXError;
+    pub fn AXUIElementCopyMultipleAttributeValues(
+        element: AXUIElementRef,
+        attributes: CFArrayRef,
+        options: u32,
+        values: *mut CFArrayRef,
     ) -> AXError;
     pub fn AXUIElementCopyAttributeNames(
         element: AXUIElementRef,
@@ -124,6 +137,7 @@ pub unsafe fn element_at_screen_position(pid: i32, x: f64, y: f64) -> Option<AXU
 // ── AXValue functions ────────────────────────────────────────────────────────
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
+    pub fn AXValueGetTypeID() -> CFTypeID;
     pub fn AXValueCreate(the_type: AXValueType, value_ptr: *const c_void) -> AXValueRef;
     pub fn AXValueGetType(value: AXValueRef) -> AXValueType;
     pub fn AXValueGetValue(
@@ -147,7 +161,291 @@ struct CGSizeValue {
 
 // ── Helper functions ──────────────────────────────────────────────────────────
 
-use core_foundation::{array::CFArray, base::TCFType, string::CFString as CFStr};
+use core_foundation::{
+    array::CFArray,
+    base::{CFGetTypeID, CFType, TCFType},
+    string::CFString as CFStr,
+};
+
+/// Slot order shared by the batch request and the individual-read decoder.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub(super) enum NodeAttribute {
+    Role,
+    Title,
+    Value,
+    Placeholder,
+    Description,
+    Identifier,
+    Help,
+    Enabled,
+    Position,
+    Size,
+    Children,
+    ValueDescription,
+    MinValue,
+    MaxValue,
+    Selected,
+}
+
+const NODE_ATTRIBUTES: [&str; 15] = [
+    "AXRole",
+    "AXTitle",
+    "AXValue",
+    "AXPlaceholderValue",
+    "AXDescription",
+    "AXIdentifier",
+    "AXHelp",
+    "AXEnabled",
+    "AXPosition",
+    "AXSize",
+    "AXChildren",
+    "AXValueDescription",
+    "AXMinValue",
+    "AXMaxValue",
+    "AXSelected",
+];
+
+/// Decode only the fields the walker needs at each existing gate. A successful
+/// batch prefetches all slots, but the individual path keeps conditional IPCs.
+#[derive(Clone, Copy)]
+pub(super) enum NodeRead {
+    Role,
+    Content,
+    Enabled,
+    Frame,
+    ControlState,
+    Children,
+}
+
+#[derive(Default, Debug, PartialEq)]
+pub(super) struct NodeAttrs {
+    pub role: Option<String>,
+    pub title: Option<String>,
+    pub copied_value: Option<StringishAttrValue>,
+    pub value: Option<String>,
+    pub description: Option<String>,
+    pub identifier: Option<String>,
+    pub help: Option<String>,
+    pub enabled: Option<bool>,
+    pub frame: Option<[f64; 4]>,
+    pub value_description: Option<String>,
+    pub min_value: Option<f64>,
+    pub max_value: Option<f64>,
+    pub selected: Option<bool>,
+    /// Each child owns a retain independently of the batch/source array.
+    pub children: Vec<CFType>,
+}
+
+pub(super) struct NodeAttributeReader {
+    element: AXUIElementRef,
+    batch: Option<CFArray<CFTypeRef>>,
+}
+
+impl NodeAttributeReader {
+    /// The caller must keep `element` alive and set its messaging timeout before
+    /// construction, after admitting this node to the walk budget.
+    pub unsafe fn new(element: AXUIElementRef) -> Self {
+        static BATCH_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *BATCH_ENABLED
+            .get_or_init(|| std::env::var_os("CUA_DRIVER_AX_BATCH").is_none_or(|v| v != "0"));
+        let batch = if enabled {
+            let names: Vec<_> = NODE_ATTRIBUTES
+                .iter()
+                .map(|name| CFStr::new(name))
+                .collect();
+            let names = CFArray::from_CFTypes(&names);
+            let mut values = std::ptr::null();
+            let error = AXUIElementCopyMultipleAttributeValues(
+                element,
+                names.as_concrete_TypeRef(),
+                0, // Never StopOnError: unsupported attributes occupy error slots.
+                &mut values,
+            );
+            // Own even a non-null result accompanying an error. Validate its
+            // type before treating it as an array; all fallback paths drop it.
+            let values = (!values.is_null()).then(|| CFType::wrap_under_create_rule(values.cast()));
+            validate_node_batch(error, values)
+        } else {
+            None
+        };
+        Self { element, batch }
+    }
+
+    /// Both sources feed the same decoder, at the same walker gates.
+    pub unsafe fn read(&self, attrs: &mut NodeAttrs, stage: NodeRead) {
+        decode_node_attrs(attrs, stage, |attribute| match &self.batch {
+            Some(values) => values
+                .get(attribute as isize)
+                .filter(|value| !value.is_null())
+                .map(|value| CFType::wrap_under_get_rule(*value)),
+            None => {
+                let name = CFStr::new(NODE_ATTRIBUTES[attribute as usize]);
+                let mut value = std::ptr::null();
+                let error = AXUIElementCopyAttributeValue(
+                    self.element,
+                    name.as_concrete_TypeRef(),
+                    &mut value,
+                );
+                let value = (!value.is_null()).then(|| CFType::wrap_under_create_rule(value));
+                if error == kAXErrorSuccess {
+                    value
+                } else {
+                    None
+                }
+            }
+        });
+    }
+}
+
+/// No live AX calls: malformed results select the individual-read source.
+fn validate_node_batch(error: AXError, values: Option<CFType>) -> Option<CFArray<CFTypeRef>> {
+    let values = values?;
+    if error != kAXErrorSuccess || values.type_of() != CFArray::<CFTypeRef>::type_id() {
+        return None;
+    }
+    let array = unsafe { CFArray::<CFTypeRef>::wrap_under_get_rule(values.as_CFTypeRef().cast()) };
+    (array.len() as usize == NODE_ATTRIBUTES.len()).then_some(array)
+}
+
+fn node_string(value: Option<CFType>) -> Option<String> {
+    let value = value?;
+    (value.type_of() == CFStr::type_id())
+        .then(|| unsafe { CFStr::wrap_under_get_rule(value.as_CFTypeRef().cast()).to_string() })
+}
+
+fn node_number(value: Option<CFType>) -> Option<f64> {
+    use core_foundation::number::CFNumber;
+    let value = value?;
+    if value.type_of() != CFNumber::type_id() {
+        return None;
+    }
+    unsafe { CFNumber::wrap_under_get_rule(value.as_CFTypeRef().cast()).to_f64() }
+}
+
+fn node_bool(value: Option<CFType>) -> Option<bool> {
+    use core_foundation::boolean::CFBoolean;
+    let value = value?;
+    if value.type_of() == CFBoolean::type_id() {
+        return Some(unsafe { CFBoolean::wrap_under_get_rule(value.as_CFTypeRef().cast()).into() });
+    }
+    // Match copy_bool_attr, not the stricter coerce_binary_value.
+    node_number(Some(value)).map(|number| number != 0.0)
+}
+
+fn node_point(value: Option<CFType>) -> Option<CGPointValue> {
+    let value = value?;
+    let mut point = CGPointValue { x: 0.0, y: 0.0 };
+    unsafe {
+        if value.type_of() != AXValueGetTypeID()
+            || !AXValueGetValue(
+                value.as_CFTypeRef() as AXValueRef,
+                kAXValueCGPointType,
+                std::ptr::from_mut(&mut point).cast(),
+            )
+        {
+            return None;
+        }
+    }
+    Some(point)
+}
+
+fn node_size(value: Option<CFType>) -> Option<CGSizeValue> {
+    let value = value?;
+    let mut size = CGSizeValue {
+        width: 0.0,
+        height: 0.0,
+    };
+    unsafe {
+        if value.type_of() != AXValueGetTypeID()
+            || !AXValueGetValue(
+                value.as_CFTypeRef() as AXValueRef,
+                kAXValueCGSizeType,
+                std::ptr::from_mut(&mut size).cast(),
+            )
+        {
+            return None;
+        }
+    }
+    Some(size)
+}
+
+/// Pure per-node decoding shared by batch and individual reads. `read` supplies
+/// owned CF values, so early returns and unused slots cannot leak. It is only
+/// called for fields required by this stage (including placeholder/size gates).
+fn decode_node_attrs(
+    attrs: &mut NodeAttrs,
+    stage: NodeRead,
+    mut read: impl FnMut(NodeAttribute) -> Option<CFType>,
+) {
+    let mut read = |attribute| {
+        let value = read(attribute)?;
+        // A failed batch slot is exactly an individual-read failure, and never
+        // causes other slots to fall back or shift position.
+        unsafe {
+            if value.type_of() == AXValueGetTypeID()
+                && AXValueGetType(value.as_CFTypeRef() as AXValueRef) == kAXValueAXErrorType
+            {
+                return None;
+            }
+        }
+        Some(value)
+    };
+    use NodeAttribute as A;
+    match stage {
+        NodeRead::Role => attrs.role = node_string(read(A::Role)),
+        NodeRead::Content => {
+            attrs.title = node_string(read(A::Title));
+            attrs.copied_value = read(A::Value)
+                .and_then(|value| unsafe { coerce_stringish_value(value.as_CFTypeRef()) });
+            attrs.value = attrs
+                .copied_value
+                .as_ref()
+                .and_then(|value| value.string_value.clone())
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| node_string(read(A::Placeholder)));
+            attrs.description = node_string(read(A::Description));
+            attrs.identifier = node_string(read(A::Identifier));
+            attrs.help = node_string(read(A::Help)).filter(|help| !help.trim().is_empty());
+        }
+        NodeRead::Enabled => attrs.enabled = node_bool(read(A::Enabled)),
+        NodeRead::Frame => {
+            attrs.frame = node_point(read(A::Position)).and_then(|point| {
+                let size = node_size(read(A::Size))?;
+                if size.width < 1.0 || size.height < 1.0 {
+                    return None;
+                }
+                Some([point.x, point.y, size.width, size.height])
+            });
+        }
+        NodeRead::ControlState => {
+            attrs.value_description = node_string(read(A::ValueDescription))
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty());
+            attrs.min_value = node_number(read(A::MinValue));
+            attrs.max_value = node_number(read(A::MaxValue));
+            attrs.selected = node_bool(read(A::Selected));
+        }
+        NodeRead::Children => {
+            attrs.children.clear();
+            if let Some(value) = read(A::Children) {
+                if value.type_of() == CFArray::<CFTypeRef>::type_id() {
+                    unsafe {
+                        let children =
+                            CFArray::<CFTypeRef>::wrap_under_get_rule(value.as_CFTypeRef().cast());
+                        attrs.children = children
+                            .iter()
+                            .filter_map(|child| {
+                                (!child.is_null() && CFGetTypeID(*child) == AXUIElementGetTypeID())
+                                    .then(|| CFType::wrap_under_get_rule(*child))
+                            })
+                            .collect();
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Whether an AX attribute is currently writable on this element.
 ///
@@ -943,6 +1241,275 @@ pub unsafe fn copy_ax_windows_including(
         windows.extend(copy_ax_window_by_remote_token(pid, window_id));
     }
     windows
+}
+
+#[cfg(test)]
+mod node_batch_tests {
+    use super::*;
+    use core_foundation::{boolean::CFBoolean, number::CFNumber};
+
+    fn ax_value<T>(kind: AXValueType, value: &T) -> CFType {
+        // Test callers supply the matching C layout; AXValueCreate only makes
+        // an in-process value, never an AX application/element or an IPC.
+        unsafe {
+            let value = AXValueCreate(kind, std::ptr::from_ref(value).cast());
+            assert!(!value.is_null());
+            CFType::wrap_under_create_rule(value.cast())
+        }
+    }
+
+    fn error_slot() -> CFType {
+        ax_value(kAXValueAXErrorType, &kAXErrorAttributeUnsupported)
+    }
+
+    fn fixture() -> Vec<CFType> {
+        vec![
+            CFStr::new("AXSlider").as_CFType(),
+            CFStr::new("").as_CFType(),
+            CFNumber::from(8.0).as_CFType(),
+            CFStr::new("placeholder").as_CFType(),
+            CFStr::new("volume").as_CFType(),
+            CFStr::new("volume-id").as_CFType(),
+            CFStr::new("  help  ").as_CFType(),
+            CFNumber::from(2.0).as_CFType(), // copy_bool_attr treats nonzero as true.
+            ax_value(kAXValueCGPointType, &CGPointValue { x: -20.0, y: 30.0 }),
+            ax_value(
+                kAXValueCGSizeType,
+                &CGSizeValue {
+                    width: 100.0,
+                    height: 40.0,
+                },
+            ),
+            // Non-element entries must be discarded, without inventing children.
+            CFArray::from_CFTypes(&[CFStr::new("not an AX element")]).as_CFType(),
+            CFStr::new("  8 dB  ").as_CFType(),
+            CFNumber::from(0.0).as_CFType(),
+            CFNumber::from(10.0).as_CFType(),
+            CFBoolean::false_value().as_CFType(),
+        ]
+    }
+
+    fn decode_all(mut read: impl FnMut(NodeAttribute) -> Option<CFType>) -> NodeAttrs {
+        let mut attrs = NodeAttrs::default();
+        for stage in [
+            NodeRead::Role,
+            NodeRead::Content,
+            NodeRead::Enabled,
+            NodeRead::Frame,
+            NodeRead::ControlState,
+            NodeRead::Children,
+        ] {
+            decode_node_attrs(&mut attrs, stage, &mut read);
+        }
+        attrs
+    }
+
+    #[test]
+    fn full_batch_matches_individual_source_and_outlives_cf_storage() {
+        let values = fixture();
+        let input = CFArray::from_CFTypes(&values);
+        let batch = validate_node_batch(kAXErrorSuccess, Some(input.as_CFType())).unwrap();
+        let decoded = decode_all(|attribute| unsafe {
+            Some(CFType::wrap_under_get_rule(
+                *batch.get(attribute as isize).unwrap(),
+            ))
+        });
+        let individual = decode_all(|attribute| Some(values[attribute as usize].clone()));
+        assert_eq!(decoded, individual);
+        drop(batch);
+        drop(input);
+        drop(values);
+        assert_eq!(decoded.role.as_deref(), Some("AXSlider"));
+        assert_eq!(decoded.title.as_deref(), Some(""));
+        assert_eq!(
+            decoded.copied_value,
+            Some(StringishAttrValue {
+                string_value: None,
+                state_value: "8".into(),
+            })
+        );
+        assert_eq!(decoded.value.as_deref(), Some("placeholder"));
+        assert_eq!(decoded.description.as_deref(), Some("volume"));
+        assert_eq!(decoded.identifier.as_deref(), Some("volume-id"));
+        assert_eq!(decoded.help.as_deref(), Some("  help  "));
+        assert_eq!(decoded.enabled, Some(true));
+        assert_eq!(decoded.frame, Some([-20.0, 30.0, 100.0, 40.0]));
+        assert_eq!(decoded.value_description.as_deref(), Some("8 dB"));
+        assert_eq!(decoded.min_value, Some(0.0));
+        assert_eq!(decoded.max_value, Some(10.0));
+        assert_eq!(decoded.selected, Some(false));
+        assert!(decoded.children.is_empty());
+    }
+
+    #[test]
+    fn every_error_slot_matches_an_individual_failure_without_losing_neighbors() {
+        for index in 0..NODE_ATTRIBUTES.len() {
+            let mut values = fixture();
+            values[index] = error_slot();
+            let batch = CFArray::from_CFTypes(&values);
+            let batch = validate_node_batch(kAXErrorSuccess, Some(batch.as_CFType())).unwrap();
+            let decoded = decode_all(|attribute| unsafe {
+                Some(CFType::wrap_under_get_rule(
+                    *batch.get(attribute as isize).unwrap(),
+                ))
+            });
+            let individual = decode_all(|attribute| {
+                (attribute as usize != index).then(|| values[attribute as usize].clone())
+            });
+            assert_eq!(
+                decoded, individual,
+                "failed slot: {}",
+                NODE_ATTRIBUTES[index]
+            );
+        }
+        assert_eq!(decode_all(|_| Some(error_slot())), NodeAttrs::default());
+    }
+
+    #[test]
+    fn whole_failure_non_array_null_and_wrong_lengths_select_fallback() {
+        let input = CFArray::from_CFTypes(&fixture());
+        let retained = input.retain_count();
+        assert!(validate_node_batch(kAXErrorFailure, Some(input.as_CFType())).is_none());
+        assert_eq!(
+            input.retain_count(),
+            retained,
+            "failed output must be released"
+        );
+        let accepted = validate_node_batch(kAXErrorSuccess, Some(input.as_CFType())).unwrap();
+        assert_eq!(input.retain_count(), retained + 1);
+        drop(accepted);
+        assert_eq!(
+            input.retain_count(),
+            retained,
+            "accepted output must be released"
+        );
+        assert!(validate_node_batch(kAXErrorSuccess, None).is_none());
+        assert!(
+            validate_node_batch(kAXErrorSuccess, Some(CFStr::new("bad").as_CFType())).is_none()
+        );
+        for length in [0, NODE_ATTRIBUTES.len() - 1, NODE_ATTRIBUTES.len() + 1] {
+            let input = CFArray::from_CFTypes(&vec![error_slot(); length]);
+            let retained = input.retain_count();
+            assert!(validate_node_batch(kAXErrorSuccess, Some(input.as_CFType())).is_none());
+            assert_eq!(
+                input.retain_count(),
+                retained,
+                "malformed output must be released"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_values_and_empty_strings_keep_placeholder_and_title_semantics() {
+        for (value, string, state, placeholder_read) in [
+            (CFStr::new("text").as_CFType(), Some("text"), "text", false),
+            (CFStr::new("").as_CFType(), Some(""), "", true),
+            (CFStr::new("  ").as_CFType(), Some("  "), "  ", true),
+            (CFNumber::from(2.5).as_CFType(), None, "2.5", true),
+            (CFBoolean::true_value().as_CFType(), None, "1", true),
+            (CFBoolean::false_value().as_CFType(), None, "0", true),
+        ] {
+            let mut values = fixture();
+            values[NodeAttribute::Value as usize] = value;
+            values[NodeAttribute::Description as usize] = CFStr::new("2").as_CFType();
+            values[NodeAttribute::Help as usize] = CFStr::new(" \t").as_CFType();
+            values[NodeAttribute::Placeholder as usize] = CFStr::new("").as_CFType();
+            let mut reads = Vec::new();
+            let mut decoded = NodeAttrs::default();
+            decode_node_attrs(&mut decoded, NodeRead::Content, |attribute| {
+                reads.push(attribute);
+                Some(values[attribute as usize].clone())
+            });
+            assert_eq!(
+                reads.contains(&NodeAttribute::Placeholder),
+                placeholder_read
+            );
+            assert_eq!(decoded.title.as_deref(), Some(""));
+            assert_eq!(decoded.description.as_deref(), Some("2"));
+            assert_eq!(decoded.help, None);
+            let copied = decoded.copied_value.unwrap();
+            assert_eq!(copied.string_value.as_deref(), string);
+            assert_eq!(copied.state_value, state);
+            assert_eq!(
+                decoded.value.as_deref(),
+                Some(if placeholder_read { "" } else { "text" })
+            );
+        }
+    }
+
+    #[test]
+    fn geometry_is_typed_and_size_is_read_only_after_a_valid_position() {
+        for position in [
+            None,
+            Some(error_slot()),
+            Some(CFStr::new("bad").as_CFType()),
+            Some(ax_value(
+                kAXValueCGSizeType,
+                &CGSizeValue {
+                    width: 20.0,
+                    height: 30.0,
+                },
+            )),
+        ] {
+            let mut attrs = NodeAttrs::default();
+            decode_node_attrs(&mut attrs, NodeRead::Frame, |attribute| {
+                assert_eq!(
+                    attribute,
+                    NodeAttribute::Position,
+                    "invalid position must skip size"
+                );
+                position.clone()
+            });
+            assert_eq!(attrs.frame, None);
+        }
+        for size in [
+            error_slot(),
+            CFNumber::from(12.0).as_CFType(),
+            ax_value(
+                kAXValueCGSizeType,
+                &CGSizeValue {
+                    width: 0.5,
+                    height: 30.0,
+                },
+            ),
+        ] {
+            let mut attrs = NodeAttrs::default();
+            decode_node_attrs(&mut attrs, NodeRead::Frame, |attribute| {
+                Some(match attribute {
+                    NodeAttribute::Position => {
+                        ax_value(kAXValueCGPointType, &CGPointValue { x: 1.0, y: 2.0 })
+                    }
+                    NodeAttribute::Size => size.clone(),
+                    _ => panic!("unexpected geometry attribute"),
+                })
+            });
+            assert_eq!(attrs.frame, None);
+        }
+    }
+
+    #[test]
+    fn layout_stages_only_decode_role_and_children() {
+        let mut attrs = NodeAttrs::default();
+        let mut reads = Vec::new();
+        for stage in [NodeRead::Role, NodeRead::Children] {
+            decode_node_attrs(&mut attrs, stage, |attribute| {
+                reads.push(attribute);
+                Some(match attribute {
+                    NodeAttribute::Role => CFStr::new("AXGroup").as_CFType(),
+                    NodeAttribute::Children => CFArray::<CFType>::from_CFTypes(&[]).as_CFType(),
+                    _ => panic!("layout container decoded content/state"),
+                })
+            });
+        }
+        assert_eq!(reads, [NodeAttribute::Role, NodeAttribute::Children]);
+        assert_eq!(
+            attrs,
+            NodeAttrs {
+                role: Some("AXGroup".into()),
+                ..NodeAttrs::default()
+            }
+        );
+    }
 }
 
 #[cfg(test)]

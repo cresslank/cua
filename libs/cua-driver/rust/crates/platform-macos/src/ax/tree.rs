@@ -10,11 +10,15 @@
 //! - Non-actionable leaf nodes with a value are rendered as `AXRole = "value"`.
 //! - AXStaticText with no title/value is omitted.
 //! - Tree is walked depth-first; element_index is assigned in DFS order.
+//!
+//! Attribute batching adapts upstream PR #1757 (Francesco Bonacci), Evan
+//! Gabrielson's e0fb050 prototype, and injaneity's 85af7c7 adaptation; the
+//! fork's traversal gates and bounds remain authoritative.
 
 use super::bindings::*;
 use super::launch::{is_still_launching, LaunchStep, LaunchWait};
 use super::window_scope::{decide_window_scope, ScopeDecision, TopLevelCandidate, WindowScope};
-use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
+use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef, TCFType};
 use cua_driver_core::walk_budget::{WalkBudget, WalkOutcome};
 use std::time::Instant;
 
@@ -425,7 +429,10 @@ unsafe fn walk_element(
     // element, so every descendant must be bounded before any attribute read.
     set_messaging_timeout(element);
 
-    let role = copy_string_attr(element, "AXRole").unwrap_or_else(|| "AXUnknown".into());
+    let reader = NodeAttributeReader::new(element);
+    let mut attrs = NodeAttrs::default();
+    reader.read(&mut attrs, NodeRead::Role);
+    let role = attrs.role.take().unwrap_or_else(|| "AXUnknown".into());
 
     let in_web_content = in_web_content || is_web_content_role(&role);
 
@@ -434,10 +441,12 @@ unsafe fn walk_element(
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
-        let children = copy_children(element);
+        reader.read(&mut attrs, NodeRead::Children);
+        let children = std::mem::take(&mut attrs.children);
+        drop(reader); // Children own their retains; release the prefetched slots.
         for child in children {
             walk_element(
-                child,
+                child.as_CFTypeRef() as AXUIElementRef,
                 depth,
                 parent_index,
                 in_web_content,
@@ -447,7 +456,6 @@ unsafe fn walk_element(
                 budget,
                 max_depth,
             );
-            CFRelease(child as CFTypeRef);
         }
         return;
     }
@@ -457,20 +465,13 @@ unsafe fn walk_element(
     // This is critical for Calculator where AXTitle="" but AXDescription="2"
     // (digit buttons). Merging them would produce "2" (quoted) instead of (2)
     // (parens), breaking _find_calc_button which searches for "(2)".
-    let title = copy_string_attr(element, "AXTitle");
-    // Read AXValue once with enough type information to preserve the existing
-    // string-only markdown while also exposing numeric/boolean control state.
-    let copied_value = copy_stringish_attr(element, "AXValue");
-    let value = copied_value
-        .as_ref()
-        .and_then(|copied| copied.string_value.clone());
-    // AXPlaceholderValue as fallback for empty text fields.
-    let value = value
-        .filter(|v| !v.trim().is_empty())
-        .or_else(|| copy_string_attr(element, "AXPlaceholderValue"));
-    let description = copy_string_attr(element, "AXDescription");
-    let identifier = copy_string_attr(element, "AXIdentifier");
-    let help = copy_string_attr(element, "AXHelp").filter(|h| !h.trim().is_empty());
+    reader.read(&mut attrs, NodeRead::Content);
+    let title = attrs.title.take();
+    let copied_value = attrs.copied_value.take();
+    let value = attrs.value.take();
+    let description = attrs.description.take();
+    let identifier = attrs.identifier.take();
+    let help = attrs.help.take();
     let actions = copy_action_names(element);
 
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
@@ -493,17 +494,20 @@ unsafe fn walk_element(
     // the same native state also causes dispatch to refuse it, and exposing an
     // index for it invites agents to retain an unusable menu target.
     let enabled = if !actions.is_empty() || value_settable {
-        copy_bool_attr(element, "AXEnabled")
+        reader.read(&mut attrs, NodeRead::Enabled);
+        attrs.enabled
     } else {
         None
     };
     let is_actionable = is_addressable(!actions.is_empty(), value_settable, enabled);
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
-        let children = copy_children(element);
+        reader.read(&mut attrs, NodeRead::Children);
+        let children = std::mem::take(&mut attrs.children);
+        drop(reader); // Children own their retains; release the prefetched slots.
         for child in children {
             walk_element(
-                child,
+                child.as_CFTypeRef() as AXUIElementRef,
                 depth + 1,
                 parent_index,
                 in_web_content,
@@ -513,29 +517,30 @@ unsafe fn walk_element(
                 budget,
                 max_depth,
             );
-            CFRelease(child as CFTypeRef);
         }
         return;
     }
 
     let element_ptr = element as usize;
-    let frame = element_screen_rect(element);
-    // Structured `elements` only contains actionable nodes. Keep all new AX
-    // round-trips behind that same gate so display-only rows pay no cost.
-    let control_state = read_control_state_if_actionable(is_actionable, || ControlState {
-        value_state: copied_value
-            .map(|copied| copied.state_value)
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| value.clone())
-            .map(|v| v.trim().to_owned())
-            .filter(|v| !v.is_empty()),
-        value_description: copy_string_attr(element, "AXValueDescription")
-            .map(|v| v.trim().to_owned())
-            .filter(|v| !v.is_empty()),
-        min_value: copy_number_attr(element, "AXMinValue"),
-        max_value: copy_number_attr(element, "AXMaxValue"),
-        enabled,
-        selected: copy_bool_attr(element, "AXSelected"),
+    reader.read(&mut attrs, NodeRead::Frame);
+    let frame = attrs.frame;
+    // Structured state is decoded only for actionable nodes. The individual
+    // path keeps these IPCs behind the gate; a batch has prefetched the slots.
+    let control_state = read_control_state_if_actionable(is_actionable, || {
+        reader.read(&mut attrs, NodeRead::ControlState);
+        ControlState {
+            value_state: copied_value
+                .map(|copied| copied.state_value)
+                .filter(|v| !v.trim().is_empty())
+                .or_else(|| value.clone())
+                .map(|v| v.trim().to_owned())
+                .filter(|v| !v.is_empty()),
+            value_description: attrs.value_description.take(),
+            min_value: attrs.min_value,
+            max_value: attrs.max_value,
+            enabled,
+            selected: attrs.selected,
+        }
     });
     let node = if is_actionable {
         let idx = *counter;
@@ -621,10 +626,12 @@ unsafe fn walk_element(
     lines.push((depth, line));
     nodes.push(node);
 
-    let children = copy_children(element);
+    reader.read(&mut attrs, NodeRead::Children);
+    let children = std::mem::take(&mut attrs.children);
+    drop(reader);
     for child in children {
         walk_element(
-            child,
+            child.as_CFTypeRef() as AXUIElementRef,
             depth + 1,
             next_parent,
             in_web_content,
@@ -634,7 +641,6 @@ unsafe fn walk_element(
             budget,
             max_depth,
         );
-        CFRelease(child as CFTypeRef);
     }
 }
 
