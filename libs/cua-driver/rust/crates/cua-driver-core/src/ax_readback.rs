@@ -25,6 +25,15 @@ pub enum ReadbackEvent {
     Tick,
 }
 
+/// A successful write without an admitted read may already have delivered text.
+/// Keep it distinct from rejection so callers cannot replay it as a failed write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AxReadbackResult<T> {
+    Rejected,
+    Unobserved,
+    Observed(T),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AxReadbackMeasurement {
     pub elapsed_ms: u64,
@@ -53,9 +62,9 @@ pub fn await_readback<T>(
     settled: impl Fn(&T) -> bool,
     elapsed: impl Fn() -> Duration,
     mut wait: impl FnMut(Duration) -> ReadbackEvent,
-) -> (Option<T>, AxReadbackMeasurement) {
+) -> (AxReadbackResult<T>, AxReadbackMeasurement) {
     if !write_succeeded {
-        return (None, AxReadbackMeasurement::default());
+        return (AxReadbackResult::Rejected, AxReadbackMeasurement::default());
     }
     let budget = readback_budget(timeout);
     let mut value = None;
@@ -64,7 +73,7 @@ pub fn await_readback<T>(
         let duration = elapsed();
         if duration >= budget || (timeout.is_zero() && value.is_some()) {
             return (
-                value,
+                value.map_or(AxReadbackResult::Unobserved, AxReadbackResult::Observed),
                 AxReadbackMeasurement {
                     elapsed_ms: duration.as_millis().min(u64::MAX as u128) as u64,
                     outcome: if timeout.is_zero() {
@@ -81,7 +90,7 @@ pub fn await_readback<T>(
         // the non-idempotent typing ladder to replay text already delivered.
         if value.as_ref().is_some_and(&settled) {
             return (
-                value,
+                AxReadbackResult::Observed(value.expect("settled read has a value")),
                 AxReadbackMeasurement {
                     elapsed_ms: duration.as_millis().min(u64::MAX as u128) as u64,
                     outcome: cause,
@@ -111,7 +120,10 @@ mod tests {
         Unreadable,
     }
 
-    fn run(value: Progress, event: ReadbackEvent) -> (Option<Progress>, AxReadbackMeasurement) {
+    fn run(
+        value: Progress,
+        event: ReadbackEvent,
+    ) -> (AxReadbackResult<Progress>, AxReadbackMeasurement) {
         let clock = Cell::new(Duration::ZERO);
         let mut reads = 0;
         let result = await_readback(
@@ -154,7 +166,7 @@ mod tests {
         assert_eq!(
             run(Progress::Complete, ReadbackEvent::Notified),
             (
-                Some(Progress::Complete),
+                AxReadbackResult::Observed(Progress::Complete),
                 AxReadbackMeasurement {
                     elapsed_ms: 2,
                     outcome: AxReadback::Notification
@@ -168,7 +180,7 @@ mod tests {
         assert_eq!(
             run(Progress::Complete, ReadbackEvent::Tick),
             (
-                Some(Progress::Complete),
+                AxReadbackResult::Observed(Progress::Complete),
                 AxReadbackMeasurement {
                     elapsed_ms: 5,
                     outcome: AxReadback::Poll
@@ -183,7 +195,7 @@ mod tests {
             assert_eq!(
                 run(progress, ReadbackEvent::Tick),
                 (
-                    Some(progress),
+                    AxReadbackResult::Observed(progress),
                     AxReadbackMeasurement {
                         elapsed_ms: 12,
                         outcome: AxReadback::TimedOut
@@ -198,7 +210,7 @@ mod tests {
         assert_eq!(
             run(Progress::Partial, ReadbackEvent::Notified),
             (
-                Some(Progress::Partial),
+                AxReadbackResult::Observed(Progress::Partial),
                 AxReadbackMeasurement {
                     elapsed_ms: 2,
                     outcome: AxReadback::Notification
@@ -217,7 +229,10 @@ mod tests {
             || panic!("clock after rejected write"),
             |_| panic!("wait after rejected write"),
         );
-        assert_eq!(result, (None, AxReadbackMeasurement::default()));
+        assert_eq!(
+            result,
+            (AxReadbackResult::Rejected, AxReadbackMeasurement::default())
+        );
     }
 
     #[test]
@@ -236,7 +251,7 @@ mod tests {
         assert_eq!(
             result,
             (
-                Some(Progress::Unchanged),
+                AxReadbackResult::Observed(Progress::Unchanged),
                 AxReadbackMeasurement {
                     elapsed_ms: 1,
                     outcome: AxReadback::Skipped,
@@ -287,7 +302,7 @@ mod tests {
             budgets,
             [Duration::from_millis(250), Duration::from_millis(45)]
         );
-        assert_eq!(result.0, Some(Progress::Unreadable));
+        assert_eq!(result.0, AxReadbackResult::Observed(Progress::Unreadable));
         assert_eq!(
             result.1,
             AxReadbackMeasurement {
@@ -323,6 +338,14 @@ mod tests {
                 },
             );
             assert_eq!(reads, usize::from(!initially_expired));
+            assert_eq!(
+                result.0,
+                if initially_expired {
+                    AxReadbackResult::Unobserved
+                } else {
+                    AxReadbackResult::Observed(Progress::Unchanged)
+                }
+            );
             assert_eq!(result.1.outcome, AxReadback::TimedOut);
             assert_eq!(result.1.elapsed_ms, 5);
         }

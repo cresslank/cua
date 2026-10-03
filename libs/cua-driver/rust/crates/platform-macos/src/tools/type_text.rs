@@ -24,7 +24,9 @@
 use async_trait::async_trait;
 use cua_driver_contract::TypeTextInput;
 use cua_driver_core::{
-    ax_readback::{await_readback, readback_budget, AxReadbackMeasurement, ReadbackEvent},
+    ax_readback::{
+        await_readback, readback_budget, AxReadbackMeasurement, AxReadbackResult, ReadbackEvent,
+    },
     protocol::ToolResult,
     tool::{Tool, ToolDef},
     tool_args::parse_typed_projection,
@@ -410,9 +412,13 @@ impl Tool for TypeTextTool {
 
         let changes = super::finish_window_observation(snapshot).await;
 
-        // Unwrap the delivery envelope: a structured refusal means no
-        // actuator ran and the caller gets the exact reason.
+        // Unwrap the delivery envelope, preserving uncertainty after an AX
+        // write separately from refusal before any actuator ran.
         let result = match result {
+            Ok(Ok(TypeTextDelivery::AxUnobserved {
+                requested_chars,
+                ax_readback,
+            })) => return ax_unobserved_result(requested_chars, ax_readback),
             Ok(Ok(TypeTextDelivery::Refused(refusal))) => {
                 let wid = window_id.expect("background refusals require a window target");
                 return super::background_refusal_result(pid, wid, &refusal);
@@ -750,6 +756,24 @@ fn synthesis_refusal_result(
     ToolResult::error(message).with_structured(structured)
 }
 
+fn ax_unobserved_result(requested_chars: usize, ax_readback: AxReadbackMeasurement) -> ToolResult {
+    let message = "type_text AX write succeeded but its read-back budget expired before observation; verify the target before deciding whether any suffix remains, and do not retry blindly";
+    ToolResult::error(message).with_structured(serde_json::json!({
+        "code": "type_text_ax_unobserved",
+        "path": PATH_AX,
+        "effect": "indeterminate",
+        "requested_chars": requested_chars,
+        "synthesized_chars": 0,
+        "atomic_ax_effect": "unverifiable",
+        "retryable": false,
+        "escalation": {
+            "recommended": "verify_state",
+            "reason": message,
+        },
+        "delivery": readback_fields(ax_readback),
+    }))
+}
+
 fn path_has_untrusted_web_readback(path: &str) -> bool {
     path == PATH_AX || path == PATH_KEY_EVENTS || path == PATH_KEY_EVENTS_FG
 }
@@ -824,11 +848,15 @@ enum BackgroundKeyboardPolicy {
     SemanticOnly(BackgroundRefusal),
 }
 
-/// Delivery envelope for `type_text_blocking`: either an actuator ran
-/// (`Typed`), or the exact-target decision refused before any event was
-/// posted (`Refused`) and the caller must return the structured refusal.
+/// Delivery envelope for `type_text_blocking`, including successful AX writes
+/// whose effect could not be observed and refusals before character synthesis.
 enum TypeTextDelivery {
     Typed(TypeTextOutcome),
+    /// The AX write succeeded, but no read was admitted. Stop all replay.
+    AxUnobserved {
+        requested_chars: usize,
+        ax_readback: AxReadbackMeasurement,
+    },
     Refused(BackgroundRefusal),
     SynthesisRefused {
         path: &'static str,
@@ -909,6 +937,43 @@ enum TypedProgress {
     Partial(usize),
     Unchanged,
     Unverifiable,
+}
+
+/// Decide whether the AX rung must stop the typing ladder before any fallback.
+/// An unobserved successful write is not evidence of zero delivery.
+fn ax_readback_delivery(
+    progress: AxReadbackResult<TypedProgress>,
+    ax_readback: AxReadbackMeasurement,
+    requested_chars: usize,
+    target_detail: &str,
+) -> Option<TypeTextDelivery> {
+    let (verified, delivered_chars, detail) = match progress {
+        AxReadbackResult::Unobserved => {
+            return Some(TypeTextDelivery::AxUnobserved {
+                requested_chars,
+                ax_readback,
+            });
+        }
+        AxReadbackResult::Observed(TypedProgress::Complete) => {
+            (true, requested_chars, format!(" into{target_detail}"))
+        }
+        AxReadbackResult::Observed(TypedProgress::Partial(count)) => (
+            false,
+            count,
+            format!(" via partial AX write into{target_detail}"),
+        ),
+        AxReadbackResult::Rejected
+        | AxReadbackResult::Observed(TypedProgress::Unchanged | TypedProgress::Unverifiable) => {
+            return None;
+        }
+    };
+    Some(TypeTextDelivery::Typed(TypeTextOutcome {
+        ax_readback,
+        detail,
+        path: PATH_AX,
+        verified,
+        delivered_chars: Some(delivered_chars),
+    }))
 }
 
 fn foreground_settle_ms(pid: i32, frontmost_pid: Option<i32>) -> u64 {
@@ -1433,37 +1498,32 @@ fn type_text_blocking(
         ax_readback = measurement;
         // Remove the worker's run-loop source before any return or fallback.
         drop(observer);
+        let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
+        if let Some(delivery) = ax_readback_delivery(
+            ax_progress,
+            ax_readback,
+            text.chars().count(),
+            &format!("{idx_str} {role} \"{title}\""),
+        ) {
+            return Ok(delivery);
+        }
         // AXValue is not renderer evidence in web content. An unchanged echo
         // there cannot prove that zero characters landed, so blind retry is
         // unsafe even though no synthesis has run yet.
-        let unchanged_web_readback = ax_progress == Some(TypedProgress::Unchanged)
+        let unchanged_web_readback = ax_progress
+            == AxReadbackResult::Observed(TypedProgress::Unchanged)
             && target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
-        if ax_progress == Some(TypedProgress::Complete) {
-            let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
-            return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
-                ax_readback,
-                detail: format!(" into{idx_str} {role} \"{title}\""),
-                path: PATH_AX,
-                verified: true,
-                delivered_chars: Some(text.chars().count()),
-            }));
-        }
-        if let Some(TypedProgress::Partial(delivered_chars)) = ax_progress {
-            let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
-            return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
-                ax_readback,
-                detail: format!(" via partial AX write into{idx_str} {role} \"{title}\""),
-                path: PATH_AX,
-                verified: false,
-                delivered_chars: Some(delivered_chars),
-            }));
-        }
         ax_attempt = match ax_progress {
-            Some(TypedProgress::Unchanged) if unchanged_web_readback => AxAttempt::Unverifiable,
-            Some(TypedProgress::Unchanged) => AxAttempt::Unchanged,
-            Some(TypedProgress::Unverifiable) => AxAttempt::Unverifiable,
-            None => AxAttempt::Rejected,
-            Some(TypedProgress::Complete | TypedProgress::Partial(_)) => unreachable!(),
+            AxReadbackResult::Observed(TypedProgress::Unchanged) if unchanged_web_readback => {
+                AxAttempt::Unverifiable
+            }
+            AxReadbackResult::Observed(TypedProgress::Unchanged) => AxAttempt::Unchanged,
+            AxReadbackResult::Observed(TypedProgress::Unverifiable) => AxAttempt::Unverifiable,
+            AxReadbackResult::Rejected => AxAttempt::Rejected,
+            AxReadbackResult::Unobserved
+            | AxReadbackResult::Observed(TypedProgress::Complete | TypedProgress::Partial(_)) => {
+                unreachable!("AX delivery must stop the ladder before fallback")
+            }
         };
         tracing::debug!(
             "AX write did not land for {role} \"{title}\" (err={err}); \
@@ -1656,6 +1716,67 @@ mod tests {
         assert_eq!(indeterminate["synthesized_chars"], 0);
         assert_eq!(indeterminate["retryable"], false);
         assert_eq!(indeterminate["escalation"]["recommended"], "verify_state");
+    }
+
+    #[test]
+    fn expired_successful_ax_write_stops_ladder_and_projects_indeterminate_delivery() {
+        use std::time::Duration;
+
+        for timeout in [Duration::ZERO, Duration::from_millis(1)] {
+            for requested_chars in [2, 6_500] {
+                // Model a scheduling delay after the successful write, without
+                // admitting native reads, sleeps, or character synthesis.
+                let budget = readback_budget(timeout);
+                let (progress, measurement) = await_readback::<TypedProgress>(
+                    true,
+                    timeout,
+                    |_| panic!("expired budget must not admit a read"),
+                    |_| panic!("there was no observation"),
+                    || budget,
+                    |_| panic!("expired budget must not wait"),
+                );
+                let delivery = ax_readback_delivery(progress, measurement, requested_chars, "")
+                    .expect("successful unobserved write must stop before any fallback");
+                let TypeTextDelivery::AxUnobserved {
+                    requested_chars: count,
+                    ax_readback,
+                } = delivery
+                else {
+                    panic!("unobserved write must not claim delivery or zero-effect refusal");
+                };
+                assert_eq!(count, requested_chars);
+                let result = ax_unobserved_result(count, ax_readback);
+                // Errors retain this structured refusal envelope at dispatch;
+                // they do not enter the successful ActionResult projection.
+                assert_eq!(result.is_error, Some(true));
+                let result = result.structured_content.expect("indeterminate result");
+                assert_eq!(result["code"], "type_text_ax_unobserved");
+                assert_eq!(result["path"], PATH_AX);
+                assert_eq!(result["effect"], "indeterminate");
+                assert_eq!(result["requested_chars"], requested_chars);
+                assert_eq!(result["synthesized_chars"], 0);
+                assert_eq!(result["atomic_ax_effect"], "unverifiable");
+                assert_eq!(result["retryable"], false);
+                assert_eq!(result["escalation"]["recommended"], "verify_state");
+                assert!(result.get("delivered_chars").is_none());
+                assert!(result.get("retry_from_character").is_none());
+                assert_eq!(result["delivery"], readback_fields(measurement));
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_ax_write_remains_eligible_for_synthesis_fallback() {
+        let (progress, measurement) = await_readback::<TypedProgress>(
+            false,
+            std::time::Duration::from_millis(1),
+            |_| panic!("rejected write must not read"),
+            |_| panic!("rejected write has no observation"),
+            || panic!("rejected write must not start the clock"),
+            |_| panic!("rejected write must not wait"),
+        );
+        assert_eq!(progress, AxReadbackResult::Rejected);
+        assert!(ax_readback_delivery(progress, measurement, 2, "").is_none());
     }
 
     #[test]
