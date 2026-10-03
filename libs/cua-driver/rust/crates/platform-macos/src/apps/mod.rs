@@ -1,12 +1,14 @@
 //! macOS app enumeration via NSWorkspace and NSRunningApplication.
 
+mod bundle_plist;
 pub mod nsworkspace;
+
+use bundle_plist::{BundlePlist, BundlePlists};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::c_void,
-    process::Command,
     sync::mpsc::{self, SyncSender},
     time::Duration,
 };
@@ -44,6 +46,10 @@ pub struct AppInfo {
 /// Automation permission for System Events — and, unlike AppKit's cached
 /// `runningApplications` array, cannot go stale in a daemon.
 pub fn list_running_apps() -> Vec<AppInfo> {
+    list_running_apps_with_plists(&mut BundlePlists::default())
+}
+
+fn list_running_apps_with_plists(plists: &mut BundlePlists) -> Vec<AppInfo> {
     // KERNEL TRUTH FIRST. `NSWorkspace.runningApplications` is a CACHE that
     // AppKit refreshes from workspace notifications delivered on a main run
     // loop. A long-lived daemon (rcdpd, cua-driver serve) has no such loop
@@ -60,7 +66,7 @@ pub fn list_running_apps() -> Vec<AppInfo> {
     // running set comes from the process table, which cannot go stale, and
     // AppKit is kept only as a fallback for the case where the process table is
     // unreadable.
-    let apps = list_running_apps_from_process_table();
+    let apps = list_running_apps_from_process_table(plists);
     if apps.is_empty() {
         return list_running_apps_native();
     }
@@ -130,24 +136,8 @@ fn bundle_root_of_executable(path: &str) -> Option<&str> {
 /// Does this bundle declare itself a background/agent process — the
 /// `NSApplicationActivationPolicyRegular` filter, read from the bundle instead
 /// of from AppKit's cache.
-fn is_background_bundle(app_path: &str) -> bool {
-    let plist = format!("{app_path}/Contents/Info.plist");
-    for key in ["LSUIElement", "LSBackgroundOnly"] {
-        let out = Command::new("/usr/bin/plutil")
-            .args(["-extract", key, "raw", "-o", "-", &plist])
-            .output();
-        if let Ok(out) = out {
-            if out.status.success() {
-                let raw = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
-                // The key is written as both a boolean and a "1"/"0" string in
-                // the wild; plutil renders the boolean as true/false.
-                if raw == "1" || raw == "true" {
-                    return true;
-                }
-            }
-        }
-    }
-    false
+fn is_background_bundle(plist: &BundlePlist) -> bool {
+    plist.is_background()
 }
 
 /// Where a user-launchable application lives. Mirrors the roots
@@ -161,7 +151,7 @@ const APP_DIRECTORY_PREFIXES: [&str; 4] = [
 ];
 
 /// Running, user-facing apps, derived from the process table.
-fn list_running_apps_from_process_table() -> Vec<AppInfo> {
+fn list_running_apps_from_process_table(plists: &mut BundlePlists) -> Vec<AppInfo> {
     let pids = all_pids();
     let live: std::collections::HashSet<i32> = pids.iter().copied().collect();
     let processes: Vec<(i32, String)> = pids
@@ -195,7 +185,7 @@ fn list_running_apps_from_process_table() -> Vec<AppInfo> {
         "{}/Applications/",
         std::env::var("HOME").unwrap_or_default()
     ));
-    running_apps_from_processes(&processes, front, &windowed, &app_roots)
+    running_apps_from_processes(&processes, front, &windowed, &app_roots, plists)
 }
 
 /// Classify one process-table snapshot into running, user-facing apps.
@@ -210,8 +200,8 @@ fn running_apps_from_processes(
     front: Option<i32>,
     windowed: &std::collections::HashSet<i32>,
     app_roots: &[String],
+    plists: &mut BundlePlists,
 ) -> Vec<AppInfo> {
-    let mut background: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     let mut meta: std::collections::HashMap<String, Option<AppInfo>> =
         std::collections::HashMap::new();
     // bundle path -> the pids of its live, user-facing processes.
@@ -224,16 +214,17 @@ fn running_apps_from_processes(
             continue; // not an app bundle: a daemon, a CLI, a helper tool
         };
         let app_path = app_path.to_owned();
-        if *background
-            .entry(app_path.clone())
-            .or_insert_with(|| is_background_bundle(&app_path))
-        {
+        let info = meta.entry(app_path.clone()).or_insert_with(|| {
+            let path = std::path::Path::new(&app_path).join("Contents/Info.plist");
+            let plist = plists.read(&path).ok()?;
+            if is_background_bundle(plist) {
+                return None;
+            }
+            app_info_from_plist(&path, plist, &mut true)
+        });
+        if info.is_none() {
             continue;
         }
-        meta.entry(app_path.clone()).or_insert_with(|| {
-            let plist = format!("{app_path}/Contents/Info.plist");
-            read_app_plist(std::path::Path::new(&plist))
-        });
         by_bundle.entry(app_path).or_default().push(*pid);
     }
 
@@ -686,24 +677,12 @@ pub(crate) fn locate_by_name(name: &str) -> Option<AppLocator> {
     resolve_bundle_id_to_locator(name)
 }
 
-/// Read `CFBundleIdentifier` from an `.app` bundle's `Info.plist`.
-/// Falls back to shelling out to `plutil` (already used elsewhere in
-/// this file) to avoid pulling in a plist crate just for this.
+/// Read the raw, non-localized bundle identifier without launching a subprocess.
 fn bundle_id_for_app_path(app_path: &str) -> Option<String> {
-    let plist = format!("{app_path}/Contents/Info.plist");
-    let out = Command::new("/usr/bin/plutil")
-        .args(["-extract", "CFBundleIdentifier", "raw", "-o", "-", &plist])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let bid = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if bid.is_empty() {
-        None
-    } else {
-        Some(bid)
-    }
+    BundlePlist::read(&std::path::Path::new(app_path).join("Contents/Info.plist"))
+        .ok()?
+        .bundle_id
+        .ok()?
 }
 
 /// Return all apps: running apps merged with installed-but-not-running apps.
@@ -718,7 +697,8 @@ pub fn list_all_apps() -> Vec<AppInfo> {
     // supplies the all-policies state for installed apps that run as
     // accessories (#3060), kept only for pids the kernel still has, since
     // its cache can go stale in a long-lived daemon.
-    let running = list_running_apps();
+    let mut plists = BundlePlists::default();
+    let running = list_running_apps_with_plists(&mut plists);
     let live: std::collections::HashSet<i32> = all_pids().into_iter().collect();
     let (_, mut running_states) = enumerate_running_apps();
     if !live.is_empty() {
@@ -727,7 +707,7 @@ pub fn list_all_apps() -> Vec<AppInfo> {
         }
         running_states.retain(|_, entries| !entries.is_empty());
     }
-    let installed = scan_installed_apps_cached();
+    let installed = scan_installed_apps_cached(&mut plists);
     merge_app_lists(running, installed, &running_states)
 }
 
@@ -878,9 +858,8 @@ struct InstalledScan {
 }
 
 /// `scan_installed_apps`, memoized. The uncached scan reads every
-/// bundle's Info.plist on every call — hundreds of file reads that
-/// dominate `list_apps` latency (seconds under load) for an answer that
-/// changes only when something is installed or removed.
+/// bundle's Info.plist on every call. Reuse that inventory between calls;
+/// running apps always get fresh per-call plist snapshots.
 struct InstalledCache {
     key: InstalledScanKey,
     at: std::time::Instant,
@@ -923,17 +902,17 @@ fn cached_installed_scan(
     apps
 }
 
-fn scan_installed_apps_cached() -> Vec<AppInfo> {
+fn scan_installed_apps_cached(plists: &mut BundlePlists) -> Vec<AppInfo> {
     static CACHE: std::sync::Mutex<Option<InstalledCache>> = std::sync::Mutex::new(None);
     let roots = installed_scan_roots();
     cached_installed_scan(
         &CACHE,
         || installed_scan_key(&roots),
-        || scan_installed_apps(&roots),
+        || scan_installed_apps(&roots, plists),
     )
 }
 
-fn scan_installed_apps(roots: &[String]) -> InstalledScan {
+fn scan_installed_apps(roots: &[String], plists: &mut BundlePlists) -> InstalledScan {
     let mut result = InstalledScan {
         apps: Vec::new(),
         complete: true,
@@ -961,7 +940,9 @@ fn scan_installed_apps(roots: &[String]) -> InstalledScan {
                 continue;
             }
             let plist_path = path.join("Contents/Info.plist");
-            if let Some(mut info) = read_app_plist_with_status(&plist_path, &mut result.complete) {
+            if let Some(mut info) =
+                read_app_plist_with_status(&plist_path, &mut result.complete, plists)
+            {
                 info.launch_path = path.to_str().map(str::to_owned);
                 info.kind = Some("desktop".to_owned());
                 info.last_used = fs_last_used(&path);
@@ -987,71 +968,43 @@ fn fs_last_used(path: &std::path::Path) -> Option<String> {
     cua_driver_core::timestamp::unix_secs_to_rfc3339(duration.as_secs() as i64)
 }
 
-fn read_app_plist(plist_path: &std::path::Path) -> Option<AppInfo> {
-    read_app_plist_with_status(plist_path, &mut true)
-}
-
 /// Missing optional name keys keep the existing fallback contract. For the
 /// upstream PR #3492 cache adaptation, failed reads must remain incomplete.
 fn read_app_plist_with_status(
     plist_path: &std::path::Path,
     complete: &mut bool,
+    plists: &mut BundlePlists,
 ) -> Option<AppInfo> {
-    read_app_plist_using(plist_path, complete, |args| {
-        Command::new("/usr/bin/plutil").args(args).output()
-    })
-}
-
-/// A nonzero extract status alone cannot prove a missing key. Confirm absence
-/// in a successfully decoded dictionary; never rely on localized diagnostics.
-fn read_plist_key(
-    path: &str,
-    key: &str,
-    run: &mut impl FnMut(&[&str]) -> std::io::Result<std::process::Output>,
-) -> Result<Option<String>, ()> {
-    let output = run(&["-extract", key, "raw", "-o", "-", path]).map_err(|_| ())?;
-    if output.status.success() {
-        let value = std::str::from_utf8(&output.stdout).map_err(|_| ())?.trim();
-        return Ok((!value.is_empty()).then(|| value.to_owned()));
+    // Keep the prior launch-path contract: paths that cannot be represented
+    // on the wire did not produce an entry through the subprocess reader.
+    if plist_path.to_str().is_none() {
+        *complete = false;
+        return None;
     }
-    // plutil uses exit 1 for a missing key as well as read/parse failures.
-    // Signals and other exit codes are unconditional failures.
-    if output.status.code() != Some(1) {
-        return Err(());
-    }
-    let dictionary = run(&["-convert", "json", "-o", "-", path]).map_err(|_| ())?;
-    if !dictionary.status.success() {
-        return Err(());
-    }
-    let dictionary: serde_json::Value =
-        serde_json::from_slice(&dictionary.stdout).map_err(|_| ())?;
-    match dictionary.as_object() {
-        Some(dictionary) if !dictionary.contains_key(key) => Ok(None),
-        _ => Err(()),
-    }
-}
-
-fn read_app_plist_using(
-    plist_path: &std::path::Path,
-    complete: &mut bool,
-    mut run: impl FnMut(&[&str]) -> std::io::Result<std::process::Output>,
-) -> Option<AppInfo> {
-    let Some(path) = plist_path.to_str() else {
+    let Ok(plist) = plists.read(plist_path) else {
         *complete = false;
         return None;
     };
-    let bundle_id = match read_plist_key(path, "CFBundleIdentifier", &mut run) {
-        Ok(Some(bundle_id)) => bundle_id,
+    app_info_from_plist(plist_path, plist, complete)
+}
+
+fn app_info_from_plist(
+    plist_path: &std::path::Path,
+    plist: &BundlePlist,
+    complete: &mut bool,
+) -> Option<AppInfo> {
+    let bundle_id = match &plist.bundle_id {
+        Ok(Some(bundle_id)) => bundle_id.clone(),
         _ => {
             *complete = false;
             return None;
         }
     };
     let mut name = None;
-    for key in ["CFBundleDisplayName", "CFBundleName"] {
-        match read_plist_key(path, key, &mut run) {
+    for value in [&plist.display_name, &plist.name] {
+        match value {
             Ok(Some(value)) => {
-                name = Some(value);
+                name = Some(value.clone());
                 break;
             }
             Ok(None) => {}
@@ -1135,25 +1088,35 @@ pub fn bundle_id_for_pid(pid: i32) -> Option<String> {
     }
 }
 
-/// Return the localized application name for a running process by PID.
-/// Uses `ps -p {pid} -o comm=` which gives the command name without path.
-/// Returns `None` if the PID is unknown or the command fails.
+/// Return the executable's basename via libproc, without launching `ps`.
+/// Prefer the full path because `proc_name` may truncate long names.
+/// Returns `None` if the process exited or neither lookup is readable.
 pub fn get_app_name_for_pid(pid: i32) -> Option<String> {
-    let out = Command::new("ps")
-        .args(["-p", &pid.to_string(), "-o", "comm="])
-        .output()
-        .ok()?;
-    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if pid <= 0 {
+        return None;
+    }
+    let raw = path_of_pid(pid).or_else(|| {
+        extern "C" {
+            fn proc_name(pid: i32, buffer: *mut c_void, buffersize: u32) -> i32;
+        }
+        let mut buffer = [0u8; 1024];
+        let len = unsafe { proc_name(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+        (len > 0).then(|| {
+            String::from_utf8_lossy(&buffer[..(len as usize).min(buffer.len())])
+                .trim_end_matches('\0')
+                .to_owned()
+        })
+    })?;
+    let raw = raw.trim_end_matches('\0').trim();
     if raw.is_empty() {
         return None;
     }
-    // Strip path prefix: "/Applications/Safari.app/Contents/MacOS/Safari" → "Safari"
     Some(
-        std::path::Path::new(&raw)
+        std::path::Path::new(raw)
             .file_name()
             .and_then(|n| n.to_str())
-            .unwrap_or(&raw)
-            .to_string(),
+            .unwrap_or(raw)
+            .to_owned(),
     )
 }
 
@@ -1375,7 +1338,13 @@ mod tests {
         let nothing = HashSet::new();
 
         let launched = [(4242, regular.clone()), (4243, "/usr/bin/ssh".to_owned())];
-        let apps = running_apps_from_processes(&launched, None, &nothing, &roots);
+        let apps = running_apps_from_processes(
+            &launched,
+            None,
+            &nothing,
+            &roots,
+            &mut super::BundlePlists::default(),
+        );
         assert_eq!(pid_of(&apps, "CuaAppProbe"), Some(4242));
         assert_eq!(
             apps.len(),
@@ -1385,7 +1354,13 @@ mod tests {
         assert!(!apps[0].active);
 
         let exited = [(4243, "/usr/bin/ssh".to_owned())];
-        let apps = running_apps_from_processes(&exited, None, &nothing, &roots);
+        let apps = running_apps_from_processes(
+            &exited,
+            None,
+            &nothing,
+            &roots,
+            &mut super::BundlePlists::default(),
+        );
         assert_eq!(
             pid_of(&apps, "CuaAppProbe"),
             None,
@@ -1404,15 +1379,33 @@ mod tests {
         let nothing = HashSet::new();
         let processes = [(900, exe.clone()), (700, exe.clone()), (800, exe)];
 
-        let apps = running_apps_from_processes(&processes, None, &nothing, &roots);
+        let apps = running_apps_from_processes(
+            &processes,
+            None,
+            &nothing,
+            &roots,
+            &mut super::BundlePlists::default(),
+        );
         assert_eq!(apps.len(), 1, "{apps:?}");
         assert_eq!((apps[0].pid, apps[0].active), (700, false));
 
-        let apps = running_apps_from_processes(&processes, Some(800), &nothing, &roots);
+        let apps = running_apps_from_processes(
+            &processes,
+            Some(800),
+            &nothing,
+            &roots,
+            &mut super::BundlePlists::default(),
+        );
         assert_eq!(apps.len(), 1, "{apps:?}");
         assert_eq!((apps[0].pid, apps[0].active), (800, true));
 
-        let apps = running_apps_from_processes(&processes, Some(1), &nothing, &roots);
+        let apps = running_apps_from_processes(
+            &processes,
+            Some(1),
+            &nothing,
+            &roots,
+            &mut super::BundlePlists::default(),
+        );
         assert_eq!(apps.len(), 1, "{apps:?}");
         assert_eq!((apps[0].pid, apps[0].active), (700, false));
     }
@@ -1430,7 +1423,13 @@ mod tests {
         let windowed: HashSet<i32> = [700, 800].into_iter().collect();
         let processes = [(700, exe.clone()), (800, exe.clone()), (900, exe)];
 
-        let apps = running_apps_from_processes(&processes, Some(800), &windowed, &roots);
+        let apps = running_apps_from_processes(
+            &processes,
+            Some(800),
+            &windowed,
+            &roots,
+            &mut super::BundlePlists::default(),
+        );
         let listed: Vec<(i32, bool)> = apps.iter().map(|a| (a.pid, a.active)).collect();
         assert_eq!(listed, vec![(700, false), (800, true)], "{apps:?}");
     }
@@ -1450,7 +1449,13 @@ mod tests {
         let processes = [(10, agent), (11, background), (12, service)];
         let in_roots = [format!("{}/", temp.path().display())];
 
-        let apps = running_apps_from_processes(&processes, None, &HashSet::new(), &in_roots);
+        let apps = running_apps_from_processes(
+            &processes,
+            None,
+            &HashSet::new(),
+            &in_roots,
+            &mut super::BundlePlists::default(),
+        );
         assert_eq!(
             apps.iter().map(|app| app.pid).collect::<Vec<_>>(),
             vec![12],
@@ -1458,12 +1463,24 @@ mod tests {
         );
 
         let elsewhere = ["/Applications/".to_owned()];
-        let apps = running_apps_from_processes(&processes, None, &HashSet::new(), &elsewhere);
+        let apps = running_apps_from_processes(
+            &processes,
+            None,
+            &HashSet::new(),
+            &elsewhere,
+            &mut super::BundlePlists::default(),
+        );
         assert!(
             apps.is_empty(),
             "windowless system bundle admitted: {apps:?}"
         );
-        let apps = running_apps_from_processes(&processes, None, &HashSet::from([12]), &elsewhere);
+        let apps = running_apps_from_processes(
+            &processes,
+            None,
+            &HashSet::from([12]),
+            &elsewhere,
+            &mut super::BundlePlists::default(),
+        );
         assert_eq!(pid_of(&apps, "CuaService"), Some(12));
     }
 
@@ -1548,110 +1565,323 @@ mod tests {
         assert_eq!(apps[0].name, "Found");
     }
 
+    // Adapted from the upstream PR #3492 cache failure tests: a single
+    // in-process snapshot can no longer fail a subprocess after reading the
+    // identifier. File/parse failures must return no entry and remain uncached.
     #[test]
-    fn failed_name_reads_after_bundle_id_are_returned_but_not_cached() {
-        use super::{cached_installed_scan, read_app_plist_using, InstalledScan};
-        use std::os::unix::process::ExitStatusExt;
-        const NAMES: &str = r#"{"CFBundleDisplayName":"Actual","CFBundleName":"Actual"}"#;
-        // Exit 1 (with a valid dictionary containing the key), other nonzero
-        // exit, signal, I/O failure, and failed absence verification.
-        for failed_key in ["CFBundleDisplayName", "CFBundleName"] {
-            for failure in 0..5 {
-                let cache = std::sync::Mutex::new(None);
-                let apps = cached_installed_scan(
-                    &cache,
-                    || Ok(vec![("/fixture".to_owned(), None)]),
-                    || {
-                        let mut complete = true;
-                        let mut calls = Vec::new();
-                        let info = read_app_plist_using(
-                            std::path::Path::new("/fixture/Directory.app/Contents/Info.plist"),
-                            &mut complete,
-                            |args| {
-                                calls.push(args[..2].join(" "));
-                                let (status, stdout) = match (args[0], args[1]) {
-                                    ("-extract", "CFBundleIdentifier") => (0, "test.fixture"),
-                                    ("-extract", key) if key == failed_key => match failure {
-                                        0 | 4 => (1 << 8, ""),
-                                        1 => (2 << 8, ""),
-                                        2 => (9, ""),
-                                        3 => {
-                                            return Err(std::io::ErrorKind::PermissionDenied.into())
-                                        }
-                                        _ => unreachable!(),
-                                    },
-                                    ("-convert", "json") if failure == 4 => (1 << 8, ""),
-                                    ("-convert", "json") => (0, NAMES),
-                                    ("-extract", "CFBundleDisplayName") => (0, ""),
-                                    ("-extract", "CFBundleName") => (0, "Fallback"),
-                                    _ => panic!("unexpected plist request: {args:?}"),
-                                };
-                                Ok(std::process::Output {
-                                    status: std::process::ExitStatus::from_raw(status),
-                                    stdout: stdout.as_bytes().to_vec(),
-                                    stderr: Vec::new(),
-                                })
-                            },
-                        )
-                        .unwrap();
-                        assert_eq!(calls[0], "-extract CFBundleIdentifier");
-                        assert!(!complete, "failure {failure} must prevent caching");
-                        assert_eq!(info.bundle_id.as_deref(), Some("test.fixture"));
-                        InstalledScan {
-                            apps: vec![info],
-                            complete,
-                        }
-                    },
-                );
-                assert_eq!(
-                    apps[0].name,
-                    if failed_key == "CFBundleDisplayName" {
-                        "Fallback"
-                    } else {
-                        "Directory"
-                    }
-                );
-                assert!(cache.lock().unwrap().is_none());
+    fn failed_plist_reads_are_not_cached_and_are_retried() {
+        use super::{cached_installed_scan, read_app_plist_with_status, InstalledScan};
+        for failure in ["missing", "directory", "malformed", "non-dictionary"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("Directory.app/Contents/Info.plist");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            match failure {
+                "missing" => {}
+                "directory" => std::fs::create_dir(&path).unwrap(),
+                "malformed" => std::fs::write(&path, "not a plist").unwrap(),
+                "non-dictionary" => {
+                    std::fs::write(&path, "<plist version=\"1.0\"><array/></plist>").unwrap()
+                }
+                _ => unreachable!(),
             }
+            let cache = std::sync::Mutex::new(None);
+            let key = || Ok(vec![(temp.path().to_str().unwrap().to_owned(), None)]);
+            for _ in 0..2 {
+                let apps = cached_installed_scan(&cache, key, || {
+                    let mut complete = true;
+                    let info = read_app_plist_with_status(
+                        &path,
+                        &mut complete,
+                        &mut super::BundlePlists::default(),
+                    );
+                    assert!(info.is_none(), "{failure}");
+                    assert!(!complete, "{failure}");
+                    InstalledScan {
+                        apps: Vec::new(),
+                        complete,
+                    }
+                });
+                assert!(apps.is_empty());
+                assert!(cache.lock().unwrap().is_none());
+                assert!(super::bundle_id_for_app_path(
+                    path.parent().unwrap().parent().unwrap().to_str().unwrap()
+                )
+                .is_none());
+            }
+            if failure == "directory" {
+                std::fs::remove_dir(&path).unwrap();
+            }
+            write_plist_fixture(
+                temp.path(),
+                "<key>CFBundleIdentifier</key><string>test.fixture</string>",
+                false,
+            );
+            let apps = cached_installed_scan(&cache, key, || {
+                let mut complete = true;
+                let info = read_app_plist_with_status(
+                    &path,
+                    &mut complete,
+                    &mut super::BundlePlists::default(),
+                )
+                .unwrap();
+                InstalledScan {
+                    apps: vec![info],
+                    complete,
+                }
+            });
+            assert_eq!(apps[0].name, "Directory");
+            assert!(cache.lock().unwrap().is_some());
         }
     }
 
     #[test]
     fn verified_missing_optional_names_allow_directory_fallback_to_cache() {
-        use std::os::unix::process::ExitStatusExt;
-        let mut complete = true;
-        let mut requests = Vec::new();
-        let info = super::read_app_plist_using(
-            std::path::Path::new("/fixture/Directory.app/Contents/Info.plist"),
-            &mut complete,
-            |args| {
-                requests.push(args[..2].join(" "));
-                let (status, stdout) = match (args[0], args[1]) {
-                    ("-extract", "CFBundleIdentifier") => (0, "test.fixture"),
-                    ("-extract", "CFBundleDisplayName" | "CFBundleName") => (1 << 8, ""),
-                    ("-convert", "json") => (0, r#"{"CFBundleIdentifier":"test.fixture"}"#),
-                    _ => panic!("unexpected plist request: {args:?}"),
-                };
-                Ok(std::process::Output {
-                    status: std::process::ExitStatus::from_raw(status),
-                    stdout: stdout.as_bytes().to_vec(),
-                    stderr: Vec::new(),
-                })
+        for binary in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = write_plist_fixture(
+                temp.path(),
+                "<key>CFBundleIdentifier</key><string>test.fixture</string>",
+                binary,
+            );
+            let mut complete = true;
+            let info = super::read_app_plist_with_status(
+                &path,
+                &mut complete,
+                &mut super::BundlePlists::default(),
+            )
+            .unwrap();
+            assert!(complete);
+            assert_eq!(info.name, "Directory");
+            let cache = std::sync::Mutex::new(None);
+            super::cached_installed_scan(
+                &cache,
+                || Ok(vec![(temp.path().to_str().unwrap().to_owned(), None)]),
+                || super::InstalledScan {
+                    apps: vec![info],
+                    complete,
+                },
+            );
+            assert!(cache.lock().unwrap().is_some());
+        }
+    }
+
+    /// Fixtures touch only temporary files, never LaunchServices or a real app.
+    fn write_plist_fixture(root: &std::path::Path, body: &str, binary: bool) -> std::path::PathBuf {
+        use core_foundation::{
+            base::{CFType, TCFType},
+            data::CFData,
+            propertylist::{
+                create_data, create_with_data, kCFPropertyListBinaryFormat_v1_0,
+                kCFPropertyListImmutable,
             },
-        )
-        .unwrap();
-        assert!(complete);
-        assert_eq!(info.name, "Directory");
-        assert_eq!(
-            requests,
-            [
-                "-extract CFBundleIdentifier",
-                "-extract CFBundleDisplayName",
-                "-convert json",
-                "-extract CFBundleName",
-                "-convert json",
-            ]
+        };
+        let path = root.join("Directory.app/Contents/Info.plist");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>{body}</dict></plist>"#
         );
+        let bytes = if binary {
+            let (raw, _) = create_with_data(
+                CFData::from_buffer(xml.as_bytes()),
+                kCFPropertyListImmutable,
+            )
+            .unwrap();
+            let plist = unsafe { CFType::wrap_under_create_rule(raw) };
+            create_data(plist.as_CFTypeRef(), kCFPropertyListBinaryFormat_v1_0)
+                .unwrap()
+                .bytes()
+                .to_vec()
+        } else {
+            xml.into_bytes()
+        };
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn plist_names_keep_raw_values_trimming_and_fallback_order() {
+        for binary in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            for (names, expected) in [
+                ("<key>CFBundleDisplayName</key><string>  Raw Display Ω  </string><key>CFBundleName</key><string>Bundle</string>", "Raw Display Ω"),
+                ("<key>CFBundleDisplayName</key><string>  </string><key>CFBundleName</key><string>  Bundle  </string>", "Bundle"),
+                ("<key>CFBundleName</key><string>Bundle</string>", "Bundle"),
+                ("<key>CFBundleDisplayName</key><string></string><key>CFBundleName</key><string> </string>", "Directory"),
+                ("", "Directory"),
+            ] {
+                let path = write_plist_fixture(temp.path(), &format!("<key>CFBundleIdentifier</key><string>  test.fixture  </string>{names}"), binary);
+                let localized = path.parent().unwrap().join("en.lproj");
+                std::fs::create_dir_all(&localized).unwrap();
+                std::fs::write(localized.join("InfoPlist.strings"), "CFBundleDisplayName = Localized;").unwrap();
+                let mut complete = true;
+                let info = super::read_app_plist_with_status(&path, &mut complete, &mut super::BundlePlists::default()).unwrap();
+                assert!(complete);
+                assert_eq!(info.name, expected);
+                assert_eq!(info.bundle_id.as_deref(), Some("test.fixture"));
+                assert_eq!(super::bundle_id_for_app_path(path.parent().unwrap().parent().unwrap().to_str().unwrap()).as_deref(), Some("test.fixture"));
+            }
+        }
+    }
+
+    #[test]
+    fn plist_requires_nonempty_bundle_identifier() {
+        for binary in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            for identifier in ["", "<key>CFBundleIdentifier</key><string>  </string>"] {
+                let path = write_plist_fixture(
+                    temp.path(),
+                    &format!("{identifier}<key>CFBundleName</key><string>Name</string>"),
+                    binary,
+                );
+                let mut complete = true;
+                assert!(super::read_app_plist_with_status(
+                    &path,
+                    &mut complete,
+                    &mut super::BundlePlists::default()
+                )
+                .is_none());
+                assert!(!complete);
+                assert!(super::bundle_id_for_app_path(
+                    path.parent().unwrap().parent().unwrap().to_str().unwrap()
+                )
+                .is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn plist_background_flags_match_raw_plutil_semantics() {
+        for binary in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            for key in ["LSUIElement", "LSBackgroundOnly"] {
+                for (value, expected) in [
+                    ("<true/>", true),
+                    ("<false/>", false),
+                    ("<string>1</string>", true),
+                    ("<string>0</string>", false),
+                    ("<string>  TrUe  </string>", true),
+                    ("<string>false</string>", false),
+                    ("<string>yes</string>", false),
+                    ("<string></string>", false),
+                    ("<integer>1</integer>", true),
+                    ("<integer>2</integer>", false),
+                    ("<real>1</real>", false),
+                ] {
+                    let path = write_plist_fixture(
+                        temp.path(),
+                        &format!("<key>{key}</key>{value}"),
+                        binary,
+                    );
+                    let plist = super::BundlePlist::read(&path).unwrap();
+                    assert_eq!(
+                        super::is_background_bundle(&plist),
+                        expected,
+                        "{key}={value}, binary={binary}"
+                    );
+                }
+            }
+            let path = write_plist_fixture(temp.path(), "", binary);
+            assert!(!super::is_background_bundle(
+                &super::BundlePlist::read(&path).unwrap()
+            ));
+        }
+    }
+
+    #[test]
+    fn plist_unusual_key_types_keep_plutil_raw_rendering() {
+        for binary in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            for (value, expected) in [
+                ("<true/>", "true"),
+                ("<integer>42</integer>", "42"),
+                ("<real>2.5</real>", "2.500000"),
+                ("<real>nan</real>", "nan"),
+                ("<data>YWJj</data>", "YWJj"),
+                ("<date>2024-01-01T00:00:00Z</date>", "2024-01-01T00:00:00Z"),
+                ("<array><string>x</string></array>", "1"),
+                (
+                    "<dict><key>z</key><string>x</string><key>a</key><string>y</string></dict>",
+                    "a\nz",
+                ),
+            ] {
+                let path = write_plist_fixture(temp.path(), &format!("<key>CFBundleIdentifier</key><string>test.fixture</string><key>CFBundleDisplayName</key>{value}"), binary);
+                let mut complete = true;
+                let info = super::read_app_plist_with_status(
+                    &path,
+                    &mut complete,
+                    &mut super::BundlePlists::default(),
+                )
+                .unwrap();
+                assert_eq!(info.name, expected, "{value}, binary={binary}");
+                assert!(complete);
+            }
+        }
+    }
+
+    #[test]
+    fn libproc_name_matches_own_executable_and_rejects_invalid_pids() {
+        let expected = std::env::current_exe().unwrap();
+        assert_eq!(
+            super::get_app_name_for_pid(std::process::id() as i32).as_deref(),
+            expected.file_name().unwrap().to_str(),
+        );
+        assert_eq!(super::get_app_name_for_pid(-1), None);
+        assert_eq!(super::get_app_name_for_pid(0), None);
+        assert_eq!(super::get_app_name_for_pid(i32::MAX), None);
+    }
+
+    #[test]
+    fn running_bundle_metadata_and_background_flags_are_live_between_calls() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = write_plist_fixture(temp.path(), "<key>CFBundleIdentifier</key><string>test.fixture</string><key>CFBundleName</key><string>Before</string>", false);
+        let bundle = path.parent().unwrap().parent().unwrap();
+        let processes = vec![
+            (
+                42,
+                bundle
+                    .join("Contents/MacOS/Test")
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            ),
+            (
+                43,
+                bundle
+                    .join("Contents/MacOS/Test")
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            ),
+        ];
+        let roots = vec![temp.path().to_str().unwrap().to_owned()];
+        let apps = running_apps_from_processes(
+            &processes,
+            None,
+            &HashSet::from([42, 43]),
+            &roots,
+            &mut super::BundlePlists::default(),
+        );
+        assert_eq!(apps.len(), 2);
+        assert!(apps.iter().all(|app| app.name == "Before"));
+        write_plist_fixture(temp.path(), "<key>CFBundleIdentifier</key><string>test.fixture</string><key>LSUIElement</key><true/>", true);
+        assert!(running_apps_from_processes(
+            &processes,
+            None,
+            &HashSet::from([42, 43]),
+            &roots,
+            &mut super::BundlePlists::default()
+        )
+        .is_empty());
+        write_plist_fixture(temp.path(), "<key>CFBundleIdentifier</key><string>test.fixture</string><key>CFBundleName</key><string>After</string>", true);
+        let apps = running_apps_from_processes(
+            &processes,
+            None,
+            &HashSet::from([42, 43]),
+            &roots,
+            &mut super::BundlePlists::default(),
+        );
+        assert_eq!(apps.len(), 2);
+        assert!(apps.iter().all(|app| app.name == "After"));
     }
 
     #[test]
@@ -1706,7 +1936,7 @@ mod tests {
         let partial = cached_installed_scan(
             &cache,
             || installed_scan_key(&roots),
-            || scan_installed_apps(&roots),
+            || scan_installed_apps(&roots, &mut super::BundlePlists::default()),
         );
         assert_eq!(partial.len(), 1);
         assert_eq!(partial[0].name, "Valid");
@@ -1717,7 +1947,7 @@ mod tests {
         let repaired = cached_installed_scan(
             &cache,
             || installed_scan_key(&roots),
-            || scan_installed_apps(&roots),
+            || scan_installed_apps(&roots, &mut super::BundlePlists::default()),
         );
         assert_eq!(repaired.len(), 2);
         assert!(cache.lock().unwrap().is_some());
@@ -1735,13 +1965,13 @@ mod tests {
         let root = temp.path().join("optional");
         let roots = vec![root.to_str().unwrap().to_owned()];
         assert_eq!(installed_scan_key(&roots).unwrap()[0].1, None);
-        assert!(scan_installed_apps(&roots).complete);
+        assert!(scan_installed_apps(&roots, &mut super::BundlePlists::default()).complete);
         // A file where a directory belongs is a real read_dir failure.
         std::fs::write(&root, "not a directory").unwrap();
-        assert!(!scan_installed_apps(&roots).complete);
+        assert!(!scan_installed_apps(&roots, &mut super::BundlePlists::default()).complete);
         std::fs::remove_file(&root).unwrap();
         std::fs::create_dir(&root).unwrap();
-        assert!(scan_installed_apps(&roots).complete);
+        assert!(scan_installed_apps(&roots, &mut super::BundlePlists::default()).complete);
         assert!(installed_scan_key(&roots).unwrap()[0].1.is_some());
     }
 

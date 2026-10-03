@@ -136,14 +136,24 @@ impl Tool for LaunchAppTool {
                 );
             }
         } else if let Some(ref n) = name {
-            let Some(locator) = crate::apps::locate_by_name(n) else {
+            // Name resolution reads bundle metadata; keep that I/O off the
+            // async executor just like the admitted launch worker below.
+            let lookup_name = n.clone();
+            let resolved = cua_driver_core::blocking::spawn(move || {
+                crate::apps::locate_by_name(&lookup_name)
+                    .map(|locator| locator.app_ref_and_bundle_id())
+            })
+            .await;
+            let Ok(resolved) = resolved else {
+                return ToolResult::error("Application name resolution failed.");
+            };
+            let Some((_, resolved_bundle_id)) = resolved else {
                 return structured_launch_error(
                     "APP_NOT_INSTALLED",
                     format!("No installed macOS app found for name '{n}'."),
                     serde_json::json!({ "name": n }),
                 );
             };
-            let (_, resolved_bundle_id) = locator.app_ref_and_bundle_id();
             response_bundle_id = resolved_bundle_id.clone();
             if resolved_bundle_id
                 .as_deref()

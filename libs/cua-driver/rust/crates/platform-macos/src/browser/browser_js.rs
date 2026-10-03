@@ -57,7 +57,11 @@ impl BrowserJs {
                 target.pid
             );
         }
-        ensure_applescript_process_identity(bundle_id, expected_pid)?;
+        let identity_bundle_id = bundle_id.to_owned();
+        cua_driver_core::blocking::spawn(move || {
+            ensure_applescript_process_identity(&identity_bundle_id, expected_pid)
+        })
+        .await??;
 
         let escaped_js = escape_js_for_applescript(javascript);
 

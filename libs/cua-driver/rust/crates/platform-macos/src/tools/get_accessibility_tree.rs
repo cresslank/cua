@@ -56,7 +56,9 @@ impl Tool for GetAccessibilityTreeTool {
     async fn invoke(&self, _args: Value) -> ToolResult {
         let _ = &self.state; // state not needed for this tool
 
-        let apps = crate::apps::list_running_apps();
+        let apps = cua_driver_core::blocking::spawn(crate::apps::list_running_apps)
+            .await
+            .unwrap_or_default();
         let windows = crate::windows::visible_windows();
 
         let mut lines = vec![format!(
