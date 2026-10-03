@@ -232,8 +232,11 @@ impl DriverRuntime {
         let _drained = self.lifecycle.write().await;
         // Drain captures a fixed set after our admitted calls finish. Leases
         // subsequently added by other runtimes cannot prolong this shutdown.
+        // It only waits on the guard reaper, never on native work, so it must
+        // not queue behind native-call admission: timed-out AX workers keep
+        // their permits and could otherwise stall shutdown indefinitely.
         #[cfg(target_os = "macos")]
-        let _ = cua_driver_core::blocking::spawn(platform_macos::post_action::drain).await;
+        let _ = tokio::task::spawn_blocking(platform_macos::post_action::drain).await;
         self.stop_lifecycle_maintenance();
         self.authorization_registry.revoke_all();
         let runtime_prefix = format!(
@@ -1352,6 +1355,43 @@ mod tests {
         assert!(
             probe.send(()).is_err(),
             "lifecycle maintenance is still running after shutdown"
+        );
+    }
+
+    // Timed-out native workers keep their admission permits until the provider
+    // returns. Shutdown's focus-guard drain must not queue behind them.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn shutdown_completes_while_native_call_admission_is_saturated() {
+        let _runtime_test = TEST_RUNTIME_LOCK.lock().await;
+        let runtime = DriverRuntime::create(standard_options()).unwrap();
+        let gate = std::sync::Arc::new(std::sync::RwLock::new(()));
+        let closed = gate.write().unwrap();
+        let stuck: Vec<_> = (0..64)
+            .map(|_| {
+                let gate = gate.clone();
+                cua_driver_core::blocking::spawn(move || drop(gate.read()))
+            })
+            .collect();
+        let mut probe = cua_driver_core::blocking::spawn(|| ());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut probe)
+                .await
+                .is_err(),
+            "native-call admission is not saturated"
+        );
+
+        let finished =
+            tokio::time::timeout(std::time::Duration::from_secs(5), runtime.shutdown()).await;
+
+        drop(closed);
+        for task in stuck {
+            task.await.unwrap();
+        }
+        probe.await.unwrap();
+        assert!(
+            finished.is_ok(),
+            "shutdown stalled behind saturated native-call admission"
         );
     }
 }
