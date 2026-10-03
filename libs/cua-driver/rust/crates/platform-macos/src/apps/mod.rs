@@ -991,76 +991,82 @@ fn read_app_plist(plist_path: &std::path::Path) -> Option<AppInfo> {
     read_app_plist_with_status(plist_path, &mut true)
 }
 
-// Missing optional name keys keep the existing fallback contract. A failed
-// subprocess must not make a fallback name look like a complete cached read.
+/// Missing optional name keys keep the existing fallback contract. For the
+/// upstream PR #3492 cache adaptation, failed reads must remain incomplete.
 fn read_app_plist_with_status(
     plist_path: &std::path::Path,
     complete: &mut bool,
 ) -> Option<AppInfo> {
-    let bundle_id_out = Command::new("plutil")
-        .args([
-            "-extract",
-            "CFBundleIdentifier",
-            "raw",
-            "-o",
-            "-",
-            plist_path.to_str()?,
-        ])
-        .output()
-        .ok()?;
-    if !bundle_id_out.status.success() {
-        return None;
-    }
-    let bundle_id = String::from_utf8_lossy(&bundle_id_out.stdout)
-        .trim()
-        .to_string();
-    if bundle_id.is_empty() {
-        return None;
-    }
+    read_app_plist_using(plist_path, complete, |args| {
+        Command::new("/usr/bin/plutil").args(args).output()
+    })
+}
 
-    let name_out = Command::new("plutil")
-        .args([
-            "-extract",
-            "CFBundleDisplayName",
-            "raw",
-            "-o",
-            "-",
-            plist_path.to_str()?,
-        ])
-        .output()
-        .inspect_err(|_| *complete = false)
-        .ok();
-    let name = name_out
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            // Fallback: CFBundleName.
-            Command::new("plutil")
-                .args([
-                    "-extract",
-                    "CFBundleName",
-                    "raw",
-                    "-o",
-                    "-",
-                    plist_path.to_str().unwrap_or(""),
-                ])
-                .output()
-                .inspect_err(|_| *complete = false)
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| {
-                    plist_path
-                        .parent()
-                        .and_then(|p| p.parent())
-                        .and_then(|p| p.file_stem())
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("")
-                        .to_string()
-                })
-        });
+/// A nonzero extract status alone cannot prove a missing key. Confirm absence
+/// in a successfully decoded dictionary; never rely on localized diagnostics.
+fn read_plist_key(
+    path: &str,
+    key: &str,
+    run: &mut impl FnMut(&[&str]) -> std::io::Result<std::process::Output>,
+) -> Result<Option<String>, ()> {
+    let output = run(&["-extract", key, "raw", "-o", "-", path]).map_err(|_| ())?;
+    if output.status.success() {
+        let value = std::str::from_utf8(&output.stdout).map_err(|_| ())?.trim();
+        return Ok((!value.is_empty()).then(|| value.to_owned()));
+    }
+    // plutil uses exit 1 for a missing key as well as read/parse failures.
+    // Signals and other exit codes are unconditional failures.
+    if output.status.code() != Some(1) {
+        return Err(());
+    }
+    let dictionary = run(&["-convert", "json", "-o", "-", path]).map_err(|_| ())?;
+    if !dictionary.status.success() {
+        return Err(());
+    }
+    let dictionary: serde_json::Value =
+        serde_json::from_slice(&dictionary.stdout).map_err(|_| ())?;
+    match dictionary.as_object() {
+        Some(dictionary) if !dictionary.contains_key(key) => Ok(None),
+        _ => Err(()),
+    }
+}
+
+fn read_app_plist_using(
+    plist_path: &std::path::Path,
+    complete: &mut bool,
+    mut run: impl FnMut(&[&str]) -> std::io::Result<std::process::Output>,
+) -> Option<AppInfo> {
+    let Some(path) = plist_path.to_str() else {
+        *complete = false;
+        return None;
+    };
+    let bundle_id = match read_plist_key(path, "CFBundleIdentifier", &mut run) {
+        Ok(Some(bundle_id)) => bundle_id,
+        _ => {
+            *complete = false;
+            return None;
+        }
+    };
+    let mut name = None;
+    for key in ["CFBundleDisplayName", "CFBundleName"] {
+        match read_plist_key(path, key, &mut run) {
+            Ok(Some(value)) => {
+                name = Some(value);
+                break;
+            }
+            Ok(None) => {}
+            Err(()) => *complete = false,
+        }
+    }
+    let name = name.unwrap_or_else(|| {
+        plist_path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string()
+    });
 
     if name.is_empty() {
         return None;
@@ -1540,6 +1546,112 @@ mod tests {
         }
         let apps = cached_installed_scan(&cache, key, || panic!("complete scan must be reused"));
         assert_eq!(apps[0].name, "Found");
+    }
+
+    #[test]
+    fn failed_name_reads_after_bundle_id_are_returned_but_not_cached() {
+        use super::{cached_installed_scan, read_app_plist_using, InstalledScan};
+        use std::os::unix::process::ExitStatusExt;
+        const NAMES: &str = r#"{"CFBundleDisplayName":"Actual","CFBundleName":"Actual"}"#;
+        // Exit 1 (with a valid dictionary containing the key), other nonzero
+        // exit, signal, I/O failure, and failed absence verification.
+        for failed_key in ["CFBundleDisplayName", "CFBundleName"] {
+            for failure in 0..5 {
+                let cache = std::sync::Mutex::new(None);
+                let apps = cached_installed_scan(
+                    &cache,
+                    || Ok(vec![("/fixture".to_owned(), None)]),
+                    || {
+                        let mut complete = true;
+                        let mut calls = Vec::new();
+                        let info = read_app_plist_using(
+                            std::path::Path::new("/fixture/Directory.app/Contents/Info.plist"),
+                            &mut complete,
+                            |args| {
+                                calls.push(args[..2].join(" "));
+                                let (status, stdout) = match (args[0], args[1]) {
+                                    ("-extract", "CFBundleIdentifier") => (0, "test.fixture"),
+                                    ("-extract", key) if key == failed_key => match failure {
+                                        0 | 4 => (1 << 8, ""),
+                                        1 => (2 << 8, ""),
+                                        2 => (9, ""),
+                                        3 => {
+                                            return Err(std::io::ErrorKind::PermissionDenied.into())
+                                        }
+                                        _ => unreachable!(),
+                                    },
+                                    ("-convert", "json") if failure == 4 => (1 << 8, ""),
+                                    ("-convert", "json") => (0, NAMES),
+                                    ("-extract", "CFBundleDisplayName") => (0, ""),
+                                    ("-extract", "CFBundleName") => (0, "Fallback"),
+                                    _ => panic!("unexpected plist request: {args:?}"),
+                                };
+                                Ok(std::process::Output {
+                                    status: std::process::ExitStatus::from_raw(status),
+                                    stdout: stdout.as_bytes().to_vec(),
+                                    stderr: Vec::new(),
+                                })
+                            },
+                        )
+                        .unwrap();
+                        assert_eq!(calls[0], "-extract CFBundleIdentifier");
+                        assert!(!complete, "failure {failure} must prevent caching");
+                        assert_eq!(info.bundle_id.as_deref(), Some("test.fixture"));
+                        InstalledScan {
+                            apps: vec![info],
+                            complete,
+                        }
+                    },
+                );
+                assert_eq!(
+                    apps[0].name,
+                    if failed_key == "CFBundleDisplayName" {
+                        "Fallback"
+                    } else {
+                        "Directory"
+                    }
+                );
+                assert!(cache.lock().unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn verified_missing_optional_names_allow_directory_fallback_to_cache() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut complete = true;
+        let mut requests = Vec::new();
+        let info = super::read_app_plist_using(
+            std::path::Path::new("/fixture/Directory.app/Contents/Info.plist"),
+            &mut complete,
+            |args| {
+                requests.push(args[..2].join(" "));
+                let (status, stdout) = match (args[0], args[1]) {
+                    ("-extract", "CFBundleIdentifier") => (0, "test.fixture"),
+                    ("-extract", "CFBundleDisplayName" | "CFBundleName") => (1 << 8, ""),
+                    ("-convert", "json") => (0, r#"{"CFBundleIdentifier":"test.fixture"}"#),
+                    _ => panic!("unexpected plist request: {args:?}"),
+                };
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(status),
+                    stdout: stdout.as_bytes().to_vec(),
+                    stderr: Vec::new(),
+                })
+            },
+        )
+        .unwrap();
+        assert!(complete);
+        assert_eq!(info.name, "Directory");
+        assert_eq!(
+            requests,
+            [
+                "-extract CFBundleIdentifier",
+                "-extract CFBundleDisplayName",
+                "-convert json",
+                "-extract CFBundleName",
+                "-convert json",
+            ]
+        );
     }
 
     #[test]

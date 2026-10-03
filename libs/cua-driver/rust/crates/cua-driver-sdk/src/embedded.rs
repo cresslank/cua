@@ -841,6 +841,7 @@ fn configuration_error<T>(reason: impl Into<String>) -> Result<T, EmbeddedDriver
 }
 
 /// Pacing allowlist adapted from hyprcat's upstream PR #3490.
+/// Preserve the AX batching kill switch for the upstream PR #1757 adaptation.
 pub(crate) fn allowed_environment_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
     upper.starts_with("LC_")
@@ -875,6 +876,7 @@ pub(crate) fn allowed_environment_name(name: &str) -> bool {
                 | "DBUS_SESSION_BUS_ADDRESS"
                 | "XAUTHORITY"
                 | "CUA_LOG"
+                | "CUA_DRIVER_AX_BATCH"
         )
 }
 
@@ -972,7 +974,7 @@ pub(crate) fn private_worker_environment(
 
 fn private_worker_override_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    upper.starts_with("LC_") || matches!(upper.as_str(), "LANG" | "CUA_LOG")
+    upper.starts_with("LC_") || matches!(upper.as_str(), "LANG" | "CUA_LOG" | "CUA_DRIVER_AX_BATCH")
 }
 
 fn merge_private_worker_environment(
@@ -1843,6 +1845,47 @@ mod tests {
 
         assert_eq!(host.state(), EmbeddedDriverHostState::Stopped);
         assert!(!socket_path.exists());
+    }
+
+    #[test]
+    fn ax_batch_kill_switch_propagates_through_both_launch_paths() {
+        const NAME: &str = "CUA_DRIVER_AX_BATCH";
+        assert!(allowed_environment_name(NAME));
+        assert!(private_worker_override_name(NAME));
+        // Inheritance, explicit configuration, and explicit override precedence.
+        for (inherited, overrides) in [
+            (vec![(NAME.to_owned(), "0".to_owned())], vec![]),
+            (
+                vec![],
+                vec![EmbeddedEnvironmentVariable {
+                    name: NAME.into(),
+                    value: "0".into(),
+                }],
+            ),
+            (
+                vec![(NAME.to_owned(), "1".to_owned())],
+                vec![EmbeddedEnvironmentVariable {
+                    name: NAME.into(),
+                    value: "0".into(),
+                }],
+            ),
+        ] {
+            let embedded = merge_safe_environment(inherited.clone(), &overrides);
+            let worker = merge_private_worker_environment(
+                inherited
+                    .into_iter()
+                    .map(|(name, value)| (name.into(), value.into())),
+                &overrides,
+                None,
+                None,
+            )
+            .unwrap();
+            for merged in [embedded, worker] {
+                assert_eq!(merged.len(), 1);
+                assert_eq!(merged[0].name, NAME);
+                assert_eq!(merged[0].value, "0");
+            }
+        }
     }
 
     /// `CUA_DRIVER_KEY_GAP_MS` must survive both propagation paths into a child launch —

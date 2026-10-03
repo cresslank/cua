@@ -167,7 +167,7 @@ use core_foundation::{
     string::CFString as CFStr,
 };
 
-/// Slot order shared by the batch request and the individual-read decoder.
+/// Attribute names shared by batch requests and the individual-read decoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub(super) enum NodeAttribute {
@@ -206,8 +206,8 @@ const NODE_ATTRIBUTES: [&str; 15] = [
     "AXSelected",
 ];
 
-/// Decode only the fields the walker needs at each existing gate. A successful
-/// batch prefetches all slots, but the individual path keeps conditional IPCs.
+/// Read only the fields the walker needs at each existing gate. Both batch
+/// and individual requests preserve the walker and decoder conditions.
 #[derive(Clone, Copy)]
 pub(super) enum NodeRead {
     Role,
@@ -239,73 +239,108 @@ pub(super) struct NodeAttrs {
 
 pub(super) struct NodeAttributeReader {
     element: AXUIElementRef,
-    batch: Option<CFArray<CFTypeRef>>,
+    batch_enabled: bool,
 }
 
 impl NodeAttributeReader {
     /// The caller must keep `element` alive and set its messaging timeout before
-    /// construction, after admitting this node to the walk budget.
+    /// construction, after admitting this node to the walk budget. Construction
+    /// performs no IPC: role must be read before the walker admits other stages.
     pub unsafe fn new(element: AXUIElementRef) -> Self {
         static BATCH_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let enabled = *BATCH_ENABLED
+        let batch_enabled = *BATCH_ENABLED
             .get_or_init(|| std::env::var_os("CUA_DRIVER_AX_BATCH").is_none_or(|v| v != "0"));
-        let batch = if enabled {
-            let names: Vec<_> = NODE_ATTRIBUTES
-                .iter()
-                .map(|name| CFStr::new(name))
-                .collect();
-            let names = CFArray::from_CFTypes(&names);
-            let mut values = std::ptr::null();
-            let error = AXUIElementCopyMultipleAttributeValues(
-                element,
-                names.as_concrete_TypeRef(),
-                0, // Never StopOnError: unsupported attributes occupy error slots.
-                &mut values,
-            );
-            // Own even a non-null result accompanying an error. Validate its
-            // type before treating it as an array; all fallback paths drop it.
-            let values = (!values.is_null()).then(|| CFType::wrap_under_create_rule(values.cast()));
-            validate_node_batch(error, values)
-        } else {
-            None
-        };
-        Self { element, batch }
+        Self {
+            element,
+            batch_enabled,
+        }
     }
 
-    /// Both sources feed the same decoder, at the same walker gates.
+    /// Both sources make requests at the same walker and conditional-read gates.
     pub unsafe fn read(&self, attrs: &mut NodeAttrs, stage: NodeRead) {
-        decode_node_attrs(attrs, stage, |attribute| match &self.batch {
-            Some(values) => values
-                .get(attribute as isize)
-                .filter(|value| !value.is_null())
-                .map(|value| CFType::wrap_under_get_rule(*value)),
-            None => {
-                let name = CFStr::new(NODE_ATTRIBUTES[attribute as usize]);
-                let mut value = std::ptr::null();
-                let error = AXUIElementCopyAttributeValue(
+        read_node_stage(attrs, stage, self.batch_enabled, |attributes| {
+            let mut value = std::ptr::null();
+            let error = if let [attribute] = attributes {
+                let name = CFStr::new(NODE_ATTRIBUTES[*attribute as usize]);
+                AXUIElementCopyAttributeValue(self.element, name.as_concrete_TypeRef(), &mut value)
+            } else {
+                let names: Vec<_> = attributes
+                    .iter()
+                    .map(|attribute| CFStr::new(NODE_ATTRIBUTES[*attribute as usize]))
+                    .collect();
+                let names = CFArray::from_CFTypes(&names);
+                let mut values = std::ptr::null();
+                let error = AXUIElementCopyMultipleAttributeValues(
                     self.element,
-                    name.as_concrete_TypeRef(),
-                    &mut value,
+                    names.as_concrete_TypeRef(),
+                    0, // Never StopOnError: unsupported attributes occupy error slots.
+                    &mut values,
                 );
-                let value = (!value.is_null()).then(|| CFType::wrap_under_create_rule(value));
-                if error == kAXErrorSuccess {
-                    value
-                } else {
-                    None
-                }
-            }
+                value = values.cast();
+                error
+            };
+            // Own even a non-null result accompanying an error. The caller
+            // validates batch type/length; all failure paths release the output.
+            (
+                error,
+                (!value.is_null()).then(|| CFType::wrap_under_create_rule(value)),
+            )
         });
     }
 }
 
+/// Request boundary for the PR #1757 adaptation. Batch only unconditional
+/// fields within an admitted stage. Placeholder and size remain individual
+/// requests after their value/position gates; role, enabled and children each
+/// have their own walker gate and must never be prefetched.
+fn read_node_stage(
+    attrs: &mut NodeAttrs,
+    stage: NodeRead,
+    batch_enabled: bool,
+    mut request: impl FnMut(&[NodeAttribute]) -> (AXError, Option<CFType>),
+) {
+    use NodeAttribute as A;
+    let attributes: &[NodeAttribute] = match stage {
+        NodeRead::Content => &[A::Title, A::Value, A::Description, A::Identifier, A::Help],
+        NodeRead::ControlState => &[A::ValueDescription, A::MinValue, A::MaxValue, A::Selected],
+        _ => &[],
+    };
+    let batch = if batch_enabled && !attributes.is_empty() {
+        let (error, values) = request(attributes);
+        validate_node_batch(error, values, attributes.len())
+    } else {
+        None
+    };
+    decode_node_attrs(attrs, stage, |attribute| {
+        if let Some(values) = &batch {
+            if let Some(index) = attributes.iter().position(|a| *a == attribute) {
+                return values
+                    .get(index as isize)
+                    .filter(|value| !value.is_null())
+                    .map(|value| unsafe { CFType::wrap_under_get_rule(*value) });
+            }
+        }
+        let (error, value) = request(&[attribute]);
+        if error == kAXErrorSuccess {
+            value
+        } else {
+            None
+        }
+    });
+}
+
 /// No live AX calls: malformed results select the individual-read source.
-fn validate_node_batch(error: AXError, values: Option<CFType>) -> Option<CFArray<CFTypeRef>> {
+fn validate_node_batch(
+    error: AXError,
+    values: Option<CFType>,
+    expected_len: usize,
+) -> Option<CFArray<CFTypeRef>> {
     let values = values?;
     if error != kAXErrorSuccess || values.type_of() != CFArray::<CFTypeRef>::type_id() {
         return None;
     }
     let array = unsafe { CFArray::<CFTypeRef>::wrap_under_get_rule(values.as_CFTypeRef().cast()) };
-    (array.len() as usize == NODE_ATTRIBUTES.len()).then_some(array)
+    (array.len() as usize == expected_len).then_some(array)
 }
 
 fn node_string(value: Option<CFType>) -> Option<String> {
@@ -1333,7 +1368,12 @@ mod node_batch_tests {
     fn full_batch_matches_individual_source_and_outlives_cf_storage() {
         let values = fixture();
         let input = CFArray::from_CFTypes(&values);
-        let batch = validate_node_batch(kAXErrorSuccess, Some(input.as_CFType())).unwrap();
+        let batch = validate_node_batch(
+            kAXErrorSuccess,
+            Some(input.as_CFType()),
+            NODE_ATTRIBUTES.len(),
+        )
+        .unwrap();
         let decoded = decode_all(|attribute| unsafe {
             Some(CFType::wrap_under_get_rule(
                 *batch.get(attribute as isize).unwrap(),
@@ -1372,7 +1412,12 @@ mod node_batch_tests {
             let mut values = fixture();
             values[index] = error_slot();
             let batch = CFArray::from_CFTypes(&values);
-            let batch = validate_node_batch(kAXErrorSuccess, Some(batch.as_CFType())).unwrap();
+            let batch = validate_node_batch(
+                kAXErrorSuccess,
+                Some(batch.as_CFType()),
+                NODE_ATTRIBUTES.len(),
+            )
+            .unwrap();
             let decoded = decode_all(|attribute| unsafe {
                 Some(CFType::wrap_under_get_rule(
                     *batch.get(attribute as isize).unwrap(),
@@ -1394,13 +1439,23 @@ mod node_batch_tests {
     fn whole_failure_non_array_null_and_wrong_lengths_select_fallback() {
         let input = CFArray::from_CFTypes(&fixture());
         let retained = input.retain_count();
-        assert!(validate_node_batch(kAXErrorFailure, Some(input.as_CFType())).is_none());
+        assert!(validate_node_batch(
+            kAXErrorFailure,
+            Some(input.as_CFType()),
+            NODE_ATTRIBUTES.len()
+        )
+        .is_none());
         assert_eq!(
             input.retain_count(),
             retained,
             "failed output must be released"
         );
-        let accepted = validate_node_batch(kAXErrorSuccess, Some(input.as_CFType())).unwrap();
+        let accepted = validate_node_batch(
+            kAXErrorSuccess,
+            Some(input.as_CFType()),
+            NODE_ATTRIBUTES.len(),
+        )
+        .unwrap();
         assert_eq!(input.retain_count(), retained + 1);
         drop(accepted);
         assert_eq!(
@@ -1408,14 +1463,22 @@ mod node_batch_tests {
             retained,
             "accepted output must be released"
         );
-        assert!(validate_node_batch(kAXErrorSuccess, None).is_none());
-        assert!(
-            validate_node_batch(kAXErrorSuccess, Some(CFStr::new("bad").as_CFType())).is_none()
-        );
+        assert!(validate_node_batch(kAXErrorSuccess, None, NODE_ATTRIBUTES.len()).is_none());
+        assert!(validate_node_batch(
+            kAXErrorSuccess,
+            Some(CFStr::new("bad").as_CFType()),
+            NODE_ATTRIBUTES.len()
+        )
+        .is_none());
         for length in [0, NODE_ATTRIBUTES.len() - 1, NODE_ATTRIBUTES.len() + 1] {
             let input = CFArray::from_CFTypes(&vec![error_slot(); length]);
             let retained = input.retain_count();
-            assert!(validate_node_batch(kAXErrorSuccess, Some(input.as_CFType())).is_none());
+            assert!(validate_node_batch(
+                kAXErrorSuccess,
+                Some(input.as_CFType()),
+                NODE_ATTRIBUTES.len()
+            )
+            .is_none());
             assert_eq!(
                 input.retain_count(),
                 retained,
@@ -1512,28 +1575,166 @@ mod node_batch_tests {
         }
     }
 
+    fn fixture_request(
+        values: &[CFType],
+        attributes: &[NodeAttribute],
+    ) -> (AXError, Option<CFType>) {
+        let values: Vec<_> = attributes
+            .iter()
+            .map(|a| values[*a as usize].clone())
+            .collect();
+        (
+            kAXErrorSuccess,
+            Some(if values.len() == 1 {
+                values[0].clone()
+            } else {
+                CFArray::from_CFTypes(&values).as_CFType()
+            }),
+        )
+    }
+
     #[test]
-    fn layout_stages_only_decode_role_and_children() {
-        let mut attrs = NodeAttrs::default();
-        let mut reads = Vec::new();
-        for stage in [NodeRead::Role, NodeRead::Children] {
-            decode_node_attrs(&mut attrs, stage, |attribute| {
-                reads.push(attribute);
-                Some(match attribute {
-                    NodeAttribute::Role => CFStr::new("AXGroup").as_CFType(),
-                    NodeAttribute::Children => CFArray::<CFType>::from_CFTypes(&[]).as_CFType(),
-                    _ => panic!("layout container decoded content/state"),
-                })
-            });
-        }
-        assert_eq!(reads, [NodeAttribute::Role, NodeAttribute::Children]);
-        assert_eq!(
-            attrs,
-            NodeAttrs {
-                role: Some("AXGroup".into()),
-                ..NodeAttrs::default()
+    fn requests_preserve_conditional_gates_with_batching_enabled_and_disabled() {
+        use NodeAttribute as A;
+        for enabled in [false, true] {
+            for has_text in [false, true] {
+                for has_position in [false, true] {
+                    let mut values = fixture();
+                    values[A::Value as usize] =
+                        CFStr::new(if has_text { "text" } else { "" }).as_CFType();
+                    if !has_position {
+                        values[A::Position as usize] = error_slot();
+                    }
+                    let mut attrs = NodeAttrs::default();
+                    let mut requests = Vec::new();
+                    for stage in [
+                        NodeRead::Role,
+                        NodeRead::Content,
+                        NodeRead::Enabled,
+                        NodeRead::Frame,
+                        NodeRead::ControlState,
+                        NodeRead::Children,
+                    ] {
+                        read_node_stage(&mut attrs, stage, enabled, |attributes| {
+                            requests.push(attributes.to_vec());
+                            fixture_request(&values, attributes)
+                        });
+                    }
+                    assert_eq!(attrs, decode_all(|a| Some(values[a as usize].clone())));
+                    let mut expected = vec![vec![A::Role]];
+                    if enabled {
+                        expected.push(vec![
+                            A::Title,
+                            A::Value,
+                            A::Description,
+                            A::Identifier,
+                            A::Help,
+                        ]);
+                        if !has_text {
+                            expected.push(vec![A::Placeholder]);
+                        }
+                    } else {
+                        expected.extend([vec![A::Title], vec![A::Value]]);
+                        if !has_text {
+                            expected.push(vec![A::Placeholder]);
+                        }
+                        expected.extend([vec![A::Description], vec![A::Identifier], vec![A::Help]]);
+                    }
+                    expected.extend([vec![A::Enabled], vec![A::Position]]);
+                    if has_position {
+                        expected.push(vec![A::Size]);
+                    }
+                    let control = vec![A::ValueDescription, A::MinValue, A::MaxValue, A::Selected];
+                    if enabled {
+                        expected.push(control);
+                    } else {
+                        expected.extend(control.into_iter().map(|a| vec![a]));
+                    }
+                    expected.push(vec![A::Children]);
+                    assert_eq!(requests, expected);
+                }
             }
-        );
+        }
+    }
+
+    #[test]
+    fn failed_or_malformed_stage_batches_fall_back_without_extra_attributes() {
+        use NodeAttribute as A;
+        let values = fixture();
+        for (error, output) in [
+            (
+                kAXErrorFailure,
+                Some(CFArray::from_CFTypes(&values).as_CFType()),
+            ),
+            (kAXErrorSuccess, None),
+            (kAXErrorSuccess, Some(CFStr::new("bad").as_CFType())),
+            (
+                kAXErrorSuccess,
+                Some(CFArray::from_CFTypes(&values).as_CFType()),
+            ),
+        ] {
+            let mut attrs = NodeAttrs::default();
+            let mut requests = Vec::new();
+            read_node_stage(&mut attrs, NodeRead::Content, true, |attributes| {
+                requests.push(attributes.to_vec());
+                if attributes.len() > 1 {
+                    (error, output.clone())
+                } else {
+                    fixture_request(&values, attributes)
+                }
+            });
+            let mut individual = NodeAttrs::default();
+            decode_node_attrs(&mut individual, NodeRead::Content, |a| {
+                Some(values[a as usize].clone())
+            });
+            assert_eq!(attrs, individual);
+            assert_eq!(
+                requests,
+                [
+                    vec![A::Title, A::Value, A::Description, A::Identifier, A::Help],
+                    vec![A::Title],
+                    vec![A::Value],
+                    vec![A::Placeholder],
+                    vec![A::Description],
+                    vec![A::Identifier],
+                    vec![A::Help],
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn layout_stages_only_request_role_and_children() {
+        for role in ["AXGroup", "AXScrollArea"] {
+            for enabled in [false, true] {
+                let mut attrs = NodeAttrs::default();
+                let mut requests = Vec::new();
+                for stage in [NodeRead::Role, NodeRead::Children] {
+                    read_node_stage(&mut attrs, stage, enabled, |attributes| {
+                        requests.push(attributes.to_vec());
+                        let value = match attributes {
+                            [NodeAttribute::Role] => CFStr::new(role).as_CFType(),
+                            [NodeAttribute::Children] => {
+                                CFArray::<CFType>::from_CFTypes(&[]).as_CFType()
+                            }
+                            _ => panic!("layout container requested content/state: {attributes:?}"),
+                        };
+                        (kAXErrorSuccess, Some(value))
+                    });
+                }
+                assert_eq!(
+                    requests,
+                    [vec![NodeAttribute::Role], vec![NodeAttribute::Children]]
+                );
+                assert_eq!(
+                    attrs,
+                    NodeAttrs {
+                        role: Some(role.into()),
+                        ..NodeAttrs::default()
+                    }
+                );
+            }
+        }
     }
 }
 

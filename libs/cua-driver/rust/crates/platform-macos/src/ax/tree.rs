@@ -442,7 +442,6 @@ unsafe fn walk_children(
     }
     reader.read(&mut attrs, NodeRead::Children);
     let children = std::mem::take(&mut attrs.children);
-    drop(reader); // Children own their retains, independently of the batch.
     for child in children {
         let child_ptr = child.as_CFTypeRef() as AXUIElementRef;
         if collapsed.as_ref().is_some_and(|rows| rows.hides(child_ptr)) {
@@ -593,8 +592,8 @@ unsafe fn walk_element(
     let element_ptr = element as usize;
     reader.read(&mut attrs, NodeRead::Frame);
     let frame = attrs.frame;
-    // Structured state is decoded only for actionable nodes. The individual
-    // path keeps these IPCs behind the gate; a batch has prefetched the slots.
+    // Structured state is requested only for actionable nodes, including when
+    // batching is enabled.
     let control_state = read_control_state_if_actionable(is_actionable, || {
         reader.read(&mut attrs, NodeRead::ControlState);
         ControlState {
