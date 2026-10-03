@@ -727,7 +727,7 @@ pub fn list_all_apps() -> Vec<AppInfo> {
         }
         running_states.retain(|_, entries| !entries.is_empty());
     }
-    let installed = scan_installed_apps();
+    let installed = scan_installed_apps_cached();
     merge_app_lists(running, installed, &running_states)
 }
 
@@ -826,36 +826,149 @@ pub(crate) fn merge_app_lists(
     running
 }
 
-fn scan_installed_apps() -> Vec<AppInfo> {
-    let dirs = [
-        "/Applications",
-        "/Applications/Utilities",
-        "/System/Applications",
-        "/System/Applications/Utilities",
-    ];
+/// The app roots `scan_installed_apps` walks, in scan order.
+fn installed_scan_roots() -> Vec<String> {
     let home = std::env::var("HOME").unwrap_or_default();
-    let user_apps = format!("{home}/Applications");
+    vec![
+        "/Applications".to_owned(),
+        "/Applications/Utilities".to_owned(),
+        "/System/Applications".to_owned(),
+        "/System/Applications/Utilities".to_owned(),
+        format!("{home}/Applications"),
+    ]
+}
 
-    let mut result = Vec::new();
-    let mut all_dirs: Vec<&str> = dirs.to_vec();
-    let user_apps_str: &str = user_apps.as_str();
-    all_dirs.push(user_apps_str);
+/// How long a cached installed-app scan stays valid when the root
+/// mtimes still match. The mtime key catches an install/uninstall
+/// instantly (adding or removing a bundle touches its parent
+/// directory); the TTL bounds drift in the per-bundle `last_used`
+/// timestamps, which can change without any root directory noticing.
+const INSTALLED_CACHE_TTL: Duration = Duration::from_secs(30);
 
-    for dir in all_dirs {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            continue;
+/// Whether a cached scan may be served: the root-mtime key must match
+/// and the entry must be younger than the TTL. Pure for unit tests.
+fn installed_cache_is_fresh<T: PartialEq>(cached_key: &[T], key: &[T], age: Duration) -> bool {
+    cached_key == key && age < INSTALLED_CACHE_TTL
+}
+
+/// Paths are part of the key so a different HOME cannot reuse another root's
+/// inventory just because the directory mtimes happen to match. Only a missing
+/// root is a cacheable `None`; other metadata failures prevent publication.
+type InstalledScanKey = Vec<(String, Option<std::time::SystemTime>)>;
+
+fn installed_scan_key(roots: &[String]) -> std::io::Result<InstalledScanKey> {
+    roots
+        .iter()
+        .map(|root| {
+            let modified = match std::fs::metadata(root) {
+                Ok(metadata) => Some(metadata.modified()?),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error),
+            };
+            Ok((root.clone(), modified))
+        })
+        .collect()
+}
+
+/// A best-effort response is still useful to this caller, but only a complete
+/// walk can be reused by subsequent callers.
+struct InstalledScan {
+    apps: Vec<AppInfo>,
+    complete: bool,
+}
+
+/// `scan_installed_apps`, memoized. The uncached scan reads every
+/// bundle's Info.plist on every call — hundreds of file reads that
+/// dominate `list_apps` latency (seconds under load) for an answer that
+/// changes only when something is installed or removed.
+struct InstalledCache {
+    key: InstalledScanKey,
+    at: std::time::Instant,
+    apps: Vec<AppInfo>,
+}
+
+/// Adapted from hyprcat's upstream PR #3492. Serve from `cache` or refresh
+/// it via `scan`. The lock is held ACROSS the synchronous scan: concurrent
+/// misses queue behind one refresh and re-check freshness after acquiring it.
+/// The key is also read under the lock, so queued readers cannot publish an
+/// older key. Failed/partial scans and roots changed during a scan are never
+/// cached. This stays inside the caller's admitted blocking worker; no await
+/// or additional worker is introduced here.
+fn cached_installed_scan(
+    cache: &std::sync::Mutex<Option<InstalledCache>>,
+    key: impl Fn() -> std::io::Result<InstalledScanKey>,
+    scan: impl FnOnce() -> InstalledScan,
+) -> Vec<AppInfo> {
+    let mut guard = cache.lock().unwrap();
+    let before = key().ok();
+    if let (Some(cached), Some(key)) = (guard.as_ref(), before.as_ref()) {
+        if installed_cache_is_fresh(&cached.key, key, cached.at.elapsed()) {
+            return cached.apps.clone();
+        }
+    }
+    // Do not leave a previous entry available after an unsuccessful refresh.
+    *guard = None;
+    let InstalledScan { apps, complete } = scan();
+    if complete {
+        if let Some(before) = before {
+            if key().ok().as_ref() == Some(&before) {
+                *guard = Some(InstalledCache {
+                    key: before,
+                    at: std::time::Instant::now(),
+                    apps: apps.clone(),
+                });
+            }
+        }
+    }
+    apps
+}
+
+fn scan_installed_apps_cached() -> Vec<AppInfo> {
+    static CACHE: std::sync::Mutex<Option<InstalledCache>> = std::sync::Mutex::new(None);
+    let roots = installed_scan_roots();
+    cached_installed_scan(
+        &CACHE,
+        || installed_scan_key(&roots),
+        || scan_installed_apps(&roots),
+    )
+}
+
+fn scan_installed_apps(roots: &[String]) -> InstalledScan {
+    let mut result = InstalledScan {
+        apps: Vec::new(),
+        complete: true,
+    };
+    for dir in roots {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            // An absent optional root is an empty directory for discovery.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                result.complete = false;
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    result.complete = false;
+                    continue;
+                }
+            };
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("app") {
                 continue;
             }
             let plist_path = path.join("Contents/Info.plist");
-            if let Some(mut info) = read_app_plist(&plist_path) {
+            if let Some(mut info) = read_app_plist_with_status(&plist_path, &mut result.complete) {
                 info.launch_path = path.to_str().map(str::to_owned);
                 info.kind = Some("desktop".to_owned());
                 info.last_used = fs_last_used(&path);
-                result.push(info);
+                result.complete &= info.launch_path.is_some() && info.last_used.is_some();
+                result.apps.push(info);
+            } else {
+                result.complete = false;
             }
         }
     }
@@ -875,6 +988,15 @@ fn fs_last_used(path: &std::path::Path) -> Option<String> {
 }
 
 fn read_app_plist(plist_path: &std::path::Path) -> Option<AppInfo> {
+    read_app_plist_with_status(plist_path, &mut true)
+}
+
+// Missing optional name keys keep the existing fallback contract. A failed
+// subprocess must not make a fallback name look like a complete cached read.
+fn read_app_plist_with_status(
+    plist_path: &std::path::Path,
+    complete: &mut bool,
+) -> Option<AppInfo> {
     let bundle_id_out = Command::new("plutil")
         .args([
             "-extract",
@@ -906,6 +1028,7 @@ fn read_app_plist(plist_path: &std::path::Path) -> Option<AppInfo> {
             plist_path.to_str()?,
         ])
         .output()
+        .inspect_err(|_| *complete = false)
         .ok();
     let name = name_out
         .filter(|o| o.status.success())
@@ -923,6 +1046,7 @@ fn read_app_plist(plist_path: &std::path::Path) -> Option<AppInfo> {
                     plist_path.to_str().unwrap_or(""),
                 ])
                 .output()
+                .inspect_err(|_| *complete = false)
                 .ok()
                 .filter(|o| o.status.success())
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -1052,8 +1176,8 @@ pub fn format_app_list(apps: &[AppInfo]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        all_pids, bundle_root_of_executable, finder_folder_handoff, merge_app_lists, path_of_pid,
-        running_apps_from_processes, AppInfo,
+        all_pids, bundle_root_of_executable, finder_folder_handoff, installed_cache_is_fresh,
+        merge_app_lists, path_of_pid, running_apps_from_processes, AppInfo, INSTALLED_CACHE_TTL,
     };
     use std::collections::HashSet;
 
@@ -1363,5 +1487,218 @@ mod tests {
             Some("/Applications/Blender.app")
         );
         assert_eq!(bundle_root_of_executable("/usr/bin/ssh"), None);
+    }
+
+    /// The installed-scan cache serves only a matching root-mtime key
+    /// within the TTL; a changed mtime, an appearing/disappearing root,
+    /// or an expired entry all force a rescan. Two missing roots
+    /// (`None` mtimes) compare equal, so a permanently missing root
+    /// still caches.
+    #[test]
+    fn installed_cache_freshness_contract() {
+        use std::time::{Duration, SystemTime};
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let t1 = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000);
+        let key = vec![Some(t0), None];
+        let fresh_age = Duration::from_secs(1);
+        assert!(installed_cache_is_fresh(&key, &key.clone(), fresh_age));
+        assert!(!installed_cache_is_fresh(
+            &key,
+            &[Some(t1), None],
+            fresh_age
+        ));
+        assert!(!installed_cache_is_fresh(
+            &key,
+            &[Some(t0), Some(t1)],
+            fresh_age
+        ));
+        assert!(!installed_cache_is_fresh(&key, &[None, None], fresh_age));
+        assert!(installed_cache_is_fresh(
+            &key,
+            &key,
+            INSTALLED_CACHE_TTL - Duration::from_nanos(1)
+        ));
+        assert!(!installed_cache_is_fresh(
+            &key,
+            &key.clone(),
+            INSTALLED_CACHE_TTL
+        ));
+    }
+
+    #[test]
+    fn incomplete_scan_is_returned_but_retried_until_complete() {
+        use super::{cached_installed_scan, InstalledScan};
+        let cache = std::sync::Mutex::new(None);
+        let key = || Ok(vec![("/fixture".to_owned(), None)]);
+        for complete in [false, false, true] {
+            let apps = cached_installed_scan(&cache, key, || InstalledScan {
+                apps: vec![app("Found", 0, Some("test.found"), false)],
+                complete,
+            });
+            assert_eq!(apps[0].name, "Found");
+            assert_eq!(cache.lock().unwrap().is_some(), complete);
+        }
+        let apps = cached_installed_scan(&cache, key, || panic!("complete scan must be reused"));
+        assert_eq!(apps[0].name, "Found");
+    }
+
+    #[test]
+    fn failed_key_or_changed_roots_do_not_publish_a_scan() {
+        use super::{cached_installed_scan, InstalledScan};
+        use std::cell::Cell;
+        let cache = std::sync::Mutex::new(None);
+        let complete = || InstalledScan {
+            apps: Vec::new(),
+            complete: true,
+        };
+        let stable = || Ok(vec![("/fixture".to_owned(), None)]);
+        cached_installed_scan(&cache, stable, complete);
+        assert!(cache.lock().unwrap().is_some());
+        cached_installed_scan(
+            &cache,
+            || Err(std::io::ErrorKind::PermissionDenied.into()),
+            complete,
+        );
+        assert!(
+            cache.lock().unwrap().is_none(),
+            "failed refresh must retire the old entry"
+        );
+
+        let generation = Cell::new(0);
+        cached_installed_scan(
+            &cache,
+            || {
+                generation.set(generation.get() + 1);
+                Ok(vec![(format!("/fixture/{}", generation.get()), None)])
+            },
+            complete,
+        );
+        assert!(
+            cache.lock().unwrap().is_none(),
+            "changing roots must not cache a mixed scan"
+        );
+    }
+
+    #[test]
+    fn installed_scan_retries_partial_filesystem_results() {
+        use super::{cached_installed_scan, installed_scan_key, scan_installed_apps};
+        let temp = tempfile::tempdir().unwrap();
+        synthetic_bundle(temp.path(), "Valid", "");
+        let broken = temp.path().join("Broken.app/Contents");
+        std::fs::create_dir_all(&broken).unwrap();
+        let plist = broken.join("Info.plist");
+        std::fs::write(&plist, "not a plist").unwrap();
+        let roots = vec![temp.path().to_str().unwrap().to_owned()];
+        let key_before = installed_scan_key(&roots).unwrap();
+        let cache = std::sync::Mutex::new(None);
+        let partial = cached_installed_scan(
+            &cache,
+            || installed_scan_key(&roots),
+            || scan_installed_apps(&roots),
+        );
+        assert_eq!(partial.len(), 1);
+        assert_eq!(partial[0].name, "Valid");
+        assert!(cache.lock().unwrap().is_none());
+        // Repair within the bundle: the scan root mtime has not changed.
+        synthetic_bundle(temp.path(), "Broken", "");
+        assert_eq!(installed_scan_key(&roots).unwrap(), key_before);
+        let repaired = cached_installed_scan(
+            &cache,
+            || installed_scan_key(&roots),
+            || scan_installed_apps(&roots),
+        );
+        assert_eq!(repaired.len(), 2);
+        assert!(cache.lock().unwrap().is_some());
+        cached_installed_scan(
+            &cache,
+            || installed_scan_key(&roots),
+            || panic!("repaired scan must cache"),
+        );
+    }
+
+    #[test]
+    fn installed_scan_distinguishes_missing_and_failed_roots() {
+        use super::{installed_scan_key, scan_installed_apps};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("optional");
+        let roots = vec![root.to_str().unwrap().to_owned()];
+        assert_eq!(installed_scan_key(&roots).unwrap()[0].1, None);
+        assert!(scan_installed_apps(&roots).complete);
+        // A file where a directory belongs is a real read_dir failure.
+        std::fs::write(&root, "not a directory").unwrap();
+        assert!(!scan_installed_apps(&roots).complete);
+        std::fs::remove_file(&root).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        assert!(scan_installed_apps(&roots).complete);
+        assert!(installed_scan_key(&roots).unwrap()[0].1.is_some());
+    }
+
+    /// Concurrent misses on a cold cache must run exactly one scan
+    /// (single-flight): the lock is held across the refresh, so racers
+    /// queue behind it and serve the fresh entry. The previous shape —
+    /// lock released before scanning — let every racer run the
+    /// expensive walk; under this test that reports 8 scans, not 1
+    /// (verified upstream by mutating the implementation back).
+    #[test]
+    fn concurrent_cold_misses_scan_once() {
+        assert_concurrent_scan_once(None);
+    }
+
+    #[test]
+    fn concurrent_expired_or_changed_root_misses_scan_once() {
+        for (root, age) in [
+            ("/fixture", INSTALLED_CACHE_TTL),
+            ("/different-home", std::time::Duration::ZERO),
+        ] {
+            assert_concurrent_scan_once(Some(super::InstalledCache {
+                key: vec![(root.to_owned(), Some(std::time::SystemTime::UNIX_EPOCH))],
+                at: std::time::Instant::now() - age,
+                apps: vec![app("Stale", 0, Some("test.stale"), false)],
+            }));
+        }
+    }
+
+    fn assert_concurrent_scan_once(initial: Option<super::InstalledCache>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+        let cache = Arc::new(Mutex::new(initial));
+        let scans = Arc::new(AtomicUsize::new(0));
+        let key = vec![(
+            "/fixture".to_owned(),
+            Some(std::time::SystemTime::UNIX_EPOCH),
+        )];
+        let start = Arc::new(std::sync::Barrier::new(8));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let cache = cache.clone();
+            let scans = scans.clone();
+            let key = key.clone();
+            let start = start.clone();
+            handles.push(std::thread::spawn(move || {
+                start.wait();
+                super::cached_installed_scan(
+                    &cache,
+                    || Ok(key.clone()),
+                    || {
+                        scans.fetch_add(1, Ordering::SeqCst);
+                        // Widen the race window: a non-single-flight
+                        // implementation lets every racer enter here.
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        super::InstalledScan {
+                            apps: Vec::new(),
+                            complete: true,
+                        }
+                    },
+                )
+            }));
+        }
+        for h in handles {
+            assert!(h.join().unwrap().is_empty(), "must return refreshed apps");
+        }
+        assert_eq!(
+            scans.load(Ordering::SeqCst),
+            1,
+            "cache miss scanned more than once"
+        );
     }
 }
