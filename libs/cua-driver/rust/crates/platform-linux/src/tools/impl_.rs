@@ -5067,12 +5067,10 @@ fn overlay_move_to_for(cursor_id: &str, sx: f64, sy: f64, heading: Option<f64>) 
 }
 
 async fn overlay_glide_to_for(cursor_id: &str, sx: f64, sy: f64) {
-    // Input always revives its agent cursor. Hiding it is useful while idle,
-    // but a hidden cursor must not make pointer or keyboard control invisible.
-    crate::overlay::send_command_for(
-        cursor_id.to_owned(),
-        cursor_overlay::OverlayCommand::SetEnabled(true),
-    );
+    // Explicit runtime disable persists across pointer and keyboard actions.
+    if !crate::overlay::is_enabled_for(cursor_id) {
+        return;
+    }
     // Every Wayland backend owns its animation loop. Send one destination and
     // let the Linux overlay layer select the exact-target semantic helper,
     // layer-shell, or older helper fallback without a competing interpolation.
@@ -5080,8 +5078,7 @@ async fn overlay_glide_to_for(cursor_id: &str, sx: f64, sy: f64) {
         overlay_move_to_for(cursor_id, sx, sy, None);
         return;
     }
-    let pos = crate::overlay::current_position_for(cursor_id);
-    if pos.0 < 0.0 && pos.1 < 0.0 {
+    if !crate::overlay::is_placed_for(cursor_id) {
         crate::overlay::send_command_for(
             cursor_id.to_owned(),
             cursor_overlay::OverlayCommand::ClickPulse { x: sx, y: sy },
@@ -5104,7 +5101,6 @@ async fn reveal_pointer_action_for(
     if !sx.is_finite() || !sy.is_finite() {
         return;
     }
-    state.cursor_registry.set_enabled(cursor_id, true);
     state.cursor_registry.update_position(cursor_id, sx, sy);
     emit_cursor_hook(cursor_id, sx, sy, false);
     overlay_glide_to_for(cursor_id, sx, sy).await;
@@ -5297,6 +5293,9 @@ async fn track_overlay_drag_for(
     duration_ms: u64,
     steps: usize,
 ) {
+    if !crate::overlay::is_enabled_for(&cursor_id) {
+        return;
+    }
     track_overlay_drag_with(
         |command| crate::overlay::send_command_for(cursor_id.clone(), command),
         from,
@@ -5314,7 +5313,6 @@ async fn track_overlay_drag_with(
     duration_ms: u64,
     steps: usize,
 ) {
-    send(cursor_overlay::OverlayCommand::SetEnabled(true));
     let _pressed = cursor_overlay::PressedVisualGuard::new(&send);
     let steps = steps.max(1);
     let step_delay = std::time::Duration::from_millis(duration_ms / steps as u64);
@@ -5344,12 +5342,12 @@ async fn cancelled_overlay_drag_releases_visual_press_without_native_commands() 
     let mut context = Context::from_waker(std::task::Waker::noop());
     assert!(drag.as_mut().poll(&mut context).is_pending());
     assert!(matches!(
-        commands.borrow()[1],
+        commands.borrow()[0],
         cursor_overlay::OverlayCommand::SetPressed(true)
     ));
     drop(drag);
     let commands = commands.borrow();
-    assert_eq!(commands.len(), 4);
+    assert_eq!(commands.len(), 3);
     assert!(matches!(
         commands.last(),
         Some(cursor_overlay::OverlayCommand::SetPressed(false))

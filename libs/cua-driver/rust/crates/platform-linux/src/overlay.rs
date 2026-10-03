@@ -404,6 +404,46 @@ fn try_send_command_for(key: CursorKey, cmd: OverlayCommand) -> bool {
     if !draws_cursor(&key) {
         return false;
     }
+    // Keep GNOME's logical and compositor commands in the same order,
+    // including the synchronous control update below.
+    #[cfg(target_os = "linux")]
+    let _gnome_order = if crate::wayland::is_gnome_wayland_session() {
+        let Ok(order) = GNOME_CURSOR_ORDER.lock() else {
+            arrival_fire(&key);
+            return true;
+        };
+        Some(order)
+    } else {
+        None
+    };
+    let synchronous = matches!(
+        &cmd,
+        OverlayCommand::SetEnabled(_)
+            | OverlayCommand::SetMotion(_)
+            | OverlayCommand::SetTheme { .. }
+    );
+    if synchronous {
+        if let Ok(mut guard) = RENDER.lock() {
+            if let Some(map) = guard.as_mut() {
+                map.apply_command(key.clone(), cmd.clone());
+            }
+            // Serialize cancellation with animation admission under RENDER.
+            if matches!(&cmd, OverlayCommand::SetEnabled(false)) {
+                arrival_cancel(&key);
+            }
+        }
+    }
+    if matches!(
+        &cmd,
+        OverlayCommand::MoveTo { .. }
+            | OverlayCommand::SnapTo { .. }
+            | OverlayCommand::ClickPulse { .. }
+            | OverlayCommand::SetPressed(true)
+    ) && !is_enabled_for(&key)
+    {
+        arrival_cancel(&key);
+        return false;
+    }
     #[cfg(target_os = "linux")]
     {
         if crate::wayland::is_gnome_wayland_session() {
@@ -411,11 +451,7 @@ fn try_send_command_for(key: CursorKey, cmd: OverlayCommand) -> bool {
                 arrival_fire(&key);
                 return true;
             }
-            let Ok(_order) = GNOME_CURSOR_ORDER.lock() else {
-                arrival_fire(&key);
-                return true;
-            };
-            if !apply_gnome_logical_command(&key, &cmd) {
+            if !synchronous && !apply_gnome_logical_command(&key, &cmd) {
                 arrival_fire(&key);
                 return true;
             }
@@ -488,7 +524,12 @@ fn try_send_command_for(key: CursorKey, cmd: OverlayCommand) -> bool {
     let native_wayland = crate::wayland::is_wayland();
     let x11_overlay_allowed =
         should_start_x11_overlay(std::env::var_os("WAYLAND_DISPLAY").is_some());
-    let x11_queued = x11_overlay_allowed && try_send_x11_message(CMD_TX.get(), msg.clone());
+    let x11_msg = if synchronous {
+        OverlayMsg::Wake
+    } else {
+        msg.clone()
+    };
+    let x11_queued = x11_overlay_allowed && try_send_x11_message(CMD_TX.get(), x11_msg);
     if x11_overlay_allowed && !x11_queued {
         tracing::warn!(
             key = %key,
@@ -677,7 +718,7 @@ pub fn is_enabled_for(key: &str) -> bool {
         .ok()
         .and_then(|g| {
             g.as_ref()
-                .and_then(|m| m.cursor_or_default(key).map(|rs| rs.core.visible))
+                .and_then(|m| m.cursor_or_default(key).map(|rs| rs.core.is_enabled()))
         })
         .unwrap_or(false)
 }
@@ -692,12 +733,7 @@ pub fn is_visible_for_session(key: &str) -> bool {
             guard
                 .as_ref()
                 .and_then(|map| map.cursors.get(key))
-                .map(|rs| {
-                    rs.core.cfg.enabled
-                        && rs.core.visible
-                        && rs.core.idle_alpha >= 0.004
-                        && rs.core.pos.0 >= -100.0
-                })
+                .map(|rs| rs.core.is_revealed())
         })
         .unwrap_or(false)
 }
@@ -716,6 +752,18 @@ pub fn current_position_for(key: &str) -> (f64, f64) {
                 .map(|rs| rs.core.pos)
         })
         .unwrap_or((-200.0, -200.0))
+}
+
+pub fn is_placed_for(key: &str) -> bool {
+    RENDER
+        .lock()
+        .ok()
+        .and_then(|g| {
+            g.as_ref()
+                .and_then(|m| m.cursors.get(key))
+                .map(|rs| rs.core.is_placed())
+        })
+        .unwrap_or(false)
 }
 
 pub fn current_motion_for(key: &str) -> cursor_overlay::MotionConfig {
@@ -770,19 +818,20 @@ pub async fn animate_cursor_to_for(key: CursorKey, x: f64, y: f64) {
         return;
     }
     seed_start_if_sentinel(&key, x, y);
-    let should_animate = {
+    let rx = {
         let guard = RENDER.lock().unwrap();
-        matches!(
+        if !matches!(
             guard.as_ref().and_then(|m| m.cursors.get(&key)),
-            Some(rs) if rs.core.cfg.enabled && rs.core.visible && rs.core.pos.0 > -50.0
-        )
+            Some(rs) if rs.core.is_enabled() && rs.core.is_placed()
+        ) {
+            return;
+        }
+        // Disable takes this same lock before cancelling, so it cannot miss
+        // a waiter registered after the enabled check.
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        arrival_register(key.clone(), tx);
+        rx
     };
-    if !should_animate {
-        return;
-    }
-
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    arrival_register(key.clone(), tx);
 
     if !try_send_command_for(
         key.clone(),
@@ -2434,7 +2483,7 @@ fn cursor_tile_bounds(
     screen_width: u32,
     screen_height: u32,
 ) -> Option<X11TileBounds> {
-    if !core.visible || core.pos.0 < -100.0 || core.idle_alpha < 0.004 {
+    if !core.is_revealed() {
         return None;
     }
 
