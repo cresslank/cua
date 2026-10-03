@@ -26,6 +26,14 @@ pub fn enable_background() {
             let holder = Holder::new();
             // Normal return and process::exit both run atexit callbacks. The
             // reaper is independent of Tokio, which may already be torn down.
+            //
+            // Exit waits for the fixed set of guards already handed off, i.e.
+            // actions that had returned before exit began; synchronous mode
+            // finished those guards before returning, so none is shortened.
+            // An action still running when exit begins loses its guard at
+            // termination, exactly as the synchronous wait did. Exit must not
+            // wait for running actions: their futures may need the executor
+            // thread that called exit (current-thread hosts), which deadlocks.
             extern "C" fn drain_before_exit() {
                 drain();
             }
