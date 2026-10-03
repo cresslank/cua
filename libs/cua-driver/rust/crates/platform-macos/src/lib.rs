@@ -42,6 +42,8 @@ pub mod pointer_shape;
 /// AX role -> cursor shape table for the presence hit-test (pure, every host).
 pub mod pointer_shape_map;
 #[cfg(target_os = "macos")]
+pub mod post_action;
+#[cfg(target_os = "macos")]
 pub mod recording_hooks;
 #[cfg(target_os = "macos")]
 pub mod session;

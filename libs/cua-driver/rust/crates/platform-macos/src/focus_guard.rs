@@ -41,9 +41,9 @@
 //!
 //! 1. A "is target already frontmost?" check so we don't arm a useless
 //!    self→self suppressor (matches Swift's `isTargetFrontmost` guard).
-//! 2. A 50ms post-action sleep that gives any in-flight focus-grab
-//!    reflex time to fire and be observed by the suppressor before the
-//!    lease is dropped. Matches Swift's `Task.sleep(nanoseconds: 50ms)`.
+//! 2. A 50ms post-action guard that gives any in-flight focus-grab reflex
+//!    time to fire. Long-lived hosts retain the lease in the background; finite
+//!    hosts keep Swift's synchronous `Task.sleep(nanoseconds: 50ms)`.
 //! 3. A static `origin` label for tracing — call sites pass a short
 //!    string like `"click.AXPress"` so leaked leases / late-firing
 //!    observers can be traced back to the caller.
@@ -67,7 +67,8 @@ use crate::focus_steal;
 ///
 /// Returns whatever `f` returns. Drops the lease ~50ms after `f`
 /// resolves so any in-flight reflex activation is observed before
-/// suppression ends.
+/// suppression ends. Long-lived hosts return as soon as `f` resolves; a bounded
+/// background holder drops the lease at the deadline.
 ///
 /// If `target_pid` is already the frontmost app (no point fighting
 /// ourselves) or `prior_frontmost` is `None` (no app to restore to),
@@ -108,15 +109,17 @@ where
     };
 
     let result = f().await;
+    let generation = crate::post_action::generation();
 
-    // Post-action settle — give the reactive observer time to fire on
-    // any side-effect activation before we drop the lease. Matches
-    // Swift's 50ms sleep in `FocusGuard.withFocusSuppressed`.
-    if _lease.is_some() {
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    // Keep the reactive observer armed for 50ms after the action. A full
+    // background holder falls back to the synchronous wait.
+    if let Some(lease) = _lease {
+        let deadline = std::time::Instant::now() + Duration::from_millis(50);
+        if let Err(_lease) = crate::post_action::hold(lease, deadline, generation) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
-    // _lease drops here (RAII end_suppression).
     result
 }
 

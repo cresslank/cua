@@ -32,9 +32,14 @@
 //! // changes.result_suffix() — append to ToolResult text.
 //! ```
 //!
-//! Dropping the `Snapshot` ends the suppression lease (RAII). `detect()`
-//! also drops the lease before returning — the lease's `Drop` is
-//! idempotent so explicit-detect + later-drop is safe.
+//! Long-lived hosts (`serve`, direct MCP, SDK runtime) use `detect_async()`:
+//! one immediate observation is returned, while a background holder retains the
+//! lease for `CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS` after the action. Windows
+//! appearing after return are not reported in that result; inspect the next
+//! screenshot or `list_windows`. `0` skips observation and releases the wildcard
+//! lease immediately. `CUA_DRIVER_WINDOW_CHANGE_POLL_MS` only affects synchronous
+//! polling. Bare registries and finite hosts retain `detect()`'s synchronous
+//! behavior. Dropping an unconsumed snapshot always releases its lease (RAII).
 
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
@@ -157,9 +162,9 @@ fn is_daemon_window(window: &WindowInfo) -> bool {
     window.pid == std::process::id() as i32
 }
 
-/// Default poll deadline — new windows triggered by a click typically
-/// appear within ~200ms on macOS; 1.0s gives the wildcard suppressor
-/// time to fire and settle.
+/// Default post-action protection duration in long-lived hosts, or synchronous
+/// observation deadline. New windows commonly appear within ~200ms; 1s gives
+/// the wildcard suppressor time to fire and settle.
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
 
 /// Default inter-poll interval. Matches Swift's 50ms.
@@ -184,7 +189,8 @@ fn observation_bounds_from(
 /// Post-action observation bounds chosen by the embedding host through
 /// `CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS` / `CUA_DRIVER_WINDOW_CHANGE_POLL_MS`
 /// on the daemon environment; `DEFAULT_TIMEOUT` / `DEFAULT_POLL_INTERVAL`
-/// when unset or unparsable.
+/// when unset or unparsable. In long-lived hosts the timeout retains focus
+/// protection after return; the poll interval applies only to synchronous mode.
 pub(crate) fn host_observation_bounds() -> WindowObservationBounds {
     WindowObservationBounds::from_env(DEFAULT_TIMEOUT, DEFAULT_POLL_INTERVAL)
 }
@@ -240,6 +246,7 @@ impl WindowChangeDetector {
         suppress_focus: bool,
         allowed_pid: Option<i32>,
     ) -> Snapshot {
+        crate::post_action::cancel();
         let window_ids: HashSet<u32> = host_windows().into_iter().map(|w| w.window_id).collect();
         Self::capture_from(window_ids, prior_front, suppress_focus, allowed_pid)
     }
@@ -292,8 +299,8 @@ impl Snapshot {
     /// An embedding host that already observes the target continuously
     /// can bound this window through `CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS` /
     /// `CUA_DRIVER_WINDOW_CHANGE_POLL_MS` on the daemon's environment.
-    /// Unset or unparsable values keep the defaults, so public callers see
-    /// no behavior change.
+    /// Unset or unparsable values keep the defaults. This method always polls
+    /// synchronously; action tools use `detect_async()` for background mode.
     ///
     /// Consumes the snapshot — the wildcard suppression lease is
     /// dropped when this returns (covers the full action + detection
@@ -325,16 +332,56 @@ impl Snapshot {
         self.detect_with(bounds.timeout, bounds.poll, observe)
     }
 
-    /// Async wrapper around `detect()` — runs the synchronous poll
-    /// loop on a `spawn_blocking` thread so it doesn't stall the
-    /// tokio runtime. Most action-tool call sites should prefer this
-    /// over the blocking `detect()`.
+    /// Finish off the async executor. Long-lived hosts take one immediate
+    /// observation, then retain focus protection for the host timeout after
+    /// observation. Finite hosts keep the synchronous polling behavior.
     pub async fn detect_async(self) -> Changes {
-        // Move the Snapshot (and its embedded lease) onto the blocking
-        // thread; the lease's Drop runs there when detect_with returns.
-        cua_driver_core::blocking::spawn(move || self.detect())
-            .await
-            .unwrap_or_else(|_| Changes::not_polled())
+        self.finish_with(
+            host_observation_bounds(),
+            crate::post_action::background(),
+            observe_host,
+            crate::post_action::hold,
+        )
+        .await
+    }
+
+    async fn finish_with(
+        mut self,
+        bounds: WindowObservationBounds,
+        background: bool,
+        mut observe: impl FnMut() -> (Vec<WindowInfo>, Option<i32>) + Send + 'static,
+        hold: impl FnOnce(SuppressionLease, Instant, u64) -> Result<(), SuppressionLease>
+            + Send
+            + 'static,
+    ) -> Changes {
+        if bounds.skips_observation() {
+            drop(self);
+            return Changes::not_polled();
+        }
+        let generation = crate::post_action::generation();
+        cua_driver_core::blocking::spawn(move || {
+            if !background {
+                return self.detect_bounded_with(bounds, observe);
+            }
+            let (current, current_front) = observe();
+            let (new_windows, _) = Self::diff(&self.window_ids, &current);
+            let changes = Changes {
+                new_windows,
+                foreground_changed: matches!((self.front_pid, current_front), (Some(a), Some(b)) if a != b),
+                polled: true,
+            };
+            let deadline = Instant::now() + bounds.timeout;
+            if let Some(lease) = self._lease.take() {
+                if let Err(_lease) = hold(lease, deadline, generation) {
+                    // Queue saturation preserves protection synchronously on
+                    // this existing blocking worker, without another thread.
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                }
+            }
+            changes
+        })
+        .await
+        .unwrap_or_else(|_| Changes::not_polled())
     }
 
     /// Same as `detect()` but with configurable timing.
@@ -423,6 +470,92 @@ fn observe_host() -> (Vec<WindowInfo>, Option<i32>) {
 mod tests {
     use super::*;
     use crate::windows::WindowBounds;
+
+    #[tokio::test]
+    async fn background_finish_observes_once_without_waiting_and_keeps_the_lease() {
+        for changed in [false, true] {
+            let (lease, active) = SuppressionLease::isolated_for_test();
+            let snap = Snapshot {
+                window_ids: HashSet::new(),
+                front_pid: Some(7),
+                _lease: Some(lease),
+            };
+            let held = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let receiver = held.clone();
+            let observations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let calls = observations.clone();
+            let started = Instant::now();
+            let changes = snap
+                .finish_with(
+                    observation_bounds_from(Some("2000"), None),
+                    true,
+                    move || {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            if changed {
+                                vec![win(2, 8, "Other", "Popup")]
+                            } else {
+                                vec![]
+                            },
+                            Some(7),
+                        )
+                    },
+                    move |lease, deadline, _| {
+                        assert!(deadline >= started + Duration::from_millis(2000));
+                        *receiver.lock().unwrap() = Some(lease);
+                        Ok(())
+                    },
+                )
+                .await;
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert_eq!(observations.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(changes.polled);
+            assert_eq!(changes.needs_restore(), changed);
+            assert!(active());
+            held.lock().unwrap().take();
+            assert!(!active());
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_timeout_releases_immediately_and_synchronous_mode_never_holds() {
+        for background in [false, true] {
+            let (lease, active) = SuppressionLease::isolated_for_test();
+            let snap = Snapshot {
+                window_ids: HashSet::new(),
+                front_pid: None,
+                _lease: Some(lease),
+            };
+            let changes = snap
+                .finish_with(
+                    observation_bounds_from(Some("0"), None),
+                    background,
+                    || panic!("zero timeout must not observe"),
+                    |_, _, _| panic!("zero timeout must not hold"),
+                )
+                .await;
+            assert!(!changes.polled);
+            assert!(!active());
+        }
+        let (lease, active) = SuppressionLease::isolated_for_test();
+        let snap = Snapshot {
+            window_ids: HashSet::new(),
+            front_pid: None,
+            _lease: Some(lease),
+        };
+        let started = Instant::now();
+        let changes = snap
+            .finish_with(
+                observation_bounds_from(Some("20"), Some("5")),
+                false,
+                || (vec![], None),
+                |_, _, _| panic!("synchronous mode must not hold"),
+            )
+            .await;
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(changes.polled);
+        assert!(!active());
+    }
 
     fn win(window_id: u32, pid: i32, app_name: &str, title: &str) -> WindowInfo {
         WindowInfo {

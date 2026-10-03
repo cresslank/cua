@@ -215,6 +215,22 @@ pub struct SuppressionLease {
 }
 
 impl SuppressionLease {
+    /// Isolated dispatcher seam: no NSWorkspace observer or native activation.
+    #[cfg(test)]
+    pub(crate) fn isolated_for_test() -> (Self, impl Fn() -> bool + Send + Sync) {
+        let dispatcher = Arc::new(Dispatcher::new());
+        let handle = dispatcher.add(None, 424242, "test.isolated");
+        let observer = dispatcher.clone();
+        (
+            Self {
+                handle,
+                dispatcher,
+                released: false,
+            },
+            move || observer.entries.lock().unwrap().contains_key(&handle.0),
+        )
+    }
+
     /// Explicit release. Useful if the caller wants to drop the lease
     /// before its scope ends without taking the `Drop` path.
     pub fn release(mut self) {

@@ -255,6 +255,7 @@ fn raise_exact_ax_window(pid: i32, window_id: u32) -> bool {
         let Some(target) = target else {
             return false;
         };
+        crate::post_action::cancel();
         let raised = perform_action(target, "AXRaise") == 0;
         let main = set_bool_attr_true(target, "AXMain") == 0;
         let focused = set_bool_attr_true(target, "AXFocused") == 0;
@@ -431,6 +432,7 @@ impl Tool for BringToFrontTool {
             let skylight_exact_accepted =
                 crate::input::skylight::make_exact_window_key(pid, window_id);
             let cocoa_accepted = unsafe {
+                crate::post_action::cancel();
                 app.activateWithOptions(
                     NSApplicationActivationOptions::NSApplicationActivateAllWindows,
                 )
@@ -467,6 +469,7 @@ impl Tool for BringToFrontTool {
         }
 
         let request_accepted = unsafe {
+            crate::post_action::cancel();
             app.activateWithOptions(NSApplicationActivationOptions::NSApplicationActivateAllWindows)
         };
         let deadline = Instant::now() + VERIFY_TIMEOUT;

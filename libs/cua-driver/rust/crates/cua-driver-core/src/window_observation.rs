@@ -1,29 +1,28 @@
 //! Host-chosen bound for the post-action window-change observation.
 //!
-//! After an input action, the macOS adapter and the Linux X11 foreground
-//! transaction poll the window set for a short time to report a menu, dialog,
-//! or new window the action opened. That poll is the dominant latency of a
-//! background action that opens nothing. An embedding host that already
-//! observes its target continuously can bound it at trusted launch through the
-//! daemon environment:
+//! Long-lived macOS hosts (`serve`, direct MCP, SDK runtime) take one immediate
+//! observation and retain focus protection in the background after returning.
+//! Windows appearing later are not reported in that action result; inspect the
+//! next screenshot or `list_windows`. Finite macOS hosts and Linux X11 foreground
+//! transactions poll synchronously. Trusted host environment settings:
 //!
 //! - [`WINDOW_CHANGE_TIMEOUT_ENV`] (`CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS`):
-//!   the observation deadline in milliseconds. `0` skips the observation.
-//! - [`WINDOW_CHANGE_POLL_ENV`] (`CUA_DRIVER_WINDOW_CHANGE_POLL_MS`): the
-//!   interval between window-set reads in milliseconds.
+//!   post-action protection duration on long-lived macOS hosts, or synchronous
+//!   observation deadline, in milliseconds. `0` skips observation and releases
+//!   the macOS wildcard lease immediately.
+//! - [`WINDOW_CHANGE_POLL_ENV`] (`CUA_DRIVER_WINDOW_CHANGE_POLL_MS`): interval
+//!   between window-set reads in synchronous mode only, in milliseconds.
 //!
-//! Unset, empty, or unparsable values keep each adapter's default, so a
-//! daemon launched without these variables behaves exactly as before. The
-//! values are read from the daemon process environment only; no tool
-//! argument can change them. See `Skills/cua-driver/EMBEDDING.md` for what a
-//! shorter or zero bound costs on each platform.
+//! Unset, empty, or unparsable values keep each adapter's default. Values are
+//! read only from the host environment; no tool argument can change them.
+//! See `Skills/cua-driver/EMBEDDING.md` for platform tradeoffs.
 
 use std::time::Duration;
 
-/// Post-action observation deadline, in milliseconds.
+/// Post-action protection duration or synchronous observation deadline, in milliseconds.
 pub const WINDOW_CHANGE_TIMEOUT_ENV: &str = "CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS";
 
-/// Interval between window-set reads during the observation, in milliseconds.
+/// Interval between synchronous window-set reads, in milliseconds.
 pub const WINDOW_CHANGE_POLL_ENV: &str = "CUA_DRIVER_WINDOW_CHANGE_POLL_MS";
 
 /// Largest accepted deadline. Larger values are clamped so a typo cannot make
@@ -40,7 +39,7 @@ pub const MAX_WINDOW_CHANGE_POLL: Duration = Duration::from_millis(1_000);
 /// Resolved observation bounds for one action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowObservationBounds {
-    /// Deadline for the observation. Zero means "do not observe".
+    /// Protection duration or synchronous observation deadline. Zero skips observation.
     pub timeout: Duration,
     /// Interval between reads. At least [`MIN_WINDOW_CHANGE_POLL`], and never
     /// longer than a non-zero `timeout` that is itself above that minimum, so

@@ -179,6 +179,7 @@ impl Tool for TypeTextTool {
             ) {
                 return synthesis_refusal_result("hid", &refusal, AxAttempt::NotAttempted);
             }
+            crate::post_action::wait_for_text_focus(None).await;
             let result = cua_driver_core::blocking::spawn(move || {
                 crate::input::keyboard::type_text_global(&text, delay_ms)
             })
@@ -351,6 +352,8 @@ impl Tool for TypeTextTool {
         }
         let text_clone = text.clone();
         let char_count = text.chars().count();
+
+        crate::post_action::wait_for_text_focus(Some(pid)).await;
 
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // Typing into a field can trigger autocomplete popovers or

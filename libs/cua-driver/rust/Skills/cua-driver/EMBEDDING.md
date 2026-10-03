@@ -202,24 +202,30 @@ daemon child.
 
 ## Bounding the post-action window observation
 
-After an input action, the driver watches the window list for a short time so
-it can report a menu, dialog, or new window that the action opened. On macOS,
-that watch lasts up to 1000 ms for an action that opens nothing, which makes it
-the largest part of a background click's latency. A host that already observes
-its target continuously can shorten it through two variables set at trusted
-launch, in the environment of the `serve --embedded` child (or of the host
-process when you use the same-process runtime). `EmbeddedCuaDriverHost` starts
-that child from an allowlisted environment that admits both variables, so pass
-them in its `environment` option or set them in the host process:
+In long-lived macOS processes (`serve`, in-process MCP, and the SDK direct
+runtime), each action reports one immediate window observation and returns.
+Focus protection stays armed in the background for the timeout below, including
+when the observation found a change. Windows appearing after return are not
+reported in that action's result; they show in the next screenshot or
+`list_windows`. The poll interval only matters in synchronous mode.
+
+Bare platform registries default to synchronous observation. Finite in-process
+embedders can call `platform_macos::post_action::keep_synchronous()` before
+creating an SDK runtime; otherwise await SDK shutdown before exiting so held
+leases drain. CLI `call` is service-backed. Linux X11 foreground delivery still
+polls synchronously; Windows ignores these settings.
+
+Set these variables at trusted launch in the `serve --embedded` child's
+environment (or the host process for a same-process runtime).
+`EmbeddedCuaDriverHost` admits both through its `environment` option:
 
 | Variable                              | Meaning                                              | Default                         | Accepted range                            |
 | ------------------------------------- | ---------------------------------------------------- | ------------------------------- | ----------------------------------------- |
-| `CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS` | Longest wait for a window change after each action.  | 1000 on macOS, 800 on Linux X11 | 0 to 10000; larger values are clamped     |
-| `CUA_DRIVER_WINDOW_CHANGE_POLL_MS`    | Interval between window-list reads during that wait. | 50                              | 5 to 1000, and never longer than the wait |
+| `CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS` | macOS background protection duration; synchronous observation timeout.  | 1000 on macOS, 800 on Linux X11 | 0 to 10000; larger values are clamped     |
+| `CUA_DRIVER_WINDOW_CHANGE_POLL_MS`    | Interval between synchronous window-list reads. | 50                              | 5 to 1000, and never longer than the wait |
 
 Unset, empty, or unparsable values, such as `-1`, `1.5`, or `100ms`, keep the
-default, so a daemon launched without these variables behaves exactly as
-before. No tool argument can change the bound. Every ingress strips
+default. No tool argument can change the bound. Every ingress strips
 underscore-prefixed arguments, so an agent cannot shorten its own focus
 protection.
 
@@ -229,21 +235,19 @@ CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS=200 \
   cua-driver serve --embedded --socket /tmp/yourapp-cua.sock
 ```
 
-A shorter wait costs something on each platform. Choose a value knowingly.
+A shorter timeout costs something on each platform.
 
-- **macOS: less focus protection.** The watch also holds a focus-steal lease:
-  while it runs, the driver reactivates the app that was frontmost before the
-  action if any other app activates, such as a browser opened by a link. The
-  lease ends when the watch ends. With a nonzero value, cross-app activations
-  are reverted only for that long after the action returns. With `0`, the lease
-  is released as soon as the action returns. The separate target-pid guard
-  remains, and it still covers the action plus a 50 ms settle when the target
-  was not frontmost. An app that activates later stays frontmost, so the host
-  must detect and correct that itself.
-- **macOS: missing result suffixes.** A window that appears after the wait
-  ends is not reported. With `0`, results never carry
+- **macOS: less focus protection.** The wildcard lease restores the app that
+  was frontmost before the action if another app activates. A shorter timeout
+  shortens this protection. With `0`, the wildcard lease is released as soon as
+  the action finishes. The separate target-PID guard still covers the action
+  plus 50 ms, deferred in long-lived hosts. New admitted mutations, snapshots,
+  and intentional driver activations cancel previously deferred guards.
+- **macOS: immediate result evidence.** Long-lived hosts do not wait for later
+  windows even with a nonzero timeout. With `0`, results never carry
   `Action opened new window(s): …` or
-  `Action caused a different app to become frontmost.`
+  `Action caused a different app to become frontmost.` Finite synchronous
+  hosts retain window-change polling and its result suffixes.
 - **Linux X11 foreground delivery: weaker evidence.** A foreground-delivery
   action (`"delivery_mode": "foreground"`) reports `effect: "confirmed"` when
   the target opened or closed a window during the wait. A dialog that maps after a shorter wait

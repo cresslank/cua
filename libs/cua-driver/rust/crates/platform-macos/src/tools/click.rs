@@ -5,7 +5,8 @@
 //! * **AX path** (`element_token`): performs AXAction on the cached
 //!   element. Fires via AX RPC — the target app never needs to be frontmost.
 //!   Extra behaviors vs. the naive dispatch:
-//!   - AXTextField / AXTextArea: 800 ms post-click delay for WebKit DOM focus settle.
+//!   - AXTextField / AXTextArea: 800 ms WebKit focus settle, deferred to the next
+//!     keyboard action for that PID in long-lived hosts.
 //!   - AXPopUpButton: appends the list of available options and redirects to set_value.
 //!   - Advertised-action warning if the element didn't list the requested action.
 //!
@@ -726,7 +727,7 @@ impl Tool for ClickTool {
             )
             .await;
 
-            // Drop the wildcard lease + detect window/foreground side-effects.
+            // Observe immediate side-effects; long-lived hosts defer the wildcard lease.
             let changes = super::finish_window_observation(snapshot).await;
 
             match result {
@@ -740,8 +741,8 @@ impl Tool for ClickTool {
                     ),
                     fronted,
                 ))) => {
-                    // For text inputs, wait 800ms for WebKit DOM focus to settle
-                    // before returning — matches the Swift reference behaviour.
+                    // Long-lived hosts defer WebKit settle to the next keyboard
+                    // action for this PID. Finite hosts retain the 800ms wait.
                     if needs_webkit_delay {
                         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
                     }
@@ -1472,6 +1473,12 @@ fn perform_ax_click(
         anyhow::bail!("AXUIElementPerformAction({ax_action}) returned {err}");
     }
 
+    // Record the deadline at AXPress completion, before foreground restore or
+    // post-action observation. Keyboard tools wait only the remaining time.
+    let needs_webkit_delay = ax_action == "AXPress"
+        && (role == "AXTextField" || role == "AXTextArea")
+        && !crate::post_action::defer_text_focus(pid);
+
     let mut summary = format!("✅ Performed {ax_action} on [{idx}] {role} \"{title}\".");
 
     // AXPopUpButton: list available options, redirect to set_value.
@@ -1527,10 +1534,6 @@ fn perform_ax_click(
              Action may have been a no-op."
         ));
     }
-
-    // WebKit DOM focus settle: 800 ms for text inputs (returned to async caller).
-    let needs_webkit_delay =
-        ax_action == "AXPress" && (role == "AXTextField" || role == "AXTextArea");
 
     // Show focus-rect highlight around the element (matches Swift showFocusRect).
     // Also move the cursor to the element center so the glide animation plays.

@@ -261,8 +261,11 @@ pub(crate) async fn acquire_background_mutation(pid: i32) -> BackgroundMutationL
     }
 }
 
-/// Finish the post-action observation window and release the wildcard
-/// focus-steal lease. The observation bound is a daemon-launch setting
+/// In long-lived hosts, report one immediate observation and retain the wildcard
+/// focus-steal lease in the background for the timeout. Later windows appear in
+/// the next screenshot or list_windows, not this result. Finite hosts poll
+/// synchronously; only that mode uses the poll interval. Zero skips observation
+/// and releases the wildcard lease immediately. The bound is a host-launch setting
 /// (`CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS` / `CUA_DRIVER_WINDOW_CHANGE_POLL_MS`),
 /// never a per-call argument: every ingress strips `_`-prefixed arguments, so
 /// a tool call cannot shorten focus protection for itself.

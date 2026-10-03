@@ -190,6 +190,7 @@ impl Tool for LaunchAppTool {
         // re-activates the prior frontmost if the target is still
         // frontmost — handles the intra-`open()` synchronous activation
         // that fired before we could arm with the real pid.
+        crate::post_action::cancel();
         let prior_frontmost = crate::apps::frontmost_pid();
         let finder_folder_handoff = response_bundle_id.as_deref().is_some_and(|bundle_id| {
             additional_arguments.is_empty()

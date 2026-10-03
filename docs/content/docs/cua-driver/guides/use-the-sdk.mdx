@@ -287,15 +287,18 @@ Python exposes the same objects:
   `health_report` with `{"include":["bundle_identity"]}` to confirm the parent
   app's bundle ID.
 
-- **Bound the post-action window wait.** After each input action the driver
-  watches the window list to report a menu, dialog, or new window the action
-  opened. For an action that opens nothing, the wait lasts 1000 ms on macOS and
-  800 ms for Linux X11 foreground delivery. Set
-  `CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS` (0 to 10000; `0` skips it) and
-  `CUA_DRIVER_WINDOW_CHANGE_POLL_MS` (5 to 1000) in the daemon's launch
-  environment to shorten it; `EmbeddedCuaDriverHost` admits both in its
-  `environment` option. On macOS the wait also holds the focus-restore
-  lease, so a shorter wait shortens that protection. Windows ignores both.
+- **Bound post-action focus protection.** Long-lived macOS processes (`serve`,
+  in-process MCP, SDK direct runtime) report one immediate window observation
+  and return while focus protection stays armed for
+  `CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS` (default 1000; 0 to 10000). Windows
+  appearing after return are not reported in that action result; they show in
+  the next screenshot or `list_windows`. `0` skips observation and releases
+  the wildcard lease immediately. A shorter timeout shortens protection.
+  `CUA_DRIVER_WINDOW_CHANGE_POLL_MS` (default 50; 5 to 1000) only affects
+  synchronous polling: finite macOS hosts and Linux X11 foreground delivery
+  (default timeout 800). Set both in the trusted host or daemon launch
+  environment; `EmbeddedCuaDriverHost` admits them in its `environment` option.
+  Await SDK shutdown before exiting so held leases drain. Windows ignores both.
 
 - **Shorten macOS keystroke pacing.** The macOS adapter waits 8 ms between
   synthesized key events. Set `CUA_DRIVER_KEY_GAP_MS` (2 to 100) in the same

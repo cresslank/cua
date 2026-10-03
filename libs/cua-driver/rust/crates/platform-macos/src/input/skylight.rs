@@ -508,6 +508,7 @@ impl SpaceQuery {
 ///
 /// Returns `true` when all SPIs resolved and both posts succeeded.
 pub fn activate_without_raise(target_pid: pid_t, target_wid: u32) -> bool {
+    crate::post_action::cancel();
     let post_fn = match post_event_record_to_fn() {
         Some(f) => f,
         None => return false,
@@ -563,6 +564,7 @@ pub fn restore_focus_after_without_raise(
     target_pid: pid_t,
     target_wid: u32,
 ) -> bool {
+    crate::post_action::cancel();
     let Some(post_fn) = post_event_record_to_fn() else {
         return false;
     };
@@ -689,6 +691,7 @@ pub fn set_front_process_persistently(target_pid: libc::pid_t, target_wid: u32) 
 
     // kCPSNoWindows = 0x400. Supplying the exact target window still makes
     // that window's process frontmost while avoiding a broad all-window raise.
+    crate::post_action::cancel();
     unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) == 0 }
 }
 
@@ -725,6 +728,7 @@ pub fn make_exact_window_key(target_pid: libc::pid_t, target_wid: u32) -> bool {
 
     // kCPSUserGenerated = 0x200. Unlike kCPSNoWindows, this permits AppKit to
     // establish the requested native key window before it validates NSMenu.
+    crate::post_action::cancel();
     if unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x200) } != 0 {
         return false;
     }
@@ -793,6 +797,7 @@ pub fn with_foreground_assist(
         return Ok(false);
     }
 
+    crate::post_action::cancel();
     unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
     // `set_front` moves WindowServer's front process but does not make the
     // target's NSWindow key, and AppKit installs a first responder only for a
@@ -805,6 +810,7 @@ pub fn with_foreground_assist(
     let result = body();
 
     if prev_ok {
+        crate::post_action::cancel();
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
     }
 
@@ -886,6 +892,7 @@ pub fn with_foreground_hid_activation(
         return action();
     }
 
+    crate::post_action::cancel();
     let activated = unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
     if activated != 0 {
         anyhow::bail!("WindowServer rejected foreground HID activation");
@@ -894,6 +901,7 @@ pub fn with_foreground_hid_activation(
     make_exact_window_key(target_pid, target_wid);
     if !await_window_focused(target_pid, target_wid) {
         if prev_ok {
+            crate::post_action::cancel();
             unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
         }
         anyhow::bail!("exact target window did not become focused for foreground HID delivery");
@@ -903,6 +911,7 @@ pub fn with_foreground_hid_activation(
     std::thread::sleep(std::time::Duration::from_millis(40));
 
     if prev_ok {
+        crate::post_action::cancel();
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
     }
 
@@ -958,6 +967,7 @@ pub fn with_menu_shortcut_activation(
     }
 
     // Make target WindowServer-frontmost (kCPSNoWindows = 0x400).
+    crate::post_action::cancel();
     unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
 
     // Run action then restore — even if action fails.
@@ -965,6 +975,7 @@ pub fn with_menu_shortcut_activation(
 
     // Restore prior frontmost (windowID=0, options=0x400).
     if prev_ok {
+        crate::post_action::cancel();
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
     }
 

@@ -243,6 +243,7 @@ impl Tool for PressKeyTool {
             let key = input.key;
             let modifiers = input.modifiers.unwrap_or_default();
             let key_for_input = key.clone();
+            crate::post_action::wait_for_text_focus(None).await;
             let result = cua_driver_core::blocking::spawn(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                 crate::input::keyboard::press_key_global(&key_for_input, &modifier_refs)
@@ -396,6 +397,8 @@ impl Tool for PressKeyTool {
             )
             .await;
         }
+
+        crate::post_action::wait_for_text_focus(Some(pid)).await;
 
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // Single-key presses can fire autocomplete (Return on a search

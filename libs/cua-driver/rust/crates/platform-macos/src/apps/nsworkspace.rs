@@ -131,6 +131,7 @@ pub fn open_application(
         ?app_url, "calling openApplicationAtURL");
 
     unsafe {
+        crate::post_action::cancel();
         ws.openApplicationAtURL_configuration_completionHandler(&url, &config, Some(&block));
     }
 
@@ -173,6 +174,7 @@ pub fn open_urls_with_application(
         ?app_url, urls_len = urls.len(), "calling openURLs:withApplicationAtURL");
 
     unsafe {
+        crate::post_action::cancel();
         ws.openURLs_withApplicationAtURL_configuration_completionHandler(
             &ns_array,
             &url,

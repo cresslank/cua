@@ -202,6 +202,8 @@ impl DriverRuntime {
             || build_registry(&options),
         )?);
         registry.init_self_weak();
+        #[cfg(target_os = "macos")]
+        platform_macos::post_action::enable_background();
         let runtime = Arc::new(Self {
             registry,
             authorization_registry,
@@ -228,6 +230,8 @@ impl DriverRuntime {
     pub(crate) async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         let _drained = self.lifecycle.write().await;
+        #[cfg(target_os = "macos")]
+        let _ = cua_driver_core::blocking::spawn(platform_macos::post_action::drain).await;
         self.stop_lifecycle_maintenance();
         self.authorization_registry.revoke_all();
         let runtime_prefix = format!(

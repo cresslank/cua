@@ -1811,6 +1811,9 @@ impl ToolRegistry {
         // Desktop pixels read off a capped get_desktop_state image are mapped
         // back to the uncapped capture before any platform interprets them.
         crate::desktop_capture_scale::map_desktop_args(&mut args);
+        if !tool.def().read_only {
+            crate::action_boundary::notify_before_mutation();
+        }
         let mut result = crate::recording::scope_dispatch_click_capture(
             pending_turn.as_ref(),
             tool.invoke(args.clone()),
@@ -3291,6 +3294,62 @@ mod runtime_isolation_tests {
             },
         }));
         Arc::new(registry)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn mutation_hook_runs_once_only_after_successful_admission() {
+        // Thread-local observation isolates this installed process hook from
+        // parallel registry tests, without a test switch in shipped dispatch.
+        thread_local! { static CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+        fn hook() {
+            CALLS.with(|calls| calls.set(calls.get() + 1));
+        }
+        crate::action_boundary::install_before_mutation_hook(hook);
+        let count = || CALLS.with(std::cell::Cell::get);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let registry = input_registry(None, hits.clone());
+        let allowed = registry
+            .invoke_with_context(
+                "click",
+                serde_json::json!({"pid": 937451, "window_id": 19}),
+                unrestricted_context(),
+            )
+            .await;
+        assert_ne!(allowed.is_error, Some(true), "{allowed:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(count(), 1);
+
+        let read = observation_registry(None, hits.clone())
+            .invoke_with_context(
+                "get_window_state",
+                serde_json::json!({"pid": 937451, "window_id": 19}),
+                standard_context(),
+            )
+            .await;
+        assert_ne!(read.is_error, Some(true), "{read:?}");
+        assert_eq!(count(), 1);
+
+        let denied_context = standard_context();
+        let scope = denied_context.runtime_scope_key();
+        crate::session::suspend_runtime_scope(&scope);
+        let denied = registry
+            .invoke_with_context(
+                "click",
+                serde_json::json!({"pid": 937451, "window_id": 19}),
+                denied_context,
+            )
+            .await;
+        crate::session::forget_suspended_runtime_scope(&scope);
+        assert_eq!(
+            denied
+                .structured_content
+                .as_ref()
+                .and_then(|v| v.pointer("/refusal/code"))
+                .and_then(serde_json::Value::as_str),
+            Some("authorization_suspended")
+        );
+        assert_eq!(count(), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 
     fn file_registry(

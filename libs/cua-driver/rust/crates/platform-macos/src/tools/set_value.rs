@@ -169,6 +169,8 @@ impl Tool for SetValueTool {
             Some(window_id),
         );
 
+        crate::post_action::wait_for_text_focus(Some(pid)).await;
+
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // AXValue writes on popups / sliders can cause reflex activations
         // in Chromium-based apps; the AXPopUpButton path also AXPresses a
@@ -189,7 +191,7 @@ impl Tool for SetValueTool {
         )
         .await;
 
-        let changes = snapshot.detect_async().await;
+        let changes = super::finish_window_observation(snapshot).await;
 
         match result {
             Ok(Ok(mut outcome)) => {

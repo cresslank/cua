@@ -397,6 +397,7 @@ unsafe fn show_modal_unsafe(opts: &PanelOpts) -> PanelOutcome {
 
     // ---- Show window + start poll timer + run modal ----
     let _: () = msg_send![window, center];
+    crate::post_action::cancel();
     let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null::<AnyObject>()];
     let _: () = msg_send![app, activateIgnoringOtherApps: true];
 

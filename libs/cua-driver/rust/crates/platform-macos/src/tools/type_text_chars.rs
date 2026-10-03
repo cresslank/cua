@@ -105,6 +105,8 @@ impl Tool for TypeTextCharsTool {
             None
         };
 
+        crate::post_action::wait_for_text_focus(Some(pid)).await;
+
         // Pre-focus element if requested.
         if !type_chars_only {
             if let Some(guard) = element_guard.as_ref().cloned() {

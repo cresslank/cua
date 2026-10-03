@@ -552,6 +552,7 @@ fn select_finder_folders(urls: &[String]) -> anyhow::Result<()> {
     let workspace = unsafe { NSWorkspace::sharedWorkspace() };
     for folder in urls {
         let folder = NSString::from_str(folder);
+        crate::post_action::cancel();
         if !unsafe { workspace.selectFile_inFileViewerRootedAtPath(None, &folder) } {
             anyhow::bail!("Finder refused to open folder: {folder}");
         }
@@ -975,7 +976,10 @@ pub fn activate_pid(pid: i32) -> bool {
     use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
     unsafe {
         match NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
-            Some(app) => app.activateWithOptions(NSApplicationActivationOptions(0)),
+            Some(app) => {
+                crate::post_action::cancel();
+                app.activateWithOptions(NSApplicationActivationOptions(0))
+            }
             None => false,
         }
     }

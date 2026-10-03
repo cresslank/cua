@@ -260,6 +260,7 @@ fn focus_ax_window(pid: i32, window_id: u32) -> Result<(), String> {
         // raise/main/focus completes the corresponding visible and semantic
         // state; these writes remain best-effort for applications that expose
         // only a subset of the attributes.
+        crate::post_action::cancel();
         let _ = perform_action(target, "AXRaise");
         let _ = set_bool_attr_true(target, "AXMain");
         let _ = set_bool_attr_true(target, "AXFocused");

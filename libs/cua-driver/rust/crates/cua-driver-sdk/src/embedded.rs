@@ -53,6 +53,12 @@ pub struct EmbeddedDriverHostOptions {
     pub session_policy_path: Option<String>,
     pub approve_session_policy: bool,
     pub dangerously_bypass_approvals: bool,
+    /// Trusted launch overrides include CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS and
+    /// CUA_DRIVER_WINDOW_CHANGE_POLL_MS. In long-lived macOS hosts, the timeout
+    /// retains focus protection after the action returns; only synchronous mode
+    /// uses the poll interval. Later windows are absent from that action result
+    /// and appear in the next screenshot or list_windows. Zero skips observation
+    /// and releases the wildcard lease immediately.
     pub environment: Vec<EmbeddedEnvironmentVariable>,
     pub inherit_stderr: bool,
     #[uniffi(default = false)]

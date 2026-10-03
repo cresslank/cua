@@ -176,6 +176,7 @@ pub fn check_required_permissions() -> Vec<MissingPermission> {
 /// macOS routes `x-apple.systempreferences:` URLs through `System Settings`
 /// automatically — same mechanism the Swift gate uses via `NSWorkspace.open`.
 pub fn open_system_settings_for(permission: MissingPermission) -> Result<()> {
+    crate::post_action::cancel();
     let status = std::process::Command::new("open")
         .arg(permission.settings_url())
         .status()?;

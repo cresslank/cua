@@ -125,6 +125,7 @@ end tell"#
         }
 
         // Relaunch.
+        crate::post_action::cancel();
         tokio::process::Command::new("open")
             .arg("-a")
             .arg(app_name)
