@@ -340,18 +340,18 @@ impl Dispatcher {
         }
     }
 
-    /// Snapshot the entries (cloned to a small Vec) — used by tests
-    /// and the activation handler to evaluate matches without holding
-    /// the lock across the restore call.
-    fn snapshot_matches(&self, activated_pid: i32) -> Vec<i32> {
+    /// Snapshot lease identities, not bare PIDs. A copied candidate is only
+    /// permission to re-check the lease when dispatching, never to restore it
+    /// after removal or expiry.
+    fn snapshot_matches(&self, activated_pid: i32) -> Vec<SuppressionHandle> {
         let mut guard = self.entries.lock().unwrap();
         // Reap expired entries first — keeps the dispatcher honest even
         // if the janitor hasn't ticked yet.
         let now = Instant::now();
         guard.retain(|_, e| e.deadline > now);
         guard
-            .values()
-            .filter(|e| {
+            .iter()
+            .filter(|(_, e)| {
                 if e.allowed_pid == Some(activated_pid) {
                     return false;
                 }
@@ -363,8 +363,19 @@ impl Dispatcher {
                     None => activated_pid != e.restore_to,
                 }
             })
-            .map(|e| e.restore_to)
+            .map(|(id, _)| SuppressionHandle(*id))
             .collect()
+    }
+
+    /// Serialize the native restore with lease removal. Removal either wins
+    /// and invalidates this candidate, or waits for the in-flight restore to
+    /// finish before returning. The observer uses a serial background queue,
+    /// so native activation cannot synchronously re-enter this dispatcher.
+    fn dispatch_restore(&self, handle: SuppressionHandle, restore: impl FnOnce(i32)) {
+        let guard = self.entries.lock().unwrap();
+        if let Some(entry) = guard.get(&handle.0).filter(|e| e.deadline > Instant::now()) {
+            restore(entry.restore_to);
+        }
     }
 
     /// Number of entries (for tests).
@@ -531,9 +542,9 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
         pid as i32
     };
 
-    let restore_pids = dispatcher.snapshot_matches(activated_pid);
-    for pid in restore_pids {
-        restore_focus(pid);
+    let candidates = dispatcher.snapshot_matches(activated_pid);
+    for handle in candidates {
+        dispatcher.dispatch_restore(handle, restore_focus);
     }
 }
 
@@ -558,6 +569,14 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    fn restore_matches(dispatcher: &Dispatcher, activated_pid: i32) -> Vec<i32> {
+        let mut restored = Vec::new();
+        for handle in dispatcher.snapshot_matches(activated_pid) {
+            dispatcher.dispatch_restore(handle, |pid| restored.push(pid));
+        }
+        restored
+    }
+
     /// Dispatcher::add returns a handle, the entry is reachable by
     /// match, and remove() drops it.
     #[test]
@@ -565,10 +584,10 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let h = d.add(Some(42), 7, "test.add");
         assert_eq!(d.len(), 1);
-        let matches = d.snapshot_matches(42);
+        let matches = restore_matches(&d, 42);
         assert_eq!(matches, vec![7]);
         // Non-matching pid: no restore candidates.
-        assert!(d.snapshot_matches(99).is_empty());
+        assert!(restore_matches(&d, 99).is_empty());
         d.remove(h);
         assert_eq!(d.len(), 0);
     }
@@ -580,9 +599,9 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let _h = d.add(None, 7, "test.wild");
         // pid 99 != restore_to 7 → should match.
-        assert_eq!(d.snapshot_matches(99), vec![7]);
+        assert_eq!(restore_matches(&d, 99), vec![7]);
         // pid 7 == restore_to → must NOT match (don't fight ourselves).
-        assert!(d.snapshot_matches(7).is_empty());
+        assert!(restore_matches(&d, 7).is_empty());
     }
 
     /// A background pixel click intentionally makes its target AppKit-active
@@ -594,16 +613,16 @@ mod tests {
         let _h = d.add_allowing(42, 7, "test.allow");
 
         assert!(
-            d.snapshot_matches(42).is_empty(),
+            restore_matches(&d, 42).is_empty(),
             "intentional target activation must not be restored before the click"
         );
         assert_eq!(
-            d.snapshot_matches(99),
+            restore_matches(&d, 99),
             vec![7],
             "unrelated activations must remain suppressed"
         );
         assert!(
-            d.snapshot_matches(7).is_empty(),
+            restore_matches(&d, 7).is_empty(),
             "restoring the original foreground must never recurse"
         );
     }
@@ -638,6 +657,98 @@ mod tests {
         assert_eq!(d.len(), 0);
     }
 
+    #[test]
+    fn cancelled_lease_invalidates_an_already_copied_restore() {
+        let d = Arc::new(Dispatcher::new());
+        let handle = d.add(Some(42), 7, "test.cancel_snapshot");
+        let lease = SuppressionLease {
+            handle,
+            dispatcher: d.clone(),
+            released: false,
+        };
+        let copied = std::sync::Barrier::new(2);
+        let cancelled = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let callback = scope.spawn(|| {
+                let candidates = d.snapshot_matches(42);
+                copied.wait();
+                cancelled.wait();
+                assert_eq!(candidates, vec![handle]);
+                for candidate in candidates {
+                    d.dispatch_restore(candidate, |_| panic!("restore after cancellation"));
+                }
+            });
+            copied.wait();
+            // Holder::cancel drops the deferred lease through this same path.
+            drop(lease);
+            cancelled.wait();
+            callback.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn lease_cancellation_joins_an_in_flight_restore() {
+        let d = Arc::new(Dispatcher::new());
+        let handle = d.add(Some(42), 7, "test.cancel_in_flight");
+        let lease = SuppressionLease {
+            handle,
+            dispatcher: d.clone(),
+            released: false,
+        };
+        let restoring = std::sync::Barrier::new(2);
+        let cancelling = std::sync::Barrier::new(2);
+        let order = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            let callback = scope.spawn(|| {
+                let mut removal_locked = false;
+                d.dispatch_restore(handle, |pid| {
+                    // Prove the removal lock stays held across native dispatch,
+                    // independently of when the cancelling thread is scheduled.
+                    removal_locked = matches!(
+                        d.entries.try_lock(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    );
+                    restoring.wait();
+                    cancelling.wait();
+                    assert_eq!(pid, 7);
+                    order.lock().unwrap().push("restore finished");
+                });
+                removal_locked
+            });
+            let cancellation = scope.spawn(|| {
+                restoring.wait();
+                cancelling.wait();
+                drop(lease);
+                order.lock().unwrap().push("cancel returned");
+            });
+            let removal_locked = callback.join().unwrap();
+            cancellation.join().unwrap();
+            assert!(
+                removal_locked,
+                "native restore did not hold the removal lock"
+            );
+        });
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["restore finished", "cancel returned"]
+        );
+        d.dispatch_restore(handle, |_| panic!("removed lease dispatched again"));
+    }
+
+    #[test]
+    fn dispatch_rechecks_expiry_after_snapshot() {
+        let d = Arc::new(Dispatcher::new());
+        let handle = d.add(Some(42), 7, "test.expired_snapshot");
+        assert_eq!(d.snapshot_matches(42), vec![handle]);
+        d.entries
+            .lock()
+            .unwrap()
+            .get_mut(&handle.0)
+            .unwrap()
+            .deadline = Instant::now() - Duration::from_secs(1);
+        d.dispatch_restore(handle, |_| panic!("expired lease dispatched"));
+    }
+
     /// Force a leaked entry whose deadline is already past, then call
     /// reap_expired and snapshot_matches — both must purge it.
     #[test]
@@ -660,7 +771,7 @@ mod tests {
         }
         assert_eq!(d.len(), 1);
         // snapshot_matches reaps expired entries before matching.
-        let matches = d.snapshot_matches(42);
+        let matches = restore_matches(&d, 42);
         assert!(matches.is_empty(), "expired entry should not fire");
         assert_eq!(d.len(), 0, "snapshot_matches should purge expired");
     }
@@ -721,7 +832,7 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let _a = d.add(Some(42), 1, "test.m1");
         let _b = d.add(Some(42), 2, "test.m2");
-        let matches = d.snapshot_matches(42);
+        let matches = restore_matches(&d, 42);
         assert_eq!(matches.len(), 2);
         // Set equality — order is HashMap-dependent.
         assert!(matches.contains(&1));

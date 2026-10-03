@@ -230,6 +230,8 @@ impl DriverRuntime {
     pub(crate) async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
         let _drained = self.lifecycle.write().await;
+        // Drain captures a fixed set after our admitted calls finish. Leases
+        // subsequently added by other runtimes cannot prolong this shutdown.
         #[cfg(target_os = "macos")]
         let _ = cua_driver_core::blocking::spawn(platform_macos::post_action::drain).await;
         self.stop_lifecycle_maintenance();
