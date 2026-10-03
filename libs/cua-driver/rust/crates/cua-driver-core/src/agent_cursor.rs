@@ -138,6 +138,38 @@ pub fn default_idle_hide_ms() -> f64 {
     AGENT_CURSOR_IDLE_TIMEOUT.as_secs_f64() * 1000.0
 }
 
+/// Persisted fork setting: zero preserves upstream speed-based motion.
+pub const GLIDE_DURATION_CONFIG_KEY: &str = "agent_cursor_glide_duration_ms";
+
+/// Use the same range as MotionConfig::with_overrides. Reject non-numbers;
+/// clamp numeric values so disk loading and both set_config shapes agree.
+pub fn parse_glide_duration(value: &serde_json::Value) -> Result<f64, &'static str> {
+    value.as_f64().filter(|v| v.is_finite()).map(|v| v.clamp(0.0, 5000.0))
+        .ok_or("agent_cursor_glide_duration_ms must be a finite number (0..=5000 ms; 0 uses speed-based motion)")
+}
+
+pub fn glide_duration_config_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "number", "minimum": 0, "maximum": 5000,
+        "description": "Default agent cursor glide duration in milliseconds (clamped to 0..5000). 0 preserves speed-based motion. Applies immediately; explicit set_agent_cursor_motion glide duration wins."
+    })
+}
+
+/// Validate either the direct field or CLI {key,value} config shape.
+pub fn glide_duration_config_arg(args: &serde_json::Value) -> Result<Option<f64>, &'static str> {
+    let direct = args.get(GLIDE_DURATION_CONFIG_KEY);
+    let keyed =
+        if args.get("key").and_then(serde_json::Value::as_str) == Some(GLIDE_DURATION_CONFIG_KEY) {
+            Some(
+                args.get("value")
+                    .ok_or("agent_cursor_glide_duration_ms requires value")?,
+            )
+        } else {
+            None
+        };
+    direct.or(keyed).map(parse_glide_duration).transpose()
+}
+
 /// Whether `idle_hide_ms` enables idle hiding (positive and finite).
 fn idle_hiding(idle_hide_ms: f64) -> bool {
     idle_hide_ms.is_finite() && idle_hide_ms > 0.0
@@ -498,6 +530,38 @@ mod tests {
         assert_eq!(
             surface.on_command("run-a", after),
             SharedSurfaceAction::Draw { switched: false }
+        );
+    }
+}
+
+#[cfg(test)]
+mod glide_config_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn config_shapes_validate_and_clamp_like_motion_overrides() {
+        assert_eq!(glide_duration_config_arg(&json!({})), Ok(None));
+        for (input, expected) in [
+            (0.0, 0.0),
+            (150.0, 150.0),
+            (12.5, 12.5),
+            (-1.0, 0.0),
+            (6000.0, 5000.0),
+        ] {
+            for args in [
+                json!({GLIDE_DURATION_CONFIG_KEY: input}),
+                json!({"key":GLIDE_DURATION_CONFIG_KEY, "value":input}),
+            ] {
+                assert_eq!(glide_duration_config_arg(&args), Ok(Some(expected)));
+            }
+        }
+        for bad in [json!(null), json!(true), json!("150"), json!([])] {
+            assert_eq!(parse_glide_duration(&bad).unwrap_err(), "agent_cursor_glide_duration_ms must be a finite number (0..=5000 ms; 0 uses speed-based motion)");
+        }
+        assert_eq!(
+            glide_duration_config_arg(&json!({"key":GLIDE_DURATION_CONFIG_KEY})),
+            Err("agent_cursor_glide_duration_ms requires value")
         );
     }
 }

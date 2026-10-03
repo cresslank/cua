@@ -19,6 +19,9 @@ pub struct MotionConfig {
     /// Main glide duration in milliseconds — used only as a legacy override.
     /// When <= 0 the render engine uses speed-based timing instead. [50, 5000]
     pub glide_duration_ms: f64,
+    /// Whether set_agent_cursor_motion explicitly selected the glide duration.
+    #[serde(skip)]
+    pub glide_duration_explicit: bool,
     /// Post-click dwell in milliseconds. [0, 5000]
     pub dwell_after_click_ms: f64,
     /// Auto-hide delay in milliseconds. 0 = never hide. [0, 60000]
@@ -45,6 +48,7 @@ impl Default for MotionConfig {
             arc_flow: 0.0,
             spring: 0.72,
             glide_duration_ms: 0.0, // 0 = speed-based mode
+            glide_duration_explicit: false,
             dwell_after_click_ms: 80.0,
             // The shared agent idle timeout (presence drops an idle agent then too).
             idle_hide_ms: cua_driver_core::agent_cursor::default_idle_hide_ms(),
@@ -86,6 +90,7 @@ impl MotionConfig {
                 0.0,
                 5000.0,
             ),
+            glide_duration_explicit: self.glide_duration_explicit || glide_duration_ms.is_some(),
             dwell_after_click_ms: clamp(
                 dwell_after_click_ms.unwrap_or(self.dwell_after_click_ms),
                 0.0,

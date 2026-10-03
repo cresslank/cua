@@ -200,7 +200,14 @@ fn unknown_argument(def: &ToolDef, args: &Value) -> Option<String> {
     let properties = schema.get("properties").and_then(Value::as_object);
     args.as_object()?
         .keys()
-        .find(|name| !properties.is_some_and(|properties| properties.contains_key(*name)))
+        .find(|name| {
+            // Fork compatibility shim: Hermes sends both fields; shared token
+            // resolution cross-checks the legacy index against the token.
+            let paired_index = name.as_str() == "element_index"
+                && properties.is_some_and(|p| p.contains_key("element_token"))
+                && args.get("element_token").and_then(Value::as_str).is_some();
+            !paired_index && !properties.is_some_and(|p| p.contains_key(*name))
+        })
         .cloned()
 }
 
@@ -1301,6 +1308,15 @@ impl ToolRegistry {
         // caller-chosen label alone. Translate it only after authorization so
         // policy and manifests continue to evaluate the public request.
         let runtime_prefix = namespace_runtime_args(&mut args, context, evidence);
+        // Preserve anonymous config calls' persisted-global scope before the
+        // lifecycle layer supplies an implicit session. This marker is trusted:
+        // caller underscore arguments have already been stripped.
+        if matches!(resolved_name, "get_config" | "set_config")
+            && args.get("_session_id").is_none()
+            && args.get("_transport_session_id").is_none()
+        {
+            args["_global_config"] = Value::Bool(true);
+        }
         if session_selecting_tool(resolved_name)
             && args.get("_session_id").and_then(Value::as_str).is_none()
         {
@@ -1423,7 +1439,15 @@ impl ToolRegistry {
         if let Some(name) = unknown_argument {
             return protected_refusal(
                 "invalid_arguments",
-                &format!("{resolved_name}: unknown argument {name}"),
+                &if name == "element_index"
+                    && tool.def().input_schema["properties"]
+                        .get("element_token")
+                        .is_some()
+                {
+                    format!("{resolved_name}: element_index requires the element_token from get_window_state")
+                } else {
+                    format!("{resolved_name}: unknown argument {name}")
+                },
             );
         }
 

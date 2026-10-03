@@ -24,7 +24,7 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "set_config".into(),
         description: "Update cua-driver-rs configuration. Changes to \
-            max_image_dimension take effect immediately. The \
+            max_image_dimension and agent_cursor_glide_duration_ms take effect immediately. Named sessions override these in memory; anonymous CLI calls persist them. The \
             experimental_pip keys are persisted to ~/.cua-driver/config.json and \
             take effect on the next daemon restart (the PiP backend is \
             initialised once at startup).\n\nNote: capture_mode is a per-call \
@@ -43,6 +43,7 @@ fn def() -> &'static ToolDef {
                 "value": {
                     "description": "New value for `key`. JSON type depends on the key."
                 },
+                "agent_cursor_glide_duration_ms": cua_driver_core::agent_cursor::glide_duration_config_schema(),
                 "max_image_dimension": {
                     "type": "integer",
                     "description": "Max dimension for screenshot resizing (0 = no limit)."
@@ -88,12 +89,16 @@ impl Tool for SetConfigTool {
             }));
         }
         // The daemon injects `_session_id` for non-anonymous MCP sessions.
-        // Absent => anonymous/global session (CLI one-shot, legacy proxy) =>
+        // Absent (or trusted _global_config) => anonymous/global CLI =>
         // today's behavior: write the shared global DriverConfig + persist to
         // disk. Present => session-scoped in-memory override only, never
         // touching the global config or the on-disk default, so two concurrent
         // sessions don't clobber each other or the persisted default.
-        let session_id = args.opt_str("_session_id");
+        let session_id = if args["_global_config"] == true {
+            None
+        } else {
+            args.opt_str("_session_id")
+        };
 
         // Accept BOTH the direct field and {key,value} shapes.
         let kv: Option<(String, Value)> = args
@@ -120,20 +125,27 @@ impl Tool for SetConfigTool {
             None => None,
         };
 
+        let glide = match cua_driver_core::agent_cursor::glide_duration_config_arg(&args) {
+            Ok(value) => value,
+            Err(message) => return ToolResult::error(message),
+        };
+        // Serialize config publication with render-default publication, including
+        // named sessions, so concurrent set_config calls cannot leave them apart.
+        let mut cfg = self.state.config.write().unwrap();
         let effective_dim = if let Some(sid) = session_id.as_deref() {
             // Session-scoped override: in-memory only, no global write, no disk.
             self.state.session_config.set(
                 sid,
                 ConfigOverrides {
                     max_image_dimension: max_dim,
+                    agent_cursor_glide_duration_ms: glide,
                 },
             );
             self.state
                 .session_config
-                .effective_max_image_dimension(Some(sid), &self.state.config.read().unwrap())
+                .effective_max_image_dimension(Some(sid), &cfg)
         } else {
             // Anonymous/global session: write the shared global + persist.
-            let mut cfg = self.state.config.write().unwrap();
             if let Some(dim32) = max_dim {
                 cfg.max_image_dimension = dim32;
                 if let Err(e) = write_driver_config_key(
@@ -143,8 +155,32 @@ impl Tool for SetConfigTool {
                     tracing::warn!("set_config: failed to persist max_image_dimension: {e}");
                 }
             }
+            if let Some(glide) = glide {
+                cfg.agent_cursor_glide_duration_ms = glide;
+                if let Err(e) = write_driver_config_key(
+                    cua_driver_core::agent_cursor::GLIDE_DURATION_CONFIG_KEY,
+                    &serde_json::json!(glide),
+                ) {
+                    tracing::warn!(
+                        "set_config: failed to persist agent_cursor_glide_duration_ms: {e}"
+                    );
+                }
+            }
+            if let Some(glide) = glide {
+                crate::cursor::overlay::set_default_glide_duration(None, glide);
+            }
             cfg.max_image_dimension
         };
+        if let (Some(glide), Some(session)) = (glide, session_id.as_deref()) {
+            if !cua_driver_core::session::is_session_ended(session) {
+                crate::cursor::overlay::set_default_glide_duration(Some(session), glide);
+            }
+        }
+        let effective_glide = self
+            .state
+            .session_config
+            .effective_glide_duration(session_id.as_deref(), &cfg);
+        drop(cfg);
         // PiP keys persist to the same config.json but take effect only on
         // next daemon restart — the backend is initialised once at startup.
         let mut pip_note = String::new();
@@ -183,13 +219,14 @@ impl Tool for SetConfigTool {
             ""
         };
         ToolResult::text(format!(
-            "Config updated: max_image_dimension={}{}{}",
-            effective_dim, scope_note, pip_note
+            "Config updated: max_image_dimension={}, agent_cursor_glide_duration_ms={}{}{}",
+            effective_dim, effective_glide, scope_note, pip_note
         ))
         .with_structured(serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "platform": "macos",
             "max_image_dimension": effective_dim,
+            "agent_cursor": { "glide_duration_ms": effective_glide },
         }))
     }
 }

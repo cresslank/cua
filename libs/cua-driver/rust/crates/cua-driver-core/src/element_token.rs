@@ -1319,6 +1319,23 @@ impl<T> ResolvedElement<T> {
     }
 }
 
+/// Fork compatibility shim for clients that send both snapshot fields.
+/// Call after token resolution: the index is only a cross-check, never a target.
+pub fn cross_check_legacy_index(
+    args: &serde_json::Value,
+    resolved_index: usize,
+) -> Result<(), ToolResult> {
+    if let Some(index) = args.get("element_index") {
+        if index.as_u64() != Some(resolved_index as u64) {
+            return Err(refusal(
+                "stale_element_token",
+                "element_index does not match element_token; pass matching fields from get_window_state".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn refusal(code: &str, message: String) -> ToolResult {
     ToolResult::error(message.clone()).with_structured(serde_json::json!({
         "status": "refused", "refusal": { "code": code, "message": message }

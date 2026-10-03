@@ -171,6 +171,7 @@ impl Snapshots {
             let code = if message == element_token::STALE_TOKEN_ERROR || message.contains("another runtime generation") { "stale_element_token" } else { "invalid_element_token" };
             cua_driver_core::protocol::ToolResult::error(message.clone()).with_structured(serde_json::json!({"status":"refused","refusal":{"code":code,"message":message}}))
         })?;
+        element_token::cross_check_legacy_index(args, element_index)?;
         let window_id = generation.lane_key().window_id;
         if args["window_id"]
             .as_u64()
@@ -522,6 +523,44 @@ mod tests {
                         .map(|entry| entry.map(|(id, _)| id))
                         .unwrap(),
                     None
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn paired_legacy_index_cross_checks_the_sparse_public_index() {
+        cua_driver_core::tool::with_runtime_scope(
+            format!("linux-paired-index-{}", uuid::Uuid::new_v4()),
+            || {
+                let cache = Snapshots::new();
+                let pid = std::process::id();
+                let window = 0x7f30_0102;
+                let id = cache
+                    .publish(cache.prepare(pid, window, &[node(7, 41)]).unwrap())
+                    .unwrap();
+                let token = cua_driver_core::element_token::token_for(id, 7);
+                assert!(cache
+                    .resolve_for_tool(
+                        pid as i32,
+                        &serde_json::json!({
+                            "element_token":token, "element_index":7
+                        }),
+                        "click"
+                    )
+                    .is_ok());
+                let refusal = cache
+                    .resolve_for_tool(
+                        pid as i32,
+                        &serde_json::json!({
+                            "element_token":token, "element_index":0
+                        }),
+                        "click",
+                    )
+                    .unwrap_err();
+                assert_eq!(
+                    refusal.structured_content.unwrap()["refusal"]["code"],
+                    "stale_element_token"
                 );
             },
         );

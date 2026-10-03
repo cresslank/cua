@@ -138,6 +138,7 @@ impl CursorConfig {
                 "--glide-ms" => {
                     if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
                         cfg.motion.glide_duration_ms = v;
+                        cfg.motion.glide_duration_explicit = true;
                         i += 1;
                     }
                 }

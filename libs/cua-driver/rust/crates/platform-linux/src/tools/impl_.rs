@@ -270,6 +270,7 @@ fn snapshot_window_resolver(
 pub struct DriverConfig {
     pub capture_mode: String,
     pub max_image_dimension: u32,
+    pub agent_cursor_glide_duration_ms: f64,
 }
 
 impl Default for DriverConfig {
@@ -277,6 +278,7 @@ impl Default for DriverConfig {
         Self {
             capture_mode: "ax".into(),
             max_image_dimension: 1568,
+            agent_cursor_glide_duration_ms: 0.0,
         }
     }
 }
@@ -299,6 +301,12 @@ pub fn load_driver_config() -> DriverConfig {
             cfg.max_image_dimension = v32;
         }
     }
+    cfg.agent_cursor_glide_duration_ms =
+        pip_preview::read_config_value(cua_driver_core::agent_cursor::GLIDE_DURATION_CONFIG_KEY)
+            .as_ref()
+            .and_then(|v| cua_driver_core::agent_cursor::parse_glide_duration(v).ok())
+            .unwrap_or(0.0);
+
     cfg
 }
 
@@ -11569,7 +11577,7 @@ impl Tool for GetConfigTool {
     fn def(&self) -> &ToolDef {
         GCFG_DEF.get_or_init(|| ToolDef {
             name: "get_config".into(),
-            description: "Return current cua-driver-rs configuration.".into(),
+            description: "Return current cua-driver-rs configuration, including the agent_cursor.glide_duration_ms default. Explicit motion overrides are reported by get_agent_cursor_state.".into(),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
             read_only: true,
             destructive: false,
@@ -11586,6 +11594,7 @@ impl Tool for GetConfigTool {
             "platform": "linux",
             "capture_mode": cfg.capture_mode,
             "max_image_dimension": cfg.max_image_dimension,
+            "agent_cursor": { "glide_duration_ms": cfg.agent_cursor_glide_duration_ms },
             "experimental_pip": pip_enabled,
             "experimental_pip_geometry": pip_geometry
         }))
@@ -11605,7 +11614,7 @@ impl Tool for SetConfigTool {
         SCFG_DEF.get_or_init(|| ToolDef {
             name: "set_config".into(),
             description: "Update cua-driver-rs configuration. capture_mode / \
-                max_image_dimension take effect immediately.\n\n\
+                max_image_dimension and agent_cursor_glide_duration_ms take effect immediately.\n\n\
                 Two input shapes (both accepted, matching Windows/Swift):\n\
                 - **{key, value}** (preferred): `{\"key\": \"max_image_dimension\", \"value\": 800}` \
                   — single leaf write.\n\
@@ -11617,6 +11626,7 @@ impl Tool for SetConfigTool {
                 "key":{"type":"string","description":"Name of a single config field to write ({key, value} shape). Pair with `value`."},
                 "value":{"description":"New value for `key`. JSON type depends on the key."},
                 "capture_mode":{"type":"string","enum":["ax","vision"],"description":"Legacy per-field shape. Default capture mode for get_window_state. (\"som\"/\"screenshot\" still decode as deprecated aliases.)"},
+                "agent_cursor_glide_duration_ms": cua_driver_core::agent_cursor::glide_duration_config_schema(),
                 "max_image_dimension":{"type":"integer","description":"Legacy per-field shape. Max dimension for screenshot resizing (0 = no limit)."},
                 "experimental_pip":{"type":"boolean","description":"Enable the experimental PiP preview window (applies next restart; Linux backend stubbed)."},
                 "experimental_pip_geometry":{"type":"string","description":"PiP window size + optional position in `WxH` or `WxH+X+Y` form."}
@@ -11638,8 +11648,23 @@ impl Tool for SetConfigTool {
                 "replacement": "action.target",
             }));
         }
+        let glide = match cua_driver_core::agent_cursor::glide_duration_config_arg(&args) {
+            Ok(value) => value,
+            Err(message) => return ToolResult::error(message),
+        };
         let mut cfg = self.state.config.write().unwrap();
         let mut parts = Vec::new();
+        if let Some(glide) = glide {
+            cfg.agent_cursor_glide_duration_ms = glide;
+            if let Err(e) = pip_preview::write_config_key(
+                cua_driver_core::agent_cursor::GLIDE_DURATION_CONFIG_KEY,
+                json!(glide),
+            ) {
+                tracing::warn!("set_config: failed to persist agent_cursor_glide_duration_ms: {e}");
+            }
+            crate::overlay::set_default_glide_duration(None, glide);
+            parts.push(format!("agent_cursor_glide_duration_ms={glide}"));
+        }
         // {key, value} shape (what the Swift/macOS and Windows callers send).
         // Linux previously read only the legacy per-field keys below, so a
         // `{"key":"max_image_dimension","value":800}` write was silently
@@ -11648,6 +11673,7 @@ impl Tool for SetConfigTool {
             (args.get("key").and_then(|v| v.as_str()), args.get("value"))
         {
             match key {
+                "agent_cursor_glide_duration_ms" => {}
                 "capture_mode" => match val.as_str() {
                     Some(s) => {
                         cfg.capture_mode = s.to_owned();
@@ -11725,7 +11751,7 @@ impl Tool for SetConfigTool {
                 },
                 other => {
                     return ToolResult::error(format!(
-                        "Unknown config key `{other}`. Known: capture_mode, max_image_dimension, experimental_pip, experimental_pip_geometry."
+                        "Unknown config key `{other}`. Known: capture_mode, max_image_dimension, agent_cursor_glide_duration_ms, experimental_pip, experimental_pip_geometry."
                     ));
                 }
             }
@@ -11779,6 +11805,7 @@ impl Tool for SetConfigTool {
         ToolResult::text(msg).with_structured(json!({
             "capture_mode": cfg.capture_mode,
             "max_image_dimension": cfg.max_image_dimension,
+            "agent_cursor": { "glide_duration_ms": cfg.agent_cursor_glide_duration_ms },
             "experimental_pip": pip_enabled,
             "experimental_pip_geometry": pip_geometry
         }))

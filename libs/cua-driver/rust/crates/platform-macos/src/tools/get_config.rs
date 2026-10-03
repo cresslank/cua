@@ -23,7 +23,7 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "get_config".into(),
-        description: "Return the current cua-driver-rs configuration.".into(),
+        description: "Return the current cua-driver-rs configuration, including the session-effective agent_cursor.glide_duration_ms default. Explicit set_agent_cursor_motion overrides are reported by get_agent_cursor_state.".into(),
         input_schema: serde_json::json!({"type":"object","properties":{},"additionalProperties":false}),
         read_only: true,
         destructive: false,
@@ -43,13 +43,21 @@ impl Tool for GetConfigTool {
         // Resolve effective values for the CALLING session: a named session
         // sees its own override layered over the global; the anonymous session
         // (absent `_session_id`) sees the raw global — today's behavior.
-        let session_id = args.opt_str("_session_id");
+        let session_id = if args["_global_config"] == true {
+            None
+        } else {
+            args.opt_str("_session_id")
+        };
         let max_image_dimension = {
             let cfg = self.state.config.read().unwrap();
             self.state
                 .session_config
                 .effective_max_image_dimension(session_id.as_deref(), &cfg)
         };
+        let glide_duration_ms = self
+            .state
+            .session_config
+            .effective_glide_duration(session_id.as_deref(), &self.state.config.read().unwrap());
         // Report the CALLING session's own cursor enabled-state, not a
         // nondeterministic HashMap.first(). Resolve the same key the click /
         // cursor tools use (cursor_id > _session_id > "default"); fall back to
@@ -81,6 +89,7 @@ impl Tool for GetConfigTool {
             "max_image_dimension": max_image_dimension,
             "agent_cursor": {
                 "enabled": cursor_enabled,
+                "glide_duration_ms": glide_duration_ms,
             },
             "experimental_pip": pip_enabled,
             "experimental_pip_geometry": pip_geometry,

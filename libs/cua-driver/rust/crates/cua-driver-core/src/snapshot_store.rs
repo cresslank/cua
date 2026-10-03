@@ -673,6 +673,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             }
             refusal
         })?;
+        element_token::cross_check_legacy_index(args, element_index)?;
         let snapshot_identity = generation.identity();
         let window_id = generation.lane_key().window_id;
         if args["window_id"]

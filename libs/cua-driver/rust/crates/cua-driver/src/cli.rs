@@ -4517,8 +4517,8 @@ const CLI_EXAMPLES: &[(&str, &[(&str, &str)])] = &[
     ("recording render", &[("cua-driver recording render ~/cua-trajectories/demo1 demo1.mp4", "Render a recorded trajectory to MP4")]),
     ("config", &[("cua-driver config", "Print the full config")]),
     ("config show", &[("cua-driver config show", "Print the full config")]),
-    ("config get", &[("cua-driver config get max_image_dimension", "Print one key")]),
-    ("config set", &[("cua-driver config set max_image_dimension 1568", "Downscale screenshots to at most 1568 px")]),
+    ("config get", &[("cua-driver config get max_image_dimension", "Print one key"), ("cua-driver config get agent_cursor.glide_duration_ms", "Print the default cursor glide duration")]),
+    ("config set", &[("cua-driver config set max_image_dimension 1568", "Downscale screenshots to at most 1568 px"), ("cua-driver config set agent_cursor_glide_duration_ms 150", "Persist a 150 ms default cursor glide (0 restores speed-based motion)")]),
     ("config reset", &[("cua-driver config reset", "Restore the defaults")]),
     ("telemetry", &[("cua-driver telemetry status", "Show the effective telemetry setting")]),
     ("telemetry enable", &[("cua-driver telemetry enable", "Enable telemetry")]),
@@ -4974,7 +4974,7 @@ pub fn run_config_cmd(
                 Some(k) => k,
                 None => {
                     eprintln!("Usage: cua-driver config get <key>");
-                    eprintln!("Keys: capture_mode, max_image_dimension, version, platform");
+                    eprintln!("Keys: capture_mode, max_image_dimension, agent_cursor_glide_duration_ms, version, platform");
                     process::exit(64);
                 }
             };
@@ -4986,7 +4986,9 @@ pub fn run_config_cmd(
             }
             let config = get_config();
             // Support dotted key paths like "agent_cursor.enabled".
-            let v = if key.contains('.') {
+            let v = if key == "agent_cursor_glide_duration_ms" {
+                config.pointer("/agent_cursor/glide_duration_ms").cloned()
+            } else if key.contains('.') {
                 let (parent, child) = key.split_once('.').unwrap();
 
                 config
@@ -5006,7 +5008,7 @@ pub fn run_config_cmd(
                 );
             } else {
                 eprintln!("Unknown config key: {key}");
-                eprintln!("Available keys: capture_mode, max_image_dimension, version, platform, agent_cursor.enabled");
+                eprintln!("Available keys: capture_mode, max_image_dimension, version, platform, agent_cursor.enabled, agent_cursor.glide_duration_ms");
                 process::exit(64);
             }
         }
@@ -5050,7 +5052,8 @@ pub fn run_config_cmd(
             // so we send the known defaults explicitly.
             let defaults = serde_json::json!({
                 "capture_mode": "ax",
-                "max_image_dimension": 0
+                "max_image_dimension": 0,
+                "agent_cursor_glide_duration_ms": 0
             });
             call("set_config", defaults);
             println!("Config reset to defaults.");

@@ -147,7 +147,15 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
     outcome.applied_key().cloned()
 }
 
-pub fn init(cfg: CursorConfig) {
+pub fn init(mut cfg: CursorConfig) {
+    if !cfg.motion.glide_duration_explicit {
+        cfg.motion.glide_duration_ms = pip_preview::read_config_value(
+            cua_driver_core::agent_cursor::GLIDE_DURATION_CONFIG_KEY,
+        )
+        .as_ref()
+        .and_then(|v| cua_driver_core::agent_cursor::parse_glide_duration(v).ok())
+        .unwrap_or(0.0);
+    }
     static INITIALIZED: OnceLock<()> = OnceLock::new();
     INITIALIZED.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel(4096);
@@ -348,17 +356,21 @@ pub fn is_visible_for_session(key: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Snapshot the current motion config for `key`, falling back to the
-/// `"default"` cursor's motion when that key has no own entry yet.
+/// Snapshot the current motion config for `key`, or its configured default
+/// when that key has no own entry yet.
 pub fn current_motion(key: &str) -> MotionConfig {
     RENDER
         .lock()
         .ok()
-        .and_then(|g| {
-            g.as_ref()
-                .and_then(|m| m.cursor_or_default(key).map(|rs| rs.core.motion.clone()))
-        })
+        .and_then(|g| g.as_ref().map(|m| m.motion_for_key(key)))
         .unwrap_or_default()
+}
+
+/// Update config defaults without overriding explicit per-session motion.
+pub fn set_default_glide_duration(session: Option<&str>, value: f64) {
+    if let Some(map) = RENDER.lock().unwrap().as_mut() {
+        map.set_default_glide_duration(session, value);
+    }
 }
 
 pub fn current_theme_state(

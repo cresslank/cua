@@ -457,12 +457,14 @@ pub struct DriverConfig {
     /// Default 1568 matches Swift's `CuaDriverConfig.defaultMaxImageDimension` —
     /// the long edge is downscaled to this before encoding.
     pub max_image_dimension: u32,
+    pub agent_cursor_glide_duration_ms: f64,
 }
 
 impl Default for DriverConfig {
     fn default() -> Self {
         Self {
             max_image_dimension: 1568,
+            agent_cursor_glide_duration_ms: 0.0,
         }
     }
 }
@@ -478,8 +480,11 @@ pub fn config_file_path() -> std::path::PathBuf {
 /// that `cua-driver config set capture_mode vision` (CLI) carries over into
 /// the next MCP session without requiring a per-call `set_config`.
 pub fn load_driver_config() -> DriverConfig {
+    load_driver_config_from_path(&config_file_path())
+}
+
+fn load_driver_config_from_path(path: &std::path::Path) -> DriverConfig {
     let mut cfg = DriverConfig::default();
-    let path = config_file_path();
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(_) => return cfg, // no file yet — use defaults
@@ -495,6 +500,11 @@ pub fn load_driver_config() -> DriverConfig {
             cfg.max_image_dimension = v32;
         }
     }
+    cfg.agent_cursor_glide_duration_ms = json
+        .get(cua_driver_core::agent_cursor::GLIDE_DURATION_CONFIG_KEY)
+        .and_then(|v| cua_driver_core::agent_cursor::parse_glide_duration(v).ok())
+        .unwrap_or(0.0);
+
     cfg
 }
 
@@ -522,7 +532,14 @@ pub async fn desktop_screenshot_point(x: f64, y: f64) -> (f64, f64) {
 /// Merges with any existing file contents so other keys are preserved.
 /// Returns `Err` if the directory cannot be created or the file cannot be written.
 pub fn write_driver_config_key(key: &str, value: &serde_json::Value) -> Result<(), String> {
-    let path = config_file_path();
+    write_driver_config_key_at(&config_file_path(), key, value)
+}
+
+fn write_driver_config_key_at(
+    path: &std::path::Path,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
     let mut json: serde_json::Value = path
         .exists()
         .then(|| std::fs::read_to_string(&path).ok())
@@ -551,6 +568,7 @@ pub fn write_driver_config_key(key: &str, value: &serde_json::Value) -> Result<(
 #[derive(Clone, Default)]
 pub struct ConfigOverrides {
     pub max_image_dimension: Option<u32>,
+    pub agent_cursor_glide_duration_ms: Option<f64>,
 }
 
 /// Thread-safe map of `session_id` → `ConfigOverrides`, mirroring
@@ -580,6 +598,9 @@ impl SessionConfigRegistry {
         }
         let mut map = self.inner.lock().unwrap();
         let entry = map.entry(session.to_owned()).or_default();
+        if delta.agent_cursor_glide_duration_ms.is_some() {
+            entry.agent_cursor_glide_duration_ms = delta.agent_cursor_glide_duration_ms;
+        }
         if delta.max_image_dimension.is_some() {
             entry.max_image_dimension = delta.max_image_dimension;
         }
@@ -598,6 +619,18 @@ impl SessionConfigRegistry {
             Some(ov) => ov.max_image_dimension.unwrap_or(global.max_image_dimension),
             None => global.max_image_dimension,
         }
+    }
+
+    pub fn effective_glide_duration(&self, session: Option<&str>, global: &DriverConfig) -> f64 {
+        session
+            .and_then(|s| {
+                self.inner
+                    .lock()
+                    .unwrap()
+                    .get(s)
+                    .and_then(|ov| ov.agent_cursor_glide_duration_ms)
+            })
+            .unwrap_or(global.agent_cursor_glide_duration_ms)
     }
 
     /// Drop `session`'s overrides. No-op for an unknown id (so `session_end`
@@ -967,6 +1000,7 @@ mod session_config_guard_tests {
     fn overrides(max_dim: u32) -> ConfigOverrides {
         ConfigOverrides {
             max_image_dimension: Some(max_dim),
+            ..ConfigOverrides::default()
         }
     }
 
@@ -1122,5 +1156,89 @@ mod recording_start_guard_tests {
         assert!(ok.is_ok(), "anonymous start must never be gated");
         assert!(rec.current_state().enabled);
         let _ = rec.stop_owner(None);
+    }
+}
+
+#[cfg(test)]
+mod glide_config_tests {
+    use super::*;
+    use cua_driver_core::agent_cursor::GLIDE_DURATION_CONFIG_KEY;
+    use serde_json::json;
+
+    #[test]
+    fn glide_config_load_validate_persist_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        assert_eq!(
+            load_driver_config_from_path(&path).agent_cursor_glide_duration_ms,
+            0.0
+        );
+        write_driver_config_key_at(&path, "max_image_dimension", &json!(800)).unwrap();
+        assert_eq!(
+            load_driver_config_from_path(&path).agent_cursor_glide_duration_ms,
+            0.0
+        );
+        for (value, expected) in [
+            (json!(150), 150.0),
+            (json!(6000), 5000.0),
+            (json!(-1), 0.0),
+            (json!(0), 0.0),
+            (json!("invalid"), 0.0),
+        ] {
+            write_driver_config_key_at(&path, GLIDE_DURATION_CONFIG_KEY, &value).unwrap();
+            let config = load_driver_config_from_path(&path);
+            assert_eq!(config.agent_cursor_glide_duration_ms, expected);
+            assert_eq!(config.max_image_dimension, 800, "preserve unrelated config");
+        }
+    }
+
+    #[test]
+    fn session_glide_config_layers_over_global_and_is_retired() {
+        let registry = SessionConfigRegistry::new();
+        let mut global = DriverConfig::default();
+        assert_eq!(global.agent_cursor_glide_duration_ms, 0.0);
+        global.agent_cursor_glide_duration_ms = 150.0;
+        let session = format!("glide-config-{}", uuid::Uuid::new_v4());
+        registry.set(
+            &session,
+            ConfigOverrides {
+                agent_cursor_glide_duration_ms: Some(250.0),
+                ..ConfigOverrides::default()
+            },
+        );
+        registry.set(
+            &session,
+            ConfigOverrides {
+                max_image_dimension: Some(800),
+                ..ConfigOverrides::default()
+            },
+        );
+        global.agent_cursor_glide_duration_ms = 300.0;
+        assert_eq!(
+            registry.effective_glide_duration(Some(&session), &global),
+            250.0
+        );
+        assert_eq!(registry.effective_glide_duration(None, &global), 300.0);
+        assert_eq!(
+            registry.effective_glide_duration(Some("other"), &global),
+            300.0
+        );
+        registry.clear(&session);
+        assert_eq!(
+            registry.effective_glide_duration(Some(&session), &global),
+            300.0
+        );
+        cua_driver_core::session::fire_session_end(&session);
+        registry.set(
+            &session,
+            ConfigOverrides {
+                agent_cursor_glide_duration_ms: Some(1.0),
+                ..ConfigOverrides::default()
+            },
+        );
+        assert_eq!(
+            registry.effective_glide_duration(Some(&session), &global),
+            300.0
+        );
     }
 }

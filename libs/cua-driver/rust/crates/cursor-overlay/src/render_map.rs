@@ -22,7 +22,7 @@
 //! Adapters keep only what their windowing system needs: geometry in
 //! [`RenderMap::platform`], arrival waiters, and render-loop scheduling.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use indexmap::IndexMap;
@@ -209,6 +209,7 @@ pub struct RenderMap<S, P = ()> {
     pub cursors: CursorMap<S>,
     /// Frozen launch-time configuration for lazily created cursors.
     pub template: CursorConfig,
+    session_glide_defaults: HashMap<CursorKey, f64>,
     /// Tombstones of ended session keys. Never contains `"default"`.
     pub ended: HashSet<CursorKey>,
     /// Most recently commanded cursor, cleared when that cursor is removed.
@@ -231,6 +232,7 @@ impl<S: RenderEntry, P> RenderMap<S, P> {
         Self {
             cursors,
             template,
+            session_glide_defaults: HashMap::new(),
             ended: HashSet::new(),
             last_active: None,
             platform,
@@ -239,7 +241,52 @@ impl<S: RenderEntry, P> RenderMap<S, P> {
 
     /// Build the cursor a new session key would receive.
     pub fn state_for_key(&self, key: &str) -> S {
-        S::from_config(keyed_config(&self.template, key))
+        let mut config = keyed_config(&self.template, key);
+        if let Some(value) = self.session_glide_defaults.get(key) {
+            config.motion.glide_duration_ms = *value;
+        }
+        S::from_config(config)
+    }
+
+    /// Effective motion for an existing or not-yet-created cursor. A session
+    /// never inherits another cursor's explicit per-session motion override.
+    pub fn motion_for_key(&self, key: &str) -> crate::MotionConfig {
+        self.cursors
+            .get(key)
+            .map(|s| s.core().motion.clone())
+            .unwrap_or_else(|| {
+                let mut motion = self.template.motion.clone();
+                if let Some(value) = self.session_glide_defaults.get(key) {
+                    motion.glide_duration_ms = *value;
+                }
+                motion
+            })
+    }
+
+    /// Apply a config default live without overwriting explicit motion calls.
+    pub fn set_default_glide_duration(&mut self, session: Option<&str>, value: f64) {
+        let value = value.clamp(0.0, 5000.0);
+        if let Some(key) = session {
+            if key.is_empty() || self.ended.contains(key) {
+                return;
+            }
+            self.session_glide_defaults.insert(key.to_owned(), value);
+        } else {
+            self.template.motion.glide_duration_ms = value;
+        }
+        for (key, cursor) in &mut self.cursors {
+            if session.is_some_and(|session| session != key) {
+                continue;
+            }
+            let motion = &mut cursor.core_mut().motion;
+            if !motion.glide_duration_explicit {
+                motion.glide_duration_ms = self
+                    .session_glide_defaults
+                    .get(key)
+                    .copied()
+                    .unwrap_or(value);
+            }
+        }
     }
 
     /// Get or lazily create `key`'s cursor. `None` for an ended session, so
@@ -274,11 +321,17 @@ impl<S: RenderEntry, P> RenderMap<S, P> {
     }
 
     /// Apply `cmd` to `key`'s cursor unless that session ended.
-    pub fn apply_command(&mut self, key: CursorKey, cmd: OverlayCommand) -> MsgOutcome {
+    pub fn apply_command(&mut self, key: CursorKey, mut cmd: OverlayCommand) -> MsgOutcome {
         let Some(cursor) = self.cursor_mut(&key) else {
             tracing::debug!(key = %key, cmd = ?cmd, "overlay: command dropped; key was ended");
             return MsgOutcome::Dropped(key);
         };
+        if let OverlayCommand::SetMotion(motion) = &mut cmd {
+            if !motion.glide_duration_explicit {
+                motion.glide_duration_ms = cursor.core().motion.glide_duration_ms;
+                motion.glide_duration_explicit = cursor.core().motion.glide_duration_explicit;
+            }
+        }
         let dirty = cursor.apply_command(cmd);
         self.last_active = Some(key.clone());
         MsgOutcome::Applied { key, dirty }
@@ -289,6 +342,7 @@ impl<S: RenderEntry, P> RenderMap<S, P> {
         if key.is_empty() || key == DEFAULT_CURSOR_KEY {
             return MsgOutcome::Ignored;
         }
+        self.session_glide_defaults.remove(&key);
         let existed = self.cursors.shift_remove(&key).is_some();
         if self.last_active.as_deref() == Some(key.as_str()) {
             self.last_active = None;
@@ -360,6 +414,76 @@ mod tests {
     use crate::ReducedMotion;
 
     type Map = RenderMap<RenderStateCore>;
+
+    #[test]
+    fn glide_defaults_update_existing_and_future_cursors_but_preserve_explicit_overrides() {
+        let mut map = Map::new(CursorConfig::default(), ());
+        assert_eq!(map.motion_for_key("new").glide_duration_ms, 0.0);
+        map.cursor_mut("existing").unwrap();
+        map.set_default_glide_duration(None, 150.0);
+        assert_eq!(map.motion_for_key("existing").glide_duration_ms, 150.0);
+        assert_eq!(map.motion_for_key("new").glide_duration_ms, 150.0);
+        let partial = map.motion_for_key("existing").with_overrides(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(42.0),
+            None,
+            None,
+            None,
+        );
+        // A queued partial update must not restore a superseded default.
+        map.set_default_glide_duration(None, 200.0);
+        map.apply_command("existing".into(), OverlayCommand::SetMotion(partial));
+        assert_eq!(map.motion_for_key("existing").glide_duration_ms, 200.0);
+        assert_eq!(map.motion_for_key("existing").dwell_after_click_ms, 42.0);
+        let explicit = map.motion_for_key("explicit").with_overrides(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(0.0),
+            None,
+            None,
+            None,
+            None,
+        );
+        map.apply_command("explicit".into(), OverlayCommand::SetMotion(explicit));
+        map.set_default_glide_duration(Some("scoped"), 350.0);
+        map.set_default_glide_duration(Some("explicit"), 400.0);
+        map.set_default_glide_duration(None, 9000.0);
+        assert_eq!(map.motion_for_key("existing").glide_duration_ms, 5000.0);
+        assert_eq!(map.motion_for_key("new").glide_duration_ms, 5000.0);
+        assert_eq!(map.motion_for_key("scoped").glide_duration_ms, 350.0);
+        assert_eq!(map.motion_for_key("explicit").glide_duration_ms, 0.0);
+        map.cursor_mut("scoped").unwrap();
+        map.set_default_glide_duration(None, -1.0);
+        assert_eq!(map.motion_for_key("scoped").glide_duration_ms, 350.0);
+        assert_eq!(map.motion_for_key("new").glide_duration_ms, 0.0);
+        map.remove("scoped".into());
+        map.set_default_glide_duration(Some("scoped"), 700.0);
+        map.revive("scoped".into());
+        assert_eq!(map.motion_for_key("scoped").glide_duration_ms, 0.0);
+        // The anonymous cursor's explicit override is never a new session default.
+        let explicit = map.motion_for_key("default").with_overrides(
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(125.0),
+            None,
+            None,
+            None,
+            None,
+        );
+        map.apply_command("default".into(), OverlayCommand::SetMotion(explicit));
+        assert_eq!(map.motion_for_key("new").glide_duration_ms, 0.0);
+    }
 
     fn map() -> Map {
         let mut map = Map::new(CursorConfig::default(), ());

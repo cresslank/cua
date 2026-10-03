@@ -586,6 +586,7 @@ fn is_windowless_desktop_action(args: &serde_json::Value) -> bool {
 pub struct DriverConfig {
     pub capture_mode: String,
     pub max_image_dimension: u32,
+    pub agent_cursor_glide_duration_ms: f64,
 }
 
 impl Default for DriverConfig {
@@ -593,6 +594,7 @@ impl Default for DriverConfig {
         Self {
             capture_mode: "ax".into(),
             max_image_dimension: 1568,
+            agent_cursor_glide_duration_ms: 0.0,
         }
     }
 }
@@ -617,6 +619,12 @@ pub fn load_driver_config() -> DriverConfig {
             cfg.max_image_dimension = v32;
         }
     }
+    cfg.agent_cursor_glide_duration_ms =
+        pip_preview::read_config_value(cua_driver_core::agent_cursor::GLIDE_DURATION_CONFIG_KEY)
+            .as_ref()
+            .and_then(|v| cua_driver_core::agent_cursor::parse_glide_duration(v).ok())
+            .unwrap_or(0.0);
+
     cfg
 }
 
@@ -8643,16 +8651,15 @@ impl Tool for GetConfigTool {
         GCFG_DEF.get_or_init(|| ToolDef {
             name: "get_config".into(),
             // Description ported from Swift `GetConfigTool.swift` with the
-            // Windows config path. Swift's `agent_cursor.*` subtree is not
-            // mirrored on Windows yet (separate cursor-overlay config path).
-            description: "Report the current persistent driver config.\n\n\
+            // Windows config path and the shared agent cursor default.
+            description: "Report the current persistent driver config, including agent_cursor.glide_duration_ms (default; explicit motion overrides are in get_agent_cursor_state).\n\n\
                 Pure read-only. Returns defaults when the underlying state is unset — \
                 same fallback the daemon uses at startup. Sibling to `set_config`.\n\n\
                 Current schema (Windows):\n\n  \
                 {\n    \"schema_version\": 1,\n    \"version\": \"<crate version>\",\n    \
                 \"source_sha\": \"<maintainer build commit or null>\",\n    \"platform\": \"windows\",\n    \
                 \"capture_mode\": \"ax\" | \"vision\" (DEPRECATED, ignored),\n    \
-                \"max_image_dimension\": 0\n  }\n\n\
+                \"max_image_dimension\": 0,\n    \"agent_cursor\": {\"enabled\": true, \"glide_duration_ms\": 0}\n  }\n\n\
                 `capture_mode` is deprecated and no longer affects behavior — \
                 `get_window_state` always returns both the UIA tree and a screenshot.".into(),
             input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
@@ -8676,7 +8683,7 @@ impl Tool for GetConfigTool {
             "platform":            "windows",
             "capture_mode":        cfg.capture_mode,
             "max_image_dimension": cfg.max_image_dimension,
-            "agent_cursor":        { "enabled": cursor_enabled },
+            "agent_cursor":        { "enabled": cursor_enabled, "glide_duration_ms": cfg.agent_cursor_glide_duration_ms },
             "experimental_pip":    pip_enabled,
             "experimental_pip_geometry": pip_geometry,
         });
@@ -8712,6 +8719,7 @@ impl Tool for SetConfigTool {
                 - `capture_mode` (string: `vision` | `ax` | `som`) — DEPRECATED and ignored; \
                   `get_window_state` always returns both the UIA tree and a screenshot. Still \
                   accepted/persisted for back-compat but has no effect.\n\
+                - `agent_cursor_glide_duration_ms` (number, clamped to 0..5000; 0 = speed-based; applies immediately)\n\
                 - `max_image_dimension` (integer)\n\
                 - `experimental_pip` (boolean; persisted to config.json, applies on next daemon restart — Windows backend stubbed today, see issue #1729)\n\
                 - `experimental_pip_geometry` (string `WxH` or `WxH+X+Y`; persisted; applies on next daemon restart)\n\n\
@@ -8720,6 +8728,7 @@ impl Tool for SetConfigTool {
                 "key":{"type":"string","description":"Dotted snake_case path to a leaf config field (Swift-compatible shape). Pair with `value`."},
                 "value":{"description":"New value for `key`. JSON type depends on the key."},
                 "capture_mode":{"type":"string","enum":["ax","vision"],"description":"DEPRECATED and ignored — get_window_state always returns both the UIA tree and a screenshot. Still accepted/persisted for back-compat but has no effect. (\"som\"/\"screenshot\" still decode as deprecated aliases.)"},
+                "agent_cursor_glide_duration_ms": cua_driver_core::agent_cursor::glide_duration_config_schema(),
                 "max_image_dimension":{"type":"integer","description":"Legacy per-field shape."},
                 "experimental_pip":{"type":"boolean","description":"Legacy per-field shape. Enables PiP preview (applies next restart)."},
                 "experimental_pip_geometry":{"type":"string","description":"Legacy per-field shape. PiP window size + optional position."}
@@ -8740,13 +8749,29 @@ impl Tool for SetConfigTool {
                 "replacement": "action.target",
             }));
         }
+        let glide = match cua_driver_core::agent_cursor::glide_duration_config_arg(&args) {
+            Ok(value) => value,
+            Err(message) => return ToolResult::error(message),
+        };
         let mut cfg = self.state.config.write().unwrap();
         let mut applied = false;
+        if let Some(glide) = glide {
+            cfg.agent_cursor_glide_duration_ms = glide;
+            if let Err(e) = pip_preview::write_config_key(
+                cua_driver_core::agent_cursor::GLIDE_DURATION_CONFIG_KEY,
+                json!(glide),
+            ) {
+                tracing::warn!("set_config: failed to persist agent_cursor_glide_duration_ms: {e}");
+            }
+            crate::overlay::set_default_glide_duration(None, glide);
+            applied = true;
+        }
         // Swift-compatible {key, value} shape.
         if let (Some(key), Some(val)) =
             (args.get("key").and_then(|v| v.as_str()), args.get("value"))
         {
             match key {
+                "agent_cursor_glide_duration_ms" => {}
                 "capture_mode" => match val.as_str() {
                     Some(s) => {
                         cfg.capture_mode = s.to_owned();
@@ -8824,7 +8849,7 @@ impl Tool for SetConfigTool {
                 },
                 other => {
                     return ToolResult::error(format!(
-                        "Unknown config key `{other}`. Known: capture_mode, max_image_dimension, experimental_pip, experimental_pip_geometry."
+                        "Unknown config key `{other}`. Known: capture_mode, max_image_dimension, agent_cursor_glide_duration_ms, experimental_pip, experimental_pip_geometry."
                     ));
                 }
             }
@@ -8894,7 +8919,7 @@ impl Tool for SetConfigTool {
             "platform":            "windows",
             "capture_mode":        cfg.capture_mode,
             "max_image_dimension": cfg.max_image_dimension,
-            "agent_cursor":        { "enabled": cursor_enabled },
+            "agent_cursor":        { "enabled": cursor_enabled, "glide_duration_ms": cfg.agent_cursor_glide_duration_ms },
             "experimental_pip":    pip_enabled,
             "experimental_pip_geometry": pip_geometry,
         });
