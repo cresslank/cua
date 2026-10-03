@@ -54,6 +54,7 @@ pub mod action_record;
 pub mod action_target;
 pub mod agent_cursor;
 pub mod authorization;
+pub mod ax_readback;
 pub mod background_input;
 pub mod blocking;
 pub mod browser;

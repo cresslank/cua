@@ -20,6 +20,7 @@ pub mod bindings;
 pub mod enablement;
 pub mod exact_target;
 pub mod launch;
+pub(crate) mod readback_observer;
 pub mod row_collapse;
 pub mod snapshot;
 pub mod tree;

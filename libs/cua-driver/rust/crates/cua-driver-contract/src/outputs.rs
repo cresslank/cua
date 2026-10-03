@@ -587,12 +587,29 @@ pub enum ActionDeliveryMode {
     Unknown,
 }
 
+/// How the background AX insertion read-back settled; not renderer verification.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum AxReadback {
+    Immediate,
+    Notification,
+    Poll,
+    TimedOut,
+    Skipped,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct ActionDelivery {
     pub mode: ActionDeliveryMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivered_count: Option<u32>,
+    /// Milliseconds since the AX write returned, excluding observer setup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ax_readback_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "nullable_ax_readback_schema")]
+    pub ax_readback: Option<AxReadback>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
@@ -769,6 +786,12 @@ fn nullable_cursor_point_schema(generator: &mut schemars::SchemaGenerator) -> sc
     schemars::json_schema!({ "anyOf": [point, { "type": "null" }] })
 }
 
+/// Preserve upstream PR #4220's string-only enums for Gemini-compatible clients.
+fn nullable_ax_readback_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let readback = generator.subschema_for::<AxReadback>();
+    schemars::json_schema!({ "anyOf": [readback, { "type": "null" }] })
+}
+
 fn nullable_escalation_reason_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
     schemars::json_schema!({
         "anyOf": [
@@ -811,6 +834,8 @@ mod tests {
             delivery: Some(ActionDelivery {
                 mode: ActionDeliveryMode::Background,
                 delivered_count: None,
+                ax_readback_ms: None,
+                ax_readback: None,
             }),
             evidence: Some(vec![ActionEvidence {
                 kind: ActionEvidenceKind::ValueReadback,
@@ -820,6 +845,36 @@ mod tests {
             summary: None,
             error: None,
         }
+    }
+
+    #[test]
+    fn action_delivery_readback_fields_are_additive_and_closed() {
+        let mut result = confirmed_result();
+        for (cause, token) in [
+            (AxReadback::Immediate, "immediate"),
+            (AxReadback::Notification, "notification"),
+            (AxReadback::Poll, "poll"),
+            (AxReadback::TimedOut, "timed_out"),
+            (AxReadback::Skipped, "skipped"),
+        ] {
+            let delivery = result.delivery.as_mut().unwrap();
+            delivery.ax_readback_ms = Some(12);
+            delivery.ax_readback = Some(cause);
+            let json = serde_json::to_value(&result).unwrap();
+            assert_eq!(json["delivery"]["ax_readback_ms"], 12);
+            assert_eq!(json["delivery"]["ax_readback"], token);
+            assert_eq!(
+                serde_json::from_value::<ActionResult>(json).unwrap(),
+                result
+            );
+        }
+        assert!(serde_json::from_value::<ActionDelivery>(json!({
+            "mode": "background", "ax_readback": "unknown"
+        }))
+        .is_err());
+        let old: ActionDelivery = serde_json::from_value(json!({"mode": "background"})).unwrap();
+        assert_eq!(old.ax_readback, None);
+        assert_eq!(old.ax_readback_ms, None);
     }
 
     #[test]
@@ -1058,6 +1113,8 @@ mod tests {
         result.delivery = Some(ActionDelivery {
             mode: ActionDeliveryMode::Foreground,
             delivered_count: None,
+            ax_readback_ms: None,
+            ax_readback: None,
         });
         assert_eq!(
             result.validate_invariants(),

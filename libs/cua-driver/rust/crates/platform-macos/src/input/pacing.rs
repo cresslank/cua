@@ -8,7 +8,8 @@
 //! launch-time knob, not a per-call one.
 
 use cua_driver_core::input_pacing::{
-    PacingKnob, CLICK_GAP, MOUSE_PRIMER, MULTI_CLICK_GAP, TYPE_TEXT_DELAY, WEBKIT_SETTLE,
+    PacingKnob, AX_READBACK_TIMEOUT, CLICK_GAP, MOUSE_PRIMER, MULTI_CLICK_GAP, TYPE_TEXT_DELAY,
+    WEBKIT_SETTLE,
 };
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -45,4 +46,10 @@ pub(crate) fn webkit_settle() -> Duration {
 pub(crate) fn type_text_default_delay_ms() -> u64 {
     static CELL: OnceLock<Duration> = OnceLock::new();
     resolve(&CELL, TYPE_TEXT_DELAY, 30).as_millis() as u64
+}
+
+/// Background AX insertion read-back bound. Default 250 ms; zero disables waiting.
+pub(crate) fn ax_readback_timeout() -> Duration {
+    static CELL: OnceLock<Duration> = OnceLock::new();
+    resolve(&CELL, AX_READBACK_TIMEOUT, 250)
 }

@@ -29,6 +29,10 @@ use std::os::raw::{c_int, c_void};
 pub struct __AXUIElement(c_void);
 pub type AXUIElementRef = *mut __AXUIElement;
 
+#[repr(C)]
+pub struct __AXObserver(c_void);
+pub type AXObserverRef = *mut __AXObserver;
+
 // ── AXError ──────────────────────────────────────────────────────────────────
 
 pub type AXError = c_int;
@@ -57,6 +61,25 @@ pub const kAXValueIllegalType: AXValueType = 1_000;
 // ── Link to AXUIElement functions ────────────────────────────────────────────
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
+    pub fn AXObserverCreate(
+        pid: i32,
+        callback: extern "C" fn(AXObserverRef, AXUIElementRef, CFStringRef, *mut c_void),
+        observer: *mut AXObserverRef,
+    ) -> AXError;
+    pub fn AXObserverAddNotification(
+        observer: AXObserverRef,
+        element: AXUIElementRef,
+        notification: CFStringRef,
+        context: *mut c_void,
+    ) -> AXError;
+    pub fn AXObserverRemoveNotification(
+        observer: AXObserverRef,
+        element: AXUIElementRef,
+        notification: CFStringRef,
+    ) -> AXError;
+    pub fn AXObserverGetRunLoopSource(
+        observer: AXObserverRef,
+    ) -> core_foundation::runloop::CFRunLoopSourceRef;
     pub fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
     pub fn AXUIElementCopyAttributeValue(
         element: AXUIElementRef,

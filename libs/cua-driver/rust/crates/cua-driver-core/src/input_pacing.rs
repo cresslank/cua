@@ -1,7 +1,7 @@
 //! Adapted from upstream PR #3490 by hyprcat; this fork retains the requested
 //! `CUA_DRIVER_RS_*` launch names.
 //!
-//! Host-chosen pacing for synthesized pointer input (macOS only).
+//! Host-chosen input pacing and AX read-back bounds (macOS only).
 //!
 //! The macOS input adapter waits fixed intervals around each synthesized
 //! click; text input also has WebKit focus settling and a default per-character
@@ -18,6 +18,8 @@
 //!   on a WebKit text input. `0` skips it.
 //! - [`TYPE_TEXT_DELAY`] (`CUA_DRIVER_RS_TYPE_TEXT_DELAY_MS`): `type_text`'s
 //!   default `delay_ms` when the caller omits it.
+//! - [`AX_READBACK_TIMEOUT`] (`CUA_DRIVER_RS_AX_READBACK_TIMEOUT_MS`): bound for
+//!   asynchronous AX insertion read-back. `0` disables waiting.
 //!
 //! Unset, empty, or unparsable values keep each adapter default, so a daemon
 //! launched without these variables behaves exactly as before. Values outside
@@ -60,13 +62,17 @@ pub const WEBKIT_SETTLE: PacingKnob = knob("CUA_DRIVER_RS_WEBKIT_SETTLE_MS", 0, 
 /// the tool schema's `delay_ms` maximum.
 pub const TYPE_TEXT_DELAY: PacingKnob = knob("CUA_DRIVER_RS_TYPE_TEXT_DELAY_MS", 0, 200);
 
+/// Background AX insertion read-back bound. macOS default 250 ms.
+pub const AX_READBACK_TIMEOUT: PacingKnob = knob("CUA_DRIVER_RS_AX_READBACK_TIMEOUT_MS", 0, 2_000);
+
 /// Every knob, for allowlists and docs.
-pub const ALL: [PacingKnob; 5] = [
+pub const ALL: [PacingKnob; 6] = [
     MOUSE_PRIMER,
     CLICK_GAP,
     MULTI_CLICK_GAP,
     WEBKIT_SETTLE,
     TYPE_TEXT_DELAY,
+    AX_READBACK_TIMEOUT,
 ];
 
 impl PacingKnob {
@@ -102,6 +108,7 @@ mod tests {
             (MULTI_CLICK_GAP, 80),
             (WEBKIT_SETTLE, 800),
             (TYPE_TEXT_DELAY, 30),
+            (AX_READBACK_TIMEOUT, 250),
         ] {
             assert_eq!(k.from_raw(None, ms(d)), ms(d), "{}", k.env);
         }
@@ -109,6 +116,11 @@ mod tests {
 
     #[test]
     fn valid_values_are_honored() {
+        assert_eq!(AX_READBACK_TIMEOUT.from_raw(Some("0"), ms(250)), ms(0));
+        assert_eq!(
+            AX_READBACK_TIMEOUT.from_raw(Some(" 125 "), ms(250)),
+            ms(125)
+        );
         assert_eq!(CLICK_GAP.from_raw(Some("4"), ms(28)), ms(4));
         assert_eq!(MULTI_CLICK_GAP.from_raw(Some(" 40\n"), ms(80)), ms(40));
         assert_eq!(WEBKIT_SETTLE.from_raw(Some("0"), ms(800)), ms(0));
@@ -144,6 +156,7 @@ mod tests {
                 "CUA_DRIVER_RS_MULTI_CLICK_GAP_MS",
                 "CUA_DRIVER_RS_WEBKIT_SETTLE_MS",
                 "CUA_DRIVER_RS_TYPE_TEXT_DELAY_MS",
+                "CUA_DRIVER_RS_AX_READBACK_TIMEOUT_MS",
             ]
         );
     }

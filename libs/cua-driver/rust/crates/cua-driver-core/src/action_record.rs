@@ -261,6 +261,7 @@ pub struct ActionExecutionRecord {
     pub evidence: Vec<ActionEvidence>,
     pub escalation: Option<ActionEscalation>,
     pub delivered_count: Option<u32>,
+    pub ax_readback: Option<crate::ax_readback::AxReadbackMeasurement>,
     pub detail: Option<String>,
     pub refusal: Option<ActionRefusal>,
 }
@@ -281,6 +282,7 @@ impl ActionExecutionRecord {
             evidence: Vec::new(),
             escalation: None,
             delivered_count: None,
+            ax_readback: None,
             detail: None,
             refusal: None,
         }
@@ -370,6 +372,8 @@ impl ActionExecutionRecord {
                         ActualDelivery::Unknown => cua_driver_contract::ActionDeliveryMode::Unknown,
                     },
                     delivered_count: delivery.delivered_count,
+                    ax_readback_ms: self.ax_readback.map(|m| m.elapsed_ms),
+                    ax_readback: self.ax_readback.map(|m| m.outcome),
                 }),
             evidence: projection.evidence.map(|evidence| {
                 evidence
@@ -486,6 +490,28 @@ impl ActionExecutionRecord {
             .or_else(|| structured.pointer("/refusal/detail/delivered_chars"))
             .and_then(serde_json::Value::as_u64)
             .and_then(|count| u32::try_from(count).ok());
+
+        if tool_name == "type_text" {
+            // Producer measurements only; never infer AX latency from request
+            // arguments or the eventual synthesized-character read-back.
+            record.ax_readback = match (
+                structured
+                    .pointer("/delivery/ax_readback_ms")
+                    .and_then(serde_json::Value::as_u64),
+                structured
+                    .pointer("/delivery/ax_readback")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value(v).ok()),
+            ) {
+                (Some(elapsed_ms), Some(outcome)) => {
+                    Some(crate::ax_readback::AxReadbackMeasurement {
+                        elapsed_ms,
+                        outcome,
+                    })
+                }
+                _ => Some(crate::ax_readback::AxReadbackMeasurement::default()),
+            };
+        }
 
         if legacy_has_publishable_readback(tool_name, structured) {
             record.evidence.push(ActionEvidence {
@@ -1953,6 +1979,47 @@ mod tests {
             record.delivered_count, None,
             "legacy request-count echoes are not delivery evidence"
         );
+    }
+
+    #[test]
+    fn type_text_ax_measurement_survives_public_projection() {
+        for (path, effect, count, cause) in [
+            ("ax", "confirmed", 3, "immediate"),
+            ("ax", "unverifiable", 3, "notification"),
+            ("ax", "partial", 1, "poll"),
+            ("key_events", "unverifiable", 3, "timed_out"),
+            ("key_events_fg", "unverifiable", 3, "skipped"),
+        ] {
+            let record = ActionExecutionRecord::from_legacy(
+                "type_text",
+                &serde_json::json!({}),
+                &serde_json::json!({
+                    "path": path, "effect": effect, "verified": effect == "confirmed",
+                    "delivered_chars": count,
+                    "delivery": {"ax_readback_ms": 17, "ax_readback": cause},
+                }),
+            )
+            .unwrap();
+            let public = serde_json::to_value(record.public_result().unwrap()).unwrap();
+            assert_eq!(public["delivery"]["ax_readback_ms"], 17);
+            assert_eq!(public["delivery"]["ax_readback"], cause);
+            assert_eq!(public["delivery"]["delivered_count"], count);
+            assert_eq!(public["effect"], effect);
+            cua_driver_contract::validate_success_output("type_text", public).unwrap();
+        }
+    }
+
+    #[test]
+    fn type_text_without_an_ax_attempt_publishes_skipped() {
+        let record = ActionExecutionRecord::from_legacy(
+            "type_text",
+            &serde_json::json!({}),
+            &serde_json::json!({"path": "key_events", "effect": "unverifiable"}),
+        )
+        .unwrap();
+        let public = serde_json::to_value(record.public_result().unwrap()).unwrap();
+        assert_eq!(public["delivery"]["ax_readback_ms"], 0);
+        assert_eq!(public["delivery"]["ax_readback"], "skipped");
     }
 
     #[test]
