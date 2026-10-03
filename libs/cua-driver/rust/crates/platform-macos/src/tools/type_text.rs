@@ -152,6 +152,13 @@ fn screen_sharing_delivery_error(
     )
 }
 
+/// Default/override precedence adapted from hyprcat's upstream PR #3490.
+/// Resolve once before both synthesis preflight and native delivery.
+fn effective_delay_ms(args: &Value, default_ms: u64) -> u64 {
+    use cua_driver_core::tool_args::ArgsExt;
+    args.u64_or("delay_ms", default_ms)
+}
+
 #[async_trait]
 impl Tool for TypeTextTool {
     fn def(&self) -> &ToolDef {
@@ -171,7 +178,9 @@ impl Tool for TypeTextTool {
             let text =
                 cua_driver_core::text_sanitize::strip_trailing_agent_protocol_tags(&input.text)
                     .into_owned();
-            let delay_ms = args.u64_or("delay_ms", 30).min(200);
+            let delay_ms =
+                effective_delay_ms(&args, crate::input::pacing::type_text_default_delay_ms())
+                    .min(200);
             if let Some(refusal) = synthesis_preflight(
                 TextDeliveryRoute::UnicodeSynthesis,
                 text.chars().count(),
@@ -222,7 +231,8 @@ impl Tool for TypeTextTool {
             Ok(window_id) => window_id,
             Err(error) => return error,
         };
-        let delay_ms = args.u64_or("delay_ms", 30);
+        let delay_ms =
+            effective_delay_ms(&args, crate::input::pacing::type_text_default_delay_ms());
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
         if let Some(error) = screen_sharing_delivery_error(
             crate::input::keyboard::is_screen_sharing_pid(pid),
@@ -1444,6 +1454,30 @@ fn type_text_blocking(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn type_text_delay_uses_knob_unless_overridden_and_preflight_uses_effective_delay() {
+        let default_ms = cua_driver_core::input_pacing::TYPE_TEXT_DELAY
+            .from_raw(Some("70"), std::time::Duration::from_millis(30))
+            .as_millis() as u64;
+        for (args, expected_ms) in [
+            (serde_json::json!({}), 70),
+            (serde_json::json!({"delay_ms": 4}), 4),
+            (serde_json::json!({"delay_ms": 0}), 0),
+        ] {
+            let delay_ms = effective_delay_ms(&args, default_ms);
+            assert_eq!(delay_ms, expected_ms);
+            let refusal =
+                synthesis_preflight(TextDeliveryRoute::UnicodeSynthesis, 100_000, delay_ms)
+                    .expect("large payload must exceed synthesis budget before native input");
+            let per_character_ms = KEY_DOWN_GAP_MS + expected_ms.max(KEY_DOWN_GAP_MS);
+            assert_eq!(refusal.per_character_ms, per_character_ms);
+            assert_eq!(
+                refusal.estimated_duration_ms,
+                100_000 * per_character_ms + DELIVERY_DRAIN_TIMEOUT.as_millis() as u64
+            );
+        }
+    }
 
     /// A semantic-only policy must refuse the terminal short-circuit before
     /// any CGEvent is posted: terminals have no semantic AX rung, so nothing

@@ -794,10 +794,14 @@ impl Tool for ClickTool {
                     ),
                     fronted,
                 ))) => {
-                    // Long-lived hosts defer WebKit settle to the next keyboard
-                    // action for this PID. Finite hosts retain the 800ms wait.
+                    // PR #3490 (hyprcat): configurable WebKit settle, retaining
+                    // the fork's deferred wait for long-lived hosts. Finite hosts
+                    // and saturated deferred maps settle synchronously.
                     if needs_webkit_delay {
-                        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                        let settle = crate::input::pacing::webkit_settle();
+                        if !settle.is_zero() {
+                            tokio::time::sleep(settle).await;
+                        }
                     }
                     msg.push_str(&changes.result_suffix());
                     // AX dispatch went through, but AXPerformAction returning

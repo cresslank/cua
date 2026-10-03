@@ -287,6 +287,48 @@ Measured on macOS 27 with TextEdit in the background, typing a 185-character
 ASCII sentence through the PID-routed key path took about 3650 ms at the default
 and about 980 ms at `2`. All ten read-backs (five per value) matched exactly.
 
+## Pacing synthesized pointer input (macOS)
+
+The macOS input adapter waits fixed intervals around each synthesized click,
+and text input has a focus settle and default per-character delay. A host
+whose targets accept faster input can shorten them at trusted launch, in
+the same environment as the window-observation variables above.
+`EmbeddedCuaDriverHost` admits all five:
+
+| Variable                           | Meaning                                                              | Default | Accepted range |
+| ---------------------------------- | -------------------------------------------------------------------- | ------- | -------------- |
+| `CUA_DRIVER_RS_MOUSE_PRIMER_MS`    | Settle after the mouseMoved primer before a click, drag, or scroll.  | 12      | 2 to 100       |
+| `CUA_DRIVER_RS_CLICK_GAP_MS`       | Mouse down→up gap within one click.                                  | 28      | 2 to 200       |
+| `CUA_DRIVER_RS_MULTI_CLICK_GAP_MS` | Gap between the down/up pairs of a double or triple click.           | 80      | 20 to 300      |
+| `CUA_DRIVER_RS_WEBKIT_SETTLE_MS`   | Wait after an AX press on a WebKit text input. `0` skips it.         | 800     | 0 to 2000      |
+| `CUA_DRIVER_RS_TYPE_TEXT_DELAY_MS` | `type_text` default `delay_ms` when the caller omits it.             | 30      | 0 to 200       |
+
+Unset, empty, or unparsable values keep the default, and out-of-range values
+are clamped. No tool argument can change them. An explicit `type_text`
+`delay_ms` still wins over the default. Values are read once per process;
+restart the daemon to change them.
+
+Long-lived hosts record the WebKit settle deadline after AXPress and return
+immediately; keyboard tools wait only the remaining time for that PID (or
+the latest pending deadline for desktop input). Finite synchronous hosts,
+or a saturated deferred-deadline map, wait in the click instead. `0` skips
+both forms of settling. This knob does not change the focus-guard deadline.
+
+- **macOS only.** Linux and Windows keep their own fixed pacing and do not
+  read these variables.
+- **What shorter values cost.** Lower values trade reliability for speed.
+  The primer settle gives AppKit time to update cursor tracking before the
+  press, so a background control can ignore a press
+  that arrives too soon. A short down→up gap can be read as a tap by targets
+  that track press duration. The multi-click gap must stay below the system
+  double-click interval for pairs to coalesce, and long enough that a target
+  sees separate pairs. With `CUA_DRIVER_RS_WEBKIT_SETTLE_MS=0`, a caller that
+  types right after clicking a web text input can race WebKit's DOM focus, so
+  it should read the field back. Lower `CUA_DRIVER_RS_TYPE_TEXT_DELAY_MS` affects
+  only synthesized keyboard input, which still waits the key gap between
+  events. Apps can drop characters if the type delay is too low; read the
+  field back before relying on faster pacing.
+
 ## What embedded mode changes (and what it doesn't)
 
 |                                               | Standalone                    | Embedded (`CUA_DRIVER_EMBEDDED=1`)     |

@@ -248,6 +248,11 @@ pub(crate) struct TextFocus {
 static TEXT_FOCUS: OnceLock<TextFocus> = OnceLock::new();
 
 impl TextFocus {
+    /// PR #3490 (hyprcat): apply the configured WebKit settle to deferred input.
+    fn record_settle(&self, pid: i32, settle: Duration) -> bool {
+        settle.is_zero() || self.record(pid, tokio::time::Instant::now() + settle)
+    }
+
     // A full map falls back to settling synchronously in the click. Never evict
     // another PID's pending settle or force unrelated PIDs to wait.
     fn record(&self, pid: i32, deadline: tokio::time::Instant) -> bool {
@@ -282,13 +287,14 @@ impl TextFocus {
 }
 
 /// Called immediately after successful text-field AXPress. False requests the
-/// original synchronous 800ms settle (finite mode or bounded-map saturation).
+/// configured synchronous settle (finite mode or bounded-map saturation).
 pub(crate) fn defer_text_focus(pid: i32) -> bool {
-    background()
-        && TEXT_FOCUS.get_or_init(TextFocus::default).record(
-            pid,
-            tokio::time::Instant::now() + Duration::from_millis(800),
-        )
+    let settle = crate::input::pacing::webkit_settle();
+    settle.is_zero()
+        || (background()
+            && TEXT_FOCUS
+                .get_or_init(TextFocus::default)
+                .record_settle(pid, settle))
 }
 
 pub(crate) async fn wait_for_text_focus(pid: Option<i32>) {
@@ -345,6 +351,25 @@ mod tests {
         }
         holder.cancel();
         assert_eq!(drops.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn webkit_knob_drives_deferred_deadline_and_zero_skips_settle() {
+        let focus = TextFocus::default();
+        for raw in [None, Some("37"), Some("9000"), Some("0")] {
+            let settle = cua_driver_core::input_pacing::WEBKIT_SETTLE
+                .from_raw(raw, Duration::from_millis(800));
+            let now = tokio::time::Instant::now();
+            assert!(focus.record_settle(7, settle));
+            assert_eq!(
+                focus.pending(Some(7)),
+                (!settle.is_zero()).then_some(now + settle)
+            );
+            tokio::time::advance(settle).await;
+            focus.wait(Some(7)).await;
+            assert_eq!(tokio::time::Instant::now(), now + settle);
+            assert!(focus.deadlines.lock().unwrap().is_empty());
+        }
     }
 
     #[tokio::test(start_paused = true)]

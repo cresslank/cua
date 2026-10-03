@@ -306,6 +306,20 @@ Python exposes the same objects:
   macOS reads it. Some targets drop key events that arrive too close together,
   so read the field back before relying on a low value.
 
+- **Shorten macOS pointer pacing.** The macOS adapter waits fixed intervals
+  around each synthesized click. Set `CUA_DRIVER_RS_MOUSE_PRIMER_MS` (2 to 100,
+  default 12), `CUA_DRIVER_RS_CLICK_GAP_MS` (2 to 200, default 28),
+  `CUA_DRIVER_RS_MULTI_CLICK_GAP_MS` (20 to 300, default 80),
+  `CUA_DRIVER_RS_WEBKIT_SETTLE_MS` (0 to 2000, default 800), or
+  `CUA_DRIVER_RS_TYPE_TEXT_DELAY_MS` (0 to 200, default 30) in the same launch
+  environment; `EmbeddedCuaDriverHost` admits all five. Only macOS reads them.
+  Values are read once per process; restart to apply changes. An explicit
+  `type_text` `delay_ms` overrides its default. Long-lived hosts defer WebKit
+  settling to keyboard input; synchronous hosts wait in the click. `0` skips
+  either settle. Lower values trade reliability for speed, and apps can drop
+  characters if the type delay is too low. Read the field back; see
+  `EMBEDDING.md` for details.
+
 Without the SDK, the equivalent low-level launch is:
 
 ```sh test="cli-shape" id="cua-driver-serve"
