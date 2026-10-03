@@ -618,14 +618,14 @@ fn shell_owner(require_helper_api: bool) -> Option<String> {
         DBUS_DEST,
         DBUS_PATH,
         &format!("{DBUS_IFACE}.GetConnectionUnixProcessID"),
-        &[owner.clone()],
+        std::slice::from_ref(&owner),
         Duration::from_millis(800),
     )?;
     let uid_raw = gdbus_call_target(
         DBUS_DEST,
         DBUS_PATH,
         &format!("{DBUS_IFACE}.GetConnectionUnixUser"),
-        &[owner.clone()],
+        std::slice::from_ref(&owner),
         Duration::from_millis(800),
     )?;
     let pid = parse_first_u32(&pid_raw)?;

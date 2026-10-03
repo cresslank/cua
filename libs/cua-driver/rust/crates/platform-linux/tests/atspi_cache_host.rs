@@ -5,7 +5,7 @@
 #[path = "../src/atspi/types.rs"]
 mod types;
 use types::{AtspiIdentity, AtspiNode};
-#[path = "../src/atspi/cache.rs"]
+#[path = "../src/atspi/snapshot.rs"]
 mod cache;
 #[path = "../src/atspi/identity.rs"]
 mod identity;

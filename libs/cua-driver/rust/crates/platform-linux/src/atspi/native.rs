@@ -27,6 +27,9 @@ use super::identity::{
 };
 use super::{AtspiIdentity, AtspiNode};
 
+// Presence hit-testing is read-only and does not redirect mutation authority.
+pub mod hit;
+
 // Point-owner redirection is deferred: it can substitute another native object.
 
 /// Per-call D-Bus timeout: a single unresponsive accessible (common in large,
@@ -1129,8 +1132,11 @@ const FRAME_MATCH_MARGIN_PX: u64 = 24;
 /// coordinates against the X11 outer geometry the caller already named. This
 /// refuses ties rather than guessing, because callers use the result to decide
 /// which window they are about to act inside.
+/// An AT-SPI frame ordinal and its screen extents (x, y, width, height).
+type FrameExtents = (usize, (i32, i32, i32, i32));
+
 fn correlate_frame_to_window(
-    candidates: &[(usize, (i32, i32, i32, i32))],
+    candidates: &[FrameExtents],
     window: &crate::x11::WindowInfo,
 ) -> Option<usize> {
     let mut scored: Vec<(u64, usize)> = candidates
@@ -1416,6 +1422,7 @@ async fn resolve_window_frame(
 /// - `max_elements = None` keeps the historical 5 000-node budget.
 /// - `max_depth = None` keeps depth uncapped (the historical behaviour);
 ///   `Some(d)` skips enqueueing children whose depth would exceed `d`.
+///
 /// Issue #22865: caps protect against Electron / large web apps that produce
 /// 10k+ element trees and blow context windows.
 async fn collect_visited_bounded<'a>(
@@ -1821,7 +1828,7 @@ async fn collect_visited_bounded_opts<'a>(
         // Enqueue children (fetched above) before moving `acc` into `visited`.
         // Honor max_depth (#22865): skip enqueueing descendants whose depth
         // would exceed the cap.
-        let descend = max_depth.map(|d| depth + 1 <= d).unwrap_or(true);
+        let descend = max_depth.map(|d| depth < d).unwrap_or(true);
         // A menu that is not open (a menubar entry that is not expanded, or
         // any menu that is not showing) keeps its child count and is not
         // walked: its items are hidden, never indexed, and cost a round-trip
@@ -2817,6 +2824,7 @@ fn list_windows_blocking(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo>
 ///      chrome),
 ///   3. the first editable anywhere (covers single-field apps like a GTK dialog
 ///      entry, or a GTK4 GtkEntry).
+///
 /// Choose the editable to write into. `complete` says whether `visited` is the
 /// whole tree: on a *partial* walk the "first editable anywhere" fallback is
 /// withheld, because the field the user means (the focused one) may simply not
@@ -3048,7 +3056,7 @@ pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
                             dlog!("GTK3 fallback: window XID {xid}, local coords ({wx},{wy})");
 
                             // Click the entry to focus the widget (widget focus, not window focus).
-                            if let Err(e) = crate::input::send_click(xid as u64, wx, wy, 1, 1) {
+                            if let Err(e) = crate::input::send_click(xid, wx, wy, 1, 1) {
                                 dlog!("GTK3 fallback: click failed: {e}");
                                 return Ok(false);
                             };
@@ -3058,7 +3066,7 @@ pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
 
                             // Now type via X11 XSendEvent — the entry widget has internal focus
                             // so it should accept the keystrokes even though the window is unfocused.
-                            if let Err(e) = crate::input::send_type_text(xid as u64, text) {
+                            if let Err(e) = crate::input::send_type_text(xid, text) {
                                 dlog!("GTK3 fallback: send_type_text failed: {e}");
                                 return Ok(false);
                             }
@@ -3334,9 +3342,7 @@ fn exact_menu_path_matches(visited: &[Visited<'_>], path: &[String]) -> Vec<usiz
             parent_at_depth.push(None);
         }
         parent_at_depth[node.depth] = Some(index);
-        for deeper in (node.depth + 1)..parent_at_depth.len() {
-            parent_at_depth[deeper] = None;
-        }
+        parent_at_depth[node.depth + 1..].fill(None);
     }
 
     visited
@@ -4109,7 +4115,7 @@ mod page_scroll_tests {
         );
         assert!(descendant_indices([0, 1, 1].into_iter(), 1).is_empty());
         assert_eq!(
-            descendant_indices(std::iter::once(0).chain(std::iter::repeat(1).take(100)), 0).len(),
+            descendant_indices(std::iter::once(0).chain(std::iter::repeat_n(1, 100)), 0).len(),
             64
         );
     }

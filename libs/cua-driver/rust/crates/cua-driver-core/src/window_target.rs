@@ -197,7 +197,7 @@ impl Tool for PidOnlyWindowTargetGuard {
             }
         }
         let candidates = self.candidates.clone();
-        let candidates = match tokio::task::spawn_blocking(move || candidates(pid)).await {
+        let candidates = match crate::blocking::spawn(move || candidates(pid)).await {
             Ok(candidates) => candidates,
             Err(error) => {
                 return ToolResult::error(format!(
@@ -230,7 +230,7 @@ impl Tool for PidOnlyWindowTargetGuard {
                 if let (Some(resolver), Some((x, y))) =
                     (self.point_resolver.clone(), desktop_frame_point(&args))
                 {
-                    let hit = tokio::task::spawn_blocking(move || resolver(pid, x, y))
+                    let hit = crate::blocking::spawn(move || resolver(pid, x, y))
                         .await
                         .ok()
                         .flatten();
@@ -256,7 +256,7 @@ impl Tool for PidOnlyWindowTargetGuard {
                 if let (Some(resolver), false) =
                     (self.fallback_resolver.clone(), carries_desktop_point)
                 {
-                    let hit = tokio::task::spawn_blocking(move || resolver(pid))
+                    let hit = crate::blocking::spawn(move || resolver(pid))
                         .await
                         .ok()
                         .flatten();

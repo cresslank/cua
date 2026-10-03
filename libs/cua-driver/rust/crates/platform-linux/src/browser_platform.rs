@@ -850,7 +850,7 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         let owned = cua_driver_core::blocking::spawn(move || {
             crate::x11::list_windows(Some(pid_u32))
                 .into_iter()
-                .map(|window| u64::from(window.xid))
+                .map(|window| window.xid)
                 .collect::<Vec<_>>()
         })
         .await

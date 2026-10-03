@@ -1248,10 +1248,14 @@ pub fn global() -> &'static TokenRegistry {
 pub fn format_token(snapshot_id: u32, element_index: usize) -> String {
     format!("s{snapshot_id:08x}:{element_index}")
 }
-pub fn token_for(snapshot_id: u32, element_index: usize) -> String {
-    format!("s{snapshot_id:08x}:{element_index}")
+pub fn format_snapshot_id(snapshot_id: u32) -> String {
+    format!("s{snapshot_id:08x}")
 }
-fn parse_token(token: &str) -> Option<(u32, usize)> {
+
+pub fn token_for(snapshot_id: u32, element_index: usize) -> String {
+    format!("{}:{element_index}", format_snapshot_id(snapshot_id))
+}
+pub(crate) fn parse_token(token: &str) -> Option<(u32, usize)> {
     let (hex, index) = token.strip_prefix('s')?.split_once(':')?;
     (hex.len() == 8).then_some(())?;
     Some((u32::from_str_radix(hex, 16).ok()?, index.parse().ok()?))
@@ -1292,91 +1296,12 @@ pub fn checked_optional_native_window_id(
 pub enum ResolvedElement<T = ()> {
     None,
     Element {
-        window_id: Option<u64>,
+        window_id: u64,
         element_index: usize,
         snapshot_identity: SnapshotIdentity,
         element: T,
-        via_token: bool,
     },
 }
-pub fn resolve_element_args(
-    pid: i32,
-    args_element_index: Option<usize>,
-    args_element_token: Option<&str>,
-    args_snapshot_id: Option<&str>,
-    args_window_id: Option<u64>,
-    tool_name: &str,
-) -> Result<ResolvedElement, crate::protocol::ToolResult> {
-    resolve_element_args_wide(
-        pid,
-        args_element_index,
-        args_element_token,
-        args_snapshot_id,
-        args_window_id,
-        tool_name,
-    )
-}
-
-/// The same target validation without narrowing a platform's native ID.
-pub fn resolve_element_args_wide(
-    pid: i32,
-    args_element_index: Option<usize>,
-    args_element_token: Option<&str>,
-    args_snapshot_id: Option<&str>,
-    args_window_id: Option<u64>,
-    tool_name: &str,
-) -> Result<ResolvedElement, crate::protocol::ToolResult> {
-    let refusal = |code: &str, message: String| {
-        crate::protocol::ToolResult::error(message.clone()).with_structured(
-            serde_json::json!({"status":"refused","refusal":{"code":code,"message":message}}),
-        )
-    };
-    let resolve_token = |token: &str| {
-        let (generation, index) = global().resolve_generation(pid, token).map_err(|message| {
-            let code = if message.contains("another runtime generation") {
-                "generation_mismatch"
-            } else if message == STALE_TOKEN_ERROR {
-                "stale_element_token"
-            } else {
-                "invalid_element_token"
-            };
-            refusal(code, message)
-        })?;
-        Ok::<_, crate::protocol::ToolResult>((generation, index))
-    };
-    match (args_element_index, args_element_token, args_snapshot_id) {
-        (None, None, None) => Ok(ResolvedElement::None),
-        (None, None, Some(_)) => Err(refusal("element_index_required",
-            format!("{tool_name}: snapshot_id requires element_index"))),
-        (Some(_), None, None) => Err(refusal("snapshot_id_required",
-            format!("{tool_name}: bare element_index is not accepted; pass element_token, or snapshot_id together with element_index"))),
-        (Some(index), None, Some(handle)) => {
-            let public = parse_snapshot_handle(handle).ok_or_else(|| refusal("invalid_snapshot_id",
-                format!("{tool_name}: snapshot_id has invalid format")))?;
-            let (generation, resolved_index) = resolve_token(&format_token(public, index))?;
-            if args_window_id.is_some_and(|w| w != generation.lane.window_id) {
-                return Err(refusal("conflicting_element_target", format!(
-                    "{tool_name}: snapshot belongs to window_id {}, not {}",
-                    generation.lane.window_id, args_window_id.unwrap())));
-            }
-            Ok(ResolvedElement::Element { window_id: Some(generation.lane.window_id),
-                element_index: resolved_index, snapshot_identity: generation.identity, element: (), via_token: false })
-        }
-        (index_arg, Some(token), handle_arg) => {
-            let (generation, index) = resolve_token(token)?;
-            let public = parse_token(token).map(|(p, _)| p);
-            if index_arg.is_some_and(|arg| arg != index)
-                || args_window_id.is_some_and(|arg| arg != generation.lane.window_id)
-                || handle_arg.is_some_and(|handle| parse_snapshot_handle(handle) != public) {
-                return Err(refusal("conflicting_element_target", format!(
-                    "{tool_name}: element_token conflicts with element_index, snapshot_id, or window_id")));
-            }
-            Ok(ResolvedElement::Element { window_id: Some(generation.lane.window_id),
-                element_index: index, snapshot_identity: generation.identity, element: (), via_token: true })
-        }
-    }
-}
-
 impl<T> ResolvedElement<T> {
     pub fn into_parts(
         self,
@@ -1389,15 +1314,15 @@ impl<T> ResolvedElement<T> {
                 element_index,
                 element,
                 ..
-            } => (Some(element_index), window_id, Some(element)),
+            } => (Some(element_index), Some(window_id), Some(element)),
         }
     }
 }
 
 pub(crate) fn refusal(code: &str, message: String) -> ToolResult {
-    ToolResult::error(message.clone()).with_structured(
-        serde_json::json!({"status":"refused","refusal":{"code":code,"message":message}}),
-    )
+    ToolResult::error(message.clone()).with_structured(serde_json::json!({
+        "status": "refused", "refusal": { "code": code, "message": message }
+    }))
 }
 
 #[cfg(test)]

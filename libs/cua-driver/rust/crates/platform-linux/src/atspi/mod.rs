@@ -9,13 +9,14 @@
 //! When the AT-SPI bus is unavailable (or the app exposes no a11y tree) we
 //! fall back to a minimal X11 property tree (window title + role) via x11rb.
 
+use self::snapshot as cache;
 use anyhow::Result;
 
-pub mod cache;
 mod identity;
 pub mod native;
-pub use cache::ElementCache;
+pub mod snapshot;
 pub use native::{ensure_listener_active, resolve_observed_click_target, ObservedClickTarget};
+pub use snapshot::Snapshots;
 
 mod types;
 pub(crate) use types::{
@@ -569,9 +570,7 @@ fn filter_tree(markdown: &str, query: &str) -> String {
             ancestors.push("");
             last_emitted.push(None);
         }
-        for d in (depth + 1)..ancestors.len() {
-            last_emitted[d] = None;
-        }
+        last_emitted[depth + 1..ancestors.len()].fill(None);
         ancestors[depth] = line;
         if line.to_lowercase().contains(&needle) {
             for d in 0..depth {

@@ -414,7 +414,8 @@ enum XShmState {
         reason: String,
         retry_after: Instant,
     },
-    Ready(XShmSession),
+    // Boxed: a live session is ~0.6 KiB and the other states are small.
+    Ready(Box<XShmSession>),
 }
 
 impl XShmState {
@@ -789,7 +790,7 @@ fn ensure_xshm_ready(guard: &mut XShmState, display: &str) -> Result<()> {
             // DISPLAY change or Uninit: drop old session (Detach on Drop) and reconnect.
             *guard = XShmState::Uninit;
             let session = XShmSession::connect(display.to_string())?;
-            *guard = XShmState::Ready(session);
+            *guard = XShmState::Ready(Box::new(session));
             Ok(())
         }
     }
@@ -1546,7 +1547,7 @@ mod tests {
         let split2 = width.saturating_mul(2) / 3;
         for (pixel, rectangle) in [
             (
-                0x0017_5b_a8,
+                0x00_17_5b_a8,
                 Rectangle {
                     x: 0,
                     y: 0,
@@ -1555,7 +1556,7 @@ mod tests {
                 },
             ),
             (
-                0x00c4_3d_52,
+                0x00_c4_3d_52,
                 Rectangle {
                     x: split1 as i16,
                     y: 0,
@@ -1564,7 +1565,7 @@ mod tests {
                 },
             ),
             (
-                0x002d_b8_71,
+                0x00_2d_b8_71,
                 Rectangle {
                     x: split2 as i16,
                     y: 0,
@@ -1878,7 +1879,7 @@ mod tests {
         xshm.capture_raw(u64::from(fixture.window))
             .expect("capture allocates replacement after detach");
 
-        let mut shm_state = XShmState::Ready(xshm);
+        let mut shm_state = XShmState::Ready(Box::new(xshm));
         ensure_xshm_ready(&mut shm_state, &second_display).expect("switch XShm DISPLAY");
         let second_shm = match &mut shm_state {
             XShmState::Ready(session) => {

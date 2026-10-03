@@ -303,8 +303,7 @@ mod tests {
         bindings: &MacCaptureBindings,
         capture_id: &str,
         args: &serde_json::Value,
-        pid: u32,
-        window_id: u64,
+        (pid, window_id): (u32, u64),
         x: f64,
         y: f64,
         native: (u32, u32),
@@ -370,7 +369,7 @@ mod tests {
             .publish_desktop(&args, png(4, 4), (4, 4), (2, 2))
             .unwrap();
         let mut dispatched = false;
-        let mismatch = admit_window(&bindings, &capture_id, &args, 1, 1, 1.0, 1.0, (2, 2));
+        let mismatch = admit_window(&bindings, &capture_id, &args, (1, 1), 1.0, 1.0, (2, 2));
         if mismatch.is_ok() {
             dispatched = true;
         }
@@ -444,15 +443,16 @@ mod tests {
         let bindings = MacCaptureBindings::new(service.clone());
         let args = args("resize-session");
         let pid = std::process::id() as i32;
-        let cache = crate::ax::cache::ElementCache::new();
+        let cache = crate::ax::snapshot::Snapshots::new();
         let snapshot = cache
             .try_publish_for_session(
                 pid,
                 13,
-                crate::ax::cache::CachedSnapshot::from_nodes(&[]),
+                crate::ax::snapshot::AxSnapshot::from_nodes(&[]),
                 Some("resize-session"),
                 Some(2.0),
             )
+            .map(|entry| entry.map(|(id, _)| id))
             .unwrap()
             .unwrap();
         let capture_id = bindings
@@ -471,8 +471,7 @@ mod tests {
             &bindings,
             &capture_id,
             &args,
-            pid as u32,
-            13,
+            (pid as u32, 13),
             1.25,
             1.5,
             (9, 6),
@@ -490,8 +489,7 @@ mod tests {
                 &bindings,
                 &capture_id,
                 &args,
-                pid as u32,
-                13,
+                (pid as u32, 13),
                 1.25,
                 1.5,
                 (8, 6)

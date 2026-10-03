@@ -1,4 +1,4 @@
-# cua WinRects — GNOME Shell helper extension (Wayland)
+# cua WinRects: GNOME Shell helper extension (Wayland)
 
 A small GNOME Shell extension that lets cua-driver get **pixel coordinates**,
 address an incarnation-qualified target, perform a bounded foreground

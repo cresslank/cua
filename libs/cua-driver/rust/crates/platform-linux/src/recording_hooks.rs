@@ -97,23 +97,14 @@ pub fn element_window_local_xy(
     args: &serde_json::Value,
     capture_point: bool,
 ) -> Option<(u64, Option<(f64, f64)>)> {
-    use cua_driver_core::element_cache::current_runtime_cache;
     use cua_driver_core::element_token::ResolvedElement;
+    use cua_driver_core::snapshot_store::current_runtime_store;
     use cua_driver_core::tool_args::ArgsExt;
-    let cache = current_runtime_cache::<crate::atspi::cache::CachedSnapshot>()?;
-    let index = args
-        .opt_u64("element_index")
-        .map(usize::try_from)
-        .transpose()
-        .ok()?;
-    let resolved = match cache.resolve_element_args(
+    let cache = current_runtime_store::<crate::atspi::snapshot::AtspiSnapshot>()?;
+    let resolved = match cache.resolve(
         i32::try_from(pid).ok()?,
-        index,
-        args.get("element_token")
-            .and_then(serde_json::Value::as_str),
-        args.get("snapshot_id").and_then(serde_json::Value::as_str),
-        args.opt_u64("window_id"),
-        "recording",
+        &serde_json::json!({"element_token": args.get("element_token")
+            .and_then(serde_json::Value::as_str), "window_id": args.opt_u64("window_id")}),
     ) {
         Ok(resolved) => resolved,
         Err(refusal) => {
@@ -121,11 +112,7 @@ pub fn element_window_local_xy(
             return None;
         }
     };
-    let ResolvedElement::Element {
-        window_id: Some(window_id),
-        ..
-    } = resolved
-    else {
+    let ResolvedElement::Element { window_id, .. } = resolved else {
         return None;
     };
     // The snapshot supplies target identity, not live geometry. An ordinal
@@ -250,11 +237,11 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn element_metadata_uses_the_live_snapshot_and_never_rewalks_an_index() {
-        use crate::atspi::cache::{CachedSnapshot, ElementCache};
+        use crate::atspi::snapshot::{AtspiSnapshot, Snapshots};
         use crate::atspi::AtspiNode;
         use cua_driver_core::element_token::token_for;
         cua_driver_core::tool::with_runtime_scope("linux-element-marker-metadata".into(), || {
-            let cache = ElementCache::new();
+            let cache = Snapshots::new();
             let pid = std::process::id() as i32;
             let window = u64::from(u32::MAX) + 71;
             let node = AtspiNode {
@@ -274,11 +261,11 @@ mod tests {
                 in_web_content: false,
                 object_ref: None,
             };
-            let id = cache
+            let (id, _invalidated_snapshot_ids) = cache
                 .try_publish_for_session(
                     pid,
                     window,
-                    CachedSnapshot::try_from_nodes(&[node]).unwrap(),
+                    AtspiSnapshot::try_from_nodes(&[node]).unwrap(),
                     Some("marker-owner"),
                     None,
                 )

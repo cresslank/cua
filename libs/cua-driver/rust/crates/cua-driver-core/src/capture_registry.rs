@@ -1375,10 +1375,10 @@ mod tests {
 
     #[test]
     fn window_capture_uses_exact_native_snapshot_generation() {
-        use crate::element_cache::ElementCacheCore;
+        use crate::snapshot_store::SnapshotStore;
         use crate::snapshot_test_support::Payload;
         let pid = std::process::id() as i32;
-        let cache = ElementCacheCore::new();
+        let cache = SnapshotStore::new();
         let service = CaptureService::default();
         let binding = service.current_binding("capture-bridge-owner").unwrap();
         let publication = || CapturePublication {
@@ -1401,6 +1401,7 @@ mod tests {
                 Some(binding.session_id()),
                 Some(1.0),
             )
+            .map(|entry| entry.map(|(id, _)| id))
             .unwrap()
             .unwrap();
         let identity = cache.identity_for_snapshot(pid, snapshot).unwrap();
@@ -1443,6 +1444,7 @@ mod tests {
                 Some(binding.session_id()),
                 Some(1.0),
             )
+            .map(|entry| entry.map(|(id, _)| id))
             .unwrap()
             .unwrap();
         let fresh_identity = cache.identity_for_snapshot(pid, fresh).unwrap();

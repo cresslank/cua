@@ -509,6 +509,33 @@ pub fn forget(cursor_id: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    // The tool passes local coordinates. Conversion belongs here, after exact
+    // target/focus revalidation, rather than in the upstream tool-side helper.
+    #[test]
+    fn persistent_wayland_pointer_coordinates_include_window_origin() {
+        let mut window = super::super::sway_ipc::Window {
+            id: 7,
+            pid: 42,
+            title: String::new(),
+            app_id: String::new(),
+            x: 100,
+            y: 200,
+            width: 800,
+            height: 600,
+            content_x: 0,
+            content_y: 0,
+            focused: true,
+            visible: true,
+            fullscreen: false,
+        };
+        assert_eq!(local_to_sway_output(&window, 10, 20).unwrap(), (110, 220));
+        // The next event must use the newly validated origin, not the origin
+        // observed when the hold began.
+        window.x = 300;
+        window.y = 400;
+        assert_eq!(local_to_sway_output(&window, 10, 20).unwrap(), (310, 420));
+    }
+
     #[test]
     fn sway_local_coordinates_include_container_and_content_origins() {
         let window = super::super::sway_ipc::Window {

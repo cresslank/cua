@@ -225,14 +225,14 @@ mod tests {
     use super::{round_action_point, CaptureGeometry, WindowsCaptureBridge, WindowsCaptureTarget};
 
     #[cfg(target_os = "windows")]
-    use crate::uia::cache::CACHE_TEST_LOCK as TEST_LOCK;
+    use crate::uia::snapshot::CACHE_TEST_LOCK as TEST_LOCK;
     #[cfg(not(target_os = "windows"))]
     static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     // Capture admission is platform-neutral. Exercise the real registry with
     // an empty native payload rather than require COM on a non-Windows host.
     struct Payload;
-    impl cua_driver_core::element_cache::SnapshotPayload for Payload {
+    impl cua_driver_core::snapshot_store::SnapshotPayload for Payload {
         type Element = ();
         fn len(&self) -> usize {
             0
@@ -241,7 +241,7 @@ mod tests {
             None
         }
     }
-    type TestCache = cua_driver_core::element_cache::ElementCacheCore<Payload>;
+    type TestCache = cua_driver_core::snapshot_store::SnapshotStore<Payload>;
 
     fn png() -> Vec<u8> {
         cua_driver_core::image_utils::encode_rgba_to_png(&[10, 20, 30, 255], 1, 1).unwrap()
