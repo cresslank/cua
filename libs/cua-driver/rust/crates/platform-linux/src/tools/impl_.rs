@@ -4495,7 +4495,14 @@ fn isolated_background_routes_do_not_reprobe_availability_before_primary_fallbac
             "{start}"
         );
         let native = invoke.split_once("if isolated_background {").unwrap().1;
-        assert!(native.contains("return match dispatch.await"), "{start}");
+        // Upstream returns its own dispatch here; the fork's click refuses the
+        // element-path pointer fallback and returns through
+        // `isolated_hyprland_action`, which awaits the same single decision.
+        assert!(
+            native.contains("return match dispatch.await")
+                || native.contains("return isolated_hyprland_action("),
+            "{start}"
+        );
     }
 }
 
@@ -6498,6 +6505,40 @@ impl Tool for TypeTextTool {
             }
         };
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if isolated_hyprland_background(delivery)
+            && resolved_elem_idx.is_none()
+            && args.get("x").is_none()
+            && args.get("y").is_none()
+        {
+            if xid_opt.is_none() {
+                return isolated_hyprland_refusal(
+                    "an exact window_id is required for isolated text",
+                );
+            }
+            match crate::wayland::hyprland_input::text_actions(&text) {
+                Ok(actions) if !actions.is_empty() => {}
+                Ok(_) => return isolated_hyprland_refusal("background text must not be empty"),
+                Err(error) => return isolated_hyprland_refusal(error.to_string()),
+            }
+            let owner = named_session_cursor_key(&args);
+            let (_cancellation, dispatch) =
+                match spawn_isolated_hyprland(&args, move |cancellation| {
+                    crate::wayland::hyprland_input::execute_background_text(
+                        owner,
+                        pid,
+                        xid,
+                        &text,
+                        cancellation,
+                    )
+                }) {
+                    Ok(dispatch) => dispatch,
+                    Err(refusal) => return refusal,
+                };
+            return match dispatch.await {
+                Ok(result) => isolated_hyprland_result(result),
+                Err(error) => isolated_hyprland_task_error(error, false),
+            };
+        }
         if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
             return refusal;
         }
@@ -8314,8 +8355,8 @@ impl Tool for ScrollTool {
             }
         }
 
-        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
-        let isolated_background = isolated_hyprland_background(delivery);
+        // Keep the isolated decision made before the pixel refusal: a second
+        // probe could lose availability and fall through to primary-seat input.
         if !isolated_background {
             if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
                 return refusal;
@@ -13085,6 +13126,23 @@ mod click_button_schema_tests {
         ClickTool { state }
     }
 
+    /// Pixel clicks need a screenshot this session captured. Publish one at
+    /// scale 1.0 for this live test process (the registry refuses unknown
+    /// pids) on a fresh window, and return `(pid, window_id, session)`.
+    fn with_screenshot_context(state: &ToolState) -> (u32, u64, &'static str) {
+        const SESSION: &str = "coordinate-click-test";
+        let pid = std::process::id();
+        let xid = NEXT_VALUE_XID.fetch_add(1, Ordering::Relaxed);
+        state.snapshots.publish_for_session(
+            pid as i32,
+            xid,
+            crate::atspi::snapshot::AtspiSnapshot::from_nodes(&[]),
+            Some(SESSION),
+            Some(1.0),
+        );
+        (pid, xid, SESSION)
+    }
+
     #[tokio::test]
     async fn click_invoke_allows_only_a_point_miss_to_reach_coordinate_delivery() {
         let clicks = Arc::new(AtomicUsize::new(0));
@@ -13097,10 +13155,11 @@ mod click_button_schema_tests {
             },
             |_, _, _| Ok(()),
         ));
+        let (pid, xid, session) = with_screenshot_context(&state);
         let result = coordinate_click(state)
-            .invoke(serde_json::json!({"pid": 41001, "window_id": 71, "x": 12, "y": 14}))
+            .invoke(serde_json::json!({"pid": pid, "window_id": xid, "x": 12, "y": 14, "_session_id": session}))
             .await;
-        assert_ne!(result.is_error, Some(true));
+        assert_ne!(result.is_error, Some(true), "{result:?}");
         assert_eq!(clicks.load(Ordering::SeqCst), 1);
 
         for error in [
@@ -13108,20 +13167,28 @@ mod click_button_schema_tests {
             "perform_action_at_screen_point timed out; delivery is indeterminate",
             "screen-point recipient changed at final mutation boundary",
         ] {
+            let points = Arc::new(AtomicUsize::new(0));
+            let points_for_backend = points.clone();
             let clicks = Arc::new(AtomicUsize::new(0));
             let clicks_for_backend = clicks.clone();
             let state = ToolState::new_with_production_route_backend(backend_with(
-                move |_, _, _| Err(anyhow::anyhow!(error)),
+                move |_, _, _| {
+                    points_for_backend.fetch_add(1, Ordering::SeqCst);
+                    Err(anyhow::anyhow!(error))
+                },
                 move |_, _, _, _, _| {
                     clicks_for_backend.fetch_add(1, Ordering::SeqCst);
                     Ok(None)
                 },
                 |_, _, _| Ok(()),
             ));
+            let (pid, xid, session) = with_screenshot_context(&state);
             let result = coordinate_click(state)
-                .invoke(serde_json::json!({"pid": 41002, "window_id": 72, "x": 1, "y": 2}))
+                .invoke(serde_json::json!({"pid": pid, "window_id": xid, "x": 1, "y": 2, "_session_id": session}))
                 .await;
             assert_eq!(result.is_error, Some(true), "{error}");
+            // The refusal must come from the point action, not an earlier gate.
+            assert_eq!(points.load(Ordering::SeqCst), 1, "{error}: {result:?}");
             assert_eq!(clicks.load(Ordering::SeqCst), 0, "{error} replayed");
         }
     }
@@ -13152,8 +13219,9 @@ mod click_button_schema_tests {
             }),
             set_value: Arc::new(|_, _, _| Ok(())),
         });
+        let (pid, xid, session) = with_screenshot_context(&state);
         let result = coordinate_click(state)
-            .invoke(serde_json::json!({"pid": 41003, "window_id": 73, "x": 3, "y": 4}))
+            .invoke(serde_json::json!({"pid": pid, "window_id": xid, "x": 3, "y": 4, "_session_id": session}))
             .await;
         assert_eq!(result.is_error, Some(true));
         assert_eq!(establish_calls.load(Ordering::SeqCst), 1);
@@ -13181,13 +13249,14 @@ mod click_button_schema_tests {
 
     static NEXT_VALUE_XID: AtomicU64 = AtomicU64::new(0x7f20_0000);
 
+    /// Publish a one-node snapshot and return the token set_value requires.
     fn publish_value_snapshot(state: &ToolState, pid: u32, xid: u64, key: u64) -> String {
         let candidate = state
             .snapshots
             .prepare(pid, xid, &[value_node(key)])
             .unwrap();
         let snapshot_id = state.snapshots.publish(candidate).unwrap();
-        format!("s{snapshot_id:08x}")
+        cua_driver_core::element_token::format_token(snapshot_id, 0)
     }
 
     #[tokio::test]
@@ -13204,12 +13273,12 @@ mod click_button_schema_tests {
         ));
         let pid = std::process::id();
         let xid = NEXT_VALUE_XID.fetch_add(1, Ordering::Relaxed);
-        let snapshot_id = publish_value_snapshot(&state, pid, xid, 0x41);
+        let token = publish_value_snapshot(&state, pid, xid, 0x41);
         let result = SetValueTool { state }
-            .invoke(serde_json::json!({"pid": pid, "window_id": xid, "element_index": 0, "snapshot_id": snapshot_id, "value": "new"}))
+            .invoke(serde_json::json!({"pid": pid, "window_id": xid, "element_token": token, "value": "new"}))
             .await;
         assert_eq!(result.is_error, Some(true));
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "{result:?}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -13230,12 +13299,12 @@ mod click_button_schema_tests {
         ));
         let pid = std::process::id();
         let xid = NEXT_VALUE_XID.fetch_add(1, Ordering::Relaxed);
-        let snapshot_id = publish_value_snapshot(&state, pid, xid, 0x41);
+        let token = publish_value_snapshot(&state, pid, xid, 0x41);
         let tool = SetValueTool {
             state: state.clone(),
         };
         {
-            let invocation = tool.invoke(serde_json::json!({"pid": pid, "window_id": xid, "element_index": 0, "snapshot_id": snapshot_id, "value": "new"}));
+            let invocation = tool.invoke(serde_json::json!({"pid": pid, "window_id": xid, "element_token": token, "value": "new"}));
             tokio::pin!(invocation);
             tokio::select! {
                 started = &mut started_rx => started.unwrap(),
