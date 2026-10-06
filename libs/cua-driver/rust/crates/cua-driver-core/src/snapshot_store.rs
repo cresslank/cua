@@ -1279,8 +1279,13 @@ mod hardened_tests {
                 let session = format!("element-cache-idle-implicit-{}", std::process::id());
                 let cache = Arc::new(SnapshotStore::<Payload>::new());
                 let retiring = cache.clone();
+                // End hooks are process-global: another test's session end must not
+                // retire this store's screenshots and reject its publications.
+                let own_session = session.clone();
                 let _hook = register_scoped_session_end_hook(move |ended| {
-                    retiring.retire_session_screenshots(ended);
+                    if ended == own_session.as_str() {
+                        retiring.retire_session_screenshots(ended);
+                    }
                 });
                 let begin = || {
                     begin_session_dispatch(
@@ -2236,7 +2241,10 @@ mod hardened_tests {
     #[test]
     fn bindings_sharing_a_scope_keep_independent_payload_ownership() {
         crate::tool::with_runtime_scope(format!("snapshot-test-{}", uuid::Uuid::new_v4()), || {
-            crate::tool::with_runtime_scope("snapshot-binding-ownership".into(), || {
+            // The fork keeps a second copy of this test; a shared scope name would
+            // let one copy retire the other's runtime stores mid-test.
+            let scope = format!("snapshot-binding-ownership-{}", uuid::Uuid::new_v4());
+            crate::tool::with_runtime_scope(scope.clone(), || {
                 let first = Arc::new(SnapshotStore::new());
                 let second = Arc::new(SnapshotStore::new());
                 register_runtime_store(&first);
@@ -2258,7 +2266,7 @@ mod hardened_tests {
                     &current_runtime_store::<Payload>().unwrap(),
                     &second
                 ));
-                retire_runtime_scope("snapshot-binding-ownership");
+                retire_runtime_scope(&scope);
             });
         });
     }
@@ -2266,7 +2274,10 @@ mod hardened_tests {
     #[test]
     fn recording_discovery_does_not_extend_payload_lifetime() {
         crate::tool::with_runtime_scope(format!("snapshot-test-{}", uuid::Uuid::new_v4()), || {
-            crate::tool::with_runtime_scope("snapshot-weak-discovery".into(), || {
+            // The fork keeps a second copy of this test; a shared scope name would
+            // let one copy retire the other's runtime stores mid-test.
+            let scope = format!("snapshot-weak-discovery-{}", uuid::Uuid::new_v4());
+            crate::tool::with_runtime_scope(scope.clone(), || {
                 let cache = Arc::new(SnapshotStore::new());
                 let drops = Arc::new(AtomicUsize::new(0));
                 cache.publish(
@@ -2284,12 +2295,12 @@ mod hardened_tests {
                 assert!(current_runtime_store::<DropCounter>().is_none());
                 {
                     let caches = runtime_stores().lock().unwrap();
-                    assert!(!caches.contains_key("snapshot-weak-discovery"));
+                    assert!(!caches.contains_key(scope.as_str()));
                     if caches.is_empty() {
                         assert_eq!(caches.capacity(), 0);
                     }
                 }
-                assert_eq!(retire_runtime_scope("snapshot-weak-discovery"), 0);
+                assert_eq!(retire_runtime_scope(&scope), 0);
             });
         });
     }
@@ -2818,8 +2829,13 @@ mod tests {
             let session = format!("snapshot-idle-implicit-{}", std::process::id());
             let cache = Arc::new(SnapshotStore::<Payload>::new());
             let retiring = cache.clone();
+            // End hooks are process-global: another test's session end must not
+            // retire this store's screenshots and reject its publications.
+            let own_session = session.clone();
             let _hook = register_scoped_session_end_hook(move |ended| {
-                retiring.retire_session_screenshots(ended);
+                if ended == own_session.as_str() {
+                    retiring.retire_session_screenshots(ended);
+                }
             });
             let begin = || {
                 begin_session_dispatch(
@@ -3202,7 +3218,10 @@ mod tests {
     #[test]
     fn bindings_sharing_a_scope_keep_independent_payload_ownership() {
         crate::tool::with_runtime_scope(format!("snapshot-test-{}", uuid::Uuid::new_v4()), || {
-            crate::tool::with_runtime_scope("snapshot-binding-ownership".into(), || {
+            // The fork keeps a second copy of this test; a shared scope name would
+            // let one copy retire the other's runtime stores mid-test.
+            let scope = format!("snapshot-binding-ownership-{}", uuid::Uuid::new_v4());
+            crate::tool::with_runtime_scope(scope.clone(), || {
                 let first = Arc::new(SnapshotStore::new());
                 let second = Arc::new(SnapshotStore::new());
                 register_runtime_store(&first);
@@ -3230,7 +3249,7 @@ mod tests {
                     &current_runtime_store::<Payload>().unwrap(),
                     &second
                 ));
-                retire_runtime_scope("snapshot-binding-ownership");
+                retire_runtime_scope(&scope);
             });
         });
     }
@@ -3238,7 +3257,10 @@ mod tests {
     #[test]
     fn recording_discovery_does_not_extend_payload_lifetime() {
         crate::tool::with_runtime_scope(format!("snapshot-test-{}", uuid::Uuid::new_v4()), || {
-            crate::tool::with_runtime_scope("snapshot-weak-discovery".into(), || {
+            // The fork keeps a second copy of this test; a shared scope name would
+            // let one copy retire the other's runtime stores mid-test.
+            let scope = format!("snapshot-weak-discovery-{}", uuid::Uuid::new_v4());
+            crate::tool::with_runtime_scope(scope.clone(), || {
                 let cache = Arc::new(SnapshotStore::new());
                 let drops = Arc::new(AtomicUsize::new(0));
                 cache.publish(
@@ -3256,12 +3278,12 @@ mod tests {
                 assert!(current_runtime_store::<DropCounter>().is_none());
                 {
                     let caches = runtime_stores().lock().unwrap();
-                    assert!(!caches.contains_key("snapshot-weak-discovery"));
+                    assert!(!caches.contains_key(scope.as_str()));
                     if caches.is_empty() {
                         assert_eq!(caches.capacity(), 0);
                     }
                 }
-                assert_eq!(retire_runtime_scope("snapshot-weak-discovery"), 0);
+                assert_eq!(retire_runtime_scope(&scope), 0);
             });
         });
     }
