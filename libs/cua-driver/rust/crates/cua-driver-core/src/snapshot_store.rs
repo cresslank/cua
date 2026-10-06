@@ -360,14 +360,23 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             )
     }
 
+    /// Read session tombstones before taking the store mutex. Revival runs its
+    /// hooks, this store's included, while holding the tombstone lock, so a
+    /// tombstone read under the store mutex inverts that order and deadlocks
+    /// against a concurrent revival of an idle-reclaimed session.
+    fn session_ended(session: Option<&str>) -> bool {
+        session.is_some_and(crate::session::is_session_ended)
+    }
+
     fn screenshot(
         &self,
         pid: i32,
         snapshot: &SnapshotMetadata,
         session: Option<&str>,
+        session_ended: bool,
     ) -> Option<ScreenshotContext> {
         if !self.metadata_live(pid, snapshot)
-            || session.is_some_and(crate::session::is_session_ended)
+            || session_ended
             || snapshot.screenshot_owner.as_deref() != session
         {
             return None;
@@ -410,11 +419,13 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         expected: ScreenshotContext,
         publish: impl FnOnce() -> R,
     ) -> Result<R, ToolResult> {
+        let session_ended = Self::session_ended(session);
         let inner = self.inner.lock().unwrap();
         if Self::session_retired(&inner, session)
             || !inner.snapshots.get(&pid).is_some_and(|lane| {
-                lane.iter()
-                    .any(|snapshot| self.screenshot(pid, snapshot, session) == Some(expected))
+                lane.iter().any(|snapshot| {
+                    self.screenshot(pid, snapshot, session, session_ended) == Some(expected)
+                })
             })
         {
             return Err(screenshot_context_refusal(
@@ -436,6 +447,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         window_id: Option<u64>,
         session: Option<&str>,
     ) -> Result<ScreenshotContext, ToolResult> {
+        let session_ended = Self::session_ended(session);
         let inner = self.inner.lock().unwrap();
         let lane = inner
             .snapshots
@@ -446,11 +458,11 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             Some(window_id) => lane
                 .iter()
                 .find(|snapshot| snapshot.window_id == window_id)
-                .and_then(|snapshot| self.screenshot(pid, snapshot, session)),
+                .and_then(|snapshot| self.screenshot(pid, snapshot, session, session_ended)),
             None => {
                 let mut contexts = lane
                     .iter()
-                    .map(|snapshot| self.screenshot(pid, snapshot, session));
+                    .map(|snapshot| self.screenshot(pid, snapshot, session, session_ended));
                 contexts.next().flatten().filter(|first| {
                     contexts.all(|context| {
                         context.is_some_and(|context| (context.scale - first.scale).abs() < 1e-9)
@@ -493,12 +505,16 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 .screenshot_context(pid, Some(window_id), session)
                 .map(|context| (pid, context));
         }
+        let session_ended = Self::session_ended(session);
         let inner = self.inner.lock().unwrap();
         let mut matches = inner.snapshots.iter().filter_map(|(pid, lane)| {
             let snapshot = lane
                 .iter()
                 .find(|snapshot| snapshot.window_id == window_id)?;
-            Some((*pid, self.screenshot(*pid, snapshot, session)?))
+            Some((
+                *pid,
+                self.screenshot(*pid, snapshot, session, session_ended)?,
+            ))
         });
         match (matches.next(), matches.next()) {
             (Some(found), None) => Ok(found),
@@ -512,6 +528,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         session: Option<&str>,
         zoom: ZoomContext,
     ) -> Result<(), ToolResult> {
+        let session_ended = Self::session_ended(session);
         let mut inner = self.inner.lock().unwrap();
         let snapshot = inner
             .snapshots
@@ -520,7 +537,9 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 lane.iter_mut()
                     .find(|snapshot| snapshot.window_id == zoom.screenshot.window_id)
             })
-            .filter(|snapshot| self.screenshot(pid, snapshot, session) == Some(zoom.screenshot))
+            .filter(|snapshot| {
+                self.screenshot(pid, snapshot, session, session_ended) == Some(zoom.screenshot)
+            })
             .ok_or_else(|| zoom_context_refusal(pid, Some(zoom.screenshot.window_id)))?;
         snapshot.zoom = Some(zoom);
         Ok(())
@@ -532,6 +551,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         window_id: Option<u64>,
         session: Option<&str>,
     ) -> Result<ZoomContext, ToolResult> {
+        let session_ended = Self::session_ended(session);
         let inner = self.inner.lock().unwrap();
         let mut zooms = inner
             .snapshots
@@ -540,7 +560,9 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             .flatten()
             .filter(|snapshot| {
                 window_id.is_none_or(|window_id| snapshot.window_id == window_id)
-                    && self.screenshot(pid, snapshot, session).is_some()
+                    && self
+                        .screenshot(pid, snapshot, session, session_ended)
+                        .is_some()
             })
             .filter_map(|snapshot| snapshot.zoom);
         match (zooms.next(), zooms.next()) {
@@ -1312,6 +1334,88 @@ mod hardened_tests {
                 crate::session::end_session(&session);
                 crate::session::revive_session(&session);
             });
+        });
+    }
+
+    #[test]
+    fn screenshot_reads_take_session_tombstones_before_the_store_mutex() {
+        // Revival runs its hooks while holding the session tombstone lock, and
+        // this store's hook then takes the store mutex. A screenshot read that
+        // waits for the tombstone lock must not already hold the store mutex,
+        // or the two deadlock.
+        let scope = format!("snapshot-test-{}", uuid::Uuid::new_v4());
+        crate::tool::with_runtime_scope(scope.clone(), || {
+            use crate::session::{
+                begin_session_dispatch, fire_session_revive_for_owner,
+                register_scoped_session_revive_hook, SessionClientKind, SessionTransport,
+            };
+            use std::sync::atomic::AtomicBool;
+            use std::time::{Duration, Instant};
+
+            let session = format!("snapshot-lock-order-{}", uuid::Uuid::new_v4());
+            let pid = std::process::id() as i32;
+            let mut store = SnapshotStore::<Payload>::new();
+            // Swap out this store's own revive hook so an inversion is reported
+            // below instead of deadlocking the test.
+            store._revive_hook = register_scoped_session_revive_hook(|_| {});
+            let store = Arc::new(store);
+            let _guard = begin_session_dispatch(
+                &session,
+                None,
+                &session,
+                true,
+                SessionTransport::McpStdio,
+                SessionClientKind::Mcp,
+            )
+            .expect("session starts");
+            store
+                .publish_for_session(pid, 20, Payload(vec![0]), Some(&session), Some(1.0))
+                .expect("live session publishes");
+
+            let inverted = Arc::new(AtomicBool::new(false));
+            let reader = Arc::new(Mutex::new(None));
+            let _probe = {
+                let (store, session, inverted, reader) = (
+                    store.clone(),
+                    session.clone(),
+                    inverted.clone(),
+                    reader.clone(),
+                );
+                register_scoped_session_revive_hook(move |revived| {
+                    if revived != session {
+                        return;
+                    }
+                    // The tombstone lock is held here: start a read and watch
+                    // whether it holds the store mutex while it waits.
+                    let handle = {
+                        let (store, session, scope) =
+                            (store.clone(), session.clone(), scope.clone());
+                        std::thread::spawn(move || {
+                            crate::tool::with_runtime_scope(scope, || {
+                                store.screenshot_context(pid, Some(20), Some(&session))
+                            })
+                        })
+                    };
+                    let deadline = Instant::now() + Duration::from_millis(500);
+                    while Instant::now() < deadline && !handle.is_finished() {
+                        if store.inner.try_lock().is_err() {
+                            inverted.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    *reader.lock().unwrap() = Some(handle);
+                })
+            };
+
+            assert!(fire_session_revive_for_owner(&session, &session));
+            let handle = reader.lock().unwrap().take().expect("probe ran");
+            let context = handle.join().expect("reader finishes once revival returns");
+            assert!(
+                !inverted.load(Ordering::SeqCst),
+                "screenshot read held the store mutex while waiting for session state"
+            );
+            assert_eq!(context.expect("live session context").scale, 1.0);
         });
     }
 
