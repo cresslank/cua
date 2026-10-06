@@ -1361,11 +1361,16 @@ impl Tool for HistoryQueryTool {
             return ToolResult::error("since_sequence must not exceed until_sequence")
                 .with_structured(serde_json::json!({"code": "invalid_history_query_range"}));
         }
-        match self
-            .manager
-            .query(query, HistoryAccessOperation::AgentQuery)
-        {
-            Ok(events) => ToolResult::text(format!(
+        // A query with the writer stopped takes the writer lease, which can
+        // wait out a transient holder; keep that blocking work and the manager
+        // mutexes it holds off the async executor.
+        let manager = self.manager.clone();
+        let result = crate::blocking::spawn(move || {
+            manager.query(query, HistoryAccessOperation::AgentQuery)
+        })
+        .await;
+        match result {
+            Ok(Ok(events)) => ToolResult::text(format!(
                 "Returned {} encrypted Computer History metadata event(s).",
                 events.len()
             ))
@@ -1374,10 +1379,12 @@ impl Tool for HistoryQueryTool {
                 "metadata_only": true,
                 "model_context_disclosure": true
             })),
-            Err(error) => {
+            Ok(Err(error)) => {
                 ToolResult::error(format!("Computer History query refused: {}", error.code()))
                     .with_structured(serde_json::json!({"code": error.code()}))
             }
+            Err(_) => ToolResult::error("Computer History query did not complete")
+                .with_structured(serde_json::json!({"code": "history_query_interrupted"})),
         }
     }
 }
@@ -1587,13 +1594,39 @@ struct WriterLease {
     _file: File,
 }
 
+/// How long a writer waits out a contended lock before refusing. A child that
+/// another thread forks (a contained perception worker runs `pre_exec` before
+/// `exec`) shares every open file description until it execs, so a lease the
+/// previous writer just dropped can stay locked for a moment. A real second
+/// writer still holds it past this bound and is refused.
+const WRITER_LOCK_CONTENTION_WAIT: Duration = Duration::from_millis(500);
+const WRITER_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
 impl WriterLease {
+    /// Blocks for up to [`WRITER_LOCK_CONTENTION_WAIT`] under contention; async
+    /// callers run it through `crate::blocking::spawn`.
     fn acquire(root: &Path) -> Result<Self, HistoryError> {
+        Self::acquire_with(root, WRITER_LOCK_CONTENTION_WAIT, thread::sleep)
+    }
+
+    fn acquire_with(
+        root: &Path,
+        wait: Duration,
+        mut pause: impl FnMut(Duration),
+    ) -> Result<Self, HistoryError> {
         prepare_history_root(root)?;
         let file = secure_open_lock_file(&root.join("writer.lock"))?;
-        fs2::FileExt::try_lock_exclusive(&file)
-            .map_err(|_| HistoryError::new(HistoryHealthCategory::WriterStopped))?;
-        Ok(Self { _file: file })
+        let contended = fs2::lock_contended_error().raw_os_error();
+        let deadline = Instant::now() + wait;
+        loop {
+            match fs2::FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(Self { _file: file }),
+                Err(error) if error.raw_os_error() == contended && Instant::now() < deadline => {
+                    pause(WRITER_LOCK_RETRY_INTERVAL);
+                }
+                Err(_) => return Err(HistoryError::new(HistoryHealthCategory::WriterStopped)),
+            }
+        }
     }
 }
 
@@ -3289,6 +3322,81 @@ mod tests {
         assert!(events
             .windows(2)
             .all(|pair| pair[0].data.sequence < pair[1].data.sequence));
+    }
+
+    fn hold_writer_lock(root: &Path) -> File {
+        // A second open file description stands in for a forked child's copy
+        // of the previous writer's lock.
+        prepare_history_root(root).unwrap();
+        let holder = secure_open_lock_file(&root.join("writer.lock")).unwrap();
+        fs2::FileExt::try_lock_exclusive(&holder).unwrap();
+        holder
+    }
+
+    #[test]
+    fn writer_lease_waits_out_a_transient_holder() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut holder = Some(hold_writer_lock(temp.path()));
+        let mut pauses = 0;
+        // The first contended attempt pauses; the holder releases during it.
+        // Unlock explicitly: a child another test forks may share this open
+        // file description until it execs, and dropping the file alone would
+        // leave the lock held for that window.
+        let lease = WriterLease::acquire_with(temp.path(), Duration::from_secs(60), |_| {
+            pauses += 1;
+            if let Some(holder) = holder.take() {
+                fs2::FileExt::unlock(&holder).unwrap();
+            }
+        });
+        assert!(
+            lease.is_ok(),
+            "a just-released lock must not refuse the writer"
+        );
+        assert_eq!(pauses, 1);
+    }
+
+    #[test]
+    fn writer_lease_refuses_a_holder_that_outlasts_the_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let _holder = hold_writer_lock(temp.path());
+        let wait = Duration::from_millis(20);
+        let started = Instant::now();
+        match WriterLease::acquire_with(temp.path(), wait, thread::sleep) {
+            Ok(_) => panic!("a held lock must refuse a second writer"),
+            Err(error) => assert_eq!(error.category, HistoryHealthCategory::WriterStopped),
+        }
+        // Contention refuses only once the deadline has passed.
+        assert!(started.elapsed() >= wait);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_query_waits_for_the_writer_lock_off_the_executor() {
+        let temp = tempfile::tempdir().unwrap();
+        let keys = Arc::new(MemoryKeyProvider::default());
+        let manager = HistoryManager::new(config(temp.path()), keys, None);
+        manager.enable().unwrap();
+        manager.disable().unwrap();
+        // The stopped writer just released the lock, and a child another test
+        // forks can share it until exec; take it as production does.
+        let _holder = WriterLease::acquire(temp.path()).expect("take the released writer lock");
+        // On a current-thread runtime this task runs only if the query yields.
+        let ticked = Arc::new(AtomicBool::new(false));
+        let ticker = {
+            let ticked = ticked.clone();
+            tokio::spawn(async move { ticked.store(true, Ordering::SeqCst) })
+        };
+        let result = HistoryQueryTool { manager }
+            .invoke(serde_json::json!({}))
+            .await;
+        assert!(
+            ticked.load(Ordering::SeqCst),
+            "the query blocked the executor while waiting for the lock"
+        );
+        ticker.await.unwrap();
+        assert_eq!(
+            result.structured_content.unwrap()["code"],
+            HistoryError::new(HistoryHealthCategory::WriterStopped).code()
+        );
     }
 
     #[test]

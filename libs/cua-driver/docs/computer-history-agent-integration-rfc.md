@@ -458,6 +458,7 @@ the existing authorization error envelope.
 | `history_quota_reached` | Capture reached its encrypted-byte quota. | Treat history after that point as incomplete. |
 | `history_events_dropped` | The nonblocking writer dropped events. | Treat the affected interval as incomplete. |
 | `history_writer_stopped` | The writer is unavailable. | Continue the agent task without assuming new events are recorded. |
+| `history_query_interrupted` | The query ended without a result. | Continue the agent task without history. |
 
 Clients must use the structured code. Human-readable text may change.
 
