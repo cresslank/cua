@@ -1180,6 +1180,15 @@ fn dispatch_actions_in_slot(
     )
 }
 
+/// Run the background text producer against a scripted dispatcher.
+#[cfg(test)]
+pub(crate) fn background_text_reply_for_test(
+    text: &str,
+    dispatch: impl FnMut(Action) -> Result<Value>,
+) -> Result<Value> {
+    execute_text_actions(text_actions(text)?, DeliveryRoute::Background, dispatch)
+}
+
 fn execute_text_actions(
     actions: Vec<Action>,
     route: DeliveryRoute,

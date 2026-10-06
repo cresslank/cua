@@ -4105,7 +4105,24 @@ fn isolated_hyprland_result(result: anyhow::Result<Value>) -> ToolResult {
     hyprland_input_result(result, false)
 }
 
+/// Background text dispatches one key action per character, so a refusal
+/// after N acknowledged keys is a partial with count N. Single actions keep
+/// the one-phase bound in [`hyprland_input_outcome`].
+fn isolated_hyprland_text_result(result: anyhow::Result<Value>) -> ToolResult {
+    hyprland_input_outcome(result, false, true)
+}
+
 fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> ToolResult {
+    hyprland_input_outcome(result, foreground, false)
+}
+
+/// `sequence` marks a multi-action dispatch (background text), whose partial
+/// progress may exceed one acknowledged phase.
+fn hyprland_input_outcome(
+    result: anyhow::Result<Value>,
+    foreground: bool,
+    sequence: bool,
+) -> ToolResult {
     use cua_driver_core::action_record::{
         ActionEffect, ActionExecutionRecord, ActionTransport, ActualDelivery, RequestedDelivery,
     };
@@ -4146,7 +4163,7 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
         ),
         Ok(mut value) => {
             if foreground && value["code"] == "foreground_partial_unknown" {
-                return hyprland_input_result(
+                return hyprland_input_outcome(
                     Err(crate::wayland::hyprland_input::unknown_dispatch(
                         anyhow::anyhow!(
                             "{}",
@@ -4160,6 +4177,7 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
                             .unwrap_or(0),
                     )),
                     true,
+                    sequence,
                 );
             }
             let code = value["code"]
@@ -4183,7 +4201,7 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
                 .and_then(|count| u32::try_from(count).ok())
                 .filter(|count| *count > 0);
             let outcome = if value["effect"] == "partial"
-                && delivered.is_some_and(|count| foreground || count == 1)
+                && delivered.is_some_and(|count| foreground || sequence || count == 1)
             {
                 record(ActionEffect::Partial)
                     .actual_delivery(actual)
@@ -4204,19 +4222,21 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
                 .with_action_record(outcome)
         }
         Err(error) if error.is::<crate::wayland::hyprland_input::LaneBusy>() => {
-            hyprland_input_result(
+            hyprland_input_outcome(
                 Ok(json!({
                     "ok": false, "code": "lane_busy", "detail": error.to_string()
                 })),
                 foreground,
+                sequence,
             )
         }
         Err(error) if error.is::<crate::wayland::hyprland_input::ActionCancelled>() => {
-            hyprland_input_result(
+            hyprland_input_outcome(
                 Ok(json!({
                     "ok": false, "code": "cancelled", "detail": error.to_string()
                 })),
                 foreground,
+                sequence,
             )
         }
         Err(error) => {
@@ -4531,6 +4551,10 @@ fn type_text_routes_isolated_background_before_generic_wayland_refusal() {
         "the plugin route must run before the generic focused-input refusal"
     );
     assert!(invoke.contains("execute_background_text"));
+    // Multi-key progress must reach the caller (see
+    // isolated_text_reports_every_acknowledged_key_before_a_refusal).
+    assert!(invoke.contains("Ok(result) => isolated_hyprland_text_result(result)"));
+    assert!(!invoke.contains("Ok(result) => isolated_hyprland_result(result)"));
 }
 
 #[cfg(test)]
@@ -4851,6 +4875,47 @@ fn isolated_hyprland_refused_partial_and_unknown_outcomes_stay_distinct() {
         cua_driver_contract::ActionDeliveryMode::Unknown
     );
     assert_eq!(delivery.delivered_count, Some(1));
+}
+
+#[cfg(test)]
+#[test]
+fn isolated_text_reports_every_acknowledged_key_before_a_refusal() {
+    // Two keys acknowledged, then the target goes stale: the real text
+    // producer reports partial/2, and the text projector must keep it.
+    let mut calls = 0;
+    let reply = crate::wayland::hyprland_input::background_text_reply_for_test("abc", |_| {
+        calls += 1;
+        Ok(if calls < 3 {
+            json!({"ok": true, "effect": "unverifiable", "route": "synthetic_events"})
+        } else {
+            json!({"ok": false, "code": "stale_target", "detail": "stale_target"})
+        })
+    })
+    .unwrap();
+    assert_eq!(calls, 3);
+    assert_eq!(reply["effect"], "partial");
+
+    let result = isolated_hyprland_text_result(Ok(reply.clone()));
+    assert_eq!(result.is_error, Some(true));
+    let value = result.structured_content.as_ref().unwrap();
+    assert_eq!(value["effect"], "partial");
+    assert_eq!(value["delivery"]["mode"], "background");
+    assert_eq!(value["delivery"]["delivered_count"], 2);
+    let public = result.action_record.unwrap().public_result().unwrap();
+    public.validate_invariants().unwrap();
+    assert_eq!(public.effect, cua_driver_contract::ActionEffect::Partial);
+    let delivery = public.delivery.unwrap();
+    assert_eq!(
+        delivery.mode,
+        cua_driver_contract::ActionDeliveryMode::Background
+    );
+    assert_eq!(delivery.delivered_count, Some(2));
+
+    // A single action never acknowledges two phases; that stays a refusal.
+    let single = isolated_hyprland_result(Ok(reply));
+    let public = single.action_record.unwrap().public_result().unwrap();
+    assert_eq!(public.effect, cua_driver_contract::ActionEffect::Refused);
+    assert!(public.delivery.is_none());
 }
 
 #[cfg(test)]
@@ -6535,7 +6600,7 @@ impl Tool for TypeTextTool {
                     Err(refusal) => return refusal,
                 };
             return match dispatch.await {
-                Ok(result) => isolated_hyprland_result(result),
+                Ok(result) => isolated_hyprland_text_result(result),
                 Err(error) => isolated_hyprland_task_error(error, false),
             };
         }
