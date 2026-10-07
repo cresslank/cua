@@ -16,3 +16,7 @@ harness-winui3/
 harness-webview/
 harness-electron/
 harness-tauri/
+
+# Linux GTK fixtures staged by ../../tests/fixtures/build/linux.sh.
+harness-gtk3/
+harness-gtk4/
