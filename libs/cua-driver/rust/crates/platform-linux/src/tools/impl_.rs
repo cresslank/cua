@@ -5806,17 +5806,6 @@ impl Tool for ClickTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        if args.get("element_index").is_some() || args.get("element_token").is_some() {
-            let mut args = args;
-            args["button"] = json!("left");
-            args["count"] = json!(2);
-            return ClickTool {
-                state: self.state.clone(),
-            }
-            .invoke(args)
-            .await;
-        }
-
         if args.get("capture_id").is_some() {
             return ToolResult::error("capture_id input routing is not yet qualified on the hardened Linux adapter; refresh get_window_state and use an element token or window coordinates")
                 .with_structured(json!({"code":"capture_route_unqualified","effect":"refused"}));
@@ -13214,6 +13203,41 @@ mod click_button_schema_tests {
             Some(1.0),
         );
         (pid, xid, SESSION)
+    }
+
+    #[tokio::test]
+    async fn element_click_resolves_its_target_without_reentering_click() {
+        // A 0.30.3 merge left double_click's delegation (button left, count 2,
+        // invoke ClickTool again) at the top of ClickTool::invoke, keyed on
+        // element_token/element_index. Every element click re-entered itself
+        // until the stack overflowed and took the whole daemon down.
+        let clicks = Arc::new(AtomicUsize::new(0));
+        let clicks_for_backend = clicks.clone();
+        let state = ToolState::new_with_production_route_backend(backend_with(
+            |_proof, _, _| Ok(None),
+            move |_proof, _, _, _, _| {
+                clicks_for_backend.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            },
+            |_, _, _| Ok(()),
+        ));
+        // (The registry refuses a bare element_index before any tool runs, so a
+        // token is the element route that reaches invoke.)
+        let (pid, xid, session) = with_screenshot_context(&state);
+        for args in [
+            serde_json::json!({"pid": pid, "element_token": "not-a-live-token", "_session_id": session}),
+            serde_json::json!({"pid": pid, "window_id": xid, "element_token": "not-a-live-token",
+                "_session_id": session}),
+        ] {
+            let result = coordinate_click(state.clone()).invoke(args).await;
+            assert_eq!(result.is_error, Some(true), "{result:?}");
+            assert_eq!(
+                result.structured_content.as_ref().unwrap()["refusal"]["code"],
+                "invalid_element_token",
+                "{result:?}"
+            );
+        }
+        assert_eq!(clicks.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
