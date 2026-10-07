@@ -1768,7 +1768,9 @@ impl Tool for GetWindowStateTool {
                 "max_dimension":{"type":"integer","minimum":1,"description":"Legacy optional cap on the returned screenshot's long edge. Applied on top of the configured max_image_dimension ceiling when max_image_dimension is omitted."},
                 "max_image_dimension":{"type":"integer","minimum":0,"description":"Per-call long-edge override. This value wins over configured and legacy limits; 0 returns native-resolution PNG bytes. Omit to preserve configured behavior."}
             },"additionalProperties":false}),
-            read_only: true, destructive: false, idempotent: true, open_world: false,
+            // Each call mints a new snapshot and its element tokens, which
+            // retires the previous ones: repeating it is not idempotent.
+            read_only: true, destructive: false, idempotent: false, open_world: false,
         })
     }
 
@@ -8006,7 +8008,7 @@ impl Tool for SetValueTool {
                     "pid":{"type":"integer","description":"Target process ID."},
                     "window_id":{"type":"integer","description":"Omit when element_token is supplied (the token carries it)."},
                     "element_token": cua_driver_core::tool_schema::element_token_schema(),
-                    "value":{"type":"string"}
+                    "value":{"type":"string","description":"New value for the element."}
                 },"additionalProperties":false
             }),
             read_only: false, destructive: true, idempotent: false, open_world: true,
@@ -9382,10 +9384,10 @@ impl Tool for DragTool {
                 "cursor_id":{"type":"string","description":"Optional multi-cursor instance id. Default: 'default'."},
                 "pid":{"type":"integer","description":"Target process ID. Required unless scope is \"desktop\"."},
                 "window_id":{"type":"integer","description":"Target window XID. Required."},
-                "from_x":{"type":"number"},
-                "from_y":{"type":"number"},
-                "to_x":{"type":"number"},
-                "to_y":{"type":"number"},
+                "from_x":{"type":"number","description":"Drag start X: window-local pixels of the target window's own get_window_state screenshot; pass scope:\"desktop\" for get_desktop_state pixels."},
+                "from_y":{"type":"number","description":"Drag start Y (same frame as from_x)."},
+                "to_x":{"type":"number","description":"Drag end X (same frame as from_x)."},
+                "to_y":{"type":"number","description":"Drag end Y (same frame as from_x)."},
                 "duration_ms":{"type":"integer","minimum":0,"maximum":10000,"description":"Total drag duration. Default: 500."},
                 "steps":{"type":"integer","minimum":1,"maximum":200,"description":"Intermediate MotionNotify events. Default: 20."},
                 "modifier": cua_driver_core::tool_schema::modifier_schema(),
@@ -11241,7 +11243,13 @@ impl Tool for MoveCursorTool {
             name: "move_cursor".into(),
             description: "Move the synthetic agent cursor without changing the user's pointer. Only an explicit scope=desktop request moves the real OS pointer in get_desktop_state coordinates.".into(),
             input_schema: json!({"type":"object","required":["x","y"],"properties":{
-                "x":{"type":"number"},"y":{"type":"number"},"pid":{"type":"integer","minimum":1},"window_id":{"type":"integer","minimum":1},"session": cua_driver_core::tool_schema::session_schema(),"cursor_id":{"type":"string"},"scope":{"type":"string","enum":["window","desktop"],"default":"window"}
+                "x":{"type":"number","description":"Destination X. Window scope: window-local pixels of window_id when pid and window_id are given, otherwise screen coordinates of the agent cursor overlay. Desktop scope: get_desktop_state screenshot pixels."},
+                "y":{"type":"number","description":"Destination Y, in the same space as x."},
+                "pid":{"type":"integer","minimum":1,"description":"Window scope: process ID of the target window. Supply with window_id; required on GNOME Wayland and in Wayland inject mode."},
+                "window_id":{"type":"integer","minimum":1,"description":"Window scope: target window id, supplied with pid. Makes x and y window-local."},
+                "session": cua_driver_core::tool_schema::session_schema(),
+                "cursor_id":{"type":"string","description":"Cursor instance to move. Default: 'default'."},
+                "scope":{"type":"string","enum":["window","desktop"],"default":"window","description":"\"window\" (default) moves only the agent cursor overlay; \"desktop\" moves the real OS pointer."}
             },"additionalProperties":false}),
             read_only: false, destructive: false, idempotent: true, open_world: false,
         })
@@ -12727,7 +12735,7 @@ impl Tool for BringToFrontTool {
                 .into(),
             input_schema: serde_json::json!({
                 "type":"object","required":["pid"],"properties":{
-                    "pid":{"type":"integer"},
+                    "pid":{"type":"integer","description":"Process ID of the app to activate."},
                     "window_id":{"type":"integer","description":"Exact window id to activate. Required when a Wayland process owns more than one toplevel."}
                 },"additionalProperties":false
             }),

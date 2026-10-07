@@ -190,8 +190,10 @@ fn tools_list_schema_shape() {
         // Chromium); foreground accepts that.
         "browser_click",
         "browser_pointer",
-        // macOS set_value has no delivery ladder.
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        // set_value has no delivery ladder on macOS or on the hardened Linux
+        // adapter, which writes through AT-SPI only and never falls back to
+        // pointer and keyboard input.
+        #[cfg(target_os = "windows")]
         "set_value",
     ];
     for tool in DELIVERY_MODE_TOOLS {
