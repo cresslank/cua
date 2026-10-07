@@ -254,7 +254,9 @@ pub fn global() -> &'static Arc<ActionLeaseTable> {
     TABLE.get_or_init(ActionLeaseTable::new)
 }
 
-type RawInputReadyHook = fn(&str) -> Result<(), String>;
+/// Receives the tool name and its call arguments: the platform route (and so
+/// the transport to prepare) can depend on arguments such as modifiers.
+type RawInputReadyHook = fn(&str, &Value) -> Result<(), String>;
 
 static RAW_INPUT_READY: OnceLock<RawInputReadyHook> = OnceLock::new();
 
@@ -263,9 +265,9 @@ pub fn install_raw_input_ready_hook(hook: RawInputReadyHook) {
     let _ = RAW_INPUT_READY.set(hook);
 }
 
-pub fn ensure_raw_input_ready(tool: &str) -> Result<(), String> {
+pub fn ensure_raw_input_ready(tool: &str, args: &Value) -> Result<(), String> {
     match RAW_INPUT_READY.get() {
-        Some(hook) => hook(tool),
+        Some(hook) => hook(tool, args),
         None => Ok(()),
     }
 }

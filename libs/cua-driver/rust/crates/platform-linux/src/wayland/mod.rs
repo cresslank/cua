@@ -11,6 +11,7 @@
 
 pub mod ext_screencopy;
 pub mod ext_toplevel;
+mod foreground_deadline;
 pub mod hyprland;
 pub mod hyprland_capture;
 mod hyprland_compatibility;
@@ -115,18 +116,153 @@ pub fn is_gnome_wayland_session() -> bool {
             || shell_helper::present())
 }
 
-/// Wait for portal/libei without holding the desktop-raw lease. Core dispatch
-/// calls this before acquiring the table entry.
-pub fn ensure_raw_input_ready_for_tool(tool: &str) -> Result<(), String> {
-    if !is_gnome_wayland_session() {
+/// Wait for portal/libei before the dispatch grant or foreground transaction.
+/// Native/inject routes never open a portal just because an action is admitted.
+pub fn ensure_raw_input_ready_for_tool(tool: &str, args: &serde_json::Value) -> Result<(), String> {
+    let session = if !is_wayland() || is_inject_mode() {
+        InputReadinessSession::Bypass
+    } else if is_gnome_wayland_session() {
+        InputReadinessSession::Gnome
+    } else {
+        InputReadinessSession::NativeWayland
+    };
+    ensure_input_ready_with(
+        tool,
+        args,
+        session,
+        probe_native_input_protocols,
+        |interface| {
+            #[cfg(feature = "portal-input")]
+            {
+                libei::reconnect_for_readiness(interface)
+            }
+            #[cfg(not(feature = "portal-input"))]
+            {
+                anyhow::bail!("input_unavailable: {interface} requires a portal-input/libei build")
+            }
+        },
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[derive(Clone, Copy)]
+enum InputReadinessSession {
+    Bypass,
+    Gnome,
+    NativeWayland,
+}
+
+#[derive(Clone, Copy)]
+struct NativeInputProtocols {
+    pointer: bool,
+    keyboard: bool,
+    wtype: bool,
+}
+
+// Dependency seam for registry/worker regressions: the routing and interface
+// requirements are production code; only compositor probing and EIS opening
+// are supplied by a hermetic fixture. Neither operation emits input.
+fn ensure_input_ready_with(
+    tool: &str,
+    args: &serde_json::Value,
+    session: InputReadinessSession,
+    probe: impl FnOnce() -> anyhow::Result<NativeInputProtocols>,
+    mut reconnect: impl FnMut(&'static str) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    if matches!(session, InputReadinessSession::Bypass) {
         return Ok(());
     }
-    let result = match tool {
-        "scroll" => require_gnome_scroll_transport_ready(),
-        "type_text" | "press_key" | "hotkey" => require_gnome_keyboard_transport_ready(),
-        _ => require_gnome_pointer_transport_ready(),
+    let tool = readiness_route(tool, args);
+    let (keyboard, pointer, scroll) = match tool {
+        "browser_prepare" => (true, true, false),
+        // Scroll fallback moves to the target before sending wheel events.
+        "scroll" => (false, true, true),
+        "type_text" | "press_key" | "hotkey" => (true, false, false),
+        "click"
+        | "double_click"
+        | "right_click"
+        | "drag"
+        | "mouse_drag"
+        | "parallel_mouse_drag"
+        | "move_cursor"
+        | "mouse_button_down"
+        | "mouse_button_up" => (false, true, false),
+        // These only use raw transport on the GNOME route. Do not require
+        // portal consent for native compositor activation/geometry operations.
+        "bring_to_front" | "set_window_frame"
+            if matches!(session, InputReadinessSession::Gnome) =>
+        {
+            (false, true, false)
+        }
+        _ => return Ok(()),
     };
-    result.map_err(|error| error.to_string())
+    let native = match session {
+        InputReadinessSession::NativeWayland => probe()?,
+        _ => NativeInputProtocols {
+            pointer: false,
+            keyboard: false,
+            wtype: false,
+        },
+    };
+    // Text and single-key delivery also need the wtype helper. Chords
+    // (hotkey, modified press_key) and browser setup navigation, which sends
+    // only hotkey_focused_for_target chords (browser_setup_ui.rs), have an
+    // in-process virtual-keyboard path. An advertised manager alone cannot make
+    // an absent helper work. Unexpected native failures after this probe still
+    // fail closed, never reconnecting inside the action.
+    let chord_only = matches!(tool, "hotkey" | "browser_prepare");
+    if keyboard && (!native.keyboard || (!chord_only && !native.wtype)) {
+        reconnect("ei_keyboard")?;
+    }
+    if pointer && !native.pointer {
+        reconnect("ei_pointer_absolute")?;
+    }
+    if scroll && !native.pointer {
+        reconnect("ei_scroll")?;
+    }
+    Ok(())
+}
+
+/// The route production dispatch takes for these arguments. PressKeyTool sends
+/// a request with modifiers as a chord through hotkey_focused*, like hotkey.
+fn readiness_route<'a>(tool: &'a str, args: &serde_json::Value) -> &'a str {
+    let modified = args
+        .get("modifiers")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|modifiers| modifiers.iter().any(serde_json::Value::is_string));
+    if tool == "press_key" && modified {
+        "hotkey"
+    } else {
+        tool
+    }
+}
+
+fn probe_native_input_protocols() -> anyhow::Result<NativeInputProtocols> {
+    let conn = Connection::connect_to_env()?;
+    let mut queue = conn.new_event_queue::<State>();
+    conn.display().get_registry(&queue.handle(), ());
+    let mut state = State::default();
+    queue.roundtrip(&mut state)?;
+    Ok(NativeInputProtocols {
+        // The same registry binding tested by open_vptr_session before it
+        // returns NO_VPTR_MARKER to with_libei_fallback.
+        pointer: state.vptr_manager.is_some(),
+        // wtype and virtual_keyboard::hotkey both use this manager. Absence
+        // selects their existing libei fallback, but consent must precede input.
+        keyboard: state.virtual_keyboard,
+        wtype: wtype_available(),
+    })
+}
+
+fn wtype_available() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path).any(|dir| {
+            std::fs::metadata(dir.join("wtype")).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+    })
 }
 
 fn desktop_name_is_gnome(desktop: &str) -> bool {
@@ -482,6 +618,7 @@ struct State {
     // Virtual-pointer manager + output dimensions, so `click` can land a real
     // button press at the output centre (over the just-activated window).
     vptr_manager: Option<ZwlrVirtualPointerManagerV1>,
+    virtual_keyboard: bool,
     output: Option<WlOutput>,
     // Logical (post-transform) output size: virtual-pointer absolute motion
     // maps onto the output's logical box, so rotated outputs swap axes.
@@ -526,6 +663,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     qh,
                     (),
                 ));
+            } else if interface == virtual_keyboard::manager_interface() {
+                state.virtual_keyboard = true;
             } else if interface == WlOutput::interface().name {
                 let out = registry.bind::<WlOutput, _, _>(name, version.min(4), qh, ());
                 if state.output.is_none() {
@@ -5033,12 +5172,13 @@ mod tests {
     }
 
     #[test]
-    fn raw_input_ready_hook_is_a_noop_off_gnome() {
-        if is_gnome_wayland_session() {
+    fn raw_input_ready_hook_is_a_noop_off_wayland() {
+        if is_wayland() {
             return;
         }
-        assert_eq!(ensure_raw_input_ready_for_tool("click"), Ok(()));
-        assert_eq!(ensure_raw_input_ready_for_tool("type_text"), Ok(()));
+        let args = serde_json::json!({});
+        assert_eq!(ensure_raw_input_ready_for_tool("click", &args), Ok(()));
+        assert_eq!(ensure_raw_input_ready_for_tool("type_text", &args), Ok(()));
     }
 
     #[test]

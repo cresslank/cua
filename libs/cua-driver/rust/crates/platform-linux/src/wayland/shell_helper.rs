@@ -401,6 +401,9 @@ struct CapturePayload {
 #[derive(Debug)]
 pub struct ForegroundTransaction {
     token: String,
+    // Installed just before BeginForeground and retained through every body
+    // path (with_foreground_input, with_focused_window, and direct guards).
+    _input_deadline: super::foreground_deadline::Scope,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -980,6 +983,7 @@ pub fn begin_foreground(window_id: u64) -> anyhow::Result<ForegroundTransaction>
     })?;
     let token = new_foreground_token();
     set_pending_foreground(Some(token.clone()));
+    let input_deadline = super::foreground_deadline::Scope::begin(Instant::now());
     let raw = gdbus_call_with_timeout(
         "BeginForeground",
         &[gvariant_string(&token), gvariant_string(&target.target_id)],
@@ -1019,7 +1023,10 @@ pub fn begin_foreground(window_id: u64) -> anyhow::Result<ForegroundTransaction>
         );
     }
     set_pending_foreground(None);
-    Ok(ForegroundTransaction { token })
+    Ok(ForegroundTransaction {
+        token,
+        _input_deadline: input_deadline,
+    })
 }
 
 fn wait_for_foreground_activation(

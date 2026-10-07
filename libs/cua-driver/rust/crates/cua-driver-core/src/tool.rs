@@ -91,10 +91,18 @@ async fn admit_action_lease(
     if class == crate::action_lease::ActionClass::Observation {
         return Ok(None);
     }
-    if class == crate::action_lease::ActionClass::DesktopRaw {
+    // Existing-profile setup uses native keyboard/pointer navigation even though
+    // its dispatch grant is BrowserProfile, not DesktopRaw. Prepare transport
+    // before either that grant or the platform foreground transaction is held.
+    if class == crate::action_lease::ActionClass::DesktopRaw
+        || is_existing_profile_prepare(tool_name, args)
+    {
         let tool = tool_name.to_owned();
-        match crate::blocking::spawn(move || crate::action_lease::ensure_raw_input_ready(&tool))
-            .await
+        let readiness_args = args.clone();
+        match crate::blocking::spawn(move || {
+            crate::action_lease::ensure_raw_input_ready(&tool, &readiness_args)
+        })
+        .await
         {
             Ok(Ok(())) => {}
             Ok(Err(message)) => {
