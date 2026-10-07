@@ -3888,6 +3888,35 @@ fn unavailable_gtk_keyboard_background(
     )
 }
 
+/// Refusal for a background element click that falls back to an X11
+/// XSendEvent. Unlike [`unavailable_gtk_pointer_background`] and
+/// [`unavailable_webkit_background`], it does not step aside when a real
+/// pointer is available: that fallback never uses it.
+fn synthetic_pointer_fallback_refusal(
+    pid: u32,
+    delivery: crate::input::delivery::DeliveryMode,
+) -> Option<ToolResult> {
+    if delivery.is_foreground() {
+        return None;
+    }
+    synthetic_pointer_fallback_refusal_for(false, is_webkitgtk_embedder(pid), is_gtk_process(pid))
+        .map(crate::input::delivery::background_unavailable_error)
+}
+
+fn synthetic_pointer_fallback_refusal_for(
+    foreground: bool,
+    webkit: bool,
+    gtk: bool,
+) -> Option<crate::input::delivery::BackgroundUnavailable> {
+    use crate::input::delivery::BackgroundUnavailable;
+    match (foreground, webkit, gtk) {
+        (true, _, _) => None,
+        (false, true, _) => Some(BackgroundUnavailable::WebKitSyntheticInput),
+        (false, false, true) => Some(BackgroundUnavailable::FocusedInputOnly),
+        (false, false, false) => None,
+    }
+}
+
 fn unavailable_gtk_pointer_background(
     pid: u32,
     delivery: crate::input::delivery::DeliveryMode,
@@ -4526,6 +4555,57 @@ fn isolated_background_routes_do_not_reprobe_availability_before_primary_fallbac
             "{start}"
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn indexed_x11_pointer_fallback_refuses_synthetic_dropping_toolkits() {
+    use crate::input::delivery::BackgroundUnavailable;
+    // The decision has no real-pointer input: the fallback it guards always
+    // sends XSendEvent, so host pointer capability must not admit GTK/WebKit.
+    for foreground in [false, true] {
+        for webkit in [false, true] {
+            for gtk in [false, true] {
+                let refusal = synthetic_pointer_fallback_refusal_for(foreground, webkit, gtk);
+                let expected = match (foreground, webkit, gtk) {
+                    (true, _, _) => None,
+                    (false, true, _) => Some(BackgroundUnavailable::WebKitSyntheticInput),
+                    (false, false, true) => Some(BackgroundUnavailable::FocusedInputOnly),
+                    (false, false, false) => None,
+                };
+                assert_eq!(
+                    refusal.map(|r| format!("{r:?}")),
+                    expected.map(|r| format!("{r:?}")),
+                    "foreground={foreground} webkit={webkit} gtk={gtk}"
+                );
+            }
+        }
+    }
+    // Needles are split with concat! so this test's own text never matches.
+    let source = include_str!("impl_.rs");
+    let one = |needle: &str| {
+        assert_eq!(source.matches(needle).count(), 1, "{needle}");
+        source.split_once(needle).unwrap().1
+    };
+    let indexed = one(concat!("async fn click_", "indexed_x11("))
+        .split_once("\n    }\n")
+        .unwrap()
+        .0;
+    let refusal = indexed
+        .find(concat!(
+            "synthetic_pointer_fallback_",
+            "refusal(pid, delivery)"
+        ))
+        .expect("indexed X11 fallback must check synthetic-pointer toolkits");
+    let synthetic = indexed
+        .find(concat!("send_click_with_", "modifiers("))
+        .expect("indexed X11 background fallback");
+    assert!(refusal < synthetic, "refuse before any synthetic dispatch");
+    let helper = one(concat!("fn synthetic_pointer_", "fallback_refusal("))
+        .split_once("\n}\n")
+        .unwrap()
+        .0;
+    assert!(!helper.contains(concat!("real_pointer_", "input_available")));
 }
 
 #[cfg(test)]
@@ -5711,6 +5791,12 @@ impl ClickTool {
                 Ok((_, suspected_noop)) => ("ax", suspected_noop),
                 Err(error) if crate::atspi::click_error_allows_pointer_fallback(&error) => {
                     if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
+                        return Ok(refusal);
+                    }
+                    // The background branch below sends XSendEvent, never the
+                    // real pointer, so refuse toolkits that drop synthetic
+                    // pointer input whatever pointer the host offers.
+                    if let Some(refusal) = synthetic_pointer_fallback_refusal(pid, delivery) {
                         return Ok(refusal);
                     }
                     let local_center = || -> anyhow::Result<(f64, f64)> {
