@@ -36,6 +36,9 @@ tokio::task_local! {
     /// Opaque generation for runtime-owned mutable resources. Nested
     /// dispatches inherit this key, while public arguments can never select it.
     static DISPATCH_RUNTIME_SCOPE: String;
+    /// Execution ownership, not reentrant admission. Native workers clone this
+    /// before detaching and install it synchronously for nested native work.
+    pub(crate) static DISPATCH_ACTION_LEASE: Option<Arc<crate::action_lease::ActionLease>>;
 }
 
 /// Return the immutable authorization context bound to the current dispatch.
@@ -77,13 +80,13 @@ fn lease_refusal(error: crate::action_lease::LeaseError) -> ToolResult {
     protected_refusal(error.code(), error.message())
 }
 
-/// Take resource-scoped write leases that do not require portal/libei.
-/// Desktop-raw stays with the platform path so a consent dialog cannot hold
-/// the seat.
+/// Take resource-scoped write leases after portal/libei readiness, so a
+/// consent dialog cannot hold the seat. Dispatch grants are shared with
+/// native continuations and remain pinned until the last owner exits.
 async fn admit_action_lease(
     tool_name: &str,
     args: &Value,
-) -> Result<Option<crate::action_lease::ActionLease>, ToolResult> {
+) -> Result<Option<Arc<crate::action_lease::ActionLease>>, ToolResult> {
     let class = crate::action_lease::classify_tool(tool_name);
     if class == crate::action_lease::ActionClass::Observation {
         return Ok(None);
@@ -110,7 +113,7 @@ async fn admit_action_lease(
         return Ok(None);
     }
     crate::action_lease::global()
-        .acquire(request)
+        .acquire_for_dispatch(request)
         .await
         .map(Some)
         .map_err(lease_refusal)
@@ -1816,7 +1819,7 @@ impl ToolRegistry {
         }
         let mut result = crate::recording::scope_dispatch_click_capture(
             pending_turn.as_ref(),
-            tool.invoke(args.clone()),
+            DISPATCH_ACTION_LEASE.scope(_action_lease.clone(), tool.invoke(args.clone())),
         )
         .await;
         match resolved_name {
@@ -3135,6 +3138,79 @@ mod runtime_isolation_tests {
         SessionAuthorizationRegistry::with_ceiling(ceiling)
             .compatibility_context(mode, Some(manifest))
             .unwrap()
+    }
+
+    struct DetachedInputProbe {
+        def: super::ToolDef,
+        worker: Mutex<
+            Option<(
+                tokio::sync::oneshot::Sender<()>,
+                std::sync::mpsc::Receiver<()>,
+            )>,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for DetachedInputProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> ToolResult {
+            let (started, release) = self.worker.lock().unwrap().take().unwrap();
+            crate::blocking::spawn(move || {
+                started.send(()).unwrap();
+                // Disconnect also releases the worker if an assertion fails.
+                let _ = release.recv_timeout(Duration::from_secs(10));
+            })
+            .await
+            .unwrap();
+            ToolResult::text("input finished")
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_input_retains_action_lease_until_native_worker_exits() {
+        use crate::action_lease::{global, LeaseRequest};
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, worker_release) = std::sync::mpsc::channel();
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(DetachedInputProbe {
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "hermetic detached input".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+            worker: Mutex::new(Some((started, worker_release))),
+        }));
+        let args = serde_json::json!({"pid": 937452, "window_id": 20});
+        let mut invocation =
+            Box::pin(registry.invoke_with_context("click", args, standard_context()));
+        tokio::select! {
+            result = &mut invocation => panic!("input returned before worker release: {result:?}"),
+            started = tokio::time::timeout(Duration::from_secs(5), running) => started.unwrap().unwrap(),
+        }
+        // Dropping, not merely detaching a JoinHandle, cancels the registry future.
+        drop(invocation);
+        let blocked = global()
+            .acquire(LeaseRequest::desktop_raw(None, Duration::from_millis(25)))
+            .await;
+        // Always release the worker before checking so a failing mutation is bounded.
+        release.send(()).unwrap();
+        assert_eq!(
+            blocked
+                .expect_err("cancelled worker must still own input")
+                .code(),
+            "input_busy"
+        );
+        global()
+            .acquire(LeaseRequest::desktop_raw(None, Duration::from_secs(2)))
+            .await
+            .expect("worker exit releases input");
     }
 
     struct ReplayProbe {

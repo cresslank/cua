@@ -15,6 +15,29 @@ use std::sync::{
 
 const MAX_CONCURRENT_NATIVE_CALLS: usize = 32;
 
+/// Ownership of the dispatch grant across a native thread or command queue.
+/// Capture in the caller, before spawning/enqueuing, and retain through input,
+/// payload destruction and cleanup. This is not admission for another action.
+/// A long-lived worker must capture per command, never once for its lifetime.
+#[derive(Clone, Default)]
+pub struct ActionLeaseScope(Option<Arc<crate::action_lease::ActionLease>>);
+
+impl ActionLeaseScope {
+    pub fn capture() -> Self {
+        Self(
+            crate::tool::DISPATCH_ACTION_LEASE
+                .try_with(Clone::clone)
+                .ok()
+                .flatten(),
+        )
+    }
+
+    /// Propagate ownership to any further native continuations started here.
+    pub fn run<R>(&self, function: impl FnOnce() -> R) -> R {
+        crate::tool::DISPATCH_ACTION_LEASE.sync_scope(self.0.clone(), function)
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum NativeDeadlineError {
     #[error("native blocking-call capacity is exhausted")]
@@ -91,16 +114,21 @@ where
         .try_acquire_owned()
         .map_err(|_| NativeDeadlineError::Busy)?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let action_lease = ActionLeaseScope::capture();
     std::thread::Builder::new()
         .name("cua-native-deadline".into())
         .spawn(move || {
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                deadline.check()?;
-                Ok(function(&deadline))
-            }));
-            // Native payload Drop may itself need native work: keep admission
-            // until authority and its payload have both been released.
-            drop(keepalive);
+            let outcome = action_lease.run(|| {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    deadline.check()?;
+                    Ok(function(&deadline))
+                }));
+                // Payload Drop can start native cleanup; keep and propagate
+                // execution ownership until that cleanup has been handed off.
+                drop(keepalive);
+                outcome
+            });
+            drop(action_lease);
             drop(admission);
             let _ = sender.send(outcome);
         })
@@ -149,6 +177,7 @@ where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
+    let action_lease = ActionLeaseScope::capture();
     tokio::spawn(async move {
         let permit = limit
             .acquire_owned()
@@ -156,7 +185,7 @@ where
             .expect("native blocking-call admission semaphore closed");
         match tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            function()
+            action_lease.run(function)
         })
         .await
         {
@@ -211,11 +240,14 @@ where
     gate.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .map_err(|_| BoundedSyncCallError::Busy)?;
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let action_lease = ActionLeaseScope::capture();
     if let Err(error) = std::thread::Builder::new()
         .name("cua-browser-cleanup".into())
         .spawn(move || {
             let lease = SyncCallLease(gate);
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(function));
+            let outcome = action_lease
+                .run(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(function)));
+            drop(action_lease);
             drop(lease);
             let _ = sender.send(outcome);
         })
@@ -255,6 +287,99 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Condvar, Mutex,
     };
+
+    #[tokio::test]
+    async fn timed_out_native_continuations_retain_the_dispatch_lease() {
+        use crate::action_lease::{ActionLeaseTable, LeaseRequest};
+        use crate::tool::DISPATCH_ACTION_LEASE;
+        use std::time::Duration;
+
+        for cleanup in [false, true] {
+            let table = ActionLeaseTable::new();
+            let lease = table
+                .acquire_for_dispatch(LeaseRequest::desktop_raw(None, Duration::ZERO))
+                .await
+                .unwrap();
+            let (started, running) = std::sync::mpsc::channel();
+            let (release, resume) = std::sync::mpsc::channel();
+            DISPATCH_ACTION_LEASE
+                .scope(Some(lease), async {
+                    spawn(move || {
+                        let work = move || {
+                            started.send(()).unwrap();
+                            let _ = resume.recv_timeout(Duration::from_secs(10));
+                        };
+                        if cleanup {
+                            let gate = Box::leak(Box::new(AtomicBool::new(false)));
+                            assert!(matches!(
+                                run_bounded_sync_with_gate(gate, Duration::from_secs(1), work),
+                                Err(BoundedSyncCallError::TimedOut)
+                            ));
+                        } else {
+                            assert!(matches!(
+                                run_native_with_deadline(
+                                    Duration::from_secs(1),
+                                    (),
+                                    move |_| work()
+                                ),
+                                Err(NativeDeadlineError::TimedOut)
+                            ));
+                        }
+                    })
+                    .await
+                    .unwrap();
+                })
+                .await;
+            running.recv_timeout(Duration::from_secs(2)).unwrap();
+            let blocked = table
+                .acquire(LeaseRequest::desktop_raw(None, Duration::from_millis(25)))
+                .await;
+            release.send(()).unwrap();
+            assert_eq!(
+                blocked
+                    .expect_err("nested worker retains input after both waiters exit")
+                    .code(),
+                "input_busy"
+            );
+            table
+                .acquire(LeaseRequest::desktop_raw(None, Duration::from_secs(2)))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_native_work_retains_the_dispatch_lease_before_admission() {
+        use crate::action_lease::{ActionLeaseTable, LeaseRequest};
+        use crate::tool::DISPATCH_ACTION_LEASE;
+        use std::time::Duration;
+        let table = ActionLeaseTable::new();
+        let lease = table
+            .acquire_for_dispatch(LeaseRequest::desktop_raw(None, Duration::ZERO))
+            .await
+            .unwrap();
+        let limit = Arc::new(tokio::sync::Semaphore::new(0));
+        let worker = DISPATCH_ACTION_LEASE
+            .scope(Some(lease), async {
+                spawn_with_limit(limit.clone(), || ())
+            })
+            .await;
+        let blocked = table
+            .acquire(LeaseRequest::desktop_raw(None, Duration::from_millis(25)))
+            .await;
+        limit.add_permits(1);
+        assert_eq!(
+            blocked
+                .expect_err("queued work already owns the action lease")
+                .code(),
+            "input_busy"
+        );
+        worker.await.unwrap();
+        table
+            .acquire(LeaseRequest::desktop_raw(None, Duration::ZERO))
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn deadline_workers_retain_capacity_across_repeated_timeouts() {

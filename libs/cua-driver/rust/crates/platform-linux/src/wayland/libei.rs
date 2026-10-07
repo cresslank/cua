@@ -144,9 +144,23 @@ enum Cmd {
     Shutdown,
 }
 
-static TX: OnceLock<Sender<Cmd>> = OnceLock::new();
+// Commands can outlive wait_for_reply's deadline. Retain each dispatch grant
+// through queueing, injection and the final flush, not for the worker lifetime.
+type QueuedCommand = (Cmd, cua_driver_core::blocking::ActionLeaseScope);
+struct CommandSender(Sender<QueuedCommand>);
 
-fn tx() -> anyhow::Result<&'static Sender<Cmd>> {
+impl CommandSender {
+    fn send(&self, command: Cmd) -> anyhow::Result<()> {
+        let lease = cua_driver_core::blocking::ActionLeaseScope::capture();
+        self.0
+            .send((command, lease))
+            .map_err(|_| anyhow::anyhow!("libei worker channel closed"))
+    }
+}
+
+static TX: OnceLock<CommandSender> = OnceLock::new();
+
+fn tx() -> anyhow::Result<&'static CommandSender> {
     TX.get()
         .ok_or_else(|| anyhow::anyhow!("libei worker not started; call ensure_started() first"))
 }
@@ -222,7 +236,7 @@ fn unparented_wayland_identifier() -> ashpd::WindowIdentifier {
 /// MCP tool invocation; subsequent calls are no-ops).
 pub fn ensure_started() -> anyhow::Result<()> {
     TX.get_or_init(|| {
-        let (tx, rx) = bounded::<Cmd>(64);
+        let (tx, rx) = bounded::<QueuedCommand>(64);
         thread::Builder::new()
             .name("cua-libei-worker".into())
             .spawn(move || {
@@ -231,7 +245,7 @@ pub fn ensure_started() -> anyhow::Result<()> {
                 }
             })
             .expect("spawn cua-libei-worker thread");
-        tx
+        CommandSender(tx)
     });
     Ok(())
 }
@@ -439,7 +453,7 @@ enum PortalKeepAlive {
     },
 }
 
-fn worker(rx: Receiver<Cmd>) -> anyhow::Result<()> {
+fn worker(rx: Receiver<QueuedCommand>) -> anyhow::Result<()> {
     // Phase 1 — acquire an EIS context (plus, on the portal path, a keep-alive
     // that owns the ashpd RemoteDesktop session + its tokio runtime).
     let (context, _portal_keepalive) =
@@ -561,7 +575,7 @@ fn open_eis_context() -> anyhow::Result<(reis::ei::Context, PortalKeepAlive)> {
 // click/move/type via the negotiated pointer/keyboard/text interfaces.
 // Region selection picks the first announced ei_device::Region.
 
-fn run_calloop(context: reis::ei::Context, rx: Receiver<Cmd>) -> anyhow::Result<()> {
+fn run_calloop(context: reis::ei::Context, rx: Receiver<QueuedCommand>) -> anyhow::Result<()> {
     use calloop::{generic::Generic, EventLoop, Interest, Mode};
 
     let mut event_loop: EventLoop<EisState> = EventLoop::try_new()
@@ -586,12 +600,12 @@ fn run_calloop(context: reis::ei::Context, rx: Receiver<Cmd>) -> anyhow::Result<
     // queue commands and run each only once `input_ready()`; fail any that wait
     // longer than READY_TIMEOUT (handle_command then replies with the natural
     // "no device" error) so a caller blocked on the reply never hangs forever.
-    let mut pending: Vec<(Cmd, std::time::Instant)> = Vec::new();
+    let mut pending: Vec<(QueuedCommand, std::time::Instant)> = Vec::new();
     const READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
     loop {
         match rx.try_recv() {
-            Ok(Cmd::Shutdown) => break,
+            Ok((Cmd::Shutdown, _)) => break,
             Ok(cmd) => pending.push((cmd, std::time::Instant::now())),
             Err(crossbeam_channel::TryRecvError::Empty) => {}
             Err(crossbeam_channel::TryRecvError::Disconnected) => break,
@@ -604,13 +618,15 @@ fn run_calloop(context: reis::ei::Context, rx: Receiver<Cmd>) -> anyhow::Result<
         // Run each queued command once the device IT needs is negotiated; time
         // stale ones out. Per-command (not one global gate) so a keyboard-only
         // session doesn't make keyboard commands wait 20s for a pointer device.
+        let mut completed_leases = Vec::new();
         if !pending.is_empty() {
             let mut still = Vec::with_capacity(pending.len());
-            for (cmd, queued) in pending.drain(..) {
+            for ((cmd, lease), queued) in pending.drain(..) {
                 if state.cmd_ready(&cmd) || queued.elapsed() >= READY_TIMEOUT {
-                    state.handle_command(cmd);
+                    lease.run(|| state.handle_command(cmd));
+                    completed_leases.push(lease);
                 } else {
-                    still.push((cmd, queued));
+                    still.push(((cmd, lease), queued));
                 }
             }
             pending = still;
@@ -621,6 +637,7 @@ fn run_calloop(context: reis::ei::Context, rx: Receiver<Cmd>) -> anyhow::Result<
         if let Some(ctx) = state.context.as_ref() {
             let _ = ctx.flush();
         }
+        drop(completed_leases);
     }
 
     Ok(())
@@ -1375,6 +1392,87 @@ fn drag_step_delay(duration_ms: u64, steps: u32) -> std::time::Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn queued_command_retains_dispatch_ownership_after_reply_waiter_leaves() {
+        use cua_driver_core::action_lease::{global, ExactWindow, LeaseRequest};
+        use cua_driver_core::protocol::ToolResult;
+        use cua_driver_core::tool::{Tool, ToolDef, ToolRegistry};
+        use std::time::Duration;
+
+        struct QueueProbe {
+            def: ToolDef,
+            sender: CommandSender,
+        }
+        #[async_trait::async_trait]
+        impl Tool for QueueProbe {
+            fn def(&self) -> &ToolDef {
+                &self.def
+            }
+            async fn invoke(&self, _: serde_json::Value) -> ToolResult {
+                let (reply, waiter) = bounded(1);
+                self.sender
+                    .send(Cmd::PressKey { keycode: 30, reply })
+                    .unwrap();
+                // Model a timed-out reply receiver without waiting 20 seconds.
+                drop(waiter);
+                ToolResult::text("waiter left")
+            }
+        }
+        let (sender, receiver) = bounded(1);
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(QueueProbe {
+            // A semantic grant exercises the same shared dispatch ownership,
+            // without starting portal readiness or touching the desktop.
+            def: ToolDef {
+                name: "set_value".into(),
+                description: "hermetic queue ownership".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+            sender: CommandSender(sender),
+        }));
+        let window = ExactWindow {
+            pid: 937453,
+            window_id: 21,
+        };
+        let result = registry
+            .invoke(
+                "set_value",
+                serde_json::json!({
+                    "pid": window.pid, "window_id": window.window_id
+                }),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(
+            global()
+                .acquire(LeaseRequest::window_semantic(window, Duration::ZERO))
+                .await
+                .unwrap_err()
+                .code(),
+            "target_busy"
+        );
+        let (command, lease) = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        drop(command);
+        // Removing/executing the command is not enough: the flush still owns it.
+        assert_eq!(
+            global()
+                .acquire(LeaseRequest::window_semantic(window, Duration::ZERO))
+                .await
+                .unwrap_err()
+                .code(),
+            "target_busy"
+        );
+        drop(lease);
+        global()
+            .acquire(LeaseRequest::window_semantic(window, Duration::ZERO))
+            .await
+            .unwrap();
+    }
 
     #[test]
     fn unparented_portal_dialog_uses_nonempty_wayland_identifier() {

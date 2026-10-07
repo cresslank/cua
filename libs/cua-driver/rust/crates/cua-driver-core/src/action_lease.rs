@@ -337,6 +337,7 @@ impl std::fmt::Debug for ActionLease {
 
 struct HeldLease {
     id: u64,
+    retain_until_drop: bool,
     resources: Vec<LeaseResource>,
     owner: Option<String>,
 }
@@ -408,6 +409,23 @@ impl ActionLeaseTable {
         self: &Arc<Self>,
         request: LeaseRequest,
     ) -> Result<ActionLease, LeaseError> {
+        self.acquire_inner(request, false).await
+    }
+
+    /// Pin dispatch grants atomically with admission. Transport teardown may
+    /// invalidate waiters, but cannot release uncancellable native execution.
+    pub(crate) async fn acquire_for_dispatch(
+        self: &Arc<Self>,
+        request: LeaseRequest,
+    ) -> Result<Arc<ActionLease>, LeaseError> {
+        self.acquire_inner(request, true).await.map(Arc::new)
+    }
+
+    async fn acquire_inner(
+        self: &Arc<Self>,
+        request: LeaseRequest,
+        retain_until_drop: bool,
+    ) -> Result<ActionLease, LeaseError> {
         let needed = Self::resources_for(&request);
         if needed.is_empty() {
             return Ok(self.issue(Vec::new(), request.owner));
@@ -415,7 +433,7 @@ impl ActionLeaseTable {
         let deadline = Instant::now() + request.wait;
         let epoch = self.reap_epoch();
         loop {
-            match self.try_grant(&needed, request.owner.as_deref(), epoch) {
+            match self.try_grant(&needed, request.owner.as_deref(), epoch, retain_until_drop) {
                 Ok(Some(lease)) => return Ok(lease),
                 Ok(None) => {}
                 Err(error) => return Err(error),
@@ -426,7 +444,7 @@ impl ActionLeaseTable {
             }
             let remaining = deadline.saturating_duration_since(now);
             let notified = self.notify.notified();
-            match self.try_grant(&needed, request.owner.as_deref(), epoch) {
+            match self.try_grant(&needed, request.owner.as_deref(), epoch, retain_until_drop) {
                 Ok(Some(lease)) => return Ok(lease),
                 Ok(None) => {}
                 Err(error) => return Err(error),
@@ -463,7 +481,7 @@ impl ActionLeaseTable {
                 .flat_map(|held| held.resources.iter().cloned())
                 .collect();
             if !set_conflicts(&needed, &held) {
-                return Ok(self.issue_locked(&mut inner, needed, request.owner.clone()));
+                return Ok(self.issue_locked(&mut inner, needed, request.owner.clone(), false));
             }
             let now = Instant::now();
             if now >= deadline {
@@ -494,11 +512,17 @@ impl ActionLeaseTable {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let before = inner.held.len();
+        let affected = inner
+            .held
+            .iter()
+            .any(|held| held.owner.as_deref() == Some(owner));
         inner
             .held
-            .retain(|held| held.owner.as_deref() != Some(owner));
+            .retain(|held| held.owner.as_deref() != Some(owner) || held.retain_until_drop);
         let released = before - inner.held.len();
-        if released > 0 {
+        // Invalidate queued requests even when a live worker still owns the
+        // grant. A later caller must wait for that worker's final Arc to drop.
+        if affected {
             inner.reap_epoch = inner.reap_epoch.wrapping_add(1);
             drop(inner);
             self.condvar.notify_all();
@@ -523,6 +547,7 @@ impl ActionLeaseTable {
         needed: &[LeaseResource],
         owner: Option<&str>,
         epoch: u64,
+        retain_until_drop: bool,
     ) -> Result<Option<ActionLease>, LeaseError> {
         let mut inner = self
             .inner
@@ -543,6 +568,7 @@ impl ActionLeaseTable {
             &mut inner,
             needed.to_vec(),
             owner.map(str::to_owned),
+            retain_until_drop,
         )))
     }
 
@@ -555,7 +581,7 @@ impl ActionLeaseTable {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.issue_locked(&mut inner, resources, owner)
+        self.issue_locked(&mut inner, resources, owner, false)
     }
 
     fn issue_locked(
@@ -563,11 +589,13 @@ impl ActionLeaseTable {
         inner: &mut TableInner,
         resources: Vec<LeaseResource>,
         owner: Option<String>,
+        retain_until_drop: bool,
     ) -> ActionLease {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         if !resources.is_empty() {
             inner.held.push(HeldLease {
                 id,
+                retain_until_drop,
                 resources,
                 owner,
             });
@@ -1034,6 +1062,41 @@ mod tests {
             .acquire(LeaseRequest::desktop_raw(None, Duration::ZERO))
             .await
             .expect("a later caller can take the seat after reap");
+    }
+
+    #[tokio::test]
+    async fn transport_reap_cannot_release_a_live_dispatch_grant() {
+        let table = ActionLeaseTable::new();
+        let lease = table
+            .acquire_for_dispatch(
+                LeaseRequest::desktop_raw(None, Duration::ZERO).with_owner("detached-client"),
+            )
+            .await
+            .unwrap();
+        let worker = lease.clone();
+        drop(lease);
+        // Poll the waiter into the table before reaping; no timing assumption.
+        let mut waiter =
+            Box::pin(table.acquire(LeaseRequest::desktop_raw(None, Duration::from_secs(2))));
+        assert!(matches!(
+            futures_util::poll!(&mut waiter),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(table.release_all_for_owner("detached-client"), 0);
+        assert_eq!(waiter.await.unwrap_err().code(), "input_stale");
+        assert_eq!(
+            table
+                .acquire(LeaseRequest::desktop_raw(None, Duration::ZERO))
+                .await
+                .unwrap_err()
+                .code(),
+            "input_busy"
+        );
+        drop(worker);
+        table
+            .acquire(LeaseRequest::desktop_raw(None, Duration::ZERO))
+            .await
+            .unwrap();
     }
 
     #[test]
