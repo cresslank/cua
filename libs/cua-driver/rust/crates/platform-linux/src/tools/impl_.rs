@@ -4530,6 +4530,40 @@ fn isolated_background_routes_do_not_reprobe_availability_before_primary_fallbac
 
 #[cfg(test)]
 #[test]
+fn right_click_refuses_synthetic_pointer_targets_before_element_delegation() {
+    // e161b001e put the element delegation to ClickTool above these refusals,
+    // so a background right click on a GTK or WebKit element was sent as an
+    // XSendEvent the toolkit drops, and reported as dispatched.
+    let source = include_str!("impl_.rs");
+    let invoke = source
+        .rsplit_once("impl Tool for RightClickTool {")
+        .unwrap()
+        .1
+        .split_once("impl Tool for DragTool {")
+        .unwrap()
+        .0
+        .split_once("async fn invoke")
+        .unwrap()
+        .1;
+    let delegation = invoke
+        .find("args.get(\"element_token\").is_some()")
+        .expect("right_click must route element targets through ClickTool");
+    for refusal in [
+        "unavailable_chromium_background(pid, delivery)",
+        "unavailable_webkit_background(pid, delivery)",
+        "unavailable_gtk_pointer_background(pid, delivery)",
+        "unavailable_wayland_focused_input_background(delivery, true)",
+    ] {
+        let at = invoke.find(refusal).expect(refusal);
+        assert!(
+            at < delegation,
+            "{refusal} must run before element delegation"
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn type_text_routes_isolated_background_before_generic_wayland_refusal() {
     let source = include_str!("impl_.rs");
     let invoke = source
@@ -9074,17 +9108,6 @@ impl Tool for RightClickTool {
         })
     }
     async fn invoke(&self, args: Value) -> ToolResult {
-        if args.get("element_index").is_some() || args.get("element_token").is_some() {
-            let mut args = args;
-            args["button"] = json!("right");
-            args["count"] = json!(1);
-            return ClickTool {
-                state: self.state.clone(),
-            }
-            .invoke(args)
-            .await;
-        }
-
         if args.get("capture_id").is_some() {
             return ToolResult::error("capture_id input routing is not yet qualified on the hardened Linux adapter; refresh get_window_state and use an element token or window coordinates")
                 .with_structured(json!({"code":"capture_route_unqualified","effect":"refused"}));
@@ -9107,6 +9130,19 @@ impl Tool for RightClickTool {
         }
         if let Some(refusal) = unavailable_wayland_focused_input_background(delivery, true) {
             return refusal;
+        }
+        if args.get("element_index").is_some() || args.get("element_token").is_some() {
+            // Element targets share ClickTool's token route. A right click has
+            // no accessibility action, so it is always pointer input and the
+            // background refusals above must run first.
+            let mut args = args;
+            args["button"] = json!("right");
+            args["count"] = json!(1);
+            return ClickTool {
+                state: self.state.clone(),
+            }
+            .invoke(args)
+            .await;
         }
         if hyprland_foreground(delivery) {
             // Share exact-target validation and the admitted native click lifecycle.
