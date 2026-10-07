@@ -205,10 +205,13 @@ impl Snapshots {
                         }}),
                     )
                 })?;
-            // These routes still focus or scroll a newly walked ordinal. Until
-            // they carry one retained native object through every dispatch, do
-            // not let a valid token authorize that different addressing model.
-            if !matches!(tool, "click" | "set_value") {
+            // Only routes carrying the retained native identity and generation
+            // permit through every mutation are qualified. Scroll and secondary
+            // clicks still use newly walked ordinals and remain refused.
+            if !matches!(
+                tool,
+                "click" | "set_value" | "type_text" | "press_key" | "hotkey"
+            ) {
                 return Err(cua_driver_core::protocol::ToolResult::error(format!(
                     "{tool}: snapshot-bound element delivery is not qualified on Linux"
                 ))
@@ -574,9 +577,9 @@ mod tests {
                 let cache = Snapshots::new();
                 let pid = std::process::id();
                 let window = 0x7f30_0101;
-                let id = cache
-                    .publish(cache.prepare(pid, window, &[node(7, 41)]).unwrap())
-                    .unwrap();
+                let candidate = cache.prepare(pid, window, &[node(7, 41)]).unwrap();
+                let expected_identity = candidate.identity();
+                let id = cache.publish(candidate).unwrap();
                 let token = cua_driver_core::element_token::token_for(id, 7);
                 for tool in [
                     "type_text",
@@ -586,20 +589,96 @@ mod tests {
                     "double_click",
                     "right_click",
                 ] {
-                    let error = cache
-                        .resolve_for_tool(
-                            pid as i32,
-                            &serde_json::json!({"element_token": &token, "window_id": window}),
-                            tool,
-                        )
-                        .unwrap_err();
-                    assert_eq!(
-                        error.structured_content.unwrap()["refusal"]["code"],
-                        "element_route_unqualified"
+                    let result = cache.resolve_for_tool(
+                        pid as i32,
+                        &serde_json::json!({"element_token": &token, "window_id": window}),
+                        tool,
                     );
+                    if matches!(tool, "type_text" | "press_key" | "hotkey") {
+                        assert!(matches!(result.unwrap(),
+                            cua_driver_core::element_token::ResolvedElement::Element {
+                                window_id, element_index: 7, snapshot_identity, ..
+                            } if window_id == window
+                                && snapshot_identity == expected_identity
+                        ));
+                    } else {
+                        let error = result.unwrap_err();
+                        assert_eq!(
+                            error.structured_content.unwrap()["refusal"]["code"],
+                            "element_route_unqualified"
+                        );
+                    }
                 }
             },
         );
+    }
+
+    #[test]
+    fn keyboard_tokens_require_current_generation_and_matching_sparse_index() {
+        isolated(|| {
+            let cache = Snapshots::new();
+            let pid = std::process::id();
+            let window = 0x7f30_0103;
+            let id = cache
+                .publish(cache.prepare(pid, window, &[node(7, 41)]).unwrap())
+                .unwrap();
+            let token = cua_driver_core::element_token::token_for(id, 7);
+            for tool in ["type_text", "press_key", "hotkey"] {
+                assert!(cache
+                    .resolve_for_tool(
+                        pid as i32,
+                        &serde_json::json!({
+                            "element_token":token, "element_index":7, "window_id":window
+                        }),
+                        tool
+                    )
+                    .is_ok());
+                for args in [
+                    serde_json::json!({"element_token":token, "element_index":0}),
+                    serde_json::json!({"element_token":cua_driver_core::element_token::token_for(id, 0)}),
+                ] {
+                    assert_eq!(
+                        cache
+                            .resolve_for_tool(pid as i32, &args, tool)
+                            .unwrap_err()
+                            .structured_content
+                            .unwrap()["refusal"]["code"],
+                        "stale_element_token"
+                    );
+                }
+                assert_eq!(
+                    cache
+                        .resolve_for_tool(
+                            pid as i32,
+                            &serde_json::json!({
+                                "element_token":token, "window_id":window + 1
+                            }),
+                            tool
+                        )
+                        .unwrap_err()
+                        .structured_content
+                        .unwrap()["refusal"]["code"],
+                    "conflicting_element_target"
+                );
+            }
+            cache
+                .publish(cache.prepare(pid, window, &[node(7, 42)]).unwrap())
+                .unwrap();
+            for tool in ["type_text", "press_key", "hotkey"] {
+                assert_eq!(
+                    cache
+                        .resolve_for_tool(
+                            pid as i32,
+                            &serde_json::json!({"element_token":token}),
+                            tool
+                        )
+                        .unwrap_err()
+                        .structured_content
+                        .unwrap()["refusal"]["code"],
+                    "stale_element_token"
+                );
+            }
+        });
     }
 
     #[test]

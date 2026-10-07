@@ -4434,7 +4434,6 @@ async fn focus_hyprland_foreground(
     args: &Value,
     pid: u32,
     xid: u64,
-    element: Option<usize>,
     pixel: Option<(f64, f64)>,
 ) -> Result<(), ToolResult> {
     if !crate::wayland::hyprland_input::enabled() {
@@ -4453,24 +4452,6 @@ async fn focus_hyprland_foreground(
             args.bool_or("from_zoom", false),
         )
         .await;
-    }
-    if let Some(index) = element {
-        let activation = foreground_hyprland_action(
-            args,
-            pid,
-            xid,
-            crate::wayland::hyprland_input::Action::Activate,
-        )
-        .await;
-        if activation.is_error == Some(true) {
-            return Err(activation);
-        }
-        match cua_driver_core::blocking::spawn(move || crate::atspi::focus_element(pid, index))
-            .await
-        {
-            Ok(Ok(true)) => {}
-            _ => return Err(foreground_hyprland_refusal("AT-SPI child focus failed")),
-        }
     }
     Ok(())
 }
@@ -4640,6 +4621,163 @@ fn right_click_refuses_synthetic_pointer_targets_before_element_delegation() {
             "{refusal} must run before element delegation"
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn keyboard_element_routes_never_rewalk_ordinals() {
+    // Split item/section anchors so this test cannot terminate another source
+    // guard's section before it reaches the production implementation.
+    let source = include_str!("impl_.rs");
+    let forbidden = [
+        concat!("focus_", "element(pid"),
+        concat!("type_into_editable", "_at("),
+        concat!("get_element_", "bounds(pid"),
+        concat!("get_element_bounds_", "for_window("),
+        concat!("resolve_element_", "local_coords("),
+    ];
+    for (start, end) in [
+        (
+            concat!("impl ", "Tool for TypeTextTool {"),
+            concat!("impl ", "Tool for PressKeyTool {"),
+        ),
+        (
+            concat!("impl ", "Tool for PressKeyTool {"),
+            concat!("impl ", "Tool for HotkeyTool {"),
+        ),
+        (
+            concat!("impl ", "Tool for HotkeyTool {"),
+            concat!("impl ", "Tool for SetValueTool {"),
+        ),
+    ] {
+        let invoke = source
+            .rsplit_once(start)
+            .unwrap()
+            .1
+            .split_once(end)
+            .unwrap()
+            .0
+            .split_once(concat!("async fn ", "invoke"))
+            .unwrap()
+            .1;
+        for ordinal in forbidden {
+            assert!(
+                !invoke.contains(ordinal),
+                "{start} contains ordinal route {ordinal}"
+            );
+        }
+        let retained = invoke
+            .find("return invoke_observed_keyboard(")
+            .expect("return through retained route");
+        assert!(invoke.contains("snapshot_identity.expect(\"element has identity\")"));
+        assert!(
+            invoke
+                .find("unavailable_chromium_background(pid, delivery)")
+                .unwrap()
+                < retained
+        );
+        if start != concat!("impl ", "Tool for TypeTextTool {") {
+            for refusal in [
+                "unavailable_webkit_keyboard_background",
+                "unavailable_gtk_keyboard_background",
+                "unavailable_wayland_focused_input_background",
+            ] {
+                assert!(
+                    invoke.find(refusal).unwrap() < retained,
+                    "{start}: {refusal} precedes mutation"
+                );
+            }
+        } else {
+            assert!(
+                invoke
+                    .find("unavailable_webkit_keyboard_background")
+                    .unwrap()
+                    < retained
+            );
+        }
+        assert!(retained < invoke.find("if hyprland_foreground(delivery)").unwrap());
+        // Overlay/legacy pixel helpers may not receive snapshot indices even
+        // if someone later accidentally moves them above the early return.
+        let compact: String = invoke.split_whitespace().collect();
+        assert!(!compact.contains("xid,resolved_elem"));
+    }
+    for (start, end) in [
+        (
+            concat!("impl ", "ObservedKeyboardAction {"),
+            concat!("async fn ", "focus_by_pixel("),
+        ),
+        (
+            concat!("async fn ", "focus_hyprland_foreground("),
+            concat!("#[cfg(", "test)]"),
+        ),
+        (
+            concat!("async fn ", "focus_nested_inject_target("),
+            concat!("// ── ", "type_text"),
+        ),
+    ] {
+        let helper = source
+            .rsplit_once(start)
+            .unwrap()
+            .1
+            .split_once(end)
+            .unwrap()
+            .0;
+        for ordinal in forbidden {
+            assert!(
+                !helper.contains(ordinal),
+                "{start} contains ordinal route {ordinal}"
+            );
+        }
+    }
+    let helper = source
+        .rsplit_once(concat!("async fn ", "invoke_observed_keyboard("))
+        .unwrap()
+        .1
+        .split_once(concat!("async fn ", "focus_by_pixel("))
+        .unwrap()
+        .0;
+    assert!(helper.contains("acquire_observed_mutation(snapshot_identity, index)"));
+    assert!(helper.contains("resolve_observed_target(pid, index, xid, &identity, proof)"));
+    assert!(helper.contains("Some(crate::wayland::establish_exact_target(pid, xid)?)"));
+    assert!(helper.contains("Ok(Some((Arc::new(permit), target)))"));
+    assert!(helper.contains("let _permit = permit;"));
+    assert!(helper.contains("if activation[\"ok\"] != true"));
+    assert!(helper.contains("return Ok(activation);"));
+    assert!(helper.contains("let _mutation = &permit;"));
+    assert!(helper.contains("with_x11_foreground_permit("));
+    assert!(helper.contains("Some(permit.clone())"));
+    assert!(helper.contains("target.type_into_editable(text)?"));
+    assert!(!helper.contains("unwrap_or(false)"));
+    for call in [
+        "action.send_nested(xid)?",
+        "action.send_wayland(validate)",
+        "action.send_x11(xid, true)",
+        "action.send_x11(xid, false)?",
+    ] {
+        let before = helper.split_once(call).unwrap().0;
+        assert!(
+            before.trim_end().ends_with("target.verify_live()?;"),
+            "{call} revalidates before injection"
+        );
+        assert!(before.rsplit_once("target.focus()?;").is_some());
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn keyboard_retained_errors_preserve_stale_refusal() {
+    let stale = observed_keyboard_error(
+        anyhow::anyhow!("stale_element_token: object disappeared")
+            .context("observed editable refresh"),
+    );
+    assert_eq!(
+        stale.structured_content.unwrap()["refusal"]["code"],
+        "stale_element_token"
+    );
+    let indeterminate =
+        observed_keyboard_error(anyhow::anyhow!("write timed out; refusing replay"));
+    assert_eq!(indeterminate.is_error, Some(true));
+    assert!(indeterminate.structured_content.is_none());
 }
 
 #[cfg(test)]
@@ -6465,6 +6603,291 @@ impl Tool for ClickTool {
 
 // ── px-focus helper (keyboard family) ───────────────────────────────────────
 
+/// A snapshot-bound keyboard action never rejoins the unaddressed editable,
+/// terminal, pixel-focus, or focused-widget fallback ladders below.
+#[derive(Clone)]
+enum ObservedKeyboardAction {
+    Text(String),
+    Key { key: String, modifiers: Vec<String> },
+}
+
+impl ObservedKeyboardAction {
+    fn send_wayland(
+        &self,
+        guard: &crate::wayland::ExactTargetInputGuard<'_>,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Text(text) => crate::wayland::type_text_focused_for_target(guard, text),
+            Self::Key { key, modifiers } => match press_key_chord(modifiers, key) {
+                Some(chord) => crate::wayland::hotkey_focused_for_target(guard, &chord),
+                None => crate::wayland::press_key_focused_for_target(guard, key),
+            },
+        }
+    }
+
+    fn send_nested(&self, xid: u64) -> anyhow::Result<()> {
+        match self {
+            Self::Text(text) => crate::wayland::inject_type_text(xid, text),
+            Self::Key { key, modifiers } => match press_key_chord(modifiers, key) {
+                Some(chord) => crate::wayland::inject_hotkey(xid, &chord),
+                None => crate::wayland::inject_press_key(xid, key),
+            },
+        }
+    }
+
+    fn send_x11(&self, xid: u64, foreground: bool) -> anyhow::Result<()> {
+        match self {
+            Self::Text(text) => {
+                anyhow::ensure!(
+                    foreground,
+                    "background text requires a retained EditableText"
+                );
+                crate::input::send_type_text_xtest(text)
+            }
+            Self::Key { key, modifiers } => {
+                let refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                if foreground {
+                    crate::input::send_key_xtest(key, &refs)
+                } else {
+                    crate::input::send_key(xid, key, &refs)
+                }
+            }
+        }
+    }
+
+    fn result(&self, path: &str, foreground: bool) -> ToolResult {
+        match self {
+            Self::Text(text) => ToolResult::text(format!(
+                "Typed {} character(s) into the observed element.", text.chars().count(),
+            )).with_structured(type_text_structured(path, text.chars().count(), false)),
+            Self::Key { .. } => ToolResult::text("Sent keys to the observed element.")
+                .with_structured(json!({"path":path, "verified":false,
+                    "effect":"unverifiable", "delivery_mode": if foreground { "foreground" } else { "background" }})),
+        }
+    }
+}
+
+fn observed_keyboard_error(error: anyhow::Error) -> ToolResult {
+    let message = format!("{error:#}");
+    let result = ToolResult::error(message.clone());
+    if message.contains("stale_element_token") {
+        result.with_structured(json!({"status":"refused", "effect":"refused",
+            "code":"stale_element_token", "refusal":{"code":"stale_element_token", "message":message}}))
+    } else {
+        result
+    }
+}
+
+/// Resolve once under the snapshot's generation permit, then move BOTH the
+/// retained object and permit into every native worker. Cancellation of an
+/// async waiter cannot retire the generation while native input is in flight.
+/// Cosmetic cursor positioning is deliberately skipped for this route: the
+/// legacy overlay helpers re-walk indices and confer no mutation authority.
+async fn invoke_observed_keyboard(
+    state: &Arc<ToolState>,
+    args: &Value,
+    pid: u32,
+    xid: u64,
+    index: usize,
+    snapshot_identity: cua_driver_core::element_token::SnapshotIdentity,
+    delivery: crate::input::delivery::DeliveryMode,
+    action: ObservedKeyboardAction,
+) -> ToolResult {
+    let snapshots = state.snapshots.clone();
+    let attempt = action.clone();
+    let resolved = cua_driver_core::blocking::spawn(move || -> anyhow::Result<_> {
+        let (permit, identity) = snapshots
+            .acquire_observed_mutation(snapshot_identity, index)
+            .map_err(|error| anyhow::anyhow!("stale_element_token: {error}"))?;
+        let proof = if crate::wayland::wayland_input_enabled() {
+            Some(crate::wayland::establish_exact_target(pid, xid)?)
+        } else {
+            None
+        };
+        let target =
+            crate::atspi::native::resolve_observed_target(pid, index, xid, &identity, proof)
+                .map_err(|error| anyhow::anyhow!("stale_element_token: {error:#}"))?;
+        if let ObservedKeyboardAction::Text(text) = &attempt {
+            // Renderer bridges can echo EditableText without DOM input events.
+            // Native editables retain their stronger focus-free addressed route.
+            if !is_chromium_embedder(pid)
+                && !is_webkitgtk_embedder(pid)
+                && target.type_into_editable(text)?
+            {
+                return Ok(None);
+            }
+        }
+        Ok(Some((Arc::new(permit), target)))
+    })
+    .await;
+    let retained = match resolved {
+        Ok(Ok(retained)) => retained,
+        Ok(Err(error)) => return observed_keyboard_error(error),
+        Err(error) => return ToolResult::error(format!("Task error: {error}")),
+    };
+    let Some((permit, target)) = retained else {
+        let ObservedKeyboardAction::Text(text) = &action else {
+            unreachable!()
+        };
+        return type_text_ax_result(pid, text.chars().count(), "via retained AT-SPI");
+    };
+
+    if hyprland_foreground(delivery) {
+        if !crate::wayland::hyprland_input::enabled() {
+            return foreground_hyprland_refusal("production Hyprland input plugin is unavailable");
+        }
+        // Preserve the Hyprland validation gates before any activation/focus.
+        let key_action = match &action {
+            ObservedKeyboardAction::Text(text) => {
+                match crate::wayland::hyprland_input::text_actions(text) {
+                    Ok(actions) if !actions.is_empty() => {}
+                    Ok(_) => {
+                        return foreground_hyprland_refusal("foreground text must not be empty")
+                    }
+                    Err(error) => return foreground_hyprland_refusal(error.to_string()),
+                }
+                None
+            }
+            ObservedKeyboardAction::Key { key, modifiers } => {
+                if let Some(keys) = args.get("keys").and_then(Value::as_array) {
+                    if keys.iter().any(|key| !key.is_string())
+                        || keys
+                            .iter()
+                            .filter(|key| key.as_str().is_some_and(|key| !is_modifier(key)))
+                            .count()
+                            != 1
+                    {
+                        return foreground_hyprland_refusal(
+                            "hotkeys require exactly one non-modifier key",
+                        );
+                    }
+                }
+                match foreground_hyprland_key(key.clone(), modifiers.clone()) {
+                    Ok(action) => Some(action),
+                    Err(error) => return error,
+                }
+            }
+        };
+        let owner = named_session_cursor_key(args);
+        let (_cancellation, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
+            let _permit = permit;
+            target.verify_live()?;
+            let activation = crate::wayland::hyprland_input::execute_foreground(
+                owner.clone(),
+                pid,
+                xid,
+                crate::wayland::hyprland_input::Action::Activate,
+                cancellation.clone(),
+            )?;
+            if activation["ok"] != true {
+                return Ok(activation);
+            }
+            target.focus()?;
+            target.verify_live()?;
+            match action {
+                ObservedKeyboardAction::Text(text) => {
+                    crate::wayland::hyprland_input::execute_foreground_text(
+                        owner,
+                        pid,
+                        xid,
+                        &text,
+                        cancellation,
+                    )
+                }
+                ObservedKeyboardAction::Key { .. } => {
+                    crate::wayland::hyprland_input::execute_foreground(
+                        owner,
+                        pid,
+                        xid,
+                        key_action.expect("validated key action"),
+                        cancellation,
+                    )
+                }
+            }
+        }) {
+            Ok(dispatch) => dispatch,
+            Err(_) => {
+                return foreground_hyprland_refusal("authenticated admitted lifecycle required")
+            }
+        };
+        return match dispatch.await {
+            Ok(Err(error)) if format!("{error:#}").contains("stale_element_token") => {
+                observed_keyboard_error(error)
+            }
+            Ok(result) => hyprland_input_result(result, true),
+            Err(error) => hyprland_input_result(
+                Err(crate::wayland::hyprland_input::unknown_dispatch(
+                    error.into(),
+                    0,
+                )),
+                true,
+            ),
+        };
+    }
+
+    let foreground = delivery.is_foreground();
+    let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<ToolResult> {
+        // Own the permit through focus, all key injection, and restoration,
+        // even when the caller drops the JoinHandle. X11 also shares it with
+        // its admission-bounded activation/restoration continuations.
+        let _mutation = &permit;
+        if crate::wayland::is_inject_mode() {
+            target.focus()?;
+            target.verify_live()?;
+            action.send_nested(xid)?;
+            return Ok(action.result("key_events", foreground));
+        }
+        if crate::wayland::wayland_input_enabled() {
+            if !foreground {
+                return Ok(crate::input::delivery::background_unavailable_error(
+                    crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
+                ));
+            }
+            crate::wayland::with_target_foreground(pid, xid, |validate| {
+                target.focus()?;
+                target.verify_live()?;
+                action.send_wayland(validate)
+            })?;
+            return Ok(action.result("key_events", true));
+        }
+        if foreground {
+            crate::input::foreground::with_x11_foreground_permit(
+                xid,
+                crate::input::ForegroundOptions::from_settle_hint(80),
+                Some(permit.clone()),
+                || {
+                    target.focus()?;
+                    target.verify_live()?;
+                    action.send_x11(xid, true)
+                },
+            )?;
+        } else {
+            if matches!(action, ObservedKeyboardAction::Text(_)) {
+                return Ok(crate::input::delivery::background_unavailable_error(
+                    crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
+                ));
+            }
+            target.focus()?;
+            target.verify_live()?;
+            action.send_x11(xid, false)?;
+        }
+        Ok(action.result(
+            if foreground {
+                "key_events_fg"
+            } else {
+                "key_events"
+            },
+            foreground,
+        ))
+    })
+    .await;
+    match result {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => observed_keyboard_error(error),
+        Err(error) => ToolResult::error(format!("Task error: {error}")),
+    }
+}
+
 /// px-focus for the keyboard family (type_text / press_key / hotkey): pixel-click
 /// at (x,y) to establish real renderer focus before a keystroke — the *element px
 /// action* form of a keyboard tool. Reuses ClickTool's exact coordinate
@@ -6515,29 +6938,14 @@ async fn focus_by_pixel(
     Ok(())
 }
 
-/// Establish widget-local focus inside a nested-compositor target without
-/// changing the compositor's focused toplevel. AX uses Component.GrabFocus;
-/// PX sends a private per-surface left click at the requested local point.
+/// Establish pixel-local focus inside a nested-compositor target without
+/// changing the compositor's focused toplevel. Element routes instead focus
+/// their retained Component in invoke_observed_keyboard.
 async fn focus_nested_inject_target(
     pid: u32,
     window_id: u64,
-    element_index: Option<usize>,
     pixel: Option<(f64, f64)>,
 ) -> Result<(), ToolResult> {
-    if let Some(index) = element_index {
-        return match cua_driver_core::blocking::spawn(move || {
-            crate::atspi::focus_element(pid, index)
-        })
-        .await
-        {
-            Ok(Ok(true)) => Ok(()),
-            Ok(Ok(false)) => Err(ToolResult::error(format!(
-                "AT-SPI Component.GrabFocus returned false for element {index}"
-            ))),
-            Ok(Err(error)) => Err(ToolResult::error(error.to_string())),
-            Err(error) => Err(ToolResult::error(format!("Task error: {error}"))),
-        };
-    }
     if let Some((x, y)) = pixel {
         return match cua_driver_core::blocking::spawn(move || {
             let target = crate::wayland::establish_exact_target(pid, window_id)?;
@@ -6642,13 +7050,18 @@ impl Tool for TypeTextTool {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let (resolved_elem_idx, resolved_window_id) = match &resolved {
+        let (resolved_elem_idx, resolved_window_id, snapshot_identity) = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element {
                 element_index,
                 window_id,
+                snapshot_identity,
                 ..
-            } => (Some(*element_index), Some(*window_id)),
-            cua_driver_core::element_token::ResolvedElement::None => (None, None),
+            } => (
+                Some(*element_index),
+                Some(*window_id),
+                Some(*snapshot_identity),
+            ),
+            cua_driver_core::element_token::ResolvedElement::None => (None, None, None),
         };
         let xid_opt = resolved_window_id.or(args.opt_u64("window_id"));
 
@@ -6735,48 +7148,39 @@ impl Tool for TypeTextTool {
             );
         }
 
+        if let Some(index) = resolved_elem_idx {
+            if let Some(refusal) = unavailable_webkit_keyboard_background(pid, delivery) {
+                return refusal;
+            }
+            return invoke_observed_keyboard(
+                &self.state,
+                &args,
+                pid,
+                xid,
+                index,
+                snapshot_identity.expect("element has identity"),
+                delivery,
+                ObservedKeyboardAction::Text(text),
+            )
+            .await;
+        }
+
         if hyprland_foreground(delivery) {
             if xid_opt.is_none() {
                 return foreground_hyprland_refusal("an exact window_id is required");
-            }
-            // Native editables retain their verifiable, addressed AT-SPI route.
-            if !is_chromium_embedder(pid) && !is_webkitgtk_embedder(pid) {
-                if let Some(index) = resolved_elem_idx {
-                    let text_ax = text.clone();
-                    if matches!(
-                        cua_driver_core::blocking::spawn(move || {
-                            crate::atspi::type_into_editable_at(pid, index, &text_ax)
-                        })
-                        .await,
-                        Ok(Ok(()))
-                    ) {
-                        return type_text_ax_result(
-                            pid,
-                            text.chars().count(),
-                            "via targeted AT-SPI",
-                        );
-                    }
-                }
             }
             match crate::wayland::hyprland_input::text_actions(&text) {
                 Ok(actions) if !actions.is_empty() => {}
                 Ok(_) => return foreground_hyprland_refusal("foreground text must not be empty"),
                 Err(error) => return foreground_hyprland_refusal(error.to_string()),
             }
-            if let Err(error) = focus_hyprland_foreground(
-                &self.state,
-                &args,
-                pid,
-                xid,
-                resolved_elem_idx,
-                px.zip(py),
-            )
-            .await
+            if let Err(error) =
+                focus_hyprland_foreground(&self.state, &args, pid, xid, px.zip(py)).await
             {
                 return error;
             }
             if named_session_cursor_key(&args).is_none() {
-                announce_keyboard_target(&args, pid, xid, resolved_elem_idx, px.zip(py)).await;
+                announce_keyboard_target(&args, pid, xid, None, px.zip(py)).await;
             }
             let owner = named_session_cursor_key(&args);
             let (_cancellation, dispatch) =
@@ -6813,38 +7217,18 @@ impl Tool for TypeTextTool {
             &args,
             pid,
             xid,
-            resolved_elem_idx,
+            None,
             px.zip(py),
             true,
         )
         .await;
 
         let text_len = text.chars().count();
-        // Native toolkit editables have a stronger focus-free route than raw
-        // compositor keyboard injection. Keep Chromium/WebKit on real key events
-        // because their accessibility bridges may echo a write that never reaches
-        // renderer-owned state.
-        if let Some(idx) = resolved_elem_idx.filter(|_| {
-            crate::wayland::is_inject_mode()
-                && !is_chromium_embedder(pid)
-                && !is_webkitgtk_embedder(pid)
-        }) {
-            let text_at = text.clone();
-            let targeted = cua_driver_core::blocking::spawn(move || {
-                crate::atspi::type_into_editable_at(pid, idx, &text_at)
-            })
-            .await;
-            if let Ok(Ok(())) = targeted {
-                return type_text_ax_result(pid, text_len, "via targeted AT-SPI");
-            }
-        }
         // The private nested compositor can target the owning Wayland client
         // directly. Establish widget-local focus first, without changing the
         // compositor's focused toplevel, so keys reach the addressed control.
         if crate::wayland::is_inject_mode() {
-            if let Err(error) =
-                focus_nested_inject_target(pid, xid, resolved_elem_idx, px.zip(py)).await
-            {
+            if let Err(error) = focus_nested_inject_target(pid, xid, px.zip(py)).await {
                 return error;
             }
             let text_w = text.clone();
@@ -6894,77 +7278,6 @@ impl Tool for TypeTextTool {
             // focused element via the background key / AT-SPI rung.
         }
 
-        if resolved_elem_idx.is_some() {
-            if let Some(refusal) = unavailable_webkit_keyboard_background(pid, delivery) {
-                return refusal;
-            }
-        }
-
-        // Renderer EditableText writes can update the accessible value without
-        // emitting the DOM input event. For an explicit foreground request on
-        // native Wayland, focus the named field and send real keyboard input so
-        // Chromium/WebKit observe the same event sequence as a user.
-        if delivery.is_foreground()
-            && crate::wayland::wayland_input_enabled()
-            && (is_chromium_embedder(pid) || is_webkitgtk_embedder(pid))
-        {
-            if let Some(idx) = resolved_elem_idx {
-                let text_w = text.clone();
-                let result = cua_driver_core::blocking::spawn(move || {
-                    let target = crate::wayland::establish_exact_target(pid, xid)?;
-                    crate::wayland::validate_exact_target(&target)?;
-                    crate::wayland::with_target_foreground(pid, xid, |validate| {
-                        if !crate::atspi::focus_element(pid, idx)? {
-                            anyhow::bail!(
-                                "AT-SPI Component.GrabFocus returned false for element {idx}"
-                            );
-                        }
-                        crate::wayland::type_text_focused_for_target(validate, &text_w)
-                    })?;
-                    Ok::<
-                        Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
-                        anyhow::Error,
-                    >(None)
-                })
-                .await;
-                return match result {
-                    Ok(Ok(outcome)) => ToolResult::text(format!(
-                        "Typed {text_len} character(s) (via Wayland virtual-keyboard)."
-                    ))
-                    .with_structured(with_foreground_diagnostics(
-                        type_text_structured("key_events", text_len, false),
-                        outcome,
-                    )),
-                    Ok(Err(error)) => ToolResult::error(error.to_string()),
-                    Err(error) => ToolResult::error(format!("Task error: {error}")),
-                };
-            }
-        }
-
-        // AX addressing names one exact editable. Try this focus-free route
-        // before native Wayland keyboard injection, which can only target the
-        // compositor's globally focused surface.
-        if let Some(idx) = resolved_elem_idx {
-            let text_at = text.clone();
-            let targeted = cua_driver_core::blocking::spawn(move || {
-                crate::atspi::type_into_editable_at(pid, idx, &text_at)
-            })
-            .await;
-            match targeted {
-                Ok(Ok(())) => {
-                    return type_text_ax_result(pid, text_len, "via targeted AT-SPI");
-                }
-                Ok(Err(_)) | Err(_)
-                    if !delivery.is_foreground() && crate::wayland::wayland_input_enabled() =>
-                {
-                    return crate::input::delivery::background_unavailable_error(
-                        crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
-                    );
-                }
-                _ => {}
-            }
-        }
-
         // Native Wayland: keys go to the *focused* surface (no pid/window
         // targeting in the protocol). Type via the virtual-keyboard tool; pair
         // with a prior `click`/`activate` to focus the intended window.
@@ -6975,19 +7288,11 @@ impl Tool for TypeTextTool {
                 );
             }
             let text_w = text.clone();
-            let idx = resolved_elem_idx;
             let result =
                 cua_driver_core::blocking::spawn(move || {
                     let target = crate::wayland::establish_exact_target(pid, xid)?;
                     crate::wayland::validate_exact_target(&target)?;
                     crate::wayland::with_target_foreground(pid, xid, |validate| {
-                        if let Some(idx) = idx {
-                            if !crate::atspi::focus_element(pid, idx)? {
-                                anyhow::bail!(
-                                    "AT-SPI Component.GrabFocus returned false for element {idx}"
-                                );
-                            }
-                        }
                         crate::wayland::type_text_focused_for_target(validate, &text_w)
                     })?;
                     Ok::<
@@ -7064,16 +7369,8 @@ impl Tool for TypeTextTool {
         // key events. Native toolkits keep their verifiable AT-SPI path below.
         if delivery.is_foreground() && (is_chromium_embedder(pid) || is_webkitgtk_embedder(pid)) {
             let text_f = text.clone();
-            let idx = resolved_elem_idx;
             let result = cua_driver_core::blocking::spawn(move || {
                 crate::input::with_x11_foreground(xid, 80, || {
-                    if let Some(idx) = idx {
-                        if !crate::atspi::focus_element(pid, idx)? {
-                            anyhow::bail!(
-                                "AT-SPI Component.GrabFocus returned false for element {idx}"
-                            );
-                        }
-                    }
                     crate::input::send_type_text_xtest(&text_f)
                 })
             })
@@ -7378,11 +7675,13 @@ impl Tool for PressKeyTool {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let resolved_element_index = match &resolved {
-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
-                Some(*element_index)
-            }
-            cua_driver_core::element_token::ResolvedElement::None => None,
+        let (resolved_element_index, snapshot_identity) = match &resolved {
+            cua_driver_core::element_token::ResolvedElement::Element {
+                element_index,
+                snapshot_identity,
+                ..
+            } => (Some(*element_index), Some(*snapshot_identity)),
+            cua_driver_core::element_token::ResolvedElement::None => (None, None),
         };
         let xid_opt = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => {
@@ -7491,6 +7790,23 @@ impl Tool for PressKeyTool {
             );
         }
 
+        if let Some(index) = resolved_element_index {
+            return invoke_observed_keyboard(
+                &self.state,
+                &args,
+                pid,
+                xid,
+                index,
+                snapshot_identity.expect("element has identity"),
+                delivery,
+                ObservedKeyboardAction::Key {
+                    key,
+                    modifiers: mods,
+                },
+            )
+            .await;
+        }
+
         if hyprland_foreground(delivery) {
             if xid_opt.is_none() {
                 return foreground_hyprland_refusal("an exact window_id is required");
@@ -7499,15 +7815,8 @@ impl Tool for PressKeyTool {
                 Ok(action) => action,
                 Err(error) => return error,
             };
-            if let Err(error) = focus_hyprland_foreground(
-                &self.state,
-                &args,
-                pid,
-                xid,
-                resolved_element_index,
-                px.zip(py),
-            )
-            .await
+            if let Err(error) =
+                focus_hyprland_foreground(&self.state, &args, pid, xid, px.zip(py)).await
             {
                 return error;
             }
@@ -7519,7 +7828,7 @@ impl Tool for PressKeyTool {
             &args,
             pid,
             xid,
-            resolved_element_index,
+            None,
             px.zip(py),
             false,
         )
@@ -7528,9 +7837,7 @@ impl Tool for PressKeyTool {
         // Nested cua-compositor addresses the owning Wayland client directly.
         // Preserve legacy modifiers by promoting the request to a chord.
         if crate::wayland::is_inject_mode() {
-            if let Err(error) =
-                focus_nested_inject_target(pid, xid, resolved_element_index, px.zip(py)).await
-            {
+            if let Err(error) = focus_nested_inject_target(pid, xid, px.zip(py)).await {
                 return error;
             }
             let result = if mods.is_empty() {
@@ -7580,25 +7887,13 @@ impl Tool for PressKeyTool {
         if crate::wayland::wayland_input_enabled() {
             let key_w = key.clone();
             let chord = press_key_chord(&mods, &key);
-            let idx = resolved_element_index;
             let result =
                 cua_driver_core::blocking::spawn(move || {
                     let target = crate::wayland::establish_exact_target(pid, xid)?;
                     crate::wayland::validate_exact_target(&target)?;
-                    crate::wayland::with_target_foreground(pid, xid, |validate| {
-                        if let Some(idx) = idx {
-                            if !crate::atspi::focus_element(pid, idx)? {
-                                anyhow::bail!(
-                                    "AT-SPI Component.GrabFocus returned false for element {idx}"
-                                );
-                            }
-                        }
-                        match chord {
-                            Some(keys) => {
-                                crate::wayland::hotkey_focused_for_target(validate, &keys)
-                            }
-                            None => crate::wayland::press_key_focused_for_target(validate, &key_w),
-                        }
+                    crate::wayland::with_target_foreground(pid, xid, |validate| match chord {
+                        Some(keys) => crate::wayland::hotkey_focused_for_target(validate, &keys),
+                        None => crate::wayland::press_key_focused_for_target(validate, &key_w),
                     })?;
                     Ok::<
                         Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
@@ -7637,22 +7932,8 @@ impl Tool for PressKeyTool {
             // XSendEvent (no focus steal) for apps that accept it.
             if deliver_fg {
                 return crate::input::with_x11_foreground(xid, 80, || {
-                    if let Some(element_index) = resolved_element_index {
-                        if !crate::atspi::focus_element(pid, element_index)? {
-                            anyhow::bail!(
-                                "AT-SPI Component.GrabFocus returned false for element {element_index}"
-                            );
-                        }
-                    }
                     crate::input::send_key_xtest(&key_for_task, &m)
                 });
-            }
-            if let Some(element_index) = resolved_element_index {
-                if !crate::atspi::focus_element(pid, element_index)? {
-                    anyhow::bail!(
-                        "AT-SPI Component.GrabFocus returned false for element {element_index}"
-                    );
-                }
             }
             if let Some((x, y)) = px_target {
                 crate::input::send_key_at(xid, x, y, &key_for_task, &m)
@@ -7783,11 +8064,13 @@ impl Tool for HotkeyTool {
             Ok(resolved) => resolved,
             Err(error) => return error,
         };
-        let resolved_element_index = match &resolved {
-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
-                Some(*element_index)
-            }
-            cua_driver_core::element_token::ResolvedElement::None => None,
+        let (resolved_element_index, snapshot_identity) = match &resolved {
+            cua_driver_core::element_token::ResolvedElement::Element {
+                element_index,
+                snapshot_identity,
+                ..
+            } => (Some(*element_index), Some(*snapshot_identity)),
+            cua_driver_core::element_token::ResolvedElement::None => (None, None),
         };
         let xid_opt = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => {
@@ -7911,6 +8194,23 @@ impl Tool for HotkeyTool {
             );
         }
 
+        if let Some(index) = resolved_element_index {
+            return invoke_observed_keyboard(
+                &self.state,
+                &args,
+                pid,
+                xid,
+                index,
+                snapshot_identity.expect("element has identity"),
+                delivery,
+                ObservedKeyboardAction::Key {
+                    key,
+                    modifiers: mods,
+                },
+            )
+            .await;
+        }
+
         if hyprland_foreground(delivery) {
             if xid_opt.is_none() {
                 return foreground_hyprland_refusal("an exact window_id is required");
@@ -7932,15 +8232,8 @@ impl Tool for HotkeyTool {
                 Ok(action) => action,
                 Err(error) => return error,
             };
-            if let Err(error) = focus_hyprland_foreground(
-                &self.state,
-                &args,
-                pid,
-                xid,
-                resolved_element_index,
-                px.zip(py),
-            )
-            .await
+            if let Err(error) =
+                focus_hyprland_foreground(&self.state, &args, pid, xid, px.zip(py)).await
             {
                 return error;
             }
@@ -7952,16 +8245,14 @@ impl Tool for HotkeyTool {
             &args,
             pid,
             xid,
-            resolved_element_index,
+            None,
             px.zip(py),
             false,
         )
         .await;
 
         if crate::wayland::is_inject_mode() {
-            if let Err(error) =
-                focus_nested_inject_target(pid, xid, resolved_element_index, px.zip(py)).await
-            {
+            if let Err(error) = focus_nested_inject_target(pid, xid, px.zip(py)).await {
                 return error;
             }
             let mut chord = mods.clone();
@@ -7977,48 +8268,6 @@ impl Tool for HotkeyTool {
                 Ok(Err(error)) => ToolResult::error(error.to_string()),
                 Err(error) => ToolResult::error(format!("Task error: {error}")),
             };
-        }
-
-        // Chromium renderer shortcuts need DOM focus established by a real
-        // pointer event. Component.GrabFocus alone can report success while
-        // the renderer still drops the virtual-keyboard chord.
-        if delivery.is_foreground()
-            && crate::wayland::wayland_input_enabled()
-            && is_chromium_embedder(pid)
-        {
-            if let Some(element_index) = resolved_element_index {
-                let coordinates = cua_driver_core::blocking::spawn(move || {
-                    resolve_element_local_coords(pid, element_index, Some(xid))
-                })
-                .await;
-                let (_, x, y) = match coordinates {
-                    Ok(Ok(value)) => value,
-                    Ok(Err(error)) => return ToolResult::error(error.to_string()),
-                    Err(error) => return ToolResult::error(format!("Task error: {error}")),
-                };
-                if let Err(error) =
-                    focus_by_pixel(&self.state, pid, Some(xid), (x, y), true, &args, false).await
-                {
-                    return error;
-                }
-            }
-        }
-
-        if let Some(element_index) = resolved_element_index {
-            let focused = cua_driver_core::blocking::spawn(move || {
-                crate::atspi::focus_element(pid, element_index)
-            })
-            .await;
-            match focused {
-                Ok(Ok(true)) => {}
-                Ok(Ok(false)) => {
-                    return ToolResult::error(format!(
-                        "AT-SPI Component.GrabFocus returned false for element {element_index}"
-                    ));
-                }
-                Ok(Err(error)) => return ToolResult::error(error.to_string()),
-                Err(error) => return ToolResult::error(format!("Task error: {error}")),
-            }
         }
 
         // ── px form: pixel-click to focus, then the combo acts on the focused field ──

@@ -2850,6 +2850,16 @@ async fn write_into_editable(visited: &[Visited<'_>], text: &str) -> Result<bool
 }
 
 async fn write_into_editable_target(target: &Visited<'_>, text: &str) -> Result<bool> {
+    write_into_editable_target_checked(target, text, None).await
+}
+
+/// The observed route revalidates after proxy/caret lookups and immediately
+/// before each mutation, including the optional GrabFocus between writes.
+async fn write_into_editable_target_checked(
+    target: &Visited<'_>,
+    text: &str,
+    observed: Option<&ObservedClickTarget>,
+) -> Result<bool> {
     dlog!(
         "insert target: role={:?} in_web_doc={} focused={} has_component={}",
         target.role,
@@ -2867,7 +2877,7 @@ async fn write_into_editable_target(target: &Visited<'_>, text: &str) -> Result<
     // A focus-free EditableText write is the strongest background route. Try it
     // before GrabFocus: WebKitGTK can invalidate the original proxy when focus
     // changes, and writing through that stale object then returns false.
-    if write_through_editable_proxies(&proxies, text).await? {
+    if write_through_editable_proxies(&proxies, text, observed).await? {
         return Ok(true);
     }
 
@@ -2877,6 +2887,9 @@ async fn write_into_editable_target(target: &Visited<'_>, text: &str) -> Result<
     // on an unfocused window's focused widget.
     if target.has_component {
         if let Ok(comp) = proxies.component().await {
+            if let Some(observed) = observed {
+                observed.verify_live_at_mutation().await?;
+            }
             match call(comp.grab_focus()).await {
                 Some(Ok(true)) => dlog!("GrabFocus succeeded on {:?}", target.role),
                 Some(Ok(false)) => dlog!("GrabFocus returned false on {:?}", target.role),
@@ -2890,12 +2903,13 @@ async fn write_into_editable_target(target: &Visited<'_>, text: &str) -> Result<
         dlog!("Target has no Component interface, skipping GrabFocus");
     }
 
-    write_through_editable_proxies(&proxies, text).await
+    write_through_editable_proxies(&proxies, text, observed).await
 }
 
 async fn write_through_editable_proxies(
     proxies: &atspi::proxy::proxy_ext::Proxies<'_>,
     text: &str,
+    observed: Option<&ObservedClickTarget>,
 ) -> Result<bool> {
     let et = proxies
         .editable_text()
@@ -2908,10 +2922,29 @@ async fn write_through_editable_proxies(
     };
     let len = text.chars().count() as i32;
 
-    if et.insert_text(off, text, len).await.unwrap_or(false) {
+    if let Some(observed) = observed {
+        observed.verify_live_at_mutation().await?;
+    }
+    // An indeterminate write on a retained target must not be replayed.
+    let inserted = et.insert_text(off, text, len).await;
+    let inserted = if observed.is_some() {
+        inserted?
+    } else {
+        inserted.unwrap_or(false)
+    };
+    if inserted {
         return Ok(true);
     }
-    if et.set_text_contents(text).await.unwrap_or(false) {
+    if let Some(observed) = observed {
+        observed.verify_live_at_mutation().await?;
+    }
+    let replaced = et.set_text_contents(text).await;
+    let replaced = if observed.is_some() {
+        replaced?
+    } else {
+        replaced.unwrap_or(false)
+    };
+    if replaced {
         return Ok(true);
     }
     Ok(false)
@@ -3708,7 +3741,7 @@ pub fn perform_verified_action_by_key(
     )
 }
 
-/// A click target resolved from the object address observed in the snapshot.
+/// A mutation target resolved from the object address observed in the snapshot.
 /// The public integer index remains an address within that snapshot only.
 pub struct ObservedClickTarget {
     pid: u32,
@@ -3821,6 +3854,84 @@ impl ObservedClickTarget {
             || is_cell_role(&target.role)
     }
 
+    /// Focus this retained Component, never a new tree ordinal. A successful
+    /// GrabFocus must be followed by this object's own Focused read-back.
+    pub fn focus(&self) -> Result<()> {
+        bounded(
+            async {
+                let target = &self.visited[self.target_position];
+                let component = target.acc.proxies().await?.component().await?;
+                self.verify_live_at_mutation().await?;
+                let accepted = call(component.grab_focus())
+                    .await
+                    .context("observed Component.GrabFocus timed out")??;
+                require_affirmative_ack(accepted, "observed Component.GrabFocus")?;
+                let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+                while tokio::time::Instant::now() < deadline {
+                    if matches!(
+                        tokio::time::timeout_at(deadline, target.acc.get_state()).await,
+                        Ok(Ok(state)) if state.contains(State::Focused)
+                    ) {
+                        return self.verify_live_at_mutation().await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                anyhow::bail!("observed Component.GrabFocus did not establish Focused state")
+            },
+            || Err(anyhow!("observed focus timed out")),
+        )
+    }
+
+    /// `false` means no EditableText interface was advertised and no write was
+    /// attempted. All errors (including indeterminate writes) stop delivery.
+    /// A toolkit focus rebuild may be retried once, by the SAME unique object
+    /// and frame identity, never by ordinal or focused/first-editable search.
+    pub fn type_into_editable(&self, text: &str) -> Result<bool> {
+        let target = &self.visited[self.target_position];
+        if !target.has_editable {
+            self.verify_live()?;
+            return Ok(false);
+        }
+        let write = |observed: &Self| {
+            bounded(
+                async {
+                    observed.verify_live_at_mutation().await?;
+                    write_into_editable_target_checked(
+                        &observed.visited[observed.target_position],
+                        text,
+                        Some(observed),
+                    )
+                    .await
+                },
+                || {
+                    Err(anyhow!(
+                        "observed EditableText write timed out; refusing replay"
+                    ))
+                },
+            )
+        };
+        if write(self)? {
+            return Ok(true);
+        }
+        let identity = target
+            .identity
+            .as_ref()
+            .context("stale_element_token: observed identity unavailable after focus")?;
+        // Outside bounded: resolving here must not nest the private runtime.
+        let refreshed = resolve_observed_target(
+            self.pid,
+            self.index,
+            self.xid,
+            identity,
+            self.exact_target.clone(),
+        )
+        .context("stale_element_token: observed editable disappeared after focus")?;
+        if write(&refreshed)? {
+            return Ok(true);
+        }
+        anyhow::bail!("observed element rejected AT-SPI EditableText; refusing another input route")
+    }
+
     pub fn set_value(&self, value: &str) -> Result<()> {
         bounded(
             async {
@@ -3892,6 +4003,79 @@ impl ObservedClickTarget {
             },
         )
     }
+}
+
+#[cfg(test)]
+#[test]
+fn observed_keyboard_mutations_verify_identity_without_nested_runtime_or_ordinal_retry() {
+    let source = include_str!("native.rs");
+    let focus = source
+        .split_once(concat!("pub fn ", "focus(&self)"))
+        .unwrap()
+        .1
+        .split_once("pub fn type_into_editable(&self")
+        .unwrap()
+        .0;
+    assert!(
+        focus.find("verify_live_at_mutation().await?").unwrap()
+            < focus.find("call(component.grab_focus())").unwrap()
+    );
+    assert!(focus.contains("target.acc.get_state()"));
+    assert!(focus.contains("state.contains(State::Focused)"));
+    assert!(focus.contains("timeout_at(deadline"));
+    let typed = source
+        .split_once(concat!("pub fn ", "type_into_editable(&self"))
+        .unwrap()
+        .1
+        .split_once("pub fn set_value(&self")
+        .unwrap()
+        .0;
+    assert!(!typed.contains(".nth("));
+    assert!(!typed.contains("pick_editable("));
+    assert!(typed
+        .split_whitespace()
+        .collect::<String>()
+        .contains("target.identity.as_ref()"));
+    let write = typed.find("if write(self)?").unwrap();
+    let resolve = typed
+        .find("let refreshed = resolve_observed_target(")
+        .unwrap();
+    assert!(
+        write < resolve,
+        "identity retry must be outside the bounded write"
+    );
+    assert!(typed.contains("self.exact_target.clone()"));
+    assert!(typed.contains("write(&refreshed)?"));
+    let checked = source
+        .split_once(concat!("async fn ", "write_into_editable_target_checked("))
+        .unwrap()
+        .1
+        .split_once("/// Write into the best editable")
+        .unwrap()
+        .0;
+    assert!(checked.contains("observed.verify_live_at_mutation().await?"));
+    assert!(
+        checked
+            .find("observed.verify_live_at_mutation().await?")
+            .unwrap()
+            < checked.find("call(comp.grab_focus())").unwrap()
+    );
+    let proxies = checked
+        .split_once("async fn write_through_editable_proxies(")
+        .unwrap()
+        .1;
+    assert!(
+        proxies
+            .find("observed.verify_live_at_mutation().await?")
+            .unwrap()
+            < proxies.find("et.insert_text(").unwrap()
+    );
+    assert!(
+        proxies
+            .rfind("observed.verify_live_at_mutation().await?")
+            .unwrap()
+            < proxies.find("et.set_text_contents(").unwrap()
+    );
 }
 
 /// Match a fresh walk against the object and owning frame observed in a
