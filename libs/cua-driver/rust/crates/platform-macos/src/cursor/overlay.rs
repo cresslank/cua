@@ -975,7 +975,7 @@ fn render_loop(
                     let raise_unpinned = last_key
                         .as_ref()
                         .and_then(|k| map.cursors.get(k))
-                        .is_some_and(cursor_is_externally_visible)
+                        .is_some_and(cursor_may_raise_unpinned)
                         && pinned.is_none();
                     let next_frame_tick_needed = map.needs_frame_tick();
                     let next_hover_poll_needed = map
@@ -1164,6 +1164,16 @@ fn cursor_is_externally_visible(state: &RenderState) -> bool {
     // drawn, and is not reported visible. Placement, not visibility, keeps a
     // second-display cursor from being re-seeded.
     state.core.cfg.enabled && state.core.is_revealed() && on_main_screen(state.core.pos)
+}
+
+/// Whether a command frame for an unpinned cursor (a direct `move_cursor`)
+/// raises the overlay window. Unlike [`cursor_is_externally_visible`] this
+/// does not require the cursor to be on the main screen yet: the raise is
+/// decided only on frames that carry a command, so a glide that starts on
+/// another display and enters the main screen on later message-free ticks
+/// would otherwise stay behind whatever covered the overlay.
+fn cursor_may_raise_unpinned(state: &RenderState) -> bool {
+    state.core.cfg.enabled && state.core.is_revealed()
 }
 
 /// Convert a `tiny_skia::Pixmap` to a `CGImage` and set it as the contents
@@ -1696,6 +1706,37 @@ mod tests {
             1920.0,
             1080.0
         ));
+    }
+
+    #[test]
+    fn unpinned_raise_admits_a_revealed_cursor_off_the_main_screen() {
+        // A placed cursor on a display left of the main screen is not
+        // externally visible, but a command for it must still raise the
+        // unpinned overlay: its glide reaches the main screen on later
+        // message-free ticks, which never re-decide the raise.
+        let mut map = empty_map();
+        assert!(!cursor_may_raise_unpinned(&map.cursors["default"]));
+        let primary = Some(ScreenFrame::new(0.0, 0.0, 1920.0, 1080.0));
+        assert!(map.seed_start_if_sentinel("neg", -800.0, 1200.0, primary));
+        assert!(!cursor_is_externally_visible(&map.cursors["neg"]));
+        assert!(cursor_may_raise_unpinned(&map.cursors["neg"]));
+        map.apply_command("neg".to_owned(), OverlayCommand::SetEnabled(false));
+        assert!(!cursor_may_raise_unpinned(&map.cursors["neg"]));
+    }
+
+    #[test]
+    fn render_loop_raises_unpinned_overlay_by_the_raise_predicate() {
+        let source = include_str!("overlay.rs");
+        let start = source
+            .find(concat!("let raise_unpinned", " = last_key"))
+            .expect("raise_unpinned decision");
+        let end = start
+            + source[start..]
+                .find(concat!("&& pinned", ".is_none();"))
+                .expect("raise_unpinned decision end");
+        let decision = &source[start..end];
+        assert!(decision.contains(concat!("cursor_may_raise", "_unpinned")));
+        assert!(!decision.contains(concat!("cursor_is_externally", "_visible")));
     }
 
     #[test]
