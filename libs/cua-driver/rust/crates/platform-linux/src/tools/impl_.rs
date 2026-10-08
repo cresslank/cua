@@ -383,6 +383,103 @@ fn coordinate_click_context(
     resolve_context()
 }
 
+/// What a native Wayland background pixel click could use once its screenshot
+/// frame exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackgroundClickForm {
+    /// Unmodified single left click: the exact-point AT-SPI action.
+    ExactPoint,
+    /// Other unmodified clicks: no focus-free route; foreground can deliver.
+    ForegroundOnly,
+    /// Modified clicks: the native Wayland pointer route cannot carry
+    /// keyboard modifier state in either delivery mode.
+    Modified,
+}
+
+fn background_click_form(button: u8, count: usize, modified: bool) -> BackgroundClickForm {
+    if modified {
+        BackgroundClickForm::Modified
+    } else if button == 1 && count == 1 {
+        BackgroundClickForm::ExactPoint
+    } else {
+        BackgroundClickForm::ForegroundOnly
+    }
+}
+
+/// Refusal for a native Wayland background pixel click whose screenshot frame
+/// is missing. Only an unmodified single left click can still be delivered in
+/// the background once a screenshot exists, so only it is told to capture and
+/// retry in the background; other unmodified clicks get the native refusal
+/// (foreground) plus the screenshot prerequisite; modified clicks are told that
+/// no mode can deliver them. Every other frame error (zoom context,
+/// arguments), and every session without the native refusal, is unchanged.
+fn missing_frame_click_refusal(
+    native_refusal: Option<ToolResult>,
+    frame_refusal: ToolResult,
+    form: BackgroundClickForm,
+) -> ToolResult {
+    let frame = frame_refusal.structured_content.as_ref();
+    let missing_screenshot = frame
+        .and_then(|structured| structured.get("code"))
+        .and_then(Value::as_str)
+        == Some("screenshot_context_missing");
+    let Some(mut native) = native_refusal.filter(|_| missing_screenshot) else {
+        return frame_refusal;
+    };
+    let code = native
+        .structured_content
+        .as_ref()
+        .and_then(|structured| structured.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("background_unavailable")
+        .to_owned();
+    let field = |name: &str| frame.and_then(|structured| structured.get(name)).cloned();
+    match form {
+        BackgroundClickForm::ExactPoint => ToolResult::error(
+            "Background delivery is not available without a screenshot: on native Wayland a \
+             background pixel click can only use the exact-point accessibility action, which \
+             needs a screenshot of this window owned by this session. Call get_window_state \
+             with a screenshot on the same connection, then retry this click with \
+             delivery_mode:\"background\".",
+        )
+        .with_structured(json!({
+            "code": code,
+            "cause": "screenshot_context_missing",
+            "pid": field("pid"),
+            "window_id": field("window_id"),
+            "suggestion": "Call get_window_state with a screenshot on the same connection, then \
+                           retry this click in the background.",
+        })),
+        BackgroundClickForm::ForegroundOnly => {
+            native
+                .content
+                .push(cua_driver_core::protocol::Content::text(
+                    "Pixel coordinates also need a screenshot of this window owned by this \
+                     session: call get_window_state with a screenshot on the same connection \
+                     before retrying.",
+                ));
+            if let Some(structured) = native.structured_content.as_mut() {
+                structured["cause"] = json!("screenshot_context_missing");
+                structured["pid"] = field("pid").unwrap_or(Value::Null);
+                structured["window_id"] = field("window_id").unwrap_or(Value::Null);
+            }
+            native
+        }
+        BackgroundClickForm::Modified => ToolResult::error(
+            "Background delivery is not available: modified pixel clicks are unavailable on \
+             native Wayland in either delivery mode, because the pointer route cannot carry \
+             keyboard modifier state. Neither a screenshot nor foreground delivery can deliver \
+             this click; retry it without modifiers.",
+        )
+        .with_structured(json!({
+            "code": code,
+            "reason": "modified_pixel_click_unsupported",
+            "pid": field("pid"),
+            "window_id": field("window_id"),
+        })),
+    }
+}
+
 fn coordinate_drag_context(
     native_refusal: Option<ToolResult>,
     resolve_context: impl FnOnce() -> Result<CoordinateContext, ToolResult>,
@@ -4919,6 +5016,150 @@ fn coordinate_scroll_keeps_wayland_background_refusal_ahead_of_screenshot_contex
 
 #[cfg(test)]
 #[test]
+fn missing_screenshot_frame_refusal_matches_the_click_form() {
+    use BackgroundClickForm::{ExactPoint, ForegroundOnly, Modified};
+    let native = || {
+        Some(crate::input::delivery::background_unavailable_error(
+            crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
+        ))
+    };
+    let fields = |result: &ToolResult| result.structured_content.clone().unwrap();
+    let text = |result: &ToolResult| {
+        serde_json::to_value(result).unwrap()["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|content| content["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let missing = || {
+        ToolResult::error("no screenshot").with_structured(
+            json!({"code": "screenshot_context_missing", "pid": 7, "window_id": 9}),
+        )
+    };
+    let zoom =
+        || ToolResult::error("no zoom").with_structured(json!({"code": "zoom_context_missing"}));
+
+    // Unmodified single left click: a capture enables the exact-point route.
+    assert_eq!(background_click_form(1, 1, false), ExactPoint);
+    let refusal = missing_frame_click_refusal(native(), missing(), ExactPoint);
+    assert_eq!(refusal.is_error, Some(true));
+    let exact = fields(&refusal);
+    assert_eq!(exact["code"], "background_unavailable", "{exact}");
+    assert_eq!(exact["cause"], "screenshot_context_missing", "{exact}");
+    assert_eq!((&exact["pid"], &exact["window_id"]), (&json!(7), &json!(9)));
+    assert!(
+        exact.get("escalation").is_none(),
+        "no foreground escalation: {exact}"
+    );
+    assert!(exact["suggestion"]
+        .as_str()
+        .unwrap()
+        .contains("get_window_state"));
+    let message = text(&refusal);
+    assert!(message.contains("get_window_state"), "{message}");
+    assert!(
+        message.contains("delivery_mode:\"background\""),
+        "{message}"
+    );
+    assert!(!message.contains("foreground"), "{message}");
+
+    // Right, middle, double and triple clicks have no background route even
+    // with a frame: foreground plus the screenshot prerequisite, no capture-
+    // then-background promise.
+    for (button, count) in [(3, 1), (2, 1), (1, 2), (1, 3)] {
+        assert_eq!(background_click_form(button, count, false), ForegroundOnly);
+        let refusal = missing_frame_click_refusal(native(), missing(), ForegroundOnly);
+        let other = fields(&refusal);
+        assert_eq!(other["code"], "background_unavailable", "{other}");
+        assert_eq!(other["cause"], "screenshot_context_missing", "{other}");
+        assert_eq!(other["escalation"]["recommended"], "foreground", "{other}");
+        assert_eq!((&other["pid"], &other["window_id"]), (&json!(7), &json!(9)));
+        let message = text(&refusal);
+        assert!(message.contains("get_window_state"), "{message}");
+        assert!(
+            !message.contains("delivery_mode:\"background\""),
+            "{message}"
+        );
+    }
+
+    // Modified clicks: no mode can deliver them on native Wayland.
+    assert_eq!(background_click_form(1, 1, true), Modified);
+    assert_eq!(background_click_form(3, 2, true), Modified);
+    let refusal = missing_frame_click_refusal(native(), missing(), Modified);
+    let modified = fields(&refusal);
+    assert_eq!(modified["code"], "background_unavailable", "{modified}");
+    assert_eq!(modified["reason"], "modified_pixel_click_unsupported");
+    assert!(modified.get("escalation").is_none(), "{modified}");
+    assert!(modified.get("suggestion").is_none(), "{modified}");
+    let message = text(&refusal);
+    assert!(message.contains("modifier"), "{message}");
+    assert!(!message.contains("get_window_state"), "{message}");
+
+    for form in [ExactPoint, ForegroundOnly, Modified] {
+        assert_eq!(
+            fields(&missing_frame_click_refusal(native(), zoom(), form))["code"],
+            "zoom_context_missing"
+        );
+        assert_eq!(
+            fields(&missing_frame_click_refusal(None, missing(), form))["code"],
+            "screenshot_context_missing"
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn pixel_click_resolves_frame_before_native_background_refusal() {
+    let source = include_str!("impl_.rs");
+    let click_impl = source
+        .rsplit_once(concat!("impl Tool for ", "ClickTool {"))
+        .unwrap()
+        .1;
+    let click_impl = &click_impl[..click_impl.find("\n}\n").expect("end of the ClickTool impl")];
+    let invoke = click_impl.split_once("async fn invoke").unwrap().1;
+    let (before_frame, after_frame) = invoke
+        .split_once(concat!("coordinate_click_context(", "None"))
+        .expect("pixel click must resolve its frame before any native refusal");
+    assert!(
+        !before_frame.contains(concat!("unavailable_wayland_focused_", "input_background(")),
+        "a native refusal before the frame would cut off the exact-point AT-SPI route"
+    );
+    let (frame_match, rest) = after_frame
+        .split_once(concat!("crate::overlay::send_", "command_for("))
+        .unwrap();
+    assert!(
+        frame_match.contains(concat!(
+            "background_click_",
+            "form(button, count, !modifiers.is_empty())"
+        )),
+        "the missing-frame refusal must follow the requested click form"
+    );
+    assert!(
+        frame_match.contains(concat!(
+            "missing_frame_click_",
+            "refusal(native_refusal, refusal, form)"
+        )),
+        "a missing frame must report the contextual background refusal"
+    );
+    let (native_route, _) = rest
+        .split_once(concat!(
+            "if !delivery.is_foreground() ",
+            "&& button == 1 && count == 1 {"
+        ))
+        .expect("the native Wayland background point route must remain after the frame")
+        .1
+        .split_once(concat!("if state_for_task.", "wayland_inject_mode()"))
+        .expect("the point route must precede pointer injection");
+    assert!(
+        native_route.contains(concat!("state_for_task.", "point_action(")),
+        "the native Wayland background route must try the exact-point AT-SPI action"
+    );
+}
+
+#[cfg(test)]
+#[test]
 fn coordinate_less_mouse_button_up_survives_snapshot_replacement() {
     let state = ToolState::new();
     let cursor_id = "held-after-replacement";
@@ -6338,6 +6579,8 @@ impl Tool for ClickTool {
         let from_zoom = args.bool_or("from_zoom", false);
         let mut x = args.f64_or("x", 0.0);
         let mut y = args.f64_or("y", 0.0);
+        // Resolve the frame first: with a frame, a native Wayland background
+        // click can still be delivered through the exact-point AT-SPI route.
         let context = coordinate_click_context(None, || {
             if from_zoom {
                 self.state
@@ -6354,7 +6597,13 @@ impl Tool for ClickTool {
                 x *= scale;
                 y *= scale;
             }
-            Err(refusal) => return refusal,
+            Err(refusal) => {
+                let native_refusal = (!isolated_background)
+                    .then(|| unavailable_wayland_focused_input_background(delivery, true))
+                    .flatten();
+                let form = background_click_form(button, count, !modifiers.is_empty());
+                return missing_frame_click_refusal(native_refusal, refusal, form);
+            }
         }
 
         crate::overlay::send_command_for(
@@ -13704,6 +13953,42 @@ mod click_button_schema_tests {
             assert_eq!(points.load(Ordering::SeqCst), 1, "{error}: {result:?}");
             assert_eq!(clicks.load(Ordering::SeqCst), 0, "{error} replayed");
         }
+    }
+
+    #[tokio::test]
+    async fn click_invoke_with_frame_delivers_background_point_action_without_pointer() {
+        // With a session screenshot, a native Wayland background left click
+        // reaches the exact-point AT-SPI action and sends no pointer input.
+        let points = Arc::new(AtomicUsize::new(0));
+        let points_for_backend = points.clone();
+        let clicks = Arc::new(AtomicUsize::new(0));
+        let clicks_for_backend = clicks.clone();
+        let state = ToolState::new_with_production_route_backend(backend_with(
+            move |_, _, _| {
+                points_for_backend.fetch_add(1, Ordering::SeqCst);
+                Ok(Some("click".into()))
+            },
+            move |_, _, _, _, _| {
+                clicks_for_backend.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            },
+            |_, _, _| Ok(()),
+        ));
+        let (pid, xid, session) = with_screenshot_context(&state);
+        let result = coordinate_click(state)
+            .invoke(
+                serde_json::json!({"pid": pid, "window_id": xid, "x": 5, "y": 6,
+                "delivery_mode": "background", "_session_id": session}),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["path"],
+            "wayland_atspi",
+            "{result:?}"
+        );
+        assert_eq!(points.load(Ordering::SeqCst), 1);
+        assert_eq!(clicks.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
