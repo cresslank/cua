@@ -3847,6 +3847,10 @@ impl ObservedClickTarget {
         )
     }
 
+    pub(crate) fn exact_target_proof(&self) -> Option<crate::wayland::ExactTargetProof> {
+        self.exact_target.clone()
+    }
+
     pub fn needs_foreground_pointer(&self) -> bool {
         let target = &self.visited[self.target_position];
         target.has_editable
@@ -4492,26 +4496,21 @@ async fn sample_page_probes(
 /// Invoke the original target's semantic actions, pacing multi-page requests
 /// with descendant motion. `Err` means no mutation was attempted; an incomplete
 /// `ScrollProgress` preserves uncertainty after an attempted mutation.
-pub fn scroll_element(
-    pid: u32,
-    idx: usize,
+pub fn scroll_observed_element(
+    observed: &ObservedClickTarget,
     direction: &str,
     amount: usize,
     by: cua_driver_contract::ScrollBy,
 ) -> Result<ScrollProgress> {
+    let pid = observed.pid;
+    let idx = observed.index;
+    let visited = &observed.visited;
+    let target = &visited[observed.target_position];
     let attempted = std::cell::Cell::new(false);
     let acknowledged = std::cell::Cell::new(0);
     let result = bounded(
         async {
-            let conn = shared_connection().await?;
-            let visited = collect_visited(conn, pid)
-                .await?
-                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
-            let target = visited
-                .iter()
-                .filter(|v| is_indexable(v))
-                .nth(idx)
-                .ok_or_else(|| anyhow!("element {idx} not found (total: {})", visited.len()))?;
+            observed.verify_live_at_mutation().await?;
             let proxies = target
                 .acc
                 .proxies()
@@ -4550,10 +4549,7 @@ pub fn scroll_element(
                 let mut observation = None;
                 if by == cua_driver_contract::ScrollBy::Page && amount > 1 {
                     let component = proxies.component().await?;
-                    let target_index = visited
-                        .iter()
-                        .position(|node| std::ptr::eq(node, target))
-                        .unwrap();
+                    let target_index = observed.target_position;
                     let mut probes = Vec::new();
                     // Fix probe identities before dispatch; never replace vanished descendants.
                     for index in
@@ -4596,7 +4592,10 @@ pub fn scroll_element(
                     observation.as_ref().map(|o| o.3.clone()),
                     &attempted,
                     &acknowledged,
-                    || async { action.do_action(action_index).await.map_err(Into::into) },
+                    || async {
+                        observed.verify_live_at_mutation().await?;
+                        action.do_action(action_index).await.map_err(Into::into)
+                    },
                     |baseline| async {
                         let (component, probes, coord, _) = observation
                             .as_ref()
@@ -4650,6 +4649,7 @@ pub fn scroll_element(
                 };
                 let next =
                     (current + sign * increment * amount.max(1) as f64).clamp(minimum, maximum);
+                observed.verify_live_at_mutation().await?;
                 attempted.set(true);
                 call(value.set_current_value(next))
                     .await
@@ -4663,9 +4663,77 @@ pub fn scroll_element(
                 "element {idx} exposes neither directional scroll actions nor Value"
             ))
         },
-        || Err(anyhow!("scroll_element timed out for pid {pid}")),
+        || Err(anyhow!("observed scroll timed out for pid {pid}")),
     );
     finish_scroll(result, attempted.get(), acknowledged.get())
+}
+
+#[cfg(test)]
+mod retained_scroll_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retained_scroll_identity_survives_reorder_and_refuses_vanished_or_duplicated_objects()
+    {
+        let observed = AtspiIdentity {
+            bus_name: ":1.7".into(),
+            path: "/scroller".into(),
+            frame_bus_name: ":1.7".into(),
+            frame_path: "/frame".into(),
+        };
+        let other = AtspiIdentity {
+            path: "/replacement".into(),
+            ..observed.clone()
+        };
+        for (live, expected) in [
+            (vec![other.clone(), observed.clone()], Some(1)),
+            (vec![other.clone()], None),
+            (vec![observed.clone(), observed.clone()], None),
+        ] {
+            let selected = unique_observed_identity_position(
+                live.iter()
+                    .enumerate()
+                    .map(|(position, identity)| ObservedIdentityCandidate {
+                        position,
+                        bus_name: &identity.bus_name,
+                        path: &identity.path,
+                        identity: Some(identity),
+                        frame_ordinal: 0,
+                        indexable: true,
+                    }),
+                &observed,
+                0,
+            );
+            let mutations = std::cell::RefCell::new(Vec::new());
+            match (selected, expected) {
+                (Ok(position), Some(expected)) => {
+                    assert_eq!(position, expected);
+                    let attempted = std::cell::Cell::new(false);
+                    let acknowledged = std::cell::Cell::new(0);
+                    scroll_sequence(
+                        2,
+                        None,
+                        &attempted,
+                        &acknowledged,
+                        || {
+                            mutations.borrow_mut().push(live[position].path.clone());
+                            std::future::ready(Ok(true))
+                        },
+                        |_| std::future::ready(Ok(vec![])),
+                    )
+                    .await
+                    .unwrap();
+                    assert_eq!(*mutations.borrow(), vec!["/scroller", "/scroller"]);
+                    assert_eq!(acknowledged.get(), 2);
+                }
+                (Err(error), None) => {
+                    assert!(error.to_string().contains("stale_element_token"));
+                    assert!(mutations.borrow().is_empty());
+                }
+                mismatch => panic!("retained scroll identity mismatch: {mismatch:?}"),
+            }
+        }
+    }
 }
 
 /// Give an indexed element keyboard focus through AT-SPI Component.GrabFocus

@@ -206,11 +206,11 @@ impl Snapshots {
                     )
                 })?;
             // Only routes carrying the retained native identity and generation
-            // permit through every mutation are qualified. Scroll and secondary
-            // clicks still use newly walked ordinals and remain refused.
+            // permit through every mutation are qualified. Secondary clicks
+            // still use newly walked ordinals and remain refused.
             if !matches!(
                 tool,
-                "click" | "set_value" | "type_text" | "press_key" | "hotkey"
+                "click" | "set_value" | "type_text" | "press_key" | "hotkey" | "scroll"
             ) {
                 return Err(cua_driver_core::protocol::ToolResult::error(format!(
                     "{tool}: snapshot-bound element delivery is not qualified on Linux"
@@ -287,6 +287,17 @@ impl Snapshots {
         self.snapshot(pid, xid)
             .map_or(0, |snapshot| snapshot.elements.len())
     }
+}
+
+/// Own a generation through a synchronous native transaction, including a
+/// detached blocking worker. Async waiter lifetime is not mutation lifetime.
+pub(crate) fn with_retained_mutation<R>(
+    permit: std::sync::Arc<MutationPermit>,
+    mutation: impl FnOnce() -> R,
+) -> R {
+    let result = mutation();
+    drop(permit);
+    result
 }
 
 impl Default for Snapshots {
@@ -594,7 +605,7 @@ mod tests {
                         &serde_json::json!({"element_token": &token, "window_id": window}),
                         tool,
                     );
-                    if matches!(tool, "type_text" | "press_key" | "hotkey") {
+                    if matches!(tool, "type_text" | "press_key" | "hotkey" | "scroll") {
                         assert!(matches!(result.unwrap(),
                             cua_driver_core::element_token::ResolvedElement::Element {
                                 window_id, element_index: 7, snapshot_identity, ..
@@ -881,6 +892,63 @@ mod tests {
                 .path,
             "/node/99"
         );
+    }
+
+    #[test]
+    fn retained_scroll_permit_blocks_retirement_until_native_return() {
+        // Keep this fixture out of the process-wide legacy lane LRU used by
+        // unrelated parallel snapshot/capture tests.
+        isolated(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let cache = Snapshots::new();
+                    let pid = std::process::id();
+                    let xid = 0x7f30_0104;
+                    let first = cache.prepare(pid, xid, &[node(7, 41)]).unwrap();
+                    let identity = first.identity();
+                    let id = cache.publish(first).unwrap();
+                    let token = cua_driver_core::element_token::token_for(id, 7);
+                    assert!(cache
+                        .resolve_for_tool(
+                            pid as i32,
+                            &serde_json::json!({"element_token":token}),
+                            "scroll"
+                        )
+                        .is_ok());
+                    let (permit, retained) = cache.acquire_observed_mutation(identity, 7).unwrap();
+                    let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+                    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+                    let worker = cua_driver_core::blocking::spawn(move || {
+                        with_retained_mutation(std::sync::Arc::new(permit), || {
+                            assert_eq!(retained.path, "/node/41");
+                            started_tx.send(()).unwrap();
+                            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                            // Simulated native scroll acknowledgement; keep this
+                            // registry test usable by the macOS host-cache harness.
+                            1_u32
+                        })
+                    });
+                    started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    worker.abort();
+                    assert!(worker.await.unwrap_err().is_cancelled());
+                    let next = cache.prepare(pid, xid, &[node(7, 99)]).unwrap();
+                    // Bounded publish refuses deterministically while the detached scroll
+                    // owns the permit; no scheduler-dependent "publisher hasn't run" test.
+                    assert!(cua_driver_core::element_token::global()
+                        .publish(next, Duration::from_millis(40))
+                        .is_err());
+                    release_tx.send(()).unwrap();
+                    let next = cache.prepare(pid, xid, &[node(7, 99)]).unwrap();
+                    cua_driver_core::element_token::global()
+                        .publish(next, Duration::from_secs(5))
+                        .unwrap();
+                    assert!(cache.acquire_observed_mutation(identity, 7).is_err());
+                });
+        });
     }
 
     #[test]

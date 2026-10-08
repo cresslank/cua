@@ -320,6 +320,8 @@ pub struct ToolState {
     pub config: Arc<RwLock<DriverConfig>>,
     #[cfg(test)]
     production_route_backend: Option<Arc<ProductionRouteBackend>>,
+    #[cfg(test)]
+    observed_scroll_backend: Option<Arc<retained_scroll_route_tests::Backend>>,
 }
 
 #[cfg(test)]
@@ -460,6 +462,8 @@ impl ToolState {
             config: Arc::new(RwLock::new(load_driver_config())),
             #[cfg(test)]
             production_route_backend: None,
+            #[cfg(test)]
+            observed_scroll_backend: None,
         })
     }
 
@@ -8568,6 +8572,238 @@ fn atspi_scroll_outcomes_preserve_uncertainty_and_acknowledged_count() {
         );
     }
 }
+#[cfg(test)]
+#[path = "retained_scroll_route_tests.rs"]
+mod retained_scroll_route_tests;
+
+/// Narrow native seam: tests substitute only retained AT-SPI I/O, while the
+/// public ScrollTool route, mutation permit and refusal policy stay real.
+trait ObservedScrollTarget: Send {
+    fn semantic_scroll(
+        &self,
+        direction: &str,
+        amount: usize,
+        by: cua_driver_contract::ScrollBy,
+    ) -> anyhow::Result<crate::atspi::ScrollProgress>;
+}
+
+impl ObservedScrollTarget for crate::atspi::ObservedClickTarget {
+    fn semantic_scroll(
+        &self,
+        direction: &str,
+        amount: usize,
+        by: cua_driver_contract::ScrollBy,
+    ) -> anyhow::Result<crate::atspi::ScrollProgress> {
+        crate::atspi::native::scroll_observed_element(self, direction, amount, by)
+    }
+}
+
+fn observed_scroll_progress(
+    progress: crate::atspi::ScrollProgress,
+    foreground: bool,
+) -> ToolResult {
+    let stale = progress
+        .detail
+        .as_deref()
+        .is_some_and(|detail| detail.contains("stale_element_token"));
+    let mut result = atspi_scroll_result(progress, foreground);
+    if stale {
+        // Keep acknowledgement/partial-effect accounting; refuse the remainder
+        // without replay, rather than disguising lost identity as an AX miss.
+        if let Some(public) = result.structured_content.as_mut() {
+            public["code"] = json!("stale_element_token");
+            public["refusal"] = json!({"code":"stale_element_token"});
+        }
+    }
+    result
+}
+
+/// Snapshot-bound scroll never rejoins the unaddressed or pixel ladders.
+/// Cosmetic ordinal cursor placement is skipped, as for retained keyboard input.
+async fn invoke_observed_scroll(
+    state: &Arc<ToolState>,
+    pid: u32,
+    xid: u64,
+    index: usize,
+    snapshot_identity: cua_driver_core::element_token::SnapshotIdentity,
+    delivery: crate::input::delivery::DeliveryMode,
+    direction: String,
+    amount: usize,
+    by: cua_driver_contract::ScrollBy,
+) -> ToolResult {
+    let snapshots = state.snapshots.clone();
+    #[cfg(test)]
+    let backend = state.observed_scroll_backend.clone();
+    let resolved = cua_driver_core::blocking::spawn(move || -> anyhow::Result<_> {
+        let (permit, identity) = snapshots
+            .acquire_observed_mutation(snapshot_identity, index)
+            .map_err(|error| anyhow::anyhow!("stale_element_token: {error}"))?;
+        #[cfg(test)]
+        if let Some(backend) = backend {
+            return Ok((
+                Arc::new(permit),
+                Box::new(backend) as Box<dyn ObservedScrollTarget>,
+            ));
+        }
+        let proof = if crate::wayland::wayland_input_enabled() {
+            Some(crate::wayland::establish_exact_target(pid, xid)?)
+        } else {
+            None
+        };
+        let target =
+            crate::atspi::native::resolve_observed_target(pid, index, xid, &identity, proof)
+                .map_err(|error| anyhow::anyhow!("stale_element_token: {error:#}"))?;
+        Ok((
+            Arc::new(permit),
+            Box::new(target) as Box<dyn ObservedScrollTarget>,
+        ))
+    })
+    .await;
+    let (permit, target) = match resolved {
+        Ok(Ok(retained)) => retained,
+        Ok(Err(error)) => return observed_keyboard_error(error),
+        Err(error) => return ToolResult::error(format!("Task error: {error}")),
+    };
+    let foreground = delivery.is_foreground();
+    let direction_for_ax = direction.clone();
+    // Semantic AT-SPI is allowed on Hyprland too. WebKitGTK's Wayland AX
+    // acknowledgement remains a known silent no-op, so do not claim delivery.
+    if !(crate::wayland::wayland_input_enabled() && is_webkitgtk_embedder(pid)) {
+        let result = cua_driver_core::blocking::spawn(move || {
+            crate::atspi::snapshot::with_retained_mutation(permit.clone(), || {
+                let result = target.semantic_scroll(&direction_for_ax, amount, by);
+                (permit, target, result)
+            })
+        })
+        .await;
+        match result {
+            Ok((_, _, Ok(progress))) => return observed_scroll_progress(progress, foreground),
+            Ok((_, _, Err(error))) if format!("{error:#}").contains("stale_element_token") => {
+                return observed_keyboard_error(error);
+            }
+            Ok((_, _, Err(_))) => {}
+            Err(error) => {
+                return observed_scroll_progress(
+                    crate::atspi::ScrollProgress {
+                        acknowledged: 0,
+                        complete: false,
+                        detail: Some(error.to_string()),
+                    },
+                    foreground,
+                )
+            }
+        }
+    }
+    // Element tokens authorize only the retained semantic route. An AX miss
+    // never rejoins any input ladder, regardless of delivery mode or compositor.
+    if !foreground {
+        return crate::input::delivery::background_unavailable_error(
+            crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
+        );
+    }
+    ToolResult::error(
+        "element_route_unqualified: the element exposes no accessible scroll action; retry scroll with x,y pixel coordinates instead of element_token",
+    )
+    .with_structured(json!({
+        "code": "element_route_unqualified",
+        "effect": "refused",
+        "refusal": {"code": "element_route_unqualified"},
+    }))
+}
+
+#[cfg(test)]
+#[test]
+fn retained_scroll_chromium_background_refuses_before_native_resolution() {
+    cua_driver_core::tool::with_runtime_scope(
+        format!("retained-scroll-background-{}", uuid::Uuid::new_v4()),
+        || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    // A headless, owned process with Chromium's exact argv fingerprint. No
+                    // native identity is stored: entering resolution would return stale, not
+                    // the required background_unavailable, even without a desktop bus.
+                    struct Child(std::process::Child);
+                    impl Drop for Child {
+                        fn drop(&mut self) {
+                            let _ = self.0.kill();
+                            let _ = self.0.wait();
+                        }
+                    }
+                    let mut child = Child(
+                        std::process::Command::new("/bin/sh")
+                            .args(["-c", "printf ready; read unused", "--type=renderer"])
+                            .stdin(std::process::Stdio::piped())
+                            .stdout(std::process::Stdio::piped())
+                            .spawn()
+                            .unwrap(),
+                    );
+                    let mut ready = [0; 5];
+                    std::io::Read::read_exact(child.0.stdout.as_mut().unwrap(), &mut ready)
+                        .unwrap();
+                    assert_eq!(&ready, b"ready");
+                    let pid = child.0.id();
+                    assert!(is_chromium_embedder(pid));
+                    let state = ToolState::new();
+                    let node = crate::atspi::AtspiNode {
+                        element_index: Some(7),
+                        element_key: 41,
+                        identity: None,
+                        role: "scroll pane".into(),
+                        name: None,
+                        value: None,
+                        checked: None,
+                        enabled: None,
+                        selected: None,
+                        description: None,
+                        actions: vec!["scroll down".into()],
+                        depth: 0,
+                        parent_element_index: None,
+                        in_web_content: false,
+                        object_ref: None,
+                    };
+                    let id = state
+                        .snapshots
+                        .publish(state.snapshots.prepare(pid, 0x7f30_0105, &[node]).unwrap())
+                        .unwrap();
+                    let token = cua_driver_core::element_token::token_for(id, 7);
+                    let result = ScrollTool { state }
+        .invoke(json!({
+            "pid":pid, "element_token":token, "direction":"down", "delivery_mode":"background"
+        }))
+        .await;
+                    assert_eq!(
+                        result.structured_content.unwrap()["code"],
+                        "background_unavailable"
+                    );
+                });
+        },
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn retained_scroll_stale_progress_keeps_acknowledgements_and_refuses_remainder() {
+    let result = observed_scroll_progress(
+        crate::atspi::ScrollProgress {
+            acknowledged: 1,
+            complete: false,
+            detail: Some("stale_element_token: object left frame".into()),
+        },
+        false,
+    );
+    assert_eq!(result.is_error, Some(true));
+    let public = result.structured_content.unwrap();
+    assert_eq!(public["refusal"]["code"], "stale_element_token");
+    assert_eq!(public["delivery"]["delivered_count"], 1);
+    assert_eq!(
+        result.action_record.unwrap().effect,
+        cua_driver_core::action_record::ActionEffect::Partial
+    );
+}
+
 static SCROLL_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 #[async_trait]
@@ -8665,10 +8901,8 @@ impl Tool for ScrollTool {
             Ok(by) => by,
             Err(error) => return ToolResult::error(format!("Invalid scroll by: {error}")),
         };
-        // The Linux scroll implementation doesn't pre-focus the element (X11
-        // scroll buttons go to the window root), but the token still needs to
-        // be validated so a stale token surfaces an error instead of silently
-        // no-op'ing.
+        // Element tokens leave the pixel/unaddressed ladders below entirely.
+        // Their retained native object and permit travel through every mutation.
         let resolved = match self
             .state
             .snapshots
@@ -8683,6 +8917,24 @@ impl Tool for ScrollTool {
             }
             cua_driver_core::element_token::ResolvedElement::None => args.opt_u64("window_id"),
         };
+
+        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        let isolated_background = isolated_hyprland_background(delivery);
+        #[cfg(test)]
+        let isolated_background = self
+            .state
+            .observed_scroll_backend
+            .as_ref()
+            .map_or(isolated_background, |backend| {
+                backend.isolated_background(delivery)
+            });
+        // Chromium/Electron background refusal precedes even retained native
+        // resolution, so a missing AT-SPI bridge cannot mask background_unavailable.
+        if !isolated_background {
+            if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
+                return refusal;
+            }
+        }
 
         if crate::wayland::is_gnome_wayland_session() && xid_opt.is_none() {
             return ToolResult::error(
@@ -8725,8 +8977,6 @@ impl Tool for ScrollTool {
             }
         };
 
-        let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
-        let isolated_background = isolated_hyprland_background(delivery);
         let native_refusal = if isolated_background {
             None
         } else {
@@ -8751,21 +9001,40 @@ impl Tool for ScrollTool {
             (None, None) => None,
             _ => return ToolResult::error("Pass both x and y to pixel-target scroll."),
         };
-        let resolved_element_index = match &resolved {
-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
-                Some(*element_index)
-            }
-            cua_driver_core::element_token::ResolvedElement::None => None,
-        };
-        if pixel_target.is_some() && resolved_element_index.is_some() {
+        if pixel_target.is_some()
+            && matches!(
+                resolved,
+                cua_driver_core::element_token::ResolvedElement::Element { .. }
+            )
+        {
             return ToolResult::error(
                 "Pass either element_token (ax) or x,y (px) to scroll, not both.",
             );
         }
 
+        if let cua_driver_core::element_token::ResolvedElement::Element {
+            element_index,
+            snapshot_identity,
+            ..
+        } = resolved
+        {
+            return invoke_observed_scroll(
+                &self.state,
+                pid,
+                xid,
+                element_index,
+                snapshot_identity,
+                delivery,
+                direction,
+                amount,
+                by,
+            )
+            .await;
+        }
+
         if named_session_cursor_key(&args).is_some() {
             let visual_target = cua_driver_core::blocking::spawn(move || {
-                explicit_keyboard_cursor_target(pid, xid, resolved_element_index, pixel_target)
+                explicit_keyboard_cursor_target(pid, xid, None, pixel_target)
                     .or_else(|| keyboard_window_center(xid))
             })
             .await
@@ -8780,35 +9049,13 @@ impl Tool for ScrollTool {
             }
         }
 
-        // Keep the isolated decision made before the pixel refusal: a second
-        // probe could lose availability and fall through to primary-seat input.
-        if !isolated_background {
-            if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
-                return refusal;
-            }
-        }
         if hyprland_foreground(delivery) {
             if xid_opt.is_none() {
                 return foreground_hyprland_refusal(
                     "an exact window_id or window-bound element token is required",
                 );
             }
-            let point = if let Some(index) = resolved_element_index {
-                match cua_driver_core::blocking::spawn(move || {
-                    resolve_element_local_coords(pid, index, Some(xid))
-                })
-                .await
-                {
-                    Ok(Ok((_, x, y))) => Some((x, y)),
-                    _ => {
-                        return foreground_hyprland_refusal(
-                            "could not resolve exact element coordinates",
-                        )
-                    }
-                }
-            } else {
-                pixel_target
-            };
+            let point = pixel_target;
             return foreground_hyprland_action(
                 &args,
                 pid,
@@ -8821,39 +9068,6 @@ impl Tool for ScrollTool {
             )
             .await;
         }
-        if let cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } =
-            &resolved
-        {
-            let idx = *element_index;
-            // WebKitGTK acknowledges the AT-SPI scroll action without moving
-            // the DOM scroller. On native Wayland, use a real compositor wheel
-            // event at the resolved element instead of reporting a silent
-            // success. Chromium's AT-SPI scroll path remains effective.
-            if !(crate::wayland::wayland_input_enabled() && is_webkitgtk_embedder(pid)) {
-                let direction_for_ax = direction.clone();
-                let ax_result = cua_driver_core::blocking::spawn(move || {
-                    crate::atspi::scroll_element(pid, idx, &direction_for_ax, amount, by)
-                })
-                .await;
-                match ax_result {
-                    Ok(Ok(progress)) => {
-                        return atspi_scroll_result(progress, delivery.is_foreground())
-                    }
-                    Err(error) => {
-                        return atspi_scroll_result(
-                            crate::atspi::ScrollProgress {
-                                acknowledged: 0,
-                                complete: false,
-                                detail: Some(error.to_string()),
-                            },
-                            delivery.is_foreground(),
-                        )
-                    }
-                    Ok(Err(_)) => {}
-                }
-            }
-        }
-
         if isolated_background {
             if xid_opt.is_none() {
                 return isolated_hyprland_refusal(
@@ -8863,12 +9077,7 @@ impl Tool for ScrollTool {
             let owner = named_session_cursor_key(&args);
             let (_cancellation, dispatch) =
                 match spawn_isolated_hyprland(&args, move |cancellation| {
-                    let point = if let Some(idx) = resolved_element_index {
-                        let (_, x, y) = resolve_element_local_coords(pid, idx, Some(xid))?;
-                        Some((x, y))
-                    } else {
-                        pixel_target
-                    };
+                    let point = pixel_target;
                     crate::wayland::hyprland_input::execute(
                         owner,
                         pid,
@@ -8931,35 +9140,7 @@ impl Tool for ScrollTool {
                 return refusal;
             }
             let direction_for_wayland = direction.clone();
-            let local_point = match (pixel_target, &resolved) {
-                (Some(point), _) => Some(point),
-                (
-                    None,
-                    cua_driver_core::element_token::ResolvedElement::Element {
-                        element_index, ..
-                    },
-                ) => {
-                    let idx = *element_index;
-                    match cua_driver_core::blocking::spawn(move || {
-                        resolve_element_local_coords(pid, idx, Some(xid))
-                    })
-                    .await
-                    {
-                        Ok(Ok((_resolved_xid, x, y))) => Some((x, y)),
-                        Ok(Err(error)) => {
-                            return ToolResult::error(format!(
-                                "Could not resolve scroll element [{idx}] coordinates: {error}"
-                            ));
-                        }
-                        Err(error) => {
-                            return ToolResult::error(format!(
-                                "Scroll element coordinate task failed: {error}"
-                            ));
-                        }
-                    }
-                }
-                (None, cua_driver_core::element_token::ResolvedElement::None) => None,
-            };
+            let local_point = pixel_target;
             let output_point = local_point.map(|(x, y)| {
                 crate::wayland::window_local_to_output(xid, x.round() as i32, y.round() as i32)
             });
@@ -8993,39 +9174,10 @@ impl Tool for ScrollTool {
             return refusal;
         }
 
-        // An element-addressed scroll must land over the element. The old
-        // fallback used (0, 0) in the window, which can report success while
-        // Chromium/GTK routes the wheel to the toplevel instead of the
-        // requested scroll region.
-        let element_point = match &resolved {
-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
-                let idx = *element_index;
-                match cua_driver_core::blocking::spawn(move || {
-                    resolve_element_local_coords(pid, idx, Some(xid))
-                })
-                .await
-                {
-                    Ok(Ok((_resolved_xid, local_x, local_y))) => {
-                        let screen = window_local_to_screen(xid, local_x, local_y).ok();
-                        Some(((local_x, local_y), screen))
-                    }
-                    Ok(Err(e)) => {
-                        return ToolResult::error(format!(
-                            "Could not resolve scroll element [{idx}] coordinates: {e}"
-                        ));
-                    }
-                    Err(e) => {
-                        return ToolResult::error(format!(
-                            "Scroll element coordinate task failed: {e}"
-                        ));
-                    }
-                }
-            }
-            cua_driver_core::element_token::ResolvedElement::None => pixel_target.map(|local| {
-                let screen = window_local_to_screen(xid, local.0, local.1).ok();
-                (local, screen)
-            }),
-        };
+        let element_point = pixel_target.map(|local| {
+            let screen = window_local_to_screen(xid, local.0, local.1).ok();
+            (local, screen)
+        });
 
         // X11 scroll buttons: 4=up, 5=down, 6=left, 7=right
         // Note: "page" scroll is still per-click on X11; send more ticks for page.

@@ -292,16 +292,6 @@ pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
 
 pub use native::ScrollProgress;
 
-pub fn scroll_element(
-    pid: u32,
-    idx: usize,
-    direction: &str,
-    amount: usize,
-    by: cua_driver_contract::ScrollBy,
-) -> Result<ScrollProgress> {
-    native::scroll_element(pid, idx, direction, amount, by)
-}
-
 /// Enumerate top-level windows from the AT-SPI registry. The window-listing
 /// fallback for Wayland compositors without `zwlr_foreign_toplevel_management`
 /// (GNOME Mutter / KDE KWin), where native apps have no X11 XID. Returns one
