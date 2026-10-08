@@ -2030,7 +2030,7 @@ pub struct ExactTargetInputGuard<'a> {
 }
 
 impl ExactTargetInputGuard<'_> {
-    fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         validate_exact_target(&self.target)?;
         if let Some(transaction) = self.transaction {
             transaction.validate()?;
@@ -2636,6 +2636,58 @@ fn click_vptr(
     record_synth_cursor(px as i32, py as i32);
     sess.vptr.destroy();
     sess.queue.roundtrip(&mut sess.state)?;
+    Ok(())
+}
+
+/// Single acknowledged retained-element click. No activation, coordinate
+/// conversion, center default, clamp or replay may occur inside this primitive.
+pub(crate) fn click_retained_point(
+    point: (i32, i32),
+    extent: (u32, u32),
+    button: u8,
+    count: usize,
+    before: &mut dyn FnMut() -> anyhow::Result<()>,
+    acknowledged: &mut dyn FnMut(),
+) -> anyhow::Result<()> {
+    let mut sess = open_vptr_session(None)?;
+    anyhow::ensure!(
+        (sess.output_w, sess.output_h) == extent,
+        "output geometry changed"
+    );
+    let (x, y) = point;
+    anyhow::ensure!(
+        x >= 0 && y >= 0 && (x as u32) < extent.0 && (y as u32) < extent.1,
+        "retained point outside output"
+    );
+    // One device/connection for both clicks; opening click 2 would reset the
+    // compositor's device identity and can turn a double-click into two singles.
+    let result = (|| -> anyhow::Result<()> {
+        for step in 0..count {
+            if step > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            sess.point_at(x as u32, y as u32)?;
+            before()?;
+            let btn = evdev_pointer_button(button);
+            sess.vptr.button(event_time_ms(), btn, ButtonState::Pressed);
+            sess.vptr.frame();
+            let press = sess.queue.roundtrip(&mut sess.state);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // Attempt release even when the press acknowledgement was lost.
+            sess.vptr
+                .button(event_time_ms(), btn, ButtonState::Released);
+            sess.vptr.frame();
+            let release = sess.queue.roundtrip(&mut sess.state);
+            press.and(release)?;
+            acknowledged();
+        }
+        Ok(())
+    })();
+    sess.vptr.destroy();
+    let cleanup = sess.queue.roundtrip(&mut sess.state);
+    result?;
+    cleanup?;
+    record_synth_cursor(x, y);
     Ok(())
 }
 

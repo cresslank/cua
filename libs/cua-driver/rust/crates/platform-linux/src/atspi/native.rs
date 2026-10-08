@@ -3783,6 +3783,126 @@ async fn live_parent_address(
     .context("stale_element_token: Parent lookup failed")
 }
 
+#[cfg(test)]
+#[path = "retained_pointer_tests.rs"]
+pub(crate) mod retained_pointer_tests;
+
+fn project_retained_pointer_bounds(
+    raw: (i32, i32, i32, i32),
+    frame_raw: (i32, i32, i32, i32),
+    origin: (i32, i32),
+    content: (i32, i32),
+    wayland: bool,
+) -> Result<(i32, i32, u32, u32)> {
+    anyhow::ensure!(
+        crate::snapshot_queries::plausible_raw_extents(frame_raw)
+            && crate::snapshot_queries::plausible_raw_extents(raw),
+        "unusable retained bounds"
+    );
+    let offset = if wayland {
+        // Chromium's negative renderer frame origin is not an output
+        // origin. Keep positive content insets, as snapshot projection does.
+        (
+            i64::from(origin.0) + i64::from(content.0) - i64::from(frame_raw.0.min(0)),
+            i64::from(origin.1) + i64::from(content.1) - i64::from(frame_raw.1.min(0)),
+        )
+    } else if frame_raw.0.abs() <= 2 && frame_raw.1.abs() <= 2 {
+        anyhow::ensure!(raw.0 != 0 || raw.1 != 0, "collapsed Screen extents");
+        (
+            i64::from(origin.0) - i64::from(frame_raw.0),
+            i64::from(origin.1) - i64::from(frame_raw.1),
+        )
+    } else {
+        anyhow::ensure!(raw.0 != 0 || raw.1 != 0, "collapsed Screen extents");
+        (0, 0)
+    };
+    Ok((
+        i32::try_from(i64::from(raw.0) + offset.0)?,
+        i32::try_from(i64::from(raw.1) + offset.1)?,
+        raw.2 as u32,
+        raw.3 as u32,
+    ))
+}
+
+fn context_menu_action(name: &str) -> bool {
+    let normalized: String = name
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "showcontextmenu" | "contextmenu" | "menu" | "popup" | "popupmenu"
+    )
+}
+
+// Native-I/O seam: discovery must never turn a failed read into an empty slot.
+trait MenuAction {
+    async fn count(&self) -> Result<i32>;
+    async fn name(&self, index: i32) -> Result<String>;
+    async fn dispatch(&self, index: i32) -> Result<bool>;
+}
+impl MenuAction for atspi::proxy::action::ActionProxy<'_> {
+    async fn count(&self) -> Result<i32> {
+        Ok(self.n_actions().await?)
+    }
+    async fn name(&self, index: i32) -> Result<String> {
+        Ok(self.get_name(index).await?)
+    }
+    async fn dispatch(&self, index: i32) -> Result<bool> {
+        Ok(self.do_action(index).await?)
+    }
+}
+
+async fn strict_context_menu<A: MenuAction, F: std::future::Future<Output = Result<()>>>(
+    proxy: impl std::future::Future<Output = Result<A>>,
+    verify: impl Fn() -> F,
+) -> Result<bool> {
+    let action = call(proxy)
+        .await
+        .context("context menu Action proxy timed out")??;
+    let count = call(action.count())
+        .await
+        .context("context menu NActions timed out")??;
+    anyhow::ensure!(
+        (0..=CHILD_ENUMERATION_CAP as i32).contains(&count),
+        "invalid context menu action count"
+    );
+    let mut names = Vec::new();
+    for index in 0..count {
+        names.push(
+            call(action.name(index))
+                .await
+                .context("context menu GetName timed out")??,
+        );
+    }
+    // Only a complete, affirmative live read of ALL names can authorize pixels.
+    let Some(index) = names.iter().position(|name| context_menu_action(name)) else {
+        return Ok(false);
+    };
+    verify().await?;
+    let accepted = call(action.dispatch(index as i32))
+        .await
+        .context("context menu DoAction timed out; refusing pointer replay")??;
+    require_affirmative_ack(accepted, "context menu")?;
+    Ok(true)
+}
+
+fn require_pointer_frame_owner(identity: Option<&AtspiIdentity>) -> Result<()> {
+    // collect_native pins BOTH addresses with identity_ref/GetNameOwner before
+    // constructing the retained proxy. Never accept raw well-known names here.
+    let qualified = identity.is_some_and(|id| {
+        atspi::zbus::names::UniqueName::try_from(id.bus_name.as_str()).is_ok()
+            && atspi::zbus::names::UniqueName::try_from(id.frame_bus_name.as_str()).is_ok()
+            && id.bus_name == id.frame_bus_name
+    });
+    anyhow::ensure!(
+        qualified,
+        "element_route_unqualified: element is in a separate accessibility process; retry with x,y"
+    );
+    Ok(())
+}
+
 impl ObservedClickTarget {
     /// Async half is also called after action-name lookups, without nesting the
     /// private runtime. Always keep the original proxy and snapshot identity.
@@ -3958,6 +4078,72 @@ impl ObservedClickTarget {
                 anyhow::bail!("observed element exposes neither EditableText nor Value")
             },
             || Err(anyhow!("observed value mutation timed out")),
+        )
+    }
+
+    /// Only an affirmative action-name miss permits a pointer fallback. Errors
+    /// from action discovery or DoAction are indeterminate and never replayed.
+    pub(crate) fn context_menu(&self) -> Result<bool> {
+        bounded(
+            async {
+                let target = &self.visited[self.target_position];
+                self.verify_live_at_mutation().await?;
+                strict_context_menu(
+                    async { Ok(target.acc.proxies().await?.action().await?) },
+                    || self.verify_live_at_mutation(),
+                )
+                .await
+            },
+            || {
+                Err(anyhow!(
+                    "context menu outcome unknown; refusing pointer replay"
+                ))
+            },
+        )
+    }
+
+    /// Strict retained-object bounds for secondary clicks. The caller supplies
+    /// the ONE authoritative geometry used for this validation and dispatch;
+    /// never consult PID/title/ordinal geometry or treat local pixels as absolute.
+    pub(crate) fn pointer_bounds(
+        &self,
+        origin: (i32, i32),
+        content: (i32, i32),
+        wayland: bool,
+    ) -> Result<(i32, i32, u32, u32)> {
+        bounded(
+            async {
+                let target = &self.visited[self.target_position];
+                require_pointer_frame_owner(target.identity.as_ref())?;
+                let identity = target
+                    .identity
+                    .as_ref()
+                    .context("retained identity missing")?;
+                let frame = self
+                    .visited
+                    .iter()
+                    .find(|node| {
+                        node.identity.as_ref().is_some_and(|id| {
+                            id.bus_name == identity.frame_bus_name && id.path == identity.frame_path
+                        })
+                    })
+                    .context("retained frame geometry unavailable")?;
+                let coord = if wayland {
+                    CoordType::Window
+                } else {
+                    CoordType::Screen
+                };
+                let component = target.acc.proxies().await?.component().await?;
+                let frame_component = frame.acc.proxies().await?.component().await?;
+                let frame_raw = call(frame_component.get_extents(coord))
+                    .await
+                    .context("retained frame bounds timed out")??;
+                let raw = call(component.get_extents(coord))
+                    .await
+                    .context("retained bounds timed out")??;
+                project_retained_pointer_bounds(raw, frame_raw, origin, content, wayland)
+            },
+            || Err(anyhow!("retained pointer bounds timed out")),
         )
     }
 

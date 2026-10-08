@@ -210,7 +210,14 @@ impl Snapshots {
             // still use newly walked ordinals and remain refused.
             if !matches!(
                 tool,
-                "click" | "set_value" | "type_text" | "press_key" | "hotkey" | "scroll"
+                "click"
+                    | "set_value"
+                    | "type_text"
+                    | "press_key"
+                    | "hotkey"
+                    | "scroll"
+                    | "right_click"
+                    | "double_click"
             ) {
                 return Err(cua_driver_core::protocol::ToolResult::error(format!(
                     "{tool}: snapshot-bound element delivery is not qualified on Linux"
@@ -599,13 +606,22 @@ mod tests {
                     "scroll",
                     "double_click",
                     "right_click",
+                    "drag",
                 ] {
                     let result = cache.resolve_for_tool(
                         pid as i32,
                         &serde_json::json!({"element_token": &token, "window_id": window}),
                         tool,
                     );
-                    if matches!(tool, "type_text" | "press_key" | "hotkey" | "scroll") {
+                    if matches!(
+                        tool,
+                        "type_text"
+                            | "press_key"
+                            | "hotkey"
+                            | "scroll"
+                            | "right_click"
+                            | "double_click"
+                    ) {
                         assert!(matches!(result.unwrap(),
                             cua_driver_core::element_token::ResolvedElement::Element {
                                 window_id, element_index: 7, snapshot_identity, ..

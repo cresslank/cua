@@ -3644,6 +3644,34 @@ pub fn send_click_xtest_desktop_with_modifiers(
     count: usize,
     modifiers: &[&str],
 ) -> Result<()> {
+    send_click_xtest_acknowledged(x, y, button, count, modifiers, &mut || Ok(()), &mut || {})
+}
+
+#[cfg(test)]
+#[path = "retained_pointer_tests.rs"]
+mod retained_pointer_tests;
+
+// The completion closure must synchronize the SAME connection that queued the
+// motion. In particular RustConnection may still have the warp in its buffer.
+fn complete_motion_before_validation(
+    complete: impl FnOnce() -> Result<()>,
+    before: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    complete()?;
+    before()
+}
+
+/// Acknowledge each released pair before cleanup; retained routes revalidate
+/// after native setup/warp and immediately before every press.
+pub(crate) fn send_click_xtest_acknowledged(
+    x: i32,
+    y: i32,
+    button: u8,
+    count: usize,
+    modifiers: &[&str],
+    before: &mut dyn FnMut() -> Result<()>,
+    acknowledged: &mut dyn FnMut(),
+) -> Result<()> {
     use x11rb::protocol::xtest::ConnectionExt as _;
     let (conn, screen_num) = connect_x11_for_input()?;
     let root = conn.setup().roots[screen_num].root;
@@ -3667,9 +3695,16 @@ pub fn send_click_xtest_desktop_with_modifiers(
         }
         // Absolute pointer warp (MotionNotify, detail=0 => absolute) so the
         // button events that follow are delivered at (x, y).
-        conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, x as i16, y as i16, 0)?;
         let count = count.max(1);
         for click_index in 0..count {
+            complete_motion_before_validation(
+                || {
+                    conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, x as i16, y as i16, 0)?
+                        .check()?;
+                    Ok(())
+                },
+                before,
+            )?;
             let press =
                 conn.xtest_fake_input(BUTTON_PRESS_EVENT, button, 0, root, x as i16, y as i16, 0)?;
             // Confirm delivery before sleeping; buffering both edges produces a zero-ms click.
@@ -3679,6 +3714,7 @@ pub fn send_click_xtest_desktop_with_modifiers(
             conn.xtest_fake_input(BUTTON_RELEASE_EVENT, button, 0, root, x as i16, y as i16, 0)?
                 .check()?;
             button_pressed = false;
+            acknowledged();
             if click_index + 1 < count {
                 // Keep the existing gap between completed click pairs.
                 sleep(Duration::from_millis(DOUBLE_CLICK_DELAY_MS));

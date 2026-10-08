@@ -322,6 +322,8 @@ pub struct ToolState {
     production_route_backend: Option<Arc<ProductionRouteBackend>>,
     #[cfg(test)]
     observed_scroll_backend: Option<Arc<retained_scroll_route_tests::Backend>>,
+    #[cfg(test)]
+    observed_click_backend: Option<Arc<retained_click::tests::Backend>>,
 }
 
 #[cfg(test)]
@@ -464,6 +466,8 @@ impl ToolState {
             production_route_backend: None,
             #[cfg(test)]
             observed_scroll_backend: None,
+            #[cfg(test)]
+            observed_click_backend: None,
         })
     }
 
@@ -5873,6 +5877,9 @@ fn bounded_click_count_arg(args: &Value) -> Result<u32, ToolResult> {
     Ok(count)
 }
 
+#[path = "retained_click.rs"]
+mod retained_click;
+
 pub struct ClickTool {
     state: Arc<ToolState>,
 }
@@ -5893,6 +5900,11 @@ impl ClickTool {
         delivery: crate::input::delivery::DeliveryMode,
         cursor_id: String,
     ) -> ToolResult {
+        if button != 1 || count != 1 || !modifiers.is_empty() {
+            return retained_click::unqualified(
+                "secondary element clicks require the retained pointer route",
+            );
+        }
         let Some(xid) = xid_hint.filter(|xid| *xid != 0) else {
             return ToolResult::error("Indexed click requires an observed exact X11 window");
         };
@@ -6086,6 +6098,11 @@ impl Tool for ClickTool {
         let has_xy = args.get("x").map(|v| v.is_number()).unwrap_or(false)
             && args.get("y").map(|v| v.is_number()).unwrap_or(false);
         if has_xy && !has_pid && !has_window_id {
+            if args.get("element_token").is_some() || args.get("element_index").is_some() {
+                return retained_click::unqualified(
+                    "element targets cannot use windowless desktop coordinates",
+                );
+            }
             if args.get("scope").and_then(Value::as_str) != Some("desktop") {
                 return ToolResult::error(
                     "click: x,y given with no pid/window_id requires scope=\"desktop\"; \
@@ -6159,7 +6176,6 @@ impl Tool for ClickTool {
             Ok(count) => count as usize,
             Err(err) => return err,
         };
-        let isolated_background = isolated_hyprland_background(delivery);
         // Surface 5: reject unknown buttons so a typo can't silently fall through
         // to a left-click. Empty string keeps back-compat with old clients.
         let button_str_raw = args.str_or("button", "left").to_lowercase();
@@ -6174,6 +6190,14 @@ impl Tool for ClickTool {
             button_str_raw.as_str()
         };
         let button = parse_mouse_button(button_str);
+        // Argument qualification precedes every platform/capability branch.
+        if args.get("element_token").is_some() || args.get("element_index").is_some() {
+            if let Err(refusal) = retained_click::qualify(delivery, button, count, &modifiers) {
+                return refusal;
+            }
+        }
+
+        let isolated_background = isolated_hyprland_background(delivery);
 
         // Surface 6: element_token / element_index precedence resolution.
         // We resolve before the legacy `opt_u64("element_index")` branch
@@ -6203,6 +6227,22 @@ impl Tool for ClickTool {
             }
             cua_driver_core::element_token::ResolvedElement::None => window_id_arg,
         };
+
+        if let Some(idx) = elem_idx_resolved {
+            if button != 1 || count != 1 || !modifiers.is_empty() {
+                return retained_click::invoke(
+                    &self.state,
+                    pid,
+                    window_id_resolved.expect("element has window"),
+                    idx,
+                    snapshot_identity.expect("element has identity"),
+                    delivery,
+                    button,
+                    count,
+                )
+                .await;
+            }
+        }
 
         if crate::wayland::is_gnome_wayland_session() && window_id_resolved.is_none() {
             return ToolResult::error(
@@ -6242,19 +6282,13 @@ impl Tool for ClickTool {
                         idx,
                         window_id_resolved,
                         snapshot_identity,
-                        button,
-                        count,
-                        modifiers,
+                        1,
+                        1,
+                        Vec::new(),
                         delivery,
                         cursor_id,
                     )
                     .await;
-            }
-            if !modifiers.is_empty() || button != 1 || count != 1 {
-                return ToolResult::error(
-                    "exact Wayland element action cannot fall through to pointer injection",
-                )
-                .with_structured(json!({"code":"element_route_unqualified","effect":"refused"}));
             }
             let proof = exact_target_proof.expect("checked exact target");
             let task = match self.state.snapshots.spawn_observed_mutation(
@@ -9334,6 +9368,9 @@ impl Tool for DoubleClickTool {
             Err(e) => return e,
         };
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if let Err(refusal) = retained_click::qualify_args(&args, delivery, 1, 2) {
+            return refusal;
+        }
         if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
             return refusal;
         }
@@ -9345,6 +9382,16 @@ impl Tool for DoubleClickTool {
         }
         if let Some(refusal) = unavailable_wayland_focused_input_background(delivery, true) {
             return refusal;
+        }
+        if args.get("element_index").is_some() || args.get("element_token").is_some() {
+            let mut args = args;
+            args["button"] = json!("left");
+            args["count"] = json!(2);
+            return ClickTool {
+                state: self.state.clone(),
+            }
+            .invoke(args)
+            .await;
         }
         if hyprland_foreground(delivery) {
             // Share exact-target validation and the admitted native click lifecycle.
@@ -9366,12 +9413,6 @@ impl Tool for DoubleClickTool {
                 Ok(r) => r,
                 Err(e) => return e,
             };
-        let elem_idx_resolved = match &resolved {
-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
-                Some(*element_index)
-            }
-            cua_driver_core::element_token::ResolvedElement::None => None,
-        };
         let window_id_resolved: Option<u64> = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => {
                 Some(*window_id)
@@ -9386,77 +9427,6 @@ impl Tool for DoubleClickTool {
                 "code": "exact_target_required",
                 "required": ["pid", "window_id"],
             }));
-        }
-        if let Some(idx) = elem_idx_resolved {
-            let xid_hint = window_id_resolved;
-            let result =
-                cua_driver_core::blocking::spawn(move || -> anyhow::Result<(u64, f64, f64)> {
-                    resolve_element_local_coords(pid, idx, xid_hint)
-                })
-                .await;
-            return match result {
-                Ok(Ok((xid, lx, ly))) => {
-                    if let Ok(Ok((sx, sy))) = cua_driver_core::blocking::spawn(move || {
-                        element_screen_center(pid, idx, Some(xid))
-                    })
-                    .await
-                    {
-                        crate::overlay::send_command_for(
-                            cursor_id.clone(),
-                            cursor_overlay::OverlayCommand::PinAbove(xid),
-                        );
-                        reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, true).await;
-                    }
-                    let lxi = lx as i32;
-                    let lyi = ly as i32;
-                    let wayland_point = crate::wayland::wayland_input_enabled()
-                        .then(|| crate::wayland::window_local_to_output(xid, lxi, lyi));
-                    let cursor_id_for_task = cursor_id.clone();
-                    let click_result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<
-                        Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
-                    > {
-                        if crate::wayland::is_inject_mode() {
-                            let (output_x, output_y) = wayland_point.unwrap_or((lxi, lyi));
-                            let target = crate::wayland::establish_exact_target(pid, xid)?;
-                            return crate::wayland::click_with_outcome(
-                                target, output_x, output_y, 2, 1,
-                            );
-                        }
-                        if crate::wayland::wayland_input_enabled() {
-                            let (output_x, output_y) = wayland_point.unwrap_or((lxi, lyi));
-                            let target = crate::wayland::establish_exact_target(pid, xid)?;
-                            return crate::wayland::click_with_outcome(
-                                target, output_x, output_y, 2, 1,
-                            );
-                        }
-                        if delivery.is_foreground() {
-                            return crate::input::with_x11_foreground(xid, 80, || {
-                                let (sx, sy) = window_local_to_screen(xid, lxi as f64, lyi as f64)?;
-                                crate::input::send_click_xtest_desktop(
-                                    sx.round() as i32,
-                                    sy.round() as i32,
-                                    1,
-                                    2,
-                                )
-                            })
-                            .map(|()| None);
-                        }
-                        x11_pixel_click_no_focus_steal(&cursor_id_for_task, xid, lxi, lyi, 1, 2)
-                            .map(|()| None)
-                    })
-                    .await;
-                    match click_result {
-                        Ok(Ok(outcome)) => {
-                            ToolResult::text(format!("✅ Double-clicked element [{idx}]."))
-                                .with_structured(with_foreground_diagnostics(json!({}), outcome))
-                        }
-                        Ok(Err(e)) => linux_input_error(e),
-                        Err(e) => ToolResult::error(format!("Task error: {e}")),
-                    }
-                }
-                Ok(Err(e)) => ToolResult::error(format!("AT-SPI bounds failed: {e}")),
-                Err(e) => ToolResult::error(format!("Task error: {e}")),
-            };
         }
         let xid = match window_id_resolved {
             Some(v) => v,
@@ -9606,6 +9576,9 @@ impl Tool for RightClickTool {
             Err(e) => return e,
         };
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if let Err(refusal) = retained_click::qualify_args(&args, delivery, 3, 1) {
+            return refusal;
+        }
         if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
             return refusal;
         }
@@ -9619,9 +9592,6 @@ impl Tool for RightClickTool {
             return refusal;
         }
         if args.get("element_index").is_some() || args.get("element_token").is_some() {
-            // Element targets share ClickTool's token route. A right click has
-            // no accessibility action, so it is always pointer input and the
-            // background refusals above must run first.
             let mut args = args;
             args["button"] = json!("right");
             args["count"] = json!(1);
@@ -9650,12 +9620,6 @@ impl Tool for RightClickTool {
             Ok(r) => r,
             Err(e) => return e,
         };
-        let elem_idx_resolved = match &resolved {
-            cua_driver_core::element_token::ResolvedElement::Element { element_index, .. } => {
-                Some(*element_index)
-            }
-            cua_driver_core::element_token::ResolvedElement::None => None,
-        };
         let window_id_resolved: Option<u64> = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => {
                 Some(*window_id)
@@ -9670,77 +9634,6 @@ impl Tool for RightClickTool {
                 "code": "exact_target_required",
                 "required": ["pid", "window_id"],
             }));
-        }
-        if let Some(idx) = elem_idx_resolved {
-            let xid_hint = window_id_resolved;
-            let result =
-                cua_driver_core::blocking::spawn(move || -> anyhow::Result<(u64, f64, f64)> {
-                    resolve_element_local_coords(pid, idx, xid_hint)
-                })
-                .await;
-            return match result {
-                Ok(Ok((xid, lx, ly))) => {
-                    if let Ok(Ok((sx, sy))) = cua_driver_core::blocking::spawn(move || {
-                        element_screen_center(pid, idx, Some(xid))
-                    })
-                    .await
-                    {
-                        crate::overlay::send_command_for(
-                            cursor_id.clone(),
-                            cursor_overlay::OverlayCommand::PinAbove(xid),
-                        );
-                        reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, true).await;
-                    }
-                    let lxi = lx as i32;
-                    let lyi = ly as i32;
-                    let wayland_point = crate::wayland::wayland_input_enabled()
-                        .then(|| crate::wayland::window_local_to_output(xid, lxi, lyi));
-                    let cursor_id_for_task = cursor_id.clone();
-                    let click_result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<
-                        Option<crate::wayland::shell_helper::ForegroundTerminalOutcome>,
-                    > {
-                        if crate::wayland::is_inject_mode() {
-                            let (output_x, output_y) = wayland_point.unwrap_or((lxi, lyi));
-                            let target = crate::wayland::establish_exact_target(pid, xid)?;
-                            return crate::wayland::click_with_outcome(
-                                target, output_x, output_y, 1, 3,
-                            );
-                        }
-                        if crate::wayland::wayland_input_enabled() {
-                            let (output_x, output_y) = wayland_point.unwrap_or((lxi, lyi));
-                            let target = crate::wayland::establish_exact_target(pid, xid)?;
-                            return crate::wayland::click_with_outcome(
-                                target, output_x, output_y, 1, 3,
-                            );
-                        }
-                        if delivery.is_foreground() {
-                            return crate::input::with_x11_foreground(xid, 80, || {
-                                let (sx, sy) = window_local_to_screen(xid, lxi as f64, lyi as f64)?;
-                                crate::input::send_click_xtest_desktop(
-                                    sx.round() as i32,
-                                    sy.round() as i32,
-                                    3,
-                                    1,
-                                )
-                            })
-                            .map(|()| None);
-                        }
-                        x11_pixel_click_no_focus_steal(&cursor_id_for_task, xid, lxi, lyi, 3, 1)
-                            .map(|()| None)
-                    })
-                    .await;
-                    match click_result {
-                        Ok(Ok(outcome)) => {
-                            ToolResult::text(format!("✅ Right-clicked element [{idx}]."))
-                                .with_structured(with_foreground_diagnostics(json!({}), outcome))
-                        }
-                        Ok(Err(e)) => linux_input_error(e),
-                        Err(e) => ToolResult::error(format!("Task error: {e}")),
-                    }
-                }
-                Ok(Err(e)) => ToolResult::error(format!("AT-SPI bounds failed: {e}")),
-                Err(e) => ToolResult::error(format!("Task error: {e}")),
-            };
         }
         let xid = match window_id_resolved {
             Some(v) => v,

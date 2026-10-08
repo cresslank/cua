@@ -129,6 +129,75 @@ pub fn list_windows() -> Option<Vec<Window>> {
     parse_tree(&output.stdout)
 }
 
+/// Fail closed rather than use a first-output physical extent for logical
+/// AT-SPI coordinates. Secondary element pointer input currently qualifies only
+/// one unscaled, unrotated, origin-zero output.
+pub(crate) fn retained_pointer_extent() -> anyhow::Result<(u32, u32)> {
+    let output = Command::new("swaymsg")
+        .args(["-r", "-t", "get_outputs"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()?;
+    anyhow::ensure!(output.status.success(), "output geometry unavailable");
+    retained_pointer_extent_from_json(&serde_json::from_slice::<serde_json::Value>(
+        &output.stdout,
+    )?)
+}
+
+fn retained_pointer_extent_from_json(value: &serde_json::Value) -> anyhow::Result<(u32, u32)> {
+    let outputs = value
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("invalid output geometry"))?;
+    let active: Vec<_> = outputs.iter().filter(|o| o["active"] == true).collect();
+    anyhow::ensure!(
+        active.len() == 1,
+        "element_route_unqualified: multiple/no active outputs"
+    );
+    let output = active[0];
+    anyhow::ensure!(
+        output["scale"].as_f64() == Some(1.0)
+            && output["transform"] == "normal"
+            && output["rect"]["x"] == 0
+            && output["rect"]["y"] == 0,
+        "element_route_unqualified: scaled, transformed or offset output"
+    );
+    let w = output["rect"]["width"]
+        .as_u64()
+        .and_then(|w| u32::try_from(w).ok());
+    let h = output["rect"]["height"]
+        .as_u64()
+        .and_then(|h| u32::try_from(h).ok());
+    match (w, h) {
+        (Some(w), Some(h)) if w > 0 && h > 0 => Ok((w, h)),
+        _ => anyhow::bail!("output dimensions unavailable"),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn secondary_pointer_output_geometry_is_fail_closed() {
+    use serde_json::json;
+    let output = json!({"active":true,"scale":1.0,"transform":"normal","rect":{"x":0,"y":0,"width":800,"height":600}});
+    assert_eq!(
+        retained_pointer_extent_from_json(&json!([output])).unwrap(),
+        (800, 600)
+    );
+    assert!(retained_pointer_extent_from_json(&json!([output, output])).is_err());
+    for (key, value) in [
+        ("scale", json!(2.0)),
+        ("transform", json!("90")),
+        ("active", json!(false)),
+    ] {
+        let mut changed = output.clone();
+        changed[key] = value;
+        assert!(retained_pointer_extent_from_json(&json!([changed])).is_err());
+    }
+    let mut changed = output.clone();
+    changed["rect"]["x"] = json!(10);
+    assert!(retained_pointer_extent_from_json(&json!([changed])).is_err());
+    assert!(retained_pointer_extent_from_json(&json!([])).is_err());
+}
+
 pub fn window_for_id(id: u64) -> Option<Window> {
     list_windows()?.into_iter().find(|window| window.id == id)
 }
