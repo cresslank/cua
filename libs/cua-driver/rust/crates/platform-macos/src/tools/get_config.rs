@@ -91,6 +91,9 @@ impl Tool for GetConfigTool {
                 "enabled": cursor_enabled,
                 "glide_duration_ms": glide_duration_ms,
             },
+            "cursor": {
+                "motion": cursor_overlay::motion_defaults::read_saved().config_json(),
+            },
             "experimental_pip": pip_enabled,
             "experimental_pip_geometry": pip_geometry,
         }))

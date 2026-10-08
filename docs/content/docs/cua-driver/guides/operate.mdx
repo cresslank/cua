@@ -274,7 +274,11 @@ cua-driver get_agent_cursor_state '{"session":"research"}'
 ```
 
 `set_agent_cursor_enabled` hides or shows it; `set_agent_cursor_motion` tunes
-movement. Labels longer than 28 characters are shortened.
+movement: `style` picks the trajectory (`signature_arc` by default, or
+`spring_settle`, `magnetic`, `comet_swoop`, `adaptive`, `classic`), `timing`
+picks `native`, `fitts`, or `fixed`, and `effects` turns the trail, glow,
+magnet, ripple, and squish on or off. The shell shortcut is
+`cua-driver cursor motion --session research --style comet_swoop`. Labels longer than 28 characters are shortened.
 
 A custom theme is a dotLottie archive with a `cua/theme.json` manifest
 (`"schema": "cua.cursor-theme/2"`), 128×128 30 fps animations for all twelve
@@ -291,6 +295,53 @@ cua-driver cursor-theme install theme.cua-theme
 cua-driver cursor-theme list
 cua-driver cursor-theme uninstall com.example.cursor.studio
 ```
+
+## Choose your cursor
+
+Six motion styles are built in. `signature_arc` is the default.
+
+| Style | Feel |
+| --- | --- |
+| `signature_arc` | One confident arc with a small follow-through. |
+| `spring_settle` | An arc that lands with one soft bounce. |
+| `magnetic` | Slows near the target, then is pulled in. |
+| `comet_swoop` | A wide arc with a short trail. |
+| `adaptive` | Careful for small targets, a swoop for long moves. |
+| `classic` | The original glide. |
+
+Pick one for every new session by saving it as the default:
+
+```bash test="cli-shape" id="cua-driver-choose-cursor-default"
+cua-driver config set cursor.motion.style magnetic
+cua-driver config set cursor.motion.timing fitts
+cua-driver config set cursor.motion.effects.trail true
+cua-driver config get cursor.motion.style
+```
+
+The default is saved in `~/.cua-driver/config.json` and applies to sessions
+started afterwards. Use `null` as the value to clear a key, or
+`cua-driver config set cursor.motion null` to clear them all. A bad value is
+rejected with the list of allowed styles.
+
+Or choose per run, before the cursor first appears, in `start_session`:
+
+```bash test="cli-shape" id="cua-driver-choose-cursor-session"
+cua-driver start_session '{"session":"research","cursor_motion":{"style":"spring_settle","timing":"fitts"}}'
+```
+
+`cursor_motion` takes the same fields as `set_agent_cursor_motion`, and
+`start_session` echoes it back. When several apply, the most specific wins:
+
+1. `set_agent_cursor_motion` on the session
+2. `cursor_motion` in `start_session`
+3. the saved default (`cursor.motion.*`)
+4. the built-in `signature_arc`
+
+Reduced motion always wins: when the theme or host asks for it, every move is a
+short straight glide with no effects, whatever you chose.
+
+Cua Driver has no settings window, so there is no cursor picker in the app. Use
+`cua-driver config set` or `start_session`.
 
 ## Telemetry
 

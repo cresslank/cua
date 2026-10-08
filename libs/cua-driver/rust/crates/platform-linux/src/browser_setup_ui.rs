@@ -1217,6 +1217,9 @@ fn set_remote_debugging(
                             .ok_or_else(|| anyhow::anyhow!("checkbox center y overflowed"))?;
                         validate_single_exact_native_window(&handle.target)?;
                         if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                            // AT-SPI screen bounds are layout coordinates, not
+                            // desktop-frame points. Keep the carried exact target;
+                            // click's native pointer space applies the layout origin.
                             crate::wayland::click(handle.target.clone(), center_x, center_y, 1, 1)?;
                         } else {
                             crate::input::with_x11_foreground(window_id, 80, || {

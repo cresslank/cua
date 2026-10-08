@@ -2,6 +2,7 @@
 
 use std::time::{Duration, Instant};
 
+use cua_driver_core::browser::platform::BrowserConsentAction;
 use cua_driver_core::browser::{
     BrowserConsentOutcome, BrowserConsentRequest, BrowserRefusal, BrowserRefusalCode,
 };
@@ -244,6 +245,45 @@ pub fn dismiss(pid: u32, window_id: u64) -> Result<bool, BrowserRefusal> {
     }
 }
 
+fn check_deadline(deadline: Instant) -> Result<(), BrowserRefusal> {
+    if Instant::now() >= deadline {
+        return Err(refusal(
+            BrowserRefusalCode::BrowserWrongTargetRefused,
+            "Chromium remote-debugging consent did not settle within its bounded attempt",
+        ));
+    }
+    Ok(())
+}
+
+async fn consent_action<T: Send + 'static>(
+    action: &BrowserConsentAction,
+    deadline: Instant,
+    operation: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> Result<T, BrowserRefusal> {
+    check_deadline(deadline)?;
+    // Commit before scheduling: dropping a running blocking task cannot cancel it.
+    let worker = action.perform(|| {
+        cua_driver_core::blocking::spawn(move || {
+            check_deadline(deadline)?;
+            operation().map_err(|error| {
+                refusal(
+                    BrowserRefusalCode::BrowserWrongTargetRefused,
+                    format!("the exact browser consent action failed: {error}"),
+                )
+            })
+        })
+    });
+    let result = worker.await.map_err(|error| {
+        refusal(
+            BrowserRefusalCode::BrowserRouteUnavailable,
+            format!("could not dispatch the exact browser consent action: {error}"),
+        )
+    })??;
+    // The native helper may outlast our deadline. Join it, then refuse without fallback.
+    check_deadline(deadline)?;
+    Ok(result)
+}
+
 pub async fn handle(
     request: BrowserConsentRequest,
 ) -> Result<BrowserConsentOutcome, BrowserRefusal> {
@@ -263,6 +303,7 @@ pub async fn handle(
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut saw_prompt = false;
     loop {
+        check_deadline(deadline)?;
         crate::wayland::validate_exact_target(&target).map_err(|error| {
             refusal(
                 BrowserRefusalCode::BrowserBindingStale,
@@ -279,13 +320,14 @@ pub async fn handle(
                         format!("could not inspect the browser consent UI: {error}"),
                     )
                 })?;
+        check_deadline(deadline)?;
         let prompt_present = remote_debugging_prompt_present(&tree.nodes);
         saw_prompt |= prompt_present;
         match exact_allow_button(&tree.nodes, &tree.bounds)? {
             Some(allow) => {
                 let expected_action = allow.action.clone();
                 let action_target = target.clone();
-                let result = cua_driver_core::blocking::spawn(move || {
+                let result = consent_action(&request.action, deadline, move || {
                     // Revalidate the immutable compositor identity in the same
                     // blocking action transaction as the stable semantic key.
                     crate::atspi::perform_verified_action_by_key(
@@ -298,19 +340,7 @@ pub async fn handle(
                         &allow.action,
                     )
                 })
-                .await
-                .map_err(|error| {
-                    refusal(
-                        BrowserRefusalCode::BrowserRouteUnavailable,
-                        format!("could not dispatch the exact browser consent action: {error}"),
-                    )
-                })?
-                .map_err(|error| {
-                    refusal(
-                        BrowserRefusalCode::BrowserWrongTargetRefused,
-                        format!("the exact browser consent action failed: {error}"),
-                    )
-                })?;
+                .await?;
                 if result.0 != expected_action || result.1 {
                     return Err(refusal(
                         BrowserRefusalCode::BrowserWrongTargetRefused,
@@ -328,15 +358,6 @@ pub async fn handle(
                     "the browser consent prompt disappeared without an explicitly acknowledged Allow action",
                 ));
             }
-            None if Instant::now() >= deadline => {
-                return Err(refusal(
-                    BrowserRefusalCode::BrowserWrongTargetRefused,
-                    format!(
-                        "no exact Chromium remote-debugging consent prompt appeared for reconnect attempt {}",
-                        request.attempt
-                    ),
-                ));
-            }
             _ => {}
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -346,6 +367,84 @@ pub async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn expired_action_never_enters_native_helper() {
+        let result = consent_action(&BrowserConsentAction::default(), Instant::now(), || {
+            panic!("expired action entered the native helper");
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            BrowserRefusalCode::BrowserWrongTargetRefused
+        );
+    }
+
+    #[test]
+    fn queued_action_checks_deadline_before_native_helper() {
+        use std::future::Future;
+        use std::task::Poll;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let blocker = runtime.spawn_blocking(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+        started_rx.recv().unwrap();
+        runtime.block_on(async {
+            let action = BrowserConsentAction::default();
+            let deadline = Instant::now() + Duration::from_millis(100);
+            let mut consent = Box::pin(consent_action(&action, deadline, || {
+                panic!("expired queued action entered the native helper");
+                #[allow(unreachable_code)]
+                Ok(())
+            }));
+            std::future::poll_fn(|cx| {
+                assert!(consent.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            release_tx.send(()).unwrap();
+            assert_eq!(
+                consent.await.unwrap_err().code,
+                BrowserRefusalCode::BrowserWrongTargetRefused
+            );
+            blocker.await.unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn running_action_is_joined_and_late_success_refused() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_completed = completed.clone();
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let result = consent_action(&BrowserConsentAction::default(), deadline, move || {
+            std::thread::sleep(Duration::from_millis(120));
+            worker_completed.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert!(
+            completed.load(Ordering::SeqCst),
+            "native worker was detached"
+        );
+        assert_eq!(
+            result.unwrap_err().code,
+            BrowserRefusalCode::BrowserWrongTargetRefused
+        );
+    }
 
     fn node(role: &str, name: &str, actions: &[&str]) -> AtspiNode {
         AtspiNode {

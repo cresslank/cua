@@ -2395,6 +2395,7 @@ mod tests {
                 session: Some(public.clone()),
                 capture_scope: None,
                 cursor_theme: None,
+                cursor_motion: None,
             })
             .await
             .unwrap();
@@ -3227,6 +3228,7 @@ mod tests {
                 session: Some("run-2".into()),
                 capture_scope: Some(cua_driver_contract::CaptureScope::Auto),
                 cursor_theme: None,
+                cursor_motion: None,
             })
             .await
             .unwrap();

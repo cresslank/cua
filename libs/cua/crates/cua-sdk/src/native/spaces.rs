@@ -2251,7 +2251,9 @@ impl Spaces {
         let host = self.host.clone();
         run(async move {
             match &host {
-                Host::Embedded(s) => Ok(s.list()?.into_iter().map(Into::into).collect()),
+                // With the account's relay machines, the directory read
+                // again, as `cua daemon`'s `ListSpaces` does.
+                Host::Embedded(s) => Ok(s.list_all().await?.into_iter().map(Into::into).collect()),
                 Host::Daemon(d) => Ok(d
                     .spaces()
                     .list_spaces(dpb::ListSpacesRequest {})
@@ -2877,6 +2879,21 @@ impl Space {
     /// `GetCapabilities` of the spacesd, as proto3 JSON.
     pub fn capabilities_json(&self) -> Result<String> {
         Ok(serde_json::to_string(self.inner.capabilities())?)
+    }
+
+    /// The cua-spacesd client over the connection this Space authenticated.
+    pub fn spacesd(&self) -> Result<Arc<super::spacesd::SpacesdClient>> {
+        let client = self.inner.spacesd()?.clone();
+        let s = self.inner.clone();
+        let refresh: super::spacesd::WsHeaderRefresh = Arc::new(move || {
+            let s = s.clone();
+            Box::pin(async move { Ok(s.websocket_headers().await?) })
+        });
+        Ok(Arc::new(
+            super::spacesd::SpacesdClient::new(client, vec![])
+                .at(self.inner.provider().as_str())
+                .with_ws_refresh(refresh),
+        ))
     }
 
     /// Headers a media WebSocket to this Space needs besides its ticket.

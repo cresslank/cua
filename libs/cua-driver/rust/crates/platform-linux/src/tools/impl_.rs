@@ -47,6 +47,14 @@ fn window_target_candidates_for_pid(
 fn desktop_point_window_resolver() -> cua_driver_core::window_target::DesktopPointWindowResolver {
     Arc::new(move |pid, x, y| {
         let pid = u32::try_from(pid).ok()?;
+        // Window geometry is in layout coordinates; on Hyprland the desktop
+        // frame starts at the top-left powered output, not the layout origin.
+        let (x, y) = if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+            let frame = crate::wayland::hyprland::desktop_frame().ok()?;
+            (x + f64::from(frame.x), y + f64::from(frame.y))
+        } else {
+            (x, y)
+        };
         topmost_window_at(&crate::wayland::list_windows_dispatch(Some(pid)), pid, x, y)
     })
 }
@@ -3702,11 +3710,37 @@ fn resolve_element_local_coords(
 }
 
 fn element_screen_center(pid: u32, idx: usize, xid: Option<u64>) -> anyhow::Result<(f64, f64)> {
+    element_screen_center_and_rect(pid, idx, xid).map(|(center, _)| center)
+}
+
+/// The element's screen centre plus its AT-SPI extents as the overlay's
+/// `[x, y, width, height]`, both from one bounds lookup (same screen space).
+fn element_screen_center_and_rect(
+    pid: u32,
+    idx: usize,
+    xid: Option<u64>,
+) -> anyhow::Result<((f64, f64), [f64; 4])> {
     let (bx, by, bw, bh) = match xid {
         Some(xid) => crate::atspi::get_element_bounds_for_window(pid, xid, idx)?,
         None => crate::atspi::get_element_bounds(pid, idx)?,
     };
-    Ok((bx as f64 + bw as f64 / 2.0, by as f64 + bh as f64 / 2.0))
+    let rect = [bx as f64, by as f64, bw as f64, bh as f64];
+    Ok(((rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0), rect))
+}
+
+/// A snapshot frame `(x, y, w, h)` as the overlay target rect, only when it
+/// is non-empty and actually contains the glide point (a redirected press or
+/// a frame in another space gets no rect rather than a wrong one).
+fn frame_target_rect(bounds: Option<(i32, i32, u32, u32)>, sx: f64, sy: f64) -> Option<[f64; 4]> {
+    let (x, y, w, h) = bounds?;
+    let rect = [f64::from(x), f64::from(y), f64::from(w), f64::from(h)];
+    (w > 0
+        && h > 0
+        && sx >= rect[0]
+        && sy >= rect[1]
+        && sx <= rect[0] + rect[2]
+        && sy <= rect[1] + rect[3])
+        .then_some(rect)
 }
 
 fn window_local_to_screen(xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
@@ -4493,6 +4527,40 @@ async fn foreground_hyprland_action(
     let owner = named_session_cursor_key(args);
     let (_cancellation, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
         crate::wayland::hyprland_input::execute_foreground(owner, pid, xid, action, cancellation)
+    }) {
+        Ok(dispatch) => dispatch,
+        Err(_) => return foreground_hyprland_refusal("authenticated admitted lifecycle required"),
+    };
+    hyprland_input_result(
+        match dispatch.await {
+            Ok(result) => result,
+            Err(error) => Err(crate::wayland::hyprland_input::unknown_dispatch(
+                error.into(),
+                0,
+            )),
+        },
+        true,
+    )
+}
+
+async fn foreground_hyprland_scroll(
+    args: &Value,
+    pid: u32,
+    xid: u64,
+    actions: Vec<crate::wayland::hyprland_input::Action>,
+) -> ToolResult {
+    if !crate::wayland::hyprland_input::enabled() {
+        return foreground_hyprland_refusal("production Hyprland input plugin is unavailable");
+    }
+    let owner = named_session_cursor_key(args);
+    let (_cancellation, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
+        crate::wayland::hyprland_input::execute_foreground_scroll(
+            owner,
+            pid,
+            xid,
+            actions,
+            cancellation,
+        )
     }) {
         Ok(dispatch) => dispatch,
         Err(_) => return foreground_hyprland_refusal("authenticated admitted lifecycle required"),
@@ -5639,17 +5707,36 @@ fn overlay_snap_to_for(cursor_id: &str, sx: f64, sy: f64, heading: Option<f64>) 
 }
 
 fn overlay_move_to_for(cursor_id: &str, sx: f64, sy: f64, heading: Option<f64>) {
+    overlay_move_to_target_for(cursor_id, sx, sy, heading, None);
+}
+
+/// [`overlay_move_to_for`] with the targeted element's screen rect
+/// `[x, y, width, height]` (same space as `sx`/`sy`).
+fn overlay_move_to_target_for(
+    cursor_id: &str,
+    sx: f64,
+    sy: f64,
+    heading: Option<f64>,
+    target: Option<[f64; 4]>,
+) {
     crate::overlay::send_command_for(
         cursor_id.to_owned(),
         cursor_overlay::OverlayCommand::MoveTo {
             x: sx,
             y: sy,
             end_heading_radians: heading.unwrap_or(std::f64::consts::FRAC_PI_4),
+            target,
         },
     );
 }
 
 async fn overlay_glide_to_for(cursor_id: &str, sx: f64, sy: f64) {
+    overlay_glide_to_target_for(cursor_id, sx, sy, None).await;
+}
+
+/// [`overlay_glide_to_for`] with the targeted element's screen rect
+/// `[x, y, width, height]` (same space as `sx`/`sy`); `None` for pixel actions.
+async fn overlay_glide_to_target_for(cursor_id: &str, sx: f64, sy: f64, target: Option<[f64; 4]>) {
     // Explicit runtime disable persists across pointer and keyboard actions.
     if !crate::overlay::is_enabled_for(cursor_id) {
         return;
@@ -5658,7 +5745,7 @@ async fn overlay_glide_to_for(cursor_id: &str, sx: f64, sy: f64) {
     // let the Linux overlay layer select the exact-target semantic helper,
     // layer-shell, or older helper fallback without a competing interpolation.
     if crate::wayland::is_wayland() {
-        overlay_move_to_for(cursor_id, sx, sy, None);
+        overlay_move_to_target_for(cursor_id, sx, sy, None, target);
         return;
     }
     if !crate::overlay::is_placed_for(cursor_id) {
@@ -5668,7 +5755,19 @@ async fn overlay_glide_to_for(cursor_id: &str, sx: f64, sy: f64) {
         );
         return;
     }
-    crate::overlay::animate_cursor_to_for(cursor_id.to_owned(), sx, sy).await;
+    crate::overlay::animate_cursor_to_target_for(cursor_id.to_owned(), sx, sy, target).await;
+}
+
+/// The compositor snapshot a desktop-scope action is addressed in. One
+/// snapshot converts the action's points, places the overlay and sizes the
+/// virtual pointer, so they cannot disagree about the monitor layout.
+async fn desktop_input_space() -> anyhow::Result<crate::wayland::DesktopInputSpace> {
+    if !crate::wayland::wayland_input_enabled() {
+        return Ok(crate::wayland::DesktopInputSpace::default());
+    }
+    cua_driver_core::blocking::spawn(crate::wayland::DesktopInputSpace::current)
+        .await
+        .map_err(|error| anyhow::anyhow!("task error: {error}"))?
 }
 
 /// Keep the logical cursor position in sync with every visibly targeted
@@ -5681,12 +5780,25 @@ async fn reveal_pointer_action_for(
     sy: f64,
     click_pulse: bool,
 ) {
+    reveal_pointer_action_for_target(state, cursor_id, sx, sy, click_pulse, None).await;
+}
+
+/// [`reveal_pointer_action_for`] with the targeted element's screen rect
+/// `[x, y, width, height]` (same space as `sx`/`sy`).
+async fn reveal_pointer_action_for_target(
+    state: &ToolState,
+    cursor_id: &str,
+    sx: f64,
+    sy: f64,
+    click_pulse: bool,
+    target: Option<[f64; 4]>,
+) {
     if !sx.is_finite() || !sy.is_finite() {
         return;
     }
     state.cursor_registry.update_position(cursor_id, sx, sy);
     emit_cursor_hook(cursor_id, sx, sy, false);
-    overlay_glide_to_for(cursor_id, sx, sy).await;
+    overlay_glide_to_target_for(cursor_id, sx, sy, target).await;
     if click_pulse {
         emit_cursor_hook(cursor_id, sx, sy, true);
         crate::overlay::send_command_for(
@@ -6155,10 +6267,10 @@ impl ClickTool {
                 .acquire_observed_mutation(snapshot_identity, idx)
                 .map_err(|error| anyhow::anyhow!("stale_element_token: {error}"))?;
             let target = crate::atspi::resolve_observed_click_target(pid, idx, xid, &identity)?;
-            let center = target
-                .screen_bounds()
-                .ok()
-                .map(|(x, y, w, h)| (x as f64 + w as f64 / 2.0, y as f64 + h as f64 / 2.0));
+            let center = target.screen_bounds().ok().map(|bounds @ (x, y, w, h)| {
+                let (sx, sy) = (x as f64 + w as f64 / 2.0, y as f64 + h as f64 / 2.0);
+                ((sx, sy), frame_target_rect(Some(bounds), sx, sy))
+            });
             // Hand the admission through the overlay wait to the mutation worker.
             // If either waiter is cancelled, native work still owns its permit.
             Ok((permit, target, center))
@@ -6171,12 +6283,13 @@ impl ClickTool {
             }
             Err(error) => return ToolResult::error(format!("Task error: {error}")),
         };
-        if let Some((sx, sy)) = center {
+        if let Some(((sx, sy), target_rect)) = center {
             crate::overlay::send_command_for(
                 cursor_id.clone(),
                 cursor_overlay::OverlayCommand::PinAbove(xid),
             );
-            reveal_pointer_action_for(&self.state, &cursor_id, sx, sy, true).await;
+            reveal_pointer_action_for_target(&self.state, &cursor_id, sx, sy, true, target_rect)
+                .await;
         }
         let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<ToolResult> {
             let permit = std::sync::Arc::new(permit);
@@ -6367,12 +6480,26 @@ impl Tool for ClickTool {
                 return ToolResult::error("click: count must be between 1 and 3")
                     .with_structured(json!({ "code": "invalid_arguments" }));
             }
+            let space = match desktop_input_space().await {
+                Ok(space) => space,
+                Err(error) => {
+                    return ToolResult::error(format!("desktop-scope click failed: {error}"))
+                }
+            };
             // Glide the agent-cursor overlay to the click point first (the macOS
             // / Windows desktop paths already do this). Without it the overlay
             // sits idle elsewhere while only the real pointer warps, so a viewer
             // sees the cursor "click somewhere else."
-            reveal_pointer_action_for(&self.state, &cursor_id, f64::from(sx), f64::from(sy), true)
-                .await;
+            // The overlay draws in layout coordinates, like the input below.
+            let (overlay_x, overlay_y) = space.to_layout(sx, sy);
+            reveal_pointer_action_for(
+                &self.state,
+                &cursor_id,
+                f64::from(overlay_x),
+                f64::from(overlay_y),
+                true,
+            )
+            .await;
             let r = cua_driver_core::blocking::spawn(move || {
                 if crate::wayland::wayland_input_enabled() {
                     if !modifiers.is_empty() {
@@ -6381,7 +6508,7 @@ impl Tool for ClickTool {
                              the virtual-pointer route cannot carry keyboard modifier state"
                         );
                     }
-                    crate::wayland::click_desktop(sx, sy, n as u32, button)
+                    crate::wayland::click_desktop(&space, sx, sy, n as u32, button)
                 } else {
                     let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                     crate::input::send_click_xtest_desktop_with_modifiers(
@@ -7396,6 +7523,8 @@ impl Tool for TypeTextTool {
                 Ok(_) => return isolated_hyprland_refusal("background text must not be empty"),
                 Err(error) => return isolated_hyprland_refusal(error.to_string()),
             }
+            position_named_session_keyboard_cursor(&self.state, &args, pid, xid, None, None, true)
+                .await;
             let owner = named_session_cursor_key(&args);
             let (_cancellation, dispatch) =
                 match spawn_isolated_hyprland(&args, move |cancellation| {
@@ -7466,7 +7595,20 @@ impl Tool for TypeTextTool {
             {
                 return error;
             }
-            if named_session_cursor_key(&args).is_none() {
+            if named_session_cursor_key(&args).is_some() {
+                if px.is_none() {
+                    position_named_session_keyboard_cursor(
+                        &self.state,
+                        &args,
+                        pid,
+                        xid,
+                        None,
+                        None,
+                        true,
+                    )
+                    .await;
+                }
+            } else {
                 announce_keyboard_target(&args, pid, xid, None, px.zip(py)).await;
             }
             let owner = named_session_cursor_key(&args);
@@ -8041,6 +8183,8 @@ impl Tool for PressKeyTool {
                     "isolated keys address the exact top-level; first click the child explicitly",
                 );
             }
+            position_named_session_keyboard_cursor(&self.state, &args, pid, xid, None, None, false)
+                .await;
             return isolated_hyprland_action(
                 &args,
                 pid,
@@ -8106,6 +8250,18 @@ impl Tool for PressKeyTool {
                 focus_hyprland_foreground(&self.state, &args, pid, xid, px.zip(py)).await
             {
                 return error;
+            }
+            if px.is_none() {
+                position_named_session_keyboard_cursor(
+                    &self.state,
+                    &args,
+                    pid,
+                    xid,
+                    None,
+                    None,
+                    false,
+                )
+                .await;
             }
             return foreground_hyprland_action(&args, pid, xid, action).await;
         }
@@ -8446,6 +8602,8 @@ impl Tool for HotkeyTool {
                     );
                 }
             }
+            position_named_session_keyboard_cursor(&self.state, &args, pid, xid, None, None, false)
+                .await;
             return isolated_hyprland_action(
                 &args,
                 pid,
@@ -8523,6 +8681,18 @@ impl Tool for HotkeyTool {
                 focus_hyprland_foreground(&self.state, &args, pid, xid, px.zip(py)).await
             {
                 return error;
+            }
+            if px.is_none() {
+                position_named_session_keyboard_cursor(
+                    &self.state,
+                    &args,
+                    pid,
+                    xid,
+                    None,
+                    None,
+                    false,
+                )
+                .await;
             }
             return foreground_hyprland_action(&args, pid, xid, action).await;
         }
@@ -9142,19 +9312,24 @@ impl Tool for ScrollTool {
             let display = direction.clone();
             let wayland = crate::wayland::wayland_input_enabled();
             let path = if wayland { "wayland_desktop" } else { "xtest" };
+            let space = match desktop_input_space().await {
+                Ok(space) => space,
+                Err(error) => return ToolResult::error(error.to_string()),
+            };
             if named_session_cursor_key(&args).is_some() {
+                let (overlay_x, overlay_y) = space.to_layout(x, y);
                 reveal_pointer_action_for(
                     &self.state,
                     &cursor_id,
-                    f64::from(x),
-                    f64::from(y),
+                    f64::from(overlay_x),
+                    f64::from(overlay_y),
                     false,
                 )
                 .await;
             }
             let result = cua_driver_core::blocking::spawn(move || {
                 if wayland {
-                    crate::wayland::scroll_desktop(x, y, &direction, amount as u32)
+                    crate::wayland::scroll_desktop(&space, x, y, &direction, amount as u32)
                 } else {
                     crate::input::send_scroll_xtest_desktop(x, y, &direction, amount)
                 }
@@ -9339,17 +9514,15 @@ impl Tool for ScrollTool {
                 );
             }
             let point = pixel_target;
-            return foreground_hyprland_action(
-                &args,
-                pid,
-                xid,
-                crate::wayland::hyprland_input::Action::Scroll {
-                    point,
-                    direction,
-                    amount,
-                },
-            )
-            .await;
+            // `by: "page"` is the documented 3-detent approximation, not an
+            // exact viewport; large requests become several wheel packets.
+            let actions =
+                match crate::wayland::hyprland_input::scroll_actions(point, &direction, amount, by)
+                {
+                    Ok(actions) => actions,
+                    Err(error) => return foreground_hyprland_refusal(error.to_string()),
+                };
+            return foreground_hyprland_scroll(&args, pid, xid, actions).await;
         }
         if isolated_background {
             if xid_opt.is_none() {
@@ -9361,15 +9534,14 @@ impl Tool for ScrollTool {
             let (_cancellation, dispatch) =
                 match spawn_isolated_hyprland(&args, move |cancellation| {
                     let point = pixel_target;
-                    crate::wayland::hyprland_input::execute(
+                    let actions = crate::wayland::hyprland_input::scroll_actions(
+                        point, &direction, amount, by,
+                    )?;
+                    crate::wayland::hyprland_input::execute_scroll(
                         owner,
                         pid,
                         xid,
-                        crate::wayland::hyprland_input::Action::Scroll {
-                            point,
-                            direction,
-                            amount,
-                        },
+                        actions,
                         cancellation,
                     )
                 }) {
@@ -10080,9 +10252,21 @@ impl Tool for DragTool {
                 return wayland_modified_drag_refusal();
             }
             let path = if wayland { "wayland_desktop" } else { "xtest" };
+            let space = match desktop_input_space().await {
+                Ok(space) => space,
+                Err(error) => return ToolResult::error(error.to_string()),
+            };
+            // The overlay draws in layout coordinates, like the input below.
+            let overlay_point = |x: f64, y: f64| {
+                let (lx, ly) = space.to_layout(x.round() as i32, y.round() as i32);
+                (f64::from(lx), f64::from(ly))
+            };
+            let (overlay_from, overlay_to) =
+                (overlay_point(from_x, from_y), overlay_point(to_x, to_y));
             let result = cua_driver_core::blocking::spawn(move || {
                 if wayland {
                     crate::wayland::drag_desktop(
+                        &space,
                         from_x.round() as i32,
                         from_y.round() as i32,
                         to_x.round() as i32,
@@ -10107,8 +10291,8 @@ impl Tool for DragTool {
             });
             let visual_drag = track_overlay_drag_for(
                 cursor_id.clone(),
-                (from_x, from_y),
-                (to_x, to_y),
+                overlay_from,
+                overlay_to,
                 duration_ms,
                 steps,
             );
@@ -10116,7 +10300,7 @@ impl Tool for DragTool {
             if matches!(&result, Ok(Ok(()))) {
                 self.state
                     .cursor_registry
-                    .update_position(&cursor_id, to_x, to_y);
+                    .update_position(&cursor_id, overlay_to.0, overlay_to.1);
             }
             return match result {
                 Ok(Ok(())) => ToolResult::text("Dragged on the desktop.").with_structured(
@@ -11483,17 +11667,60 @@ impl Tool for GetScreenSizeTool {
             return result;
         }
         let result = cua_driver_core::blocking::spawn(|| {
+            if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+                // Shared manifest admission needs content-free display
+                // metadata even when this native desktop has no X11 DISPLAY.
+                // The adapter attests the IPC/Wayland compositor peer and
+                // refuses layouts its logical frame cannot represent: no
+                // powered output, or a rotated powered output.
+                // Scaled outputs report logical pixels plus the output scale.
+                // The size and the monitor list come from one snapshot.
+                let (frame, monitors) = crate::wayland::hyprland::screen_report()?;
+                return Ok((frame.width, frame.height, frame.scale, Some(monitors)));
+            }
             // X11 reports pixel dimensions; scale factor on X11 is not
             // well-defined per-monitor, so report 1.0 (matches DPI-unaware
             // assumption). Other Wayland compositors retain their existing
             // limitation; do not infer native metadata support there.
             let (w, h) = x11_screen_size()?;
-            Ok::<(u32, u32, f64), anyhow::Error>((w, h, 1.0))
+            Ok::<(u32, u32, f64, Option<Value>), anyhow::Error>((w, h, 1.0, None))
         })
         .await;
         match result {
+            Ok(Ok((w, h, scale, Some(monitors)))) => {
+                // Tell the agent which monitors are actually on: the desktop
+                // frame covers powered monitors only and changes as they turn
+                // on or off, so re-read it after any display change.
+                let describe = |m: &Value| {
+                    let name = m["name"].as_str().unwrap_or("?");
+                    match (
+                        m["powered"].as_bool(),
+                        m["frame_x"].as_i64(),
+                        m["frame_y"].as_i64(),
+                    ) {
+                        (Some(true), Some(x), Some(y)) => format!(
+                            "{name} {}x{} on, at ({x},{y}) in the desktop frame",
+                            m["width"], m["height"]
+                        ),
+                        _ => format!("{name} off (standby), not in the desktop frame"),
+                    }
+                };
+                let lines: Vec<String> = monitors
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(describe)
+                    .collect();
+                ToolResult::text(format!(
+                    "✅ Desktop frame: {w}x{h} points @ {scale}x, spanning every monitor that is on.\n{}",
+                    lines.join("\n")
+                ))
+                .with_structured(json!({
+                    "width": w, "height": h, "scale_factor": scale, "monitors": monitors,
+                }))
+            }
             // Matches Swift text format 1:1.
-            Ok(Ok((w, h, scale))) => {
+            Ok(Ok((w, h, scale, None))) => {
                 ToolResult::text(format!("✅ Main display: {w}x{h} points @ {scale}x"))
                     .with_structured(json!({ "width": w, "height": h, "scale_factor": scale }))
             }
@@ -11614,11 +11841,26 @@ impl Tool for GetDesktopStateTool {
             // The agent reads this image, so the Driver's own cursor and
             // session pill are hidden around the grab (or the limitation is
             // reported) instead of being baked over the controls it reads.
+            // Hyprland: read the desktop frame once. The screenshot, its action
+            // size and the window geometry below all use it.
+            let hyprland_plan =
+                if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+                    Some(crate::wayland::hyprland::desktop_capture_plan()?)
+                } else {
+                    None
+                };
             let (native_png, overlay_capture) =
                 cursor_overlay::capture_exclusion::capture_excluding_overlays(
                     &crate::overlay_capture::OverlayExcluder,
                     |hidden| {
-                        let png = crate::capture::screenshot_display_bytes()?;
+                        // A multi-monitor layout is composed from the frame
+                        // read above, so the image is exactly that frame.
+                        let png = match &hyprland_plan {
+                            Some(plan) if plan.composite => {
+                                crate::wayland::hyprland::compose_desktop_capture(&plan.frame)?
+                            }
+                            _ => crate::capture::screenshot_display_bytes()?,
+                        };
                         Ok::<_, anyhow::Error>(crate::overlay_capture::verify_hidden_capture(
                             png, hidden,
                         ))
@@ -11634,7 +11876,10 @@ impl Tool for GetDesktopStateTool {
             // abort the tool even though the screenshot already succeeded.
             // Only fall back to the X11 root-window geometry off Wayland, so
             // the X11 / XWayland path is unchanged. See #2017 / Sway testing.
-            let (screen_w, screen_h) = if crate::wayland::is_wayland() {
+            let hyprland_frame = hyprland_plan.map(|plan| plan.frame);
+            let (screen_w, screen_h) = if let Some(frame) = &hyprland_frame {
+                (frame.width, frame.height)
+            } else if crate::wayland::is_wayland() {
                 crate::capture_action_frame::desktop_action_dimensions((native_w, native_h))?
             } else {
                 x11_screen_size()?
@@ -11670,6 +11915,16 @@ impl Tool for GetDesktopStateTool {
             let mut windows = crate::wayland::list_windows_dispatch(None);
             windows
                 .retain(|w| w.is_on_screen && w.pid.is_some_and(crate::proc_fs::is_process_live));
+            if let Some(frame) = &hyprland_frame {
+                // Window geometry is in layout coordinates; screenshot pixel
+                // (0, 0) is the frame origin. Refuse rather than pair this
+                // capture with a layout that changed meanwhile.
+                anyhow::ensure!(
+                    crate::wayland::hyprland::desktop_frame()? == *frame,
+                    "the Hyprland monitor layout changed during get_desktop_state; call it again"
+                );
+                frame.rebase_windows(&mut windows);
+            }
             let capture_id = crate::capture_action_frame::publish_desktop(
                 &capture_service,
                 &capture_args,
@@ -11834,6 +12089,28 @@ impl Tool for GetCursorPositionTool {
         {
             return result;
         }
+        // Hyprland reports the real pointer over IPC; return it in the
+        // desktop-frame coordinates that get_desktop_state and desktop actions use.
+        if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+            let position = cua_driver_core::blocking::spawn(|| -> anyhow::Result<(i32, i32)> {
+                let (x, y) = crate::wayland::hyprland::cursor_position()?;
+                Ok(crate::wayland::hyprland::desktop_frame()?
+                    .from_layout(x.round() as i32, y.round() as i32))
+            })
+            .await;
+            // The synthetic registry below holds layout coordinates, not the
+            // desktop frame, so a failed compositor query is an error here.
+            return match position {
+                Ok(Ok((x, y))) => {
+                    ToolResult::text(format!("✅ Cursor at ({x}, {y}) in the desktop frame"))
+                        .with_structured(json!({ "x": x, "y": y, "source": "compositor" }))
+                }
+                Ok(Err(e)) => ToolResult::error(format!(
+                    "Could not read the Hyprland pointer position: {e:#}"
+                )),
+                Err(e) => ToolResult::error(format!("Task error: {e}")),
+            };
+        }
         // Native Wayland: there's no protocol for clients to query the real
         // global cursor position. Fall back to the synthetic registry that
         // records every `motion_absolute` this process emits.
@@ -11926,7 +12203,8 @@ impl Tool for MoveCursorTool {
             };
             let result = if wayland {
                 cua_driver_core::blocking::spawn(move || {
-                    crate::wayland::move_cursor_absolute(None, xi, yi)
+                    let space = crate::wayland::DesktopInputSpace::current()?;
+                    crate::wayland::move_cursor_desktop(&space, xi, yi)
                 })
                 .await
             } else {
@@ -12078,6 +12356,10 @@ impl Tool for SetAgentCursorMotionV2Tool {
             None,
             cursor_number(args.get("turn_radius")),
         );
+        let motion = match motion.with_style_args(&args) {
+            Ok(motion) => motion,
+            Err(message) => return ToolResult::error(message),
+        };
         crate::overlay::send_command_for(
             session.clone(),
             cursor_overlay::OverlayCommand::SetMotion(motion.clone()),
@@ -12085,17 +12367,7 @@ impl Tool for SetAgentCursorMotionV2Tool {
         ToolResult::text(format!(
             "Agent cursor motion updated for session '{session}'."
         ))
-        .with_structured(json!({"session":session,"motion":{
-            "start_handle":motion.start_handle,
-            "end_handle":motion.end_handle,
-            "arc_size":motion.arc_size,
-            "arc_flow":motion.arc_flow,
-            "spring":motion.spring,
-            "glide_duration_ms":motion.glide_duration_ms,
-            "dwell_after_click_ms":motion.dwell_after_click_ms,
-            "idle_hide_ms":motion.idle_hide_ms,
-            "turn_radius":motion.turn_radius
-        }}))
+        .with_structured(json!({"session":session,"motion":motion.output_json()}))
     }
 }
 
@@ -12228,17 +12500,7 @@ impl Tool for GetAgentCursorStateV2Tool {
                     "frame":visual.frame(),
                     "preempted_count":visual.preempted_count
                 },
-                "motion":{
-                    "start_handle":motion.start_handle,
-                    "end_handle":motion.end_handle,
-                    "arc_size":motion.arc_size,
-                    "arc_flow":motion.arc_flow,
-                    "spring":motion.spring,
-                    "glide_duration_ms":motion.glide_duration_ms,
-                    "dwell_after_click_ms":motion.dwell_after_click_ms,
-                    "idle_hide_ms":motion.idle_hide_ms,
-                    "turn_radius":motion.turn_radius
-                }
+                "motion":motion.output_json()
             }),
         )
     }
@@ -12361,6 +12623,7 @@ impl Tool for GetConfigTool {
             "capture_mode": cfg.capture_mode,
             "max_image_dimension": cfg.max_image_dimension,
             "agent_cursor": { "glide_duration_ms": cfg.agent_cursor_glide_duration_ms },
+            "cursor": { "motion": cursor_overlay::motion_defaults::read_saved().config_json() },
             "experimental_pip": pip_enabled,
             "experimental_pip_geometry": pip_geometry
         }))
@@ -12368,6 +12631,13 @@ impl Tool for GetConfigTool {
 }
 
 // ── set_config ────────────────────────────────────────────────────────────────
+
+fn with_cursor_motion_config_properties(mut schema: Value) -> Value {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.extend(cursor_overlay::motion_defaults::config_schema_properties());
+    }
+    schema
+}
 
 pub struct SetConfigTool {
     state: Arc<ToolState>,
@@ -12387,8 +12657,10 @@ impl Tool for SetConfigTool {
                 - **Legacy per-field**: `{\"capture_mode\": \"som\", \"max_image_dimension\": 0}`.\n\n\
                 The experimental_pip keys persist to ~/.cua-driver/config.json and apply on next \
                 daemon restart (the PiP backend is initialised once at startup; \
-                Linux ships only the trait stub today — see issue #1729).".into(),
-            input_schema: json!({"type":"object","properties":{
+                Linux ships only the trait stub today — see issue #1729).\n\n\
+                `cursor.motion.style`, `cursor.motion.timing` and `cursor.motion.effects.<name>` \
+                save the default cursor motion for sessions started afterwards.".into(),
+            input_schema: with_cursor_motion_config_properties(json!({"type":"object","properties":{
                 "key":{"type":"string","description":"Name of a single config field to write ({key, value} shape). Pair with `value`."},
                 "value":{"description":"New value for `key`. JSON type depends on the key."},
                 "capture_mode":{"type":"string","enum":["ax","vision"],"description":"Legacy per-field shape. Default capture mode for get_window_state. (\"som\"/\"screenshot\" still decode as deprecated aliases.)"},
@@ -12396,7 +12668,7 @@ impl Tool for SetConfigTool {
                 "max_image_dimension":{"type":"integer","description":"Legacy per-field shape. Max dimension for screenshot resizing (0 = no limit)."},
                 "experimental_pip":{"type":"boolean","description":"Enable the experimental PiP preview window (applies next restart; Linux backend stubbed)."},
                 "experimental_pip_geometry":{"type":"string","description":"PiP window size + optional position in `WxH` or `WxH+X+Y` form."}
-            },"additionalProperties":false}),
+            },"additionalProperties":false})),
             read_only: false, destructive: false, idempotent: true, open_world: false,
         })
     }
@@ -12418,8 +12690,15 @@ impl Tool for SetConfigTool {
             Ok(value) => value,
             Err(message) => return ToolResult::error(message),
         };
+        let motion_keys = match cursor_overlay::motion_defaults::apply_config_args(&args) {
+            Ok(keys) => keys,
+            Err(message) => return ToolResult::error(message),
+        };
         let mut cfg = self.state.config.write().unwrap();
-        let mut parts = Vec::new();
+        let mut parts: Vec<String> = motion_keys
+            .iter()
+            .map(|key| format!("{key} (applies to sessions started from now on)"))
+            .collect();
         if let Some(glide) = glide {
             if let Err(error) = crate::overlay::set_default_glide_duration(None, glide) {
                 return ToolResult::error(error.to_string()).with_structured(json!({
@@ -12519,11 +12798,10 @@ impl Tool for SetConfigTool {
                         ));
                     }
                 },
-                other => {
-                    return ToolResult::error(format!(
-                        "Unknown config key `{other}`. Known: capture_mode, max_image_dimension, agent_cursor_glide_duration_ms, experimental_pip, experimental_pip_geometry."
-                    ));
-                }
+                other if motion_keys.iter().any(|written| written == other) => {}
+                other => return ToolResult::error(format!(
+                    "Unknown config key `{other}`. Known: capture_mode, max_image_dimension, agent_cursor_glide_duration_ms, experimental_pip, experimental_pip_geometry, cursor.motion.style, cursor.motion.timing, cursor.motion.effects.<name>."
+                )),
             }
         }
         // Legacy per-field shape.

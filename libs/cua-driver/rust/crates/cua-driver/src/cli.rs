@@ -249,6 +249,10 @@ const VALUE_FLAGS: &[&str] = &[
     // override (--experimental-pip itself is a bare flag and doesn't
     // need to be listed here).
     "--experimental-pip-geometry",
+    // `cursor motion` options.
+    "--style",
+    "--timing",
+    "--effects",
 ];
 
 /// Authorization selectors are trusted-daemon startup inputs. Direct MCP
@@ -351,6 +355,7 @@ fn finite_command_name_from_args(args: &[String]) -> Option<&'static str> {
         Some("extension") => Some("extension"),
         Some("perception") => Some("perception"),
         Some("cursor-theme") => Some("cursor_theme"),
+        Some("cursor") => Some("call"),
         Some("config") => Some("config"),
         Some(_) => Some("call"),
     }
@@ -514,6 +519,7 @@ fn finite_tool_name_from_args(args: &[String]) -> Option<String> {
     let positionals = positional_args(args);
     match positionals.as_slice() {
         ["call", tool, ..] => Some((*tool).to_owned()),
+        ["cursor", ..] => Some(<cua_driver_contract::SetAgentCursorMotionInput as cua_driver_contract::ToolInput>::TOOL_NAME.to_owned()),
         [tool, ..] => Some((*tool).to_owned()),
         _ => None,
     }
@@ -692,6 +698,17 @@ pub fn parse_command() -> Command {
         println!("  cua-driver cursor-theme list [--json]");
         println!("  cua-driver cursor-theme uninstall <theme-id>");
         println!("                                  Theme installation is local-only and is never an agent tool.");
+        println!();
+        println!("cursor options (forwards to set_agent_cursor_motion on the daemon):");
+        println!(
+            "  cua-driver cursor motion --session <label> [--style <name>] [--timing <timing>]"
+        );
+        println!("                           [--effects trail=on,glow=off,...] [--glide-ms <ms>]");
+        println!("    --style     signature_arc (default), spring_settle, magnetic, comet_swoop,");
+        println!("                adaptive, or classic (the previous Dubins glide).");
+        println!("    --timing    native (the style's own), fitts (distance and target size), or");
+        println!("                fixed (--glide-ms, 1430 ms when 0).");
+        println!("    --effects   trail, glow, magnet, ripple, squish set to on, off, or default.");
         println!();
         println!("manifest options:");
         println!("  cua-driver manifest             Emit a stable JSON description of this CLI's surface");
@@ -1074,6 +1091,25 @@ pub fn parse_command() -> Command {
                 args: args[index + 1..].to_vec(),
             }
         }
+        Some("cursor") => match pos.next() {
+            Some("motion") => match cursor_motion_args(&args) {
+                Ok(json_args) => Command::Call {
+                    tool: "set_agent_cursor_motion".to_owned(),
+                    json_args: Some(json_args),
+                    screenshot_out_file,
+                    socket: socket.clone(),
+                },
+                Err(message) => {
+                    eprintln!("error: {message}");
+                    eprintln!("{CURSOR_MOTION_USAGE}");
+                    process::exit(64);
+                }
+            },
+            _ => {
+                eprintln!("{CURSOR_MOTION_USAGE}");
+                process::exit(64);
+            }
+        },
         Some(first) => {
             // Implicit call: unrecognised first positional → treat as tool name.
             // Same parse-error handling as the explicit `call` branch above. See #1637.
@@ -1108,6 +1144,70 @@ pub fn parse_command() -> Command {
             }
         }
     }
+}
+
+const CURSOR_MOTION_USAGE: &str = "Usage: cua-driver cursor motion --session <label> [--style <name>] [--timing native|fitts|fixed] [--effects trail=on,glow=off,...] [--glide-ms <ms>]";
+
+/// Build `set_agent_cursor_motion` arguments from `cua-driver cursor motion`
+/// flags. Effects take `on`, `off` or `default` (the style's own choice).
+fn cursor_motion_args(args: &[String]) -> Result<serde_json::Value, String> {
+    let mut out = serde_json::Map::new();
+    let session = flag_value(args, "--session")
+        .filter(|value| !value.is_empty())
+        .ok_or("cursor motion needs --session <label>")?;
+    out.insert("session".into(), session.into());
+    if let Some(style) = flag_value(args, "--style") {
+        let parsed: cua_driver_contract::CursorMotionStyle =
+            serde_json::from_value(style.clone().into()).map_err(|_| {
+                format!(
+                    "unknown style `{style}`; expected one of {}",
+                    cua_driver_contract::CursorMotionStyle::ALL
+                        .map(cua_driver_contract::CursorMotionStyle::as_str)
+                        .join(", ")
+                )
+            })?;
+        out.insert("style".into(), parsed.as_str().into());
+    }
+    if let Some(timing) = flag_value(args, "--timing") {
+        let parsed: cua_driver_contract::CursorMotionTiming =
+            serde_json::from_value(timing.clone().into()).map_err(|_| {
+                format!("unknown timing `{timing}`; expected native, fitts or fixed")
+            })?;
+        out.insert("timing".into(), parsed.as_str().into());
+    }
+    if let Some(effects) = flag_value(args, "--effects") {
+        let mut map = serde_json::Map::new();
+        for entry in effects.split(',').filter(|entry| !entry.trim().is_empty()) {
+            let (name, value) = entry
+                .split_once('=')
+                .ok_or_else(|| format!("effect `{entry}` must look like name=on|off|default"))?;
+            let name = name.trim();
+            if !matches!(name, "trail" | "glow" | "magnet" | "ripple" | "squish") {
+                return Err(format!(
+                    "unknown effect `{name}`; expected trail, glow, magnet, ripple or squish"
+                ));
+            }
+            let value = match value.trim() {
+                "on" | "true" => serde_json::Value::Bool(true),
+                "off" | "false" => serde_json::Value::Bool(false),
+                "default" => serde_json::Value::Null,
+                other => {
+                    return Err(format!(
+                        "effect `{name}` takes on, off or default, got `{other}`"
+                    ))
+                }
+            };
+            map.insert(name.to_owned(), value);
+        }
+        out.insert("effects".into(), map.into());
+    }
+    if let Some(ms) = flag_value(args, "--glide-ms") {
+        let ms: f64 = ms
+            .parse()
+            .map_err(|_| format!("--glide-ms takes a number of milliseconds, got `{ms}`"))?;
+        out.insert("glide_duration_ms".into(), ms.into());
+    }
+    Ok(out.into())
 }
 
 fn parse_expected_stop_pid(args: &[String], command: Option<&str>) -> Option<u32> {
@@ -2049,6 +2149,17 @@ pub fn build_manifest() -> serde_json::Value {
                   { "name": "--output", "type": "string", "description": "Output path (build, preview)." },
                   { "name": "--development", "type": "flag", "description": "Allow the reserved com.example development namespace (validate, build)." },
                   { "name": "--json", "type": "flag", "description": "Emit machine-readable JSON (inspect, list)." }
+              ] },
+            { "name": "cursor",
+              "description": "Set a session cursor's motion style, timing and effects through set_agent_cursor_motion.",
+              "args": [
+                  { "name": "subcommand", "type": "positional-string", "description": "motion" },
+                  { "name": "--session", "type": "string", "description": "Public label of the session that owns the cursor (required)." },
+                  { "name": "--style", "type": "string", "description": "signature_arc | spring_settle | magnetic | comet_swoop | adaptive | classic" },
+                  { "name": "--timing", "type": "string", "description": "native | fitts | fixed" },
+                  { "name": "--effects", "type": "string", "description": "Comma-separated name=on|off|default for trail, glow, magnet, ripple, squish." },
+                  { "name": "--glide-ms", "type": "string", "description": "Move duration in milliseconds for fixed timing." },
+                  { "name": "--socket", "type": "string", "description": "Override the daemon socket path." }
               ] },
             { "name": "autostart",
               "description": "Platform-native auto-start so `cua-driver serve` comes up on every logon.",
@@ -4013,6 +4124,7 @@ const HELP_SUBCOMMANDS: &[&str] = &[
     "perception",
     "channel",
     "cursor-theme",
+    "cursor",
     "sessions",
     "history",
     "mcp-config",
@@ -4296,7 +4408,7 @@ fn cli_docs_literal() -> serde_json::Value {
                 "subcommands": [
                     {"name":"show","abstract":"Print the full config.","discussion":"","arguments":[],"options":[],"flags":[],"subcommands":[]},
                     {"name":"get","abstract":"Print one config key.","discussion":"","arguments":[{"name":"key","help":"Config key to read.","type":"String","is_optional":false}],"options":[],"flags":[],"subcommands":[]},
-                    {"name":"set","abstract":"Set one config key.","discussion":"","arguments":[{"name":"key","help":"Config key to write.","type":"String","is_optional":false},{"name":"value","help":"Value to store.","type":"String","is_optional":false}],"options":[],"flags":[],"subcommands":[]},
+                    {"name":"set","abstract":"Set one config key.","discussion":"Cursor motion defaults are saved keys that apply to sessions started afterwards: cursor.motion.style (signature_arc, spring_settle, magnetic, comet_swoop, adaptive, classic), cursor.motion.timing (native, fitts, fixed) and cursor.motion.effects.<trail|glow|magnet|ripple|squish> (true, false). Use null for a key to clear it, or cursor.motion null to clear all. A start_session cursor_motion or a set_agent_cursor_motion call overrides the saved default.","arguments":[{"name":"key","help":"Config key to write.","type":"String","is_optional":false},{"name":"value","help":"Value to store.","type":"String","is_optional":false}],"options":[],"flags":[],"subcommands":[]},
                     {"name":"reset","abstract":"Reset config to defaults.","discussion":"","arguments":[],"options":[],"flags":[],"subcommands":[]}
                 ]
             },
@@ -4454,6 +4566,17 @@ fn cli_docs_literal() -> serde_json::Value {
                 ]
             },
             {
+                "name": "cursor",
+                "abstract": "Configure a session's agent cursor from the command line.",
+                "discussion": "Forwards to the set_agent_cursor_motion tool on the running daemon. Fields you leave out keep their current value.",
+                "arguments": no_args,
+                "options": no_options,
+                "flags": no_flags,
+                "subcommands": [
+                    {"name":"motion","abstract":"Set the cursor's motion style, timing and effects.","discussion":"Effects take on, off, or default (the style's own choice).","arguments":[],"options":[{"name":"session","short_name":null,"help":"Public label of the session that owns the cursor.","type":"String","default_value":null,"is_optional":false},{"name":"style","short_name":null,"help":"signature_arc, spring_settle, magnetic, comet_swoop, adaptive, or classic.","type":"String","default_value":null,"is_optional":true},{"name":"timing","short_name":null,"help":"native, fitts, or fixed.","type":"String","default_value":null,"is_optional":true},{"name":"effects","short_name":null,"help":"Comma-separated name=on|off|default for trail, glow, magnet, ripple, squish.","type":"String","default_value":null,"is_optional":true},{"name":"glide-ms","short_name":null,"help":"Move duration in milliseconds for fixed timing (1430 when 0).","type":"Number","default_value":null,"is_optional":true},{"name":"socket","short_name":null,"help":"Override the daemon socket path.","type":"Path","default_value":null,"is_optional":true}],"flags":[],"subcommands":[]}
+                ]
+            },
+            {
                 "name": "dump-docs",
                 "abstract": "Output machine-readable CLI and MCP documentation JSON.",
                 "discussion": "Used by the docs generator to keep reference pages in sync with the live binary.",
@@ -4518,7 +4641,13 @@ const CLI_EXAMPLES: &[(&str, &[(&str, &str)])] = &[
     ("config", &[("cua-driver config", "Print the full config")]),
     ("config show", &[("cua-driver config show", "Print the full config")]),
     ("config get", &[("cua-driver config get max_image_dimension", "Print one key"), ("cua-driver config get agent_cursor.glide_duration_ms", "Print the default cursor glide duration")]),
-    ("config set", &[("cua-driver config set max_image_dimension 1568", "Downscale screenshots to at most 1568 px"), ("cua-driver config set agent_cursor_glide_duration_ms 150", "Persist a 150 ms default cursor glide (0 restores speed-based motion)")]),
+    ("config set", &[
+        ("cua-driver config set max_image_dimension 1568", "Downscale screenshots to at most 1568 px"),
+        ("cua-driver config set agent_cursor_glide_duration_ms 150", "Persist a 150 ms default cursor glide (0 restores speed-based motion)"),
+        ("cua-driver config set cursor.motion.style magnetic", "Make magnetic the default cursor motion for new sessions"),
+        ("cua-driver config set cursor.motion.timing fitts", "Scale cursor move time with distance and target size"),
+        ("cua-driver config set cursor.motion.effects.trail true", "Turn the cursor trail on by default"),
+    ]),
     ("config reset", &[("cua-driver config reset", "Restore the defaults")]),
     ("telemetry", &[("cua-driver telemetry status", "Show the effective telemetry setting")]),
     ("telemetry enable", &[("cua-driver telemetry enable", "Enable telemetry")]),
@@ -4569,6 +4698,12 @@ const CLI_EXAMPLES: &[(&str, &[(&str, &str)])] = &[
     ("perception parse", &[("cua-driver perception parse --image screen.png --capture capture.json --json", "Parse a PNG into visual regions")]),
     ("manifest", &[("cua-driver manifest --pretty", "Print the CLI surface as JSON")]),
     ("cursor-theme", &[("cua-driver cursor-theme list", "List cursor themes")]),
+    ("cursor", &[("cua-driver cursor motion --session demo --style magnetic", "Use the magnetic cursor motion")]),
+    ("cursor motion", &[
+        ("cua-driver cursor motion --session demo --style comet_swoop", "Use the comet swoop cursor motion"),
+        ("cua-driver cursor motion --session demo --timing fixed --glide-ms 900", "Make every move take 900 ms"),
+        ("cua-driver cursor motion --session demo --effects trail=off,ripple=default", "Turn off the trail and reset the click ripple"),
+    ]),
     ("cursor-theme validate", &[("cua-driver cursor-theme validate my-cursor.lottie", "Validate a source archive")]),
     ("cursor-theme build", &[("cua-driver cursor-theme build my-cursor.lottie --output my-cursor.cua-theme", "Compile a theme")]),
     ("cursor-theme inspect", &[("cua-driver cursor-theme inspect my-cursor.cua-theme --json", "Print a theme's metadata")]),
@@ -4902,6 +5037,25 @@ fn diagnose_config_paths_section() -> String {
     lines.join("\n")
 }
 
+/// Print a tool-level error (`isError` result) to stderr and exit 1, so a
+/// rejected `config set` never reports success.
+fn exit_on_tool_error(result: &serde_json::Value) {
+    if result.get("isError").and_then(serde_json::Value::as_bool) != Some(true) {
+        return;
+    }
+    let message = result
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+        })
+        .unwrap_or("set_config failed");
+    eprintln!("{message}");
+    process::exit(1);
+}
+
 /// `cua-driver config [show|get|set|reset] [key] [value]`
 ///
 /// Thin daemon-only wrapper around the `get_config` / `set_config` tools.
@@ -4974,7 +5128,7 @@ pub fn run_config_cmd(
                 Some(k) => k,
                 None => {
                     eprintln!("Usage: cua-driver config get <key>");
-                    eprintln!("Keys: capture_mode, max_image_dimension, agent_cursor_glide_duration_ms, version, platform");
+                    eprintln!("Keys: capture_mode, max_image_dimension, agent_cursor_glide_duration_ms, version, platform, cursor.motion.style, cursor.motion.timing");
                     process::exit(64);
                 }
             };
@@ -4989,11 +5143,8 @@ pub fn run_config_cmd(
             let v = if key == "agent_cursor_glide_duration_ms" {
                 config.pointer("/agent_cursor/glide_duration_ms").cloned()
             } else if key.contains('.') {
-                let (parent, child) = key.split_once('.').unwrap();
-
-                config
-                    .get(parent)
-                    .and_then(|object| object.get(child))
+                key.split('.')
+                    .try_fold(&config, |node, part| node.get(part))
                     .cloned()
             } else {
                 config.get(key).cloned()
@@ -5008,7 +5159,7 @@ pub fn run_config_cmd(
                 );
             } else {
                 eprintln!("Unknown config key: {key}");
-                eprintln!("Available keys: capture_mode, max_image_dimension, version, platform, agent_cursor.enabled, agent_cursor.glide_duration_ms");
+                eprintln!("Available keys: capture_mode, max_image_dimension, version, platform, agent_cursor.enabled, agent_cursor.glide_duration_ms, agent_cursor_glide_duration_ms, cursor.motion.style, cursor.motion.timing, cursor.motion.effects");
                 process::exit(64);
             }
         }
@@ -5037,7 +5188,14 @@ pub fn run_config_cmd(
             // Parse value: try JSON, fall back to string.
             let parsed_value: serde_json::Value = serde_json::from_str(value)
                 .unwrap_or_else(|_| serde_json::Value::String(value.to_owned()));
-            call("set_config", serde_json::json!({ key: parsed_value }));
+            // Dotted keys (cursor.motion.style, ...) use the {key, value} shape.
+            let set_args = if key.contains('.') {
+                serde_json::json!({ "key": key, "value": parsed_value })
+            } else {
+                serde_json::json!({ key: parsed_value })
+            };
+            let result = call("set_config", set_args);
+            exit_on_tool_error(&result);
             println!("Config updated.");
             let config = get_config();
             println!(
@@ -5056,6 +5214,11 @@ pub fn run_config_cmd(
                 "agent_cursor_glide_duration_ms": 0
             });
             call("set_config", defaults);
+            // Also clear the saved cursor motion defaults.
+            exit_on_tool_error(&call(
+                "set_config",
+                serde_json::json!({ "key": "cursor.motion", "value": null }),
+            ));
             println!("Config reset to defaults.");
             let config = get_config();
             println!(
@@ -5320,6 +5483,73 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn cursor_motion_builds_set_agent_cursor_motion_args() {
+        let argv = args(&[
+            "cursor",
+            "motion",
+            "--session",
+            "demo",
+            "--style",
+            "dubins-glide",
+            "--timing",
+            "fixed",
+            "--effects",
+            "trail=on,ripple=default",
+            "--glide-ms",
+            "900",
+        ]);
+        assert_eq!(
+            cursor_motion_args(&argv).unwrap(),
+            serde_json::json!({
+                "session": "demo",
+                "style": "classic",
+                "timing": "fixed",
+                "effects": {"trail": true, "ripple": null},
+                "glide_duration_ms": 900.0
+            })
+        );
+        assert_eq!(finite_command_name_from_args(&argv), Some("call"));
+        assert_eq!(
+            finite_tool_name_from_args(&argv).as_deref(),
+            Some("set_agent_cursor_motion")
+        );
+        let parsed: cua_driver_contract::SetAgentCursorMotionInput =
+            serde_json::from_value(cursor_motion_args(&argv).unwrap()).unwrap();
+        assert_eq!(
+            parsed.style,
+            Some(cua_driver_contract::CursorMotionStyle::Classic)
+        );
+    }
+
+    #[test]
+    fn cursor_motion_rejects_bad_flags() {
+        for argv in [
+            &["cursor", "motion", "--style", "magnetic"][..],
+            &["cursor", "motion", "--session", "s", "--style", "zigzag"],
+            &["cursor", "motion", "--session", "s", "--timing", "slow"],
+            &[
+                "cursor",
+                "motion",
+                "--session",
+                "s",
+                "--effects",
+                "sparkle=on",
+            ],
+            &[
+                "cursor",
+                "motion",
+                "--session",
+                "s",
+                "--effects",
+                "trail=maybe",
+            ],
+            &["cursor", "motion", "--session", "s", "--glide-ms", "fast"],
+        ] {
+            assert!(cursor_motion_args(&args(argv)).is_err(), "{argv:?}");
+        }
     }
 
     #[test]

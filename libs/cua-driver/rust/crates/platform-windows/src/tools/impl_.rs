@@ -299,6 +299,12 @@ fn screen_to_bitmap(hwnd: u64, sx: i32, sy: i32) -> (i32, i32) {
 /// is possible only for a direct platform call without lifecycle metadata; in
 /// that case every overlay operation short-circuits.
 async fn overlay_glide_to(key: &str, sx: f64, sy: f64) {
+    overlay_glide_to_target(key, sx, sy, None).await;
+}
+
+/// [`overlay_glide_to`] with the targeted element's screen rect
+/// `[x, y, width, height]` (same space as `sx`/`sy`); `None` for pixel actions.
+async fn overlay_glide_to_target(key: &str, sx: f64, sy: f64, target: Option<[f64; 4]>) {
     if key.is_empty() {
         return;
     }
@@ -330,6 +336,7 @@ async fn overlay_glide_to(key: &str, sx: f64, sy: f64) {
                 x: sx,
                 y: sy,
                 end_heading_radians: std::f64::consts::FRAC_PI_4,
+                target,
             },
         );
         tokio::time::sleep(std::time::Duration::from_millis(
@@ -338,7 +345,26 @@ async fn overlay_glide_to(key: &str, sx: f64, sy: f64) {
         .await;
         return;
     }
-    crate::overlay::animate_cursor_to(key.to_owned(), sx, sy).await;
+    crate::overlay::animate_cursor_to_target(key.to_owned(), sx, sy, target).await;
+}
+
+/// The admitted element's cached UIA/MSAA bounding rect as the overlay's
+/// `[x, y, width, height]`, in the same screen space as its cached `center`
+/// (and so as the glide point). `(dx, dy)` shifts it when the glide point
+/// moved off the cached center (scroll-into-view re-resolution).
+fn element_target_rect(
+    element: Option<&crate::uia::snapshot::AdmittedElement>,
+    (dx, dy): (i32, i32),
+) -> Option<[f64; 4]> {
+    let (l, t, r, b) = element?.rect?;
+    (r > l && b > t).then(|| {
+        [
+            (l + dx) as f64,
+            (t + dy) as f64,
+            (r - l) as f64,
+            (b - t) as f64,
+        ]
+    })
 }
 
 async fn track_overlay_drag(
@@ -3612,7 +3638,13 @@ impl ClickTool {
                     }
                 };
                 pin_overlay_above(&cursor_key, hwnd);
-                overlay_glide_to(&cursor_key, tx as f64, ty as f64).await;
+                overlay_glide_to_target(
+                    &cursor_key,
+                    tx as f64,
+                    ty as f64,
+                    element_target_rect(admitted.as_ref(), (0, 0)),
+                )
+                .await;
                 crate::overlay::send_command(
                     cursor_key.clone(),
                     cursor_overlay::OverlayCommand::ClickPulse {
@@ -3680,7 +3712,13 @@ impl ClickTool {
             // from an off-screen button.
             // Step 2: pin overlay to target window, then animate to screen coords.
             pin_overlay_above(&cursor_key, hwnd);
-            overlay_glide_to(&cursor_key, cx as f64, cy as f64).await;
+            overlay_glide_to_target(
+                &cursor_key,
+                cx as f64,
+                cy as f64,
+                element_target_rect(admitted.as_ref(), (0, 0)),
+            )
+            .await;
             // Step 3: click pulse + actual click.
             crate::overlay::send_command(
                 cursor_key.clone(),
@@ -4810,9 +4848,16 @@ impl Tool for TypeTextTool {
             }
         };
         if elem_idx.is_some() {
-            if let Some((cx, cy)) = admitted.as_ref().map(|element| element.center) {
+            if let Some(element) = admitted.as_ref() {
+                let (cx, cy) = element.center;
                 pin_overlay_above(&cursor_key, hwnd);
-                overlay_glide_to(&cursor_key, cx as f64, cy as f64).await;
+                overlay_glide_to_target(
+                    &cursor_key,
+                    cx as f64,
+                    cy as f64,
+                    element_target_rect(Some(element), (0, 0)),
+                )
+                .await;
                 self.state
                     .cursor_registry
                     .update_position(&cursor_key, cx as f64, cy as f64);
@@ -4941,9 +4986,16 @@ impl Tool for TypeTextTool {
         // can see *where* the agent is typing — same visual feedback as a click.
         // Only when an element_index is supplied (we have its cached center);
         // the focused-element path has no resolvable position to point at.
-        if let Some(idx) = elem_idx {
-            if let Some((cx, cy)) = admitted.as_ref().map(|element| element.center) {
-                overlay_glide_to(&cursor_key, cx as f64, cy as f64).await;
+        if elem_idx.is_some() {
+            if let Some(element) = admitted.as_ref() {
+                let (cx, cy) = element.center;
+                overlay_glide_to_target(
+                    &cursor_key,
+                    cx as f64,
+                    cy as f64,
+                    element_target_rect(Some(element), (0, 0)),
+                )
+                .await;
                 crate::overlay::send_command(
                     cursor_key.clone(),
                     cursor_overlay::OverlayCommand::ClickPulse {
@@ -6189,7 +6241,13 @@ impl Tool for SetValueTool {
         // overlay is disabled or the element has no cached center.
         if let Some((cx, cy)) = admitted.as_ref().map(|element| element.center) {
             pin_overlay_above(&cursor_key, hwnd);
-            overlay_glide_to(&cursor_key, cx as f64, cy as f64).await;
+            overlay_glide_to_target(
+                &cursor_key,
+                cx as f64,
+                cy as f64,
+                element_target_rect(admitted.as_ref(), (0, 0)),
+            )
+            .await;
             crate::overlay::send_command(
                 cursor_key.clone(),
                 cursor_overlay::OverlayCommand::ClickPulse {
@@ -6942,7 +7000,16 @@ impl Tool for DoubleClickTool {
                 Err(result) => return result,
             };
             pin_overlay_above(&cursor_key, hwnd);
-            overlay_glide_to(&cursor_key, cx as f64, cy as f64).await;
+            overlay_glide_to_target(
+                &cursor_key,
+                cx as f64,
+                cy as f64,
+                element_target_rect(
+                    admitted.as_ref(),
+                    (cx - recorded_center.0, cy - recorded_center.1),
+                ),
+            )
+            .await;
             crate::overlay::send_command(
                 cursor_key.clone(),
                 cursor_overlay::OverlayCommand::ClickPulse {
@@ -7292,7 +7359,16 @@ impl Tool for RightClickTool {
                 Err(result) => return result,
             };
             pin_overlay_above(&cursor_key, hwnd);
-            overlay_glide_to(&cursor_key, cx as f64, cy as f64).await;
+            overlay_glide_to_target(
+                &cursor_key,
+                cx as f64,
+                cy as f64,
+                element_target_rect(
+                    admitted.as_ref(),
+                    (cx - recorded_center.0, cy - recorded_center.1),
+                ),
+            )
+            .await;
             crate::overlay::send_command(
                 cursor_key.clone(),
                 cursor_overlay::OverlayCommand::ClickPulse {
@@ -8298,6 +8374,10 @@ impl Tool for SetAgentCursorMotionV2Tool {
             None,
             cursor_number(args.get("turn_radius")),
         );
+        let motion = match motion.with_style_args(&args) {
+            Ok(motion) => motion,
+            Err(message) => return ToolResult::error(message),
+        };
         crate::overlay::send_command(
             session.clone(),
             cursor_overlay::OverlayCommand::SetMotion(motion.clone()),
@@ -8305,17 +8385,7 @@ impl Tool for SetAgentCursorMotionV2Tool {
         ToolResult::text(format!(
             "Agent cursor motion updated for session '{session}'."
         ))
-        .with_structured(json!({"session":session,"motion":{
-            "start_handle":motion.start_handle,
-            "end_handle":motion.end_handle,
-            "arc_size":motion.arc_size,
-            "arc_flow":motion.arc_flow,
-            "spring":motion.spring,
-            "glide_duration_ms":motion.glide_duration_ms,
-            "dwell_after_click_ms":motion.dwell_after_click_ms,
-            "idle_hide_ms":motion.idle_hide_ms,
-            "turn_radius":motion.turn_radius
-        }}))
+        .with_structured(json!({"session":session,"motion":motion.output_json()}))
     }
 }
 
@@ -8454,17 +8524,7 @@ impl Tool for GetAgentCursorStateV2Tool {
                     "frame":visual.frame(),
                     "preempted_count":visual.preempted_count
                 },
-                "motion":{
-                    "start_handle":motion.start_handle,
-                    "end_handle":motion.end_handle,
-                    "arc_size":motion.arc_size,
-                    "arc_flow":motion.arc_flow,
-                    "spring":motion.spring,
-                    "glide_duration_ms":motion.glide_duration_ms,
-                    "dwell_after_click_ms":motion.dwell_after_click_ms,
-                    "idle_hide_ms":motion.idle_hide_ms,
-                    "turn_radius":motion.turn_radius
-                }
+                "motion":motion.output_json()
             }),
         )
     }
@@ -8688,6 +8748,7 @@ impl Tool for GetConfigTool {
             "capture_mode":        cfg.capture_mode,
             "max_image_dimension": cfg.max_image_dimension,
             "agent_cursor":        { "enabled": cursor_enabled, "glide_duration_ms": cfg.agent_cursor_glide_duration_ms },
+            "cursor":              { "motion": cursor_overlay::motion_defaults::read_saved().config_json() },
             "experimental_pip":    pip_enabled,
             "experimental_pip_geometry": pip_geometry,
         });
@@ -8698,6 +8759,13 @@ impl Tool for GetConfigTool {
 }
 
 // ── set_config ────────────────────────────────────────────────────────────────
+
+fn with_cursor_motion_config_properties(mut schema: Value) -> Value {
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.extend(cursor_overlay::motion_defaults::config_schema_properties());
+    }
+    schema
+}
 
 pub struct SetConfigTool {
     state: Arc<ToolState>,
@@ -8727,8 +8795,9 @@ impl Tool for SetConfigTool {
                 - `max_image_dimension` (integer)\n\
                 - `experimental_pip` (boolean; persisted to config.json, applies on next daemon restart — Windows backend stubbed today, see issue #1729)\n\
                 - `experimental_pip_geometry` (string `WxH` or `WxH+X+Y`; persisted; applies on next daemon restart)\n\n\
+                - `cursor.motion.style`, `cursor.motion.timing`, `cursor.motion.effects.<name>` — saved default cursor motion for sessions started afterwards (see the cursor docs).\n\n\
                 Returns the full updated config in the same shape as `get_config`.".into(),
-            input_schema: json!({"type":"object","properties":{
+            input_schema: with_cursor_motion_config_properties(json!({"type":"object","properties":{
                 "key":{"type":"string","description":"Dotted snake_case path to a leaf config field (Swift-compatible shape). Pair with `value`."},
                 "value":{"description":"New value for `key`. JSON type depends on the key."},
                 "capture_mode":{"type":"string","enum":["ax","vision"],"description":"DEPRECATED and ignored — get_window_state always returns both the UIA tree and a screenshot. Still accepted/persisted for back-compat but has no effect. (\"som\"/\"screenshot\" still decode as deprecated aliases.)"},
@@ -8736,7 +8805,7 @@ impl Tool for SetConfigTool {
                 "max_image_dimension":{"type":"integer","description":"Legacy per-field shape."},
                 "experimental_pip":{"type":"boolean","description":"Legacy per-field shape. Enables PiP preview (applies next restart)."},
                 "experimental_pip_geometry":{"type":"string","description":"Legacy per-field shape. PiP window size + optional position."}
-            },"additionalProperties":false}),
+            },"additionalProperties":false})),
             read_only: false, destructive: false, idempotent: true, open_world: false,
         })
     }
@@ -8757,8 +8826,12 @@ impl Tool for SetConfigTool {
             Ok(value) => value,
             Err(message) => return ToolResult::error(message),
         };
+        let motion_keys = match cursor_overlay::motion_defaults::apply_config_args(&args) {
+            Ok(keys) => keys,
+            Err(message) => return ToolResult::error(message),
+        };
         let mut cfg = self.state.config.write().unwrap();
-        let mut applied = false;
+        let mut applied = !motion_keys.is_empty();
         if let Some(glide) = glide {
             cfg.agent_cursor_glide_duration_ms = glide;
             if let Err(e) = pip_preview::write_config_key(
@@ -8851,9 +8924,10 @@ impl Tool for SetConfigTool {
                         ));
                     }
                 },
+                other if motion_keys.iter().any(|written| written == other) => {}
                 other => {
                     return ToolResult::error(format!(
-                        "Unknown config key `{other}`. Known: capture_mode, max_image_dimension, agent_cursor_glide_duration_ms, experimental_pip, experimental_pip_geometry."
+                        "Unknown config key `{other}`. Known: capture_mode, max_image_dimension, agent_cursor_glide_duration_ms, experimental_pip, experimental_pip_geometry, cursor.motion.style, cursor.motion.timing, cursor.motion.effects.<name>."
                     ));
                 }
             }

@@ -436,7 +436,7 @@
    "idempotent": false,
    "input_schema": {
     "additionalProperties": false,
-    "description": "Exact, immediate-child application menu path to resolve and invoke through\nthe operating system's accessibility API. Path labels are matched after\ntrimming surrounding whitespace and otherwise remain case-sensitive.",
+    "description": "Exact, immediate-child application menu path to resolve and invoke through\nthe operating system's accessibility API. Path labels are matched after\ntrimming surrounding whitespace and otherwise remain case-sensitive. On\nmacOS, three periods in a label also match the ellipsis character that\nnative menu titles use (`Save As...` finds `Save As…`).",
     "properties": {
      "path": {
       "description": "Menu labels from the top-level menu to the item, e.g. `[\"File\", \"Save As...\"]`\n(1 to 16 labels).",
@@ -2003,21 +2003,21 @@
    "read_only": false
   },
   {
-   "description": "Configure only movement physics and visibility timing for a session cursor.",
+   "description": "Configure the movement style, timing, effects and visibility timing for a session cursor.",
    "destructive": false,
    "idempotent": true,
    "input_schema": {
     "additionalProperties": false,
     "properties": {
      "arc_flow": {
-      "description": "Arc asymmetry: positive puts the apex near the destination, negative near the start.\nClamped to -1..1 (default 0).",
+      "description": "Added to the arc asymmetry of `signature_arc`, `spring_settle` and `comet_swoop`:\npositive moves the apex toward the destination. Clamped to -1..1 (default 0).",
       "type": [
        "number",
        "null"
       ]
      },
      "arc_size": {
-      "description": "Sideways arc deflection as a fraction of the distance. Clamped to 0..1 (default 0.25).",
+      "description": "Scales the arc of `signature_arc`, `spring_settle` and `comet_swoop`: 0.25 (default)\nkeeps the style's arc, 0 is a straight line, 0.5 doubles it. Clamped to 0..1.",
       "type": [
        "number",
        "null"
@@ -2030,15 +2030,60 @@
        "null"
       ]
      },
+     "effects": {
+      "additionalProperties": false,
+      "description": "Turn single effects on or off. An omitted effect keeps its current setting; null\nrestores the style's default.",
+      "properties": {
+       "glow": {
+        "description": "Soft glow around the cursor that grows with speed.",
+        "type": [
+         "boolean",
+         "null"
+        ]
+       },
+       "magnet": {
+        "description": "Target glow when the `magnetic` style locks on.",
+        "type": [
+         "boolean",
+         "null"
+        ]
+       },
+       "ripple": {
+        "description": "Ring that expands from the hotspot on click.",
+        "type": [
+         "boolean",
+         "null"
+        ]
+       },
+       "squish": {
+        "description": "Brief scale-down of the cursor on click.",
+        "type": [
+         "boolean",
+         "null"
+        ]
+       },
+       "trail": {
+        "description": "Short fading trail behind the cursor.",
+        "type": [
+         "boolean",
+         "null"
+        ]
+       }
+      },
+      "type": [
+       "object",
+       "null"
+      ]
+     },
      "end_handle": {
-      "description": "Path control-point offset from the end, as a fraction of the distance. Clamped to 0..1\n(default 0.3).",
+      "description": "Arc control-point offset from the end, as a fraction of the distance, for\n`signature_arc`, `spring_settle` and `comet_swoop`. Clamped to 0..1 (default 0.3).",
       "type": [
        "number",
        "null"
       ]
      },
      "glide_duration_ms": {
-      "description": "Fixed glide duration in milliseconds. 0 (the default) uses speed-based timing. Clamped\nto 0..5000.",
+      "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` timing also fixes the duration. Clamped to 0..5000.",
       "type": [
        "number",
        "null"
@@ -2056,21 +2101,42 @@
       "type": "string"
      },
      "spring": {
-      "description": "Post-arrival spring damping: 1 is critically damped, 0.3 is bouncy. Clamped to 0.3..1\n(default 0.72).",
+      "description": "Arrival spring damping for `classic`: 1 is critically damped, 0.3 is bouncy. Clamped\nto 0.3..1 (default 0.72).",
       "type": [
        "number",
        "null"
       ]
      },
      "start_handle": {
-      "description": "Path control-point offset from the start, as a fraction of the distance. Clamped to\n0..1 (default 0.3).",
+      "description": "Arc control-point offset from the start, as a fraction of the distance, for\n`signature_arc`, `spring_settle` and `comet_swoop`. Clamped to 0..1 (default 0.3).",
       "type": [
        "number",
        "null"
       ]
      },
+     "style": {
+      "description": "Trajectory style. `signature_arc` (default) is one arc with a small follow-through;\n`spring_settle` lands with one soft bounce; `magnetic` is pulled into the target;\n`comet_swoop` is a wide arc with a short trail; `adaptive` picks a careful approach for\nsmall targets and a swoop for long moves; `classic` is the previous Dubins glide. When\nthe theme's reduced motion is on, every move is a short straight glide with no effects.",
+      "enum": [
+       "signature_arc",
+       "spring_settle",
+       "magnetic",
+       "comet_swoop",
+       "adaptive",
+       "classic"
+      ],
+      "type": "string"
+     },
+     "timing": {
+      "description": "`native` uses the style's own timing; `fitts` scales the move time with distance and\ntarget size; `fixed` uses glide_duration_ms (1430 ms when 0).",
+      "enum": [
+       "native",
+       "fitts",
+       "fixed"
+      ],
+      "type": "string"
+     },
      "turn_radius": {
-      "description": "Minimum turning radius of the glide path, in points; smaller turns tighter. Clamped to\n1..1000 (default 80).",
+      "description": "Minimum turning radius of the `classic` glide path, in points; smaller turns tighter.\nClamped to 1..1000 (default 80).",
       "type": [
        "number",
        "null"
@@ -2160,7 +2226,7 @@
    "read_only": true
   },
   {
-   "description": "Single-call end-to-end driver diagnostics. Designed to let downstream consumers ship one stable call instead of stitching together check_permissions, doctor, version, bundle attribution, and platform capability status. On macOS, prompt-capable direct capture is deliberately skipped; use `cua-driver permissions grant` to verify it explicitly. cua-driver owns the health model; consumers stay thin.\n\nInput — all optional:\n  {\n    \"include\": [\"<check_name>\", ...],   // run only these\n    \"skip\":    [\"<check_name>\", ...]    // skip these\n  }\nIf both are given, `include` wins.\n\nCanonical check names:\n  macOS  : binary_version, platform_supported, session_active,\n           bundle_identity, tcc_accessibility, tcc_screen_recording,\n           ax_capability, screen_capture_capability\n  Windows: binary_version, platform_supported, session_active,\n           ax_capability (via UIA), screen_capture_capability (via DXGI)\n  Linux  : binary_version, platform_supported, session_active,\n           ax_capability (via AT-SPI), screen_capture_capability (via X11)\n\nOutput — stable contract, schema_version=\"1\":\n  {\n    \"schema_version\": \"1\",\n    \"platform\": \"darwin\" | \"win32\" | \"linux\",\n    \"driver_version\": \"<semver>\",\n    \"overall\": \"ok\" | \"degraded\" | \"failed\",\n    \"checks\": [\n      {\n        \"name\": \"<one of the canonical names above>\",\n        \"status\": \"pass\" | \"fail\" | \"skip\",\n        \"message\": \"<one-line summary, always present>\",\n        \"hint\": \"<remediation step, present when status=fail>\",\n        \"data\": { /* check-specific structured fields */ }\n      },\n      ...\n    ]\n  }\n\n`overall` rules:\n  - `ok`       — every non-skipped check passes\n  - `degraded` — at least one non-core check fails (binary is still usable)\n  - `failed`   — any core check fails (binary_version, platform_supported, session_active)\n\nStability: schema_version=\"1\" is the contract. Future breaking changes will be `\"2\"`. Adding new check names under the same schema_version is non-breaking; consumers must tolerate unknown check names.",
+   "description": "Single-call end-to-end driver diagnostics. Designed to let downstream consumers ship one stable call instead of stitching together check_permissions, doctor, version, bundle attribution, and platform capability status. On macOS, prompt-capable direct capture is deliberately skipped. For standalone CuaDriver, use `cua-driver permissions grant` to verify it explicitly. For an embedded or linked driver, use the host's permission flow for the app or executable macOS attributes this process's permission request to; the standalone command does not verify the host's capture readiness. cua-driver owns the health model; consumers stay thin.\n\nInput — all optional:\n  {\n    \"include\": [\"<check_name>\", ...],   // run only these\n    \"skip\":    [\"<check_name>\", ...]    // skip these\n  }\nIf both are given, `include` wins.\n\nCanonical check names:\n  macOS  : binary_version, platform_supported, session_active,\n           bundle_identity, tcc_accessibility, tcc_screen_recording,\n           ax_capability, screen_capture_capability\n  Windows: binary_version, platform_supported, session_active,\n           ax_capability (via UIA), screen_capture_capability (via DXGI)\n  Linux  : binary_version, platform_supported, session_active,\n           ax_capability (via AT-SPI), screen_capture_capability (via X11)\n\nOutput — stable contract, schema_version=\"1\":\n  {\n    \"schema_version\": \"1\",\n    \"platform\": \"darwin\" | \"win32\" | \"linux\",\n    \"driver_version\": \"<semver>\",\n    \"overall\": \"ok\" | \"degraded\" | \"failed\",\n    \"checks\": [\n      {\n        \"name\": \"<one of the canonical names above>\",\n        \"status\": \"pass\" | \"fail\" | \"skip\",\n        \"message\": \"<one-line summary, always present>\",\n        \"hint\": \"<remediation step, present when status=fail>\",\n        \"data\": { /* check-specific structured fields */ }\n      },\n      ...\n    ]\n  }\n\n`overall` rules:\n  - `ok`       — every non-skipped check passes\n  - `degraded` — at least one non-core check fails (binary is still usable)\n  - `failed`   — any core check fails (binary_version, platform_supported, session_active)\n\nStability: schema_version=\"1\" is the contract. Future breaking changes will be `\"2\"`. Adding new check names under the same schema_version is non-breaking; consumers must tolerate unknown check names.",
    "destructive": false,
    "idempotent": true,
    "input_schema": {
@@ -2208,7 +2274,7 @@
    "read_only": true
   },
   {
-   "description": "Update cua-driver-rs configuration. capture_mode / max_image_dimension take effect immediately.\n\nTwo input shapes (both accepted, matching Windows/Swift):\n- **{key, value}** (preferred): `{\"key\": \"max_image_dimension\", \"value\": 800}` — single leaf write.\n- **Legacy per-field**: `{\"capture_mode\": \"som\", \"max_image_dimension\": 0}`.\n\nThe experimental_pip keys persist to ~/.cua-driver/config.json and apply on next daemon restart (the PiP backend is initialised once at startup; Linux ships only the trait stub today — see issue #1729).",
+   "description": "Update cua-driver-rs configuration. capture_mode / max_image_dimension take effect immediately.\n\nTwo input shapes (both accepted, matching Windows/Swift):\n- **{key, value}** (preferred): `{\"key\": \"max_image_dimension\", \"value\": 800}` — single leaf write.\n- **Legacy per-field**: `{\"capture_mode\": \"som\", \"max_image_dimension\": 0}`.\n\nThe experimental_pip keys persist to ~/.cua-driver/config.json and apply on next daemon restart (the PiP backend is initialised once at startup; Linux ships only the trait stub today — see issue #1729).\n\n`cursor.motion.style`, `cursor.motion.timing` and `cursor.motion.effects.<name>` save the default cursor motion for sessions started afterwards.",
    "destructive": false,
    "idempotent": true,
    "input_schema": {
@@ -2219,6 +2285,50 @@
       "enum": [
        "ax",
        "vision"
+      ],
+      "type": "string"
+     },
+     "cursor.motion": {
+      "description": "Pass null (or `default`) to clear every saved cursor motion default."
+     },
+     "cursor.motion.effects.glow": {
+      "description": "Saved default for the `glow` cursor effect. Unset follows the style.",
+      "type": "boolean"
+     },
+     "cursor.motion.effects.magnet": {
+      "description": "Saved default for the `magnet` cursor effect. Unset follows the style.",
+      "type": "boolean"
+     },
+     "cursor.motion.effects.ripple": {
+      "description": "Saved default for the `ripple` cursor effect. Unset follows the style.",
+      "type": "boolean"
+     },
+     "cursor.motion.effects.squish": {
+      "description": "Saved default for the `squish` cursor effect. Unset follows the style.",
+      "type": "boolean"
+     },
+     "cursor.motion.effects.trail": {
+      "description": "Saved default for the `trail` cursor effect. Unset follows the style.",
+      "type": "boolean"
+     },
+     "cursor.motion.style": {
+      "description": "Saved default cursor motion style for new sessions. Overridden by start_session cursor_motion and set_agent_cursor_motion; reduced motion always wins. Built-in default: signature_arc.",
+      "enum": [
+       "signature_arc",
+       "spring_settle",
+       "magnetic",
+       "comet_swoop",
+       "adaptive",
+       "classic"
+      ],
+      "type": "string"
+     },
+     "cursor.motion.timing": {
+      "description": "Saved default cursor move timing for new sessions.",
+      "enum": [
+       "native",
+       "fitts",
+       "fixed"
       ],
       "type": "string"
      },
@@ -3043,6 +3153,145 @@
        "desktop"
       ],
       "type": "string"
+     },
+     "cursor_motion": {
+      "additionalProperties": false,
+      "description": "Optional initial cursor motion (style, timing, effects and tuning). The host applies it\nbefore the cursor is first made visible. A later `set_agent_cursor_motion` call wins;\nthis wins over the saved default (`cursor.motion.*` in the driver config) and the\nbuilt-in `signature_arc`. Reduced motion always wins.",
+      "properties": {
+       "arc_flow": {
+        "description": "Added to the arc asymmetry of `signature_arc`, `spring_settle` and `comet_swoop`:\npositive moves the apex toward the destination. Clamped to -1..1 (default 0).",
+        "type": [
+         "number",
+         "null"
+        ]
+       },
+       "arc_size": {
+        "description": "Scales the arc of `signature_arc`, `spring_settle` and `comet_swoop`: 0.25 (default)\nkeeps the style's arc, 0 is a straight line, 0.5 doubles it. Clamped to 0..1.",
+        "type": [
+         "number",
+         "null"
+        ]
+       },
+       "dwell_after_click_ms": {
+        "description": "Pause after a click animation, in milliseconds. Clamped to 0..5000 (default 80).",
+        "type": [
+         "number",
+         "null"
+        ]
+       },
+       "effects": {
+        "additionalProperties": false,
+        "description": "Turn single effects on or off. An omitted effect keeps its current setting; null\nrestores the style's default.",
+        "properties": {
+         "glow": {
+          "description": "Soft glow around the cursor that grows with speed.",
+          "type": [
+           "boolean",
+           "null"
+          ]
+         },
+         "magnet": {
+          "description": "Target glow when the `magnetic` style locks on.",
+          "type": [
+           "boolean",
+           "null"
+          ]
+         },
+         "ripple": {
+          "description": "Ring that expands from the hotspot on click.",
+          "type": [
+           "boolean",
+           "null"
+          ]
+         },
+         "squish": {
+          "description": "Brief scale-down of the cursor on click.",
+          "type": [
+           "boolean",
+           "null"
+          ]
+         },
+         "trail": {
+          "description": "Short fading trail behind the cursor.",
+          "type": [
+           "boolean",
+           "null"
+          ]
+         }
+        },
+        "type": [
+         "object",
+         "null"
+        ]
+       },
+       "end_handle": {
+        "description": "Arc control-point offset from the end, as a fraction of the distance, for\n`signature_arc`, `spring_settle` and `comet_swoop`. Clamped to 0..1 (default 0.3).",
+        "type": [
+         "number",
+         "null"
+        ]
+       },
+       "glide_duration_ms": {
+        "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` timing also fixes the duration. Clamped to 0..5000.",
+        "type": [
+         "number",
+         "null"
+        ]
+       },
+       "idle_hide_ms": {
+        "description": "Hide the cursor after this many idle milliseconds; 0 never hides it. Clamped to\n0..60000 (default 15000).",
+        "type": [
+         "number",
+         "null"
+        ]
+       },
+       "spring": {
+        "description": "Arrival spring damping for `classic`: 1 is critically damped, 0.3 is bouncy. Clamped\nto 0.3..1 (default 0.72).",
+        "type": [
+         "number",
+         "null"
+        ]
+       },
+       "start_handle": {
+        "description": "Arc control-point offset from the start, as a fraction of the distance, for\n`signature_arc`, `spring_settle` and `comet_swoop`. Clamped to 0..1 (default 0.3).",
+        "type": [
+         "number",
+         "null"
+        ]
+       },
+       "style": {
+        "description": "Trajectory style. `signature_arc` (default) is one arc with a small follow-through;\n`spring_settle` lands with one soft bounce; `magnetic` is pulled into the target;\n`comet_swoop` is a wide arc with a short trail; `adaptive` picks a careful approach for\nsmall targets and a swoop for long moves; `classic` is the previous Dubins glide. When\nthe theme's reduced motion is on, every move is a short straight glide with no effects.",
+        "enum": [
+         "signature_arc",
+         "spring_settle",
+         "magnetic",
+         "comet_swoop",
+         "adaptive",
+         "classic"
+        ],
+        "type": "string"
+       },
+       "timing": {
+        "description": "`native` uses the style's own timing; `fitts` scales the move time with distance and\ntarget size; `fixed` uses glide_duration_ms (1430 ms when 0).",
+        "enum": [
+         "native",
+         "fitts",
+         "fixed"
+        ],
+        "type": "string"
+       },
+       "turn_radius": {
+        "description": "Minimum turning radius of the `classic` glide path, in points; smaller turns tighter.\nClamped to 1..1000 (default 80).",
+        "type": [
+         "number",
+         "null"
+        ]
+       }
+      },
+      "type": [
+       "object",
+       "null"
+      ]
      },
      "cursor_theme": {
       "description": "Optional initial cursor theme. The host applies it before the cursor is\nfirst made visible, avoiding a flash of the default theme.",

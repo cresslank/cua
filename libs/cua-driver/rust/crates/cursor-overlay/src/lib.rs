@@ -13,6 +13,7 @@ pub mod bezier;
 pub mod capture_exclusion;
 pub mod capture_utils;
 pub mod motion;
+pub mod motion_defaults;
 pub mod path_planner;
 pub mod render_map;
 pub mod render_state;
@@ -20,11 +21,15 @@ pub mod session_badge;
 pub mod surface_fit;
 pub mod theme;
 pub mod theme_artifact;
+pub mod trajectory;
 pub mod z_order;
 
 pub use badge_glyphs::{BadgeChip, BadgeGlyph};
 pub use bezier::CubicBezier;
-pub use motion::{MotionConfig, Spring};
+pub use motion::{
+    MotionConfig, MotionEffects, MotionStyle, MotionTiming, ResolvedEffects, Spring,
+    DEFAULT_FIXED_MS,
+};
 pub use path_planner::{PathPlanner, PathState, PlannedPath};
 pub use render_map::{
     keyed_config, seed_position, CursorMap, MsgOutcome, RenderEntry, RenderMap, ScreenFrame,
@@ -104,6 +109,9 @@ impl CursorConfig {
     /// ```
     pub fn from_args() -> Self {
         let args: Vec<String> = std::env::args().collect();
+        // Load the saved `cursor.motion.*` defaults; the render map layers
+        // them under each cursor it creates.
+        motion_defaults::load_active();
         Self::parse(&args[1..])
     }
 
@@ -350,6 +358,10 @@ pub enum OverlayCommand {
         x: f64,
         y: f64,
         end_heading_radians: f64,
+        /// Screen rect `[x, y, width, height]` of the element being targeted,
+        /// when known (AX frame, browser element box). Drives Fitts timing,
+        /// adaptive dispatch and the magnet glow; `None` uses a 24 pt box.
+        target: Option<[f64; 4]>,
     },
     /// Snap the cursor immediately to a screen position, optionally updating heading.
     SnapTo {
@@ -365,6 +377,10 @@ pub enum OverlayCommand {
     SetEnabled(bool),
     /// Update the motion/timing config live.
     SetMotion(MotionConfig),
+    /// Apply `set_agent_cursor_motion`-shaped fields on top of the cursor's
+    /// current motion (the `cursor_motion` of `start_session`). Invalid
+    /// values are ignored; the tool boundary already rejected them.
+    ApplyMotion(serde_json::Value),
     /// Pin the overlay above a specific window (by platform window id).
     PinAbove(u64),
     /// Begin a best-effort semantic cursor cue.

@@ -128,11 +128,28 @@ and staples the app, packs it with `scripts/package-dmg.sh` into
 `cua-spaces-<version>-darwin-universal.dmg`, signs, notarizes and staples
 that, and builds the MDM .pkg from the same app. The app needs macOS 26.
 
+The app ships the `cua` CLI, daemon and app core built from `libs/cua` at the
+release tag, so a fix that lands only in `libs/cua` (for example the sign-in
+refresh in #4633) reaches app users with the next Cua Spaces release. Cut one
+when such a fix should go out; the `cua-spaces` Release Please component counts
+commits under this directory.
+
 ```sh
 scripts/build-release.sh --version 0.2.0 --out /tmp/spaces-release   # ad hoc signed, universal
 scripts/package-dmg.sh --app "/tmp/spaces-release/Cua Spaces.app" --out /tmp/cua-spaces.dmg
 scripts/verify-release.sh cua-spaces-0.2.0-darwin-universal.dmg      # a downloaded release
 ```
+
+The disk image window is the spaces.cua.ai hero with the blue Cua Spaces key
+missing. The app, whose icon is that key, sits on the left. The Applications
+alias, whose icon is the key's outline with an Applications glyph, sits where
+the key was, so installing is dragging the key into its place.
+`package-dmg.sh` lays the window out with a pinned
+[dmgbuild](https://github.com/dmgbuild/dmgbuild) (`scripts/dmg-settings.py`)
+and makes the alias with `scripts/make-alias.swift`. The art in
+`Support/dmg` and the app icon `Support/AppIcon.icns` are drawn from the
+site's keycap sprites by `scripts/dmg-art/render.sh` (headless Chrome); rerun
+it only when the art changes.
 
 ## Updates (Sparkle)
 

@@ -2137,7 +2137,7 @@ impl Spaces {
         // Until the Space is registered, the create's journal holds its
         // token and what it made: a process that dies mid-create (a daemon
         // crash, a quit) leaves it, and [`Spaces::recover_interrupted_creates`]
-        // then registers the sandbox or deletes it, never a hidden one; a
+        // then recovers it or retains it for manual cleanup; an explicit
         // cancel removes what it made. Only a name nothing used before is
         // this create's to delete.
         let fresh = !self.inner.sandboxes.local_name_in_use(&name).await;
@@ -2168,14 +2168,16 @@ impl Spaces {
         if expect_env {
             create = create.wait_for(Probe::Tcp(cua_proto::SPACESD_DEFAULT_PORT));
         }
-        let started = tokio::time::Instant::now();
+        let started = std::time::Instant::now();
         // Cancel-safe: dropped (a cancelled create), it stops and deletes
         // what it made (its own token never fires; the create's does).
-        let created = self
-            .inner
-            .sandboxes
-            .create_cancellable(create, cua_sandbox_core::CancellationToken::new())
-            .await;
+        let (created, image_ready) = cua_sandbox_core::progress::past(
+            cua_sandbox_core::progress::Phase::Pulling,
+            self.inner
+                .sandboxes
+                .create_cancellable(create, cua_sandbox_core::CancellationToken::new()),
+        )
+        .await;
         if let Err(e) = created {
             // A start that failed after the instance existed (a readiness
             // probe that never passed) leaves a running VM no registry
@@ -2197,14 +2199,7 @@ impl Spaces {
             token: Some(token),
             ..Default::default()
         };
-        // A chosen timeout governs the whole wait; the default budget caps
-        // the handshake at SPACESD_READY_TIMEOUT.
-        let mut remaining = timeout
-            .saturating_sub(started.elapsed())
-            .max(Duration::from_secs(10));
-        if opts.timeout.is_none() {
-            remaining = remaining.min(cua_sandbox_core::SPACESD_READY_TIMEOUT);
-        }
+        let remaining = connect_budget(opts.timeout, image_ready.unwrap_or(started));
         cua_sandbox_core::progress::report(cua_sandbox_core::progress::Progress::phase(
             cua_sandbox_core::progress::Phase::Connecting,
         ));
@@ -2214,7 +2209,7 @@ impl Spaces {
         {
             Ok(s) => s,
             Err(e) => {
-                if let Ok(sb) = self.inner.sandboxes.connect(&name).await {
+                if fresh && let Ok(sb) = self.inner.sandboxes.connect(&name).await {
                     let _ = sb.delete().await;
                 }
                 return Err(e);
@@ -2231,17 +2226,11 @@ impl Spaces {
         self.info(&id)
     }
 
-    /// Local creates a process that died left half done (its daemon
-    /// crashed or was killed between starting the sandbox and registering
-    /// the Space): each such sandbox is registered when its cua-spacesd
-    /// answers within `budget`, else deleted, so nothing keeps running
-    /// that no Space lists. Creates of live processes are left alone. The
-    /// daemon runs this when it starts.
-    ///
-    /// A create someone cancelled (its `.cancel` marker), a cloud or host
-    /// create, and one under a name that was in use before are not
-    /// registered: what they made is removed ([`Spaces::cancel_create`]'s
-    /// undo), and a sandbox that existed before is left as it was.
+    /// Recovers local creates left by a dead process when their cua-spacesd
+    /// authenticates within `budget`. Failed, cancelled or borrowed local
+    /// attempts retain their resources and journals for explicit cleanup.
+    /// Live processes are left alone; nonlocal creates retain cancellation
+    /// cleanup. The daemon runs this at startup.
     pub async fn recover_interrupted_creates(&self, budget: Duration) -> Vec<RecoveredCreate> {
         use crate::creating::Made;
         let mut out = Vec::new();
@@ -2254,7 +2243,7 @@ impl Spaces {
                 Made::LocalSandbox { fresh, .. } => Some(*fresh),
                 _ => None,
             });
-            if crate::creating::cancel_marked(&home, &stem) || j.kind != "local" {
+            if j.kind != "local" {
                 let message = self.undo(&j).await;
                 tracing::info!(create = %stem, message, "interrupted create undone");
                 crate::creating::remove(&home, &stem);
@@ -2271,12 +2260,15 @@ impl Spaces {
             let id = SpaceId::Local {
                 name: j.name.clone(),
             };
-            // Nothing made yet (cut off while resolving the image), or a
-            // name that was someone else's: nothing of this create's to
-            // delete.
-            let untouchable =
-                (j.token.is_empty() && j.made.is_empty()) || local_made == Some(false);
-            let outcome = if self
+            let outcome = if crate::creating::cancel_marked(&home, &stem)
+                || local_made == Some(false)
+                || j.token.trim().is_empty()
+                || !j.spacesd
+            {
+                RecoveryOutcome::Failed(
+                    "local attempt retained; inspect and clean up manually".into(),
+                )
+            } else if self
                 .inner
                 .registry
                 .get(&id.to_string())
@@ -2285,18 +2277,6 @@ impl Spaces {
                 .is_some()
             {
                 RecoveryOutcome::AlreadyRegistered
-            } else if untouchable && self.inner.sandboxes.connect(&j.name).await.is_err() {
-                RecoveryOutcome::NothingLeft
-            } else if self.inner.sandboxes.connect(&j.name).await.is_err() {
-                // Cut off before the sandbox was recorded: an instance the
-                // runtime started is deleted, never left running unlisted.
-                match self.inner.sandboxes.delete_local_instance(&j.name).await {
-                    Ok(true) => RecoveryOutcome::Deleted(
-                        "the create was cut off before the sandbox was recorded".into(),
-                    ),
-                    Ok(false) => RecoveryOutcome::NothingLeft,
-                    Err(e) => RecoveryOutcome::Failed(format!("delete: {e}")),
-                }
             } else {
                 let credential = Credential {
                     token: Some(j.token.clone()),
@@ -2317,38 +2297,25 @@ impl Spaces {
                             self.notify_connected(&id);
                             RecoveryOutcome::Registered
                         }
-                        Err(e) if untouchable => RecoveryOutcome::Failed(e.to_string()),
-                        Err(e) => self.discard_interrupted(&j.name, e.to_string()).await,
+                        Err(e) => RecoveryOutcome::Failed(format!(
+                            "{e}; local attempt retained for manual cleanup"
+                        )),
                     },
-                    Err(e) if untouchable => RecoveryOutcome::Failed(e.to_string()),
-                    Err(e) => self.discard_interrupted(&j.name, e.to_string()).await,
+                    Err(e) => RecoveryOutcome::Failed(format!(
+                        "{e}; local attempt retained for manual cleanup"
+                    )),
                 }
             };
             tracing::info!(space = %id, ?outcome, "interrupted create");
-            crate::creating::remove(&home, &stem);
+            if !matches!(outcome, RecoveryOutcome::Failed(_)) {
+                crate::creating::remove(&home, &stem);
+            }
             out.push(RecoveredCreate {
                 id: id.to_string(),
                 outcome,
             });
         }
         out
-    }
-
-    async fn discard_interrupted(&self, name: &str, why: String) -> RecoveryOutcome {
-        let deleted = match self.inner.sandboxes.connect(name).await {
-            Ok(sb) => sb.delete().await.map(|_| ()).map_err(Error::from),
-            Err(_) => self
-                .inner
-                .sandboxes
-                .delete_local_instance(name)
-                .await
-                .map(|_| ())
-                .map_err(Error::from),
-        };
-        match deleted {
-            Ok(()) => RecoveryOutcome::Deleted(why),
-            Err(e) => RecoveryOutcome::Failed(format!("{why}; delete: {e}")),
-        }
     }
 
     /// Deletes a Space's sandbox and forgets it: a cloud Space's sandbox is
@@ -2563,6 +2530,16 @@ impl Spaces {
     async fn capture_thumbnail_once(&self, id: &str) -> Result<crate::thumbnails::Thumbnail> {
         use crate::thumbnails::{MAX_DIMENSION, QUALITY, Thumbnail};
         let space = self.space(id).await?;
+        // A machine that does not share its desktop says so in its
+        // capabilities: never ask its ComputerService (each refusal is a
+        // line in its owner's access log). The refusal still backs off.
+        if let Some(f) = crate::thumbnails::desktop_not_shared(space.capabilities()) {
+            return Err(Error::CapabilityMissing {
+                space: id.to_string(),
+                feature: f.name.clone(),
+                limitation: f.limitation.clone(),
+            });
+        }
         let shot = space
             .spacesd()?
             .screenshot(cua_spacesd_client::ScreenshotOptions {
@@ -2794,7 +2771,7 @@ pub enum RecoveryOutcome {
     Registered,
     /// It never became a Space (why): its sandbox was deleted.
     Deleted(String),
-    /// Its sandbox could not be deleted (why).
+    /// Recovery failed (why); a local attempt and its journal are retained.
     Failed(String),
     /// It had been registered after all.
     AlreadyRegistered,
@@ -2824,6 +2801,20 @@ impl Drop for UndoOnDrop {
                 tracing::info!(message, "a dropped create was undone");
             });
         }
+    }
+}
+
+/// How long a new local Space's cua-spacesd has to accept the connection
+/// once its sandbox is ready. A chosen `timeout` is counted from `clock`
+/// (when the image was present), with at least 10 s left; the default gives
+/// the handshake [`cua_sandbox_core::SPACESD_READY_TIMEOUT`] however long
+/// the boot took.
+fn connect_budget(timeout: Option<Duration>, clock: std::time::Instant) -> Duration {
+    match timeout {
+        Some(t) => t
+            .saturating_sub(clock.elapsed())
+            .max(Duration::from_secs(10)),
+        None => cua_sandbox_core::SPACESD_READY_TIMEOUT,
     }
 }
 
@@ -2924,6 +2915,31 @@ fn thumbnail_failure(f: &crate::thumbnails::CaptureFailure) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_default_connect_budget_does_not_depend_on_the_boot() {
+        let now = std::time::Instant::now();
+        assert_eq!(
+            connect_budget(None, now),
+            cua_sandbox_core::SPACESD_READY_TIMEOUT
+        );
+        if let Some(long_ago) = now.checked_sub(Duration::from_secs(900)) {
+            assert_eq!(
+                connect_budget(None, long_ago),
+                cua_sandbox_core::SPACESD_READY_TIMEOUT
+            );
+        }
+    }
+
+    #[test]
+    fn a_chosen_connect_budget_counts_from_the_image_being_present() {
+        let t = Duration::from_secs(600);
+        let left = connect_budget(Some(t), std::time::Instant::now());
+        assert!(left > Duration::from_secs(590), "{left:?}");
+        if let Some(spent) = std::time::Instant::now().checked_sub(Duration::from_secs(900)) {
+            assert_eq!(connect_budget(Some(t), spent), Duration::from_secs(10));
+        }
+    }
 
     #[test]
     fn a_pinned_cloud_image_carries_its_digest_a_tag_none() {

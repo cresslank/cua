@@ -571,12 +571,17 @@ impl Tool for ClickTool {
             // Animate cursor to element center BEFORE firing AX action,
             // mirroring Swift's `performElementClick` → `animateAndWait(to:)`.
             let center_guard = element_guard.clone();
-            let center = cua_driver_core::blocking::spawn(move || unsafe {
-                crate::ax::bindings::element_screen_center(center_guard.as_ptr() as AXUIElementRef)
+            // The element's screen rect rides along on the glide so motion
+            // styles can time by target size and highlight the target.
+            let (center, target_rect) = cua_driver_core::blocking::spawn(move || unsafe {
+                let el = center_guard.as_ptr() as AXUIElementRef;
+                (
+                    crate::ax::bindings::element_screen_center(el),
+                    element_screen_rect(el),
+                )
             })
             .await
-            .ok()
-            .flatten();
+            .unwrap_or((None, None));
 
             // Surface 5: button=middle on the AX path has no AX equivalent.
             // Fall back to a pixel middle-click at the element's screen-space center
@@ -597,7 +602,13 @@ impl Tool for ClickTool {
                     cursor_key.clone(),
                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
                 );
-                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy).await;
+                crate::cursor::overlay::animate_cursor_to_target(
+                    cursor_key.clone(),
+                    cx,
+                    cy,
+                    target_rect,
+                )
+                .await;
                 self.state
                     .cursor_registry
                     .update_position(&cursor_key, cx, cy);
@@ -639,7 +650,13 @@ impl Tool for ClickTool {
                     cursor_key.clone(),
                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
                 );
-                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy).await;
+                crate::cursor::overlay::animate_cursor_to_target(
+                    cursor_key.clone(),
+                    cx,
+                    cy,
+                    target_rect,
+                )
+                .await;
                 // Keep the registry in sync with the overlay so
                 // get_agent_cursor_state reports a truthful position even when
                 // the click was dispatched via the AX path (no pixel coords).
