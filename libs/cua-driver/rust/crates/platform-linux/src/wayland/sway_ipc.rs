@@ -19,9 +19,12 @@ struct Rect {
 #[derive(Clone, Debug, Default, Deserialize)]
 struct Node {
     id: u64,
-    #[serde(default)]
+    // Sway sends `null` for unnamed containers and for XWayland views'
+    // `app_id`; `default` covers only a missing field, and one null used to
+    // discard the whole tree.
+    #[serde(default, deserialize_with = "nullable_string")]
     name: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "nullable_string")]
     app_id: String,
     pid: Option<u32>,
     #[serde(default)]
@@ -44,6 +47,13 @@ struct Node {
 
 fn default_visible() -> bool {
     true
+}
+
+fn nullable_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -636,6 +646,49 @@ mod tests {
         assert!(windows[0].focused);
         assert!(windows[0].fullscreen);
         assert_eq!(windows[1].title, "Dialog");
+    }
+
+    #[test]
+    fn parses_xwayland_null_app_id_and_nullable_container_names() {
+        // Sway 1.11 shape: an unnamed split container and an XWayland view
+        // whose app_id is null, on a workspace that is not visible.
+        let tree = br#"{
+          "id": 1,
+          "name": "root",
+          "nodes": [{
+            "id": 2,
+            "name": null,
+            "app_id": null,
+            "nodes": [{
+              "id": 10,
+              "name": "Native",
+              "app_id": "org.example.Native",
+              "pid": 123,
+              "rect": {"x": 0, "y": 0, "width": 400, "height": 300}
+            }, {
+              "id": 41,
+              "name": "GTK3 XWayland",
+              "app_id": null,
+              "pid": 456,
+              "visible": false,
+              "rect": {"x": 400, "y": 0, "width": 400, "height": 300}
+            }]
+          }]
+        }"#;
+        let windows = parse_tree(tree).expect("null names and app ids must not discard the tree");
+        assert_eq!(windows.len(), 2);
+        let xwayland = windows.iter().find(|w| w.pid == 456).unwrap();
+        assert_eq!(xwayland.id, 41);
+        assert_eq!(xwayland.title, "GTK3 XWayland");
+        assert_eq!(xwayland.app_id, "");
+        assert!(!xwayland.visible);
+        assert_eq!(windows.iter().find(|w| w.pid == 123).unwrap().id, 10);
+
+        // Missing fields still default; malformed values still reject the tree.
+        assert!(parse_tree(br#"{"id": 1, "nodes": [{"id": 3, "pid": 7, "name": "x"}]}"#).is_some());
+        assert!(parse_tree(br#"{"id": 1, "name": 5}"#).is_none());
+        assert!(parse_tree(br#"{"id": 1, "app_id": {"a": 1}}"#).is_none());
+        assert!(parse_tree(br#"{"id": "1"}"#).is_none());
     }
 
     #[test]
