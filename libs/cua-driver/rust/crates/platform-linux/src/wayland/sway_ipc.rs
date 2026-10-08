@@ -286,6 +286,57 @@ fn wait_for_exact_container_focus(id: u64, pid: u32, timeout: std::time::Duratio
     }
 }
 
+/// Activate without restoring prior focus; the caller holds the raw-input lease.
+pub fn focus_exact(pid: u32, id: u64) -> anyhow::Result<()> {
+    focus_exact_using(
+        pid,
+        id,
+        || {
+            list_windows().ok_or_else(|| {
+                anyhow::anyhow!("foreground_unavailable: Sway IPC tree is unavailable")
+            })
+        },
+        focus_container_exact,
+        |id, pid| wait_for_exact_container_focus(id, pid, std::time::Duration::from_millis(500)),
+    )
+}
+
+fn focus_exact_using(
+    pid: u32,
+    id: u64,
+    mut read_windows: impl FnMut() -> anyhow::Result<Vec<Window>>,
+    mut focus: impl FnMut(u64, u32) -> bool,
+    mut wait_for_focus: impl FnMut(u64, u32) -> bool,
+) -> anyhow::Result<()> {
+    if !read_windows()?
+        .iter()
+        .any(|window| window.id == id && window.pid == pid)
+    {
+        anyhow::bail!("stale_target: Sway container {id} is no longer owned by pid {pid}");
+    }
+    if !focus(id, pid) {
+        anyhow::bail!(
+            "foreground_unavailable: Sway refused to focus exact container {id} for pid {pid}"
+        );
+    }
+    if !wait_for_focus(id, pid) {
+        anyhow::bail!("foreground_unavailable: Sway did not confirm focus on exact container {id} for pid {pid}");
+    }
+    // Check again at the return boundary, including focus theft and id reuse.
+    match read_windows()?.into_iter().find(|window| window.id == id) {
+        Some(window) if window.pid != pid => {
+            anyhow::bail!("stale_target: Sway container {id} changed owner while acquiring focus");
+        }
+        Some(window) if window.focused => Ok(()),
+        Some(_) => anyhow::bail!(
+            "foreground_unavailable: exact Sway container {id} for pid {pid} is not focused"
+        ),
+        None => {
+            anyhow::bail!("stale_target: Sway container {id} disappeared while acquiring focus")
+        }
+    }
+}
+
 /// Exact Sway focus transaction for a stateful press/move/release sequence.
 /// Its caller must hold the host raw-input lease for this value's lifetime.
 pub struct StatefulFocus {
@@ -505,6 +556,108 @@ mod tests {
             visible: true,
             fullscreen: false,
         }
+    }
+
+    #[test]
+    fn focus_exact_pid_mismatch_refuses_before_focus() {
+        let error = focus_exact_using(
+            20,
+            2,
+            || Ok(vec![window(2, 99, false)]),
+            |_, _| panic!("must not focus a mismatched pid"),
+            |_, _| panic!("must not wait after mismatch"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stale_target"));
+    }
+
+    #[test]
+    fn focus_exact_refused_focus_does_not_wait() {
+        let error = focus_exact_using(
+            20,
+            2,
+            || Ok(vec![window(2, 20, false)]),
+            |id, pid| {
+                assert_eq!((id, pid), (2, 20));
+                false
+            },
+            |_, _| panic!("must not wait after refused focus"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("foreground_unavailable"));
+    }
+
+    #[test]
+    fn focus_exact_readback_timeout_refuses() {
+        let error = focus_exact_using(
+            20,
+            2,
+            || Ok(vec![window(1, 10, true), window(2, 20, false)]),
+            |id, pid| {
+                assert_eq!((id, pid), (2, 20));
+                true
+            },
+            |id, pid| {
+                assert_eq!((id, pid), (2, 20));
+                false
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("foreground_unavailable"));
+    }
+
+    #[test]
+    fn focus_exact_other_focused_container_refuses_after_wait() {
+        let error = focus_exact_using(
+            20,
+            2,
+            || Ok(vec![window(1, 10, true), window(2, 20, false)]),
+            |_, _| true,
+            |_, _| true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("foreground_unavailable"));
+    }
+
+    #[test]
+    fn focus_exact_pid_replacement_after_wait_refuses() {
+        let mut reads = [vec![window(2, 20, false)], vec![window(2, 99, true)]].into_iter();
+        let error = focus_exact_using(
+            20,
+            2,
+            || Ok(reads.next().unwrap()),
+            |_, _| true,
+            |_, _| true,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("stale_target"));
+    }
+
+    #[test]
+    fn focus_exact_success_checks_same_container_and_pid() {
+        let mut reads = [vec![window(2, 20, false)], vec![window(2, 20, true)]].into_iter();
+        let calls = std::cell::RefCell::new(Vec::new());
+        focus_exact_using(
+            20,
+            2,
+            || {
+                calls.borrow_mut().push("read");
+                Ok(reads.next().unwrap())
+            },
+            |id, pid| {
+                assert_eq!((id, pid), (2, 20));
+                calls.borrow_mut().push("focus");
+                true
+            },
+            |id, pid| {
+                assert_eq!((id, pid), (2, 20));
+                calls.borrow_mut().push("wait");
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), ["read", "focus", "wait", "read"]);
+        assert!(reads.next().is_none());
     }
 
     #[test]

@@ -428,7 +428,7 @@ pub fn ensure_nested_session() {
     });
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Toplevel {
     title: String,
     app_id: String,
@@ -574,23 +574,55 @@ fn identity_for(id: u64) -> Option<ToplevelIdentity> {
         })
 }
 
+/// Return an item only when the complete candidate set proves uniqueness.
+fn unique_match<T>(mut candidates: impl Iterator<Item = T>) -> Option<T> {
+    let candidate = candidates.next()?;
+    candidates.next().is_none().then_some(candidate)
+}
+
+/// Candidates must have a live protocol handle; closed toplevels cannot match.
+fn matching_protocol_id<'a>(
+    identity: &ToplevelIdentity,
+    candidates: impl Iterator<Item = (u32, &'a str, &'a str, bool)> + Clone,
+) -> Option<u32> {
+    let live = candidates.filter(|(_, _, _, closed)| !closed);
+    let mut titles = live
+        .clone()
+        .filter(|(_, title, _, _)| !identity.title.is_empty() && *title == identity.title);
+    if let Some((id, _, _, _)) = titles.next() {
+        // An ambiguous title is a refusal, not permission to fall back to app_id.
+        return titles.next().is_none().then_some(id);
+    }
+    unique_match(
+        live.filter(|(_, _, app_id, _)| !identity.app_id.is_empty() && *app_id == identity.app_id),
+    )
+    .map(|(id, _, _, _)| id)
+}
+
 fn matching_handle(state: &State, id: u64) -> Option<ZwlrForeignToplevelHandleV1> {
     if let Some(identity) = identity_for(id) {
-        let by_title = state.toplevels.iter().find_map(|(protocol_id, toplevel)| {
-            (!identity.title.is_empty() && toplevel.title == identity.title)
-                .then(|| state.handles.get(protocol_id).cloned())
-                .flatten()
-        });
-        return by_title.or_else(|| {
-            state.toplevels.iter().find_map(|(protocol_id, toplevel)| {
-                (!identity.app_id.is_empty() && toplevel.app_id == identity.app_id)
-                    .then(|| state.handles.get(protocol_id).cloned())
-                    .flatten()
-            })
-        });
+        let protocol_id = matching_protocol_id(
+            &identity,
+            state.toplevels.iter().filter_map(|(id, tl)| {
+                state.handles.contains_key(id).then_some((
+                    *id,
+                    tl.title.as_str(),
+                    tl.app_id.as_str(),
+                    tl.closed,
+                ))
+            }),
+        )?;
+        return state.handles.get(&protocol_id).cloned();
     }
 
     let protocol_id = u32::try_from(id).ok()?;
+    if state
+        .toplevels
+        .get(&protocol_id)
+        .is_some_and(|tl| tl.closed)
+    {
+        return None;
+    }
     state.handles.get(&protocol_id).cloned()
 }
 
@@ -925,9 +957,80 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
     }
 
     let sway_windows = sway_windows_for_mode(is_inject_mode(), sway_ipc::list_windows);
-    let mut used_sway_ids = HashSet::new();
+    Ok(correlated_toplevel_windows(&state.toplevels, &sway_windows)
+        .into_iter()
+        .map(|(window, identity)| {
+            remember_identity(window.xid, &identity);
+            window
+        })
+        .collect())
+}
+
+/// Pair by successively stronger/disjoint keys, never by HashMap order. Each
+/// pass sees the same unclaimed Sway snapshot, and counts *all* live toplevels.
+fn pair_sway_toplevels<'a>(
+    toplevels: &HashMap<u32, Toplevel>,
+    sway_windows: &'a [sway_ipc::Window],
+) -> HashMap<u32, &'a sway_ipc::Window> {
+    let live: Vec<_> = toplevels
+        .iter()
+        .filter(|(_, tl)| !tl.closed && !tl.app_id.starts_with("surface:"))
+        .collect();
+    let mut paired = HashMap::new();
+    let mut claimed = HashSet::new();
+    for key in 0..3 {
+        let mut additions = Vec::new();
+        for (id, tl) in &live {
+            if paired.contains_key(*id) {
+                continue;
+            }
+            let eligible = match key {
+                0 => !tl.title.is_empty(),
+                1 => !tl.title.is_empty() && !tl.app_id.is_empty(),
+                _ => {
+                    !tl.app_id.is_empty()
+                        && !sway_windows.iter().any(|window| window.title == tl.title)
+                }
+            };
+            if !eligible {
+                continue;
+            }
+            let matches = |title: &str, app_id: &str| match key {
+                0 => title == tl.title,
+                1 => title == tl.title && app_id == tl.app_id,
+                _ => app_id == tl.app_id,
+            };
+            if live
+                .iter()
+                .filter(|(_, other)| matches(&other.title, &other.app_id))
+                .count()
+                != 1
+            {
+                continue;
+            }
+            if let Some(window) = unique_match(sway_windows.iter().filter(|window| {
+                !claimed.contains(&window.id) && matches(&window.title, &window.app_id)
+            })) {
+                additions.push((**id, window));
+            }
+        }
+        for (id, window) in additions {
+            claimed.insert(window.id);
+            paired.insert(id, window);
+        }
+    }
+    paired
+}
+
+/// Pure enumeration plan, including the identities the caller must remember.
+fn correlated_toplevel_windows(
+    toplevels: &HashMap<u32, Toplevel>,
+    sway_windows: &[sway_ipc::Window],
+) -> Vec<(WindowInfo, Toplevel)> {
+    let paired = pair_sway_toplevels(toplevels, sway_windows);
+    let used_sway_ids: HashSet<_> = paired.values().map(|window| window.id).collect();
     let mut out = Vec::new();
-    for (id, tl) in &state.toplevels {
+    for (id, tl) in toplevels {
         if tl.closed {
             continue;
         }
@@ -937,73 +1040,113 @@ pub fn list_windows() -> anyhow::Result<Vec<WindowInfo>> {
         } else {
             format!("{} [{}]", tl.title, tl.app_id)
         };
-        let sway = if exact_private_target {
-            None
-        } else {
-            sway_windows
-                .iter()
-                .find(|window| {
-                    !used_sway_ids.contains(&window.id)
-                        && !tl.title.is_empty()
-                        && window.title == tl.title
-                })
-                .or_else(|| {
-                    sway_windows.iter().find(|window| {
-                        !used_sway_ids.contains(&window.id)
-                            && !tl.app_id.is_empty()
-                            && window.app_id == tl.app_id
-                    })
-                })
-        };
+        let sway = paired.get(id).copied();
+        // Ambiguous protocol handles add no identity to an authoritative Sway
+        // record. Keep protocol-only windows only when Sway cannot represent them.
+        if !exact_private_target
+            && sway.is_none()
+            && sway_windows.iter().any(|window| {
+                if tl.title.is_empty() {
+                    !tl.app_id.is_empty() && window.app_id == tl.app_id
+                } else {
+                    window.title == tl.title
+                }
+            })
+        {
+            continue;
+        }
         let stable_id = if exact_private_target {
             private_target_window_id(&tl.app_id)
         } else {
             sway.map(|window| window.id).unwrap_or(*id as u64)
         };
-        if let Some(window) = sway {
-            used_sway_ids.insert(window.id);
-        }
-        remember_identity(stable_id, tl);
-        out.push(WindowInfo {
-            xid: stable_id,
-            pid: if exact_private_target {
-                private_target_client_pid(&tl.app_id)
-            } else {
-                sway.map(|window| window.pid)
+        out.push((
+            WindowInfo {
+                xid: stable_id,
+                pid: if exact_private_target {
+                    private_target_client_pid(&tl.app_id)
+                } else {
+                    sway.map(|window| window.pid)
+                },
+                app_name: if exact_private_target {
+                    String::new()
+                } else {
+                    tl.app_id.clone()
+                },
+                title,
+                is_on_screen: sway.map(|window| window.visible).unwrap_or(true),
+                z_index: None,
+                x: sway.map(|window| window.x).unwrap_or(0),
+                y: sway.map(|window| window.y).unwrap_or(0),
+                width: sway.map(|window| window.width).unwrap_or(0),
+                height: sway.map(|window| window.height).unwrap_or(0),
+                native_window_id: Some(u64::from(*id)),
+                target_id: exact_private_target.then(|| tl.app_id.clone()),
+                // Private compositor targets are exact surface tokens, not GNOME
+                // helper identities. Conflating the token's generation segment
+                // with a helper epoch makes the proof constructor require the
+                // GNOME exact-target-v2 capability and rejects every private target.
+                helper_epoch: None,
+                transient_for_window_id: None,
+                transient_for_target_id: None,
+                is_attached_dialog: None,
+                is_modal: None,
+                window_type: None,
+                workspace_index: None,
+                workspace_active: None,
+                sticky: None,
+                monitor: None,
+                capture_current: None,
+                identity_capabilities: None,
             },
-            app_name: if exact_private_target {
-                String::new()
-            } else {
-                tl.app_id.clone()
-            },
-            title,
-            is_on_screen: sway.map(|window| window.visible).unwrap_or(true),
-            z_index: None,
-            x: sway.map(|window| window.x).unwrap_or(0),
-            y: sway.map(|window| window.y).unwrap_or(0),
-            width: sway.map(|window| window.width).unwrap_or(0),
-            height: sway.map(|window| window.height).unwrap_or(0),
-            native_window_id: Some(u64::from(*id)),
-            target_id: exact_private_target.then(|| tl.app_id.clone()),
-            // Private compositor targets are exact surface tokens, not GNOME
-            // helper identities. Conflating the token's generation segment
-            // with a helper epoch makes the proof constructor require the
-            // GNOME exact-target-v2 capability and rejects every private target.
-            helper_epoch: None,
-            transient_for_window_id: None,
-            transient_for_target_id: None,
-            is_attached_dialog: None,
-            is_modal: None,
-            window_type: None,
-            workspace_index: None,
-            workspace_active: None,
-            sticky: None,
-            monitor: None,
-            capture_current: None,
-            identity_capabilities: None,
-        });
+            tl.clone(),
+        ));
     }
-    Ok(out)
+    for sway in sway_windows
+        .iter()
+        .filter(|window| !used_sway_ids.contains(&window.id))
+    {
+        let identity = Toplevel {
+            title: sway.title.clone(),
+            app_id: sway.app_id.clone(),
+            closed: false,
+            activated: false,
+        };
+        out.push((
+            WindowInfo {
+                xid: sway.id,
+                pid: Some(sway.pid),
+                app_name: sway.app_id.clone(),
+                title: if sway.app_id.is_empty() {
+                    sway.title.clone()
+                } else {
+                    format!("{} [{}]", sway.title, sway.app_id)
+                },
+                is_on_screen: sway.visible,
+                z_index: None,
+                x: sway.x,
+                y: sway.y,
+                width: sway.width,
+                height: sway.height,
+                native_window_id: None,
+                target_id: None,
+                helper_epoch: None,
+                transient_for_window_id: None,
+                transient_for_target_id: None,
+                is_attached_dialog: None,
+                is_modal: None,
+                window_type: None,
+                workspace_index: None,
+                workspace_active: None,
+                sticky: None,
+                monitor: None,
+                capture_current: None,
+                identity_capabilities: None,
+            },
+            identity,
+        ));
+    }
+    out
 }
 
 // ── Capture (native screencopy + grim fallback) ──────────────────────────────
@@ -2312,6 +2455,23 @@ pub fn activate_window_for_input_target(
         let transaction = shell_helper::begin_foreground(window_id)?;
         return Ok(ForegroundInputGuard {
             _transaction: Some(transaction),
+            _lease: Some(lease),
+            _inject_target: None,
+        });
+    }
+
+    if let Some(window) = sway_ipc::window_for_id(window_id) {
+        if window.pid != target.pid {
+            anyhow::bail!(
+                "stale_target: Sway container {window_id} is no longer owned by pid {}",
+                target.pid
+            );
+        }
+        // A Sway-known id must never be translated back to a protocol handle.
+        // Revalidate ownership, focus by con_id+pid, and read that exact pair back.
+        sway_ipc::focus_exact(target.pid, window_id)?;
+        return Ok(ForegroundInputGuard {
+            _transaction: None,
             _lease: Some(lease),
             _inject_target: None,
         });
@@ -4603,18 +4763,29 @@ pub fn inject_drag(
     }])
 }
 
-fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
-    let mut windows = crate::atspi::list_windows(filter_pid);
-    // AT-SPI can retain a toolkit's default placement (commonly 120,120)
-    // after Sway has placed the real toplevel at another origin. Reconcile the
-    // fallback records with compositor-owned metadata before exposing them to
-    // callers; element bounds already use this same authoritative Sway tree.
-    for window in &mut windows {
-        let sway = window
-            .pid
-            .and_then(sway_ipc::window_for_pid)
-            .or_else(|| sway_ipc::window_for_title(&window.title))
-            .or_else(|| sway_ipc::window_for_app_id(&window.app_name));
+/// A known AT-SPI PID is an ownership constraint, not a preferred search key.
+fn reconcile_atspi_sway_windows(
+    windows: &mut [WindowInfo],
+    sway_windows: &[sway_ipc::Window],
+    mut window_for_pid: impl FnMut(u32) -> Option<sway_ipc::Window>,
+) {
+    for window in windows {
+        let sway =
+            if let Some(pid) = window.pid {
+                window_for_pid(pid).filter(|sway| sway.pid == pid)
+            } else {
+                unique_match(
+                    sway_windows
+                        .iter()
+                        .filter(|sway| !window.title.is_empty() && sway.title == window.title),
+                )
+                .or_else(|| {
+                    unique_match(sway_windows.iter().filter(|sway| {
+                        !window.app_name.is_empty() && sway.app_id == window.app_name
+                    }))
+                })
+                .cloned()
+            };
         if let Some(sway) = sway {
             window.xid = sway.id;
             window.x = sway.x;
@@ -4624,6 +4795,16 @@ fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
             window.is_on_screen = sway.visible && sway.width > 0 && sway.height > 0;
         }
     }
+}
+
+fn wayland_atspi_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
+    let mut windows = crate::atspi::list_windows(filter_pid);
+    // AT-SPI can retain a toolkit's default placement (commonly 120,120)
+    // after Sway has placed the real toplevel at another origin. Reconcile the
+    // fallback records only within the AT-SPI PID, or by unique exact keys
+    // when AT-SPI has no PID. Never adopt another process's container by title.
+    let sway_windows = sway_ipc::list_windows().unwrap_or_default();
+    reconcile_atspi_sway_windows(&mut windows, &sway_windows, sway_ipc::window_for_pid);
     if is_inject_mode() {
         for window in &mut windows {
             if let Some((window_x, window_y)) = inject_window_origin_for_window(window.xid) {
@@ -4807,6 +4988,13 @@ fn enrich_native_windows(
     adopt_atspi_ids: bool,
 ) -> Vec<WindowInfo> {
     let mut claimed = std::collections::HashSet::new();
+    // Count the original batch, not the remaining pid-less windows after edits.
+    let mut title_counts = HashMap::new();
+    for window in native.iter().filter(|window| window.pid.is_none()) {
+        *title_counts
+            .entry(undecorated_native_title(window).to_owned())
+            .or_insert(0usize) += 1;
+    }
     for window in &mut native {
         // A private surface token is an exact compositor identity. Its PID
         // must come from credentials embedded by that compositor; never fill
@@ -4820,12 +5008,15 @@ fn enrich_native_windows(
             continue;
         }
         let native_title = undecorated_native_title(window);
-        let title_match = atspi.iter().enumerate().find_map(|(index, candidate)| {
-            (!claimed.contains(&index)
-                && !native_title.is_empty()
-                && candidate.title == native_title)
-                .then_some(index)
-        });
+        let title_match = if !native_title.is_empty() && title_counts.get(native_title) == Some(&1)
+        {
+            unique_match(atspi.iter().enumerate().filter(|(index, candidate)| {
+                !claimed.contains(index) && candidate.title == native_title
+            }))
+            .map(|(index, _)| index)
+        } else {
+            None
+        };
         let app_match = title_match.or_else(|| {
             let matches = atspi
                 .iter()
@@ -5044,6 +5235,9 @@ mod output_transform_tests {
         assert!(rotate_png_for_output_transform(two_pixel_png(), 5).is_err());
     }
 }
+
+#[cfg(test)]
+mod identity_tests;
 
 #[cfg(test)]
 mod tests {
