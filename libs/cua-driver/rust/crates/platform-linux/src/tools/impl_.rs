@@ -6205,13 +6205,16 @@ fn element_ax_failure_may_fallback(exact_wayland_action: bool) -> bool {
     !exact_wayland_action
 }
 
-/// Only an affirmative, pre-dispatch `None` permits a native Wayland point
-/// action to try another route. Errors include failed or indeterminate delivery
-/// and must propagate without replay.
+/// Only an affirmative, pre-dispatch result permits a native Wayland point
+/// action to try another route: a miss (`None`), or a node that takes a real
+/// pointer press (`ElementClickNeedsForeground`, refused before any action was
+/// sent). Every other error includes failed or indeterminate delivery and must
+/// propagate without replay.
 fn exact_point_action_may_fallback(result: anyhow::Result<Option<String>>) -> anyhow::Result<bool> {
     match result {
         Ok(Some(_)) => Ok(false),
         Ok(None) => Ok(true),
+        Err(error) if error.is::<crate::atspi::ElementClickNeedsForeground>() => Ok(true),
         Err(error) => Err(error),
     }
 }
@@ -14270,6 +14273,43 @@ mod click_button_schema_tests {
     }
 
     #[tokio::test]
+    async fn click_invoke_never_fires_the_action_of_a_node_that_takes_a_real_press() {
+        // The point lands on a text field: the point route refuses before
+        // firing (its `activate` is Enter), and the click goes to the real
+        // pointer route this backend offers, exactly once.
+        let points = Arc::new(AtomicUsize::new(0));
+        let points_for_backend = points.clone();
+        let clicks = Arc::new(AtomicUsize::new(0));
+        let clicks_for_backend = clicks.clone();
+        let state = ToolState::new_with_production_route_backend(backend_with(
+            move |_, _, _| {
+                points_for_backend.fetch_add(1, Ordering::SeqCst);
+                Err(crate::atspi::ElementClickNeedsForeground.into())
+            },
+            move |_, _, _, _, _| {
+                clicks_for_backend.fetch_add(1, Ordering::SeqCst);
+                Ok(None)
+            },
+            |_, _, _| Ok(()),
+        ));
+        let (pid, xid, session) = with_screenshot_context(&state);
+        let result = coordinate_click(state)
+            .invoke(
+                serde_json::json!({"pid": pid, "window_id": xid, "x": 5, "y": 6,
+                "delivery_mode": "background", "_session_id": session}),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        assert_eq!(
+            result.structured_content.as_ref().unwrap()["path"],
+            "wayland_cua_compositor",
+            "{result:?}"
+        );
+        assert_eq!(points.load(Ordering::SeqCst), 1);
+        assert_eq!(clicks.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn click_invoke_carries_original_epoch_identity_across_point_miss() {
         let current = Arc::new(Mutex::new("epoch-a:target-a".to_owned()));
         let establish_calls = Arc::new(AtomicUsize::new(0));
@@ -14431,6 +14471,17 @@ mod click_button_schema_tests {
     fn only_pre_dispatch_point_miss_allows_coordinate_fallback() {
         assert!(exact_point_action_may_fallback(Ok(None)).unwrap());
         assert!(!exact_point_action_may_fallback(Ok(Some("click".into()))).unwrap());
+    }
+
+    #[test]
+    fn a_point_on_a_node_that_takes_a_real_press_falls_back_to_the_pointer_route() {
+        // The at-point route refuses editable text, focus-taking controls and
+        // table cells before firing anything (a GTK entry's `activate` is
+        // Enter). That refusal sent no input, so the pointer route may run.
+        assert!(exact_point_action_may_fallback(Err(
+            crate::atspi::ElementClickNeedsForeground.into()
+        ))
+        .unwrap());
     }
 
     #[test]

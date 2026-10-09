@@ -3269,6 +3269,16 @@ fn is_cell_role(role: &str) -> bool {
     )
 }
 
+/// Whether a click on this node must be a real pointer press. A press on
+/// editable text, a focus-taking control (entry, spin button, slider, combo
+/// box) or a table cell places the caret or cell cursor. Its accessibility
+/// action does something else: a GTK entry's `activate` is Enter, which can
+/// submit a dialog's default button. Element clicks and pixel clicks that
+/// resolve to an accessible node share this rule.
+fn requires_real_pointer_press(has_editable: bool, role: &str) -> bool {
+    has_editable || super::is_focus_taking_role(role) || is_cell_role(role)
+}
+
 pub(crate) fn is_tooltip_role(role: &str) -> bool {
     matches!(
         role.trim().to_ascii_lowercase().as_str(),
@@ -3973,9 +3983,7 @@ impl ObservedClickTarget {
 
     pub fn needs_foreground_pointer(&self) -> bool {
         let target = &self.visited[self.target_position];
-        target.has_editable
-            || super::is_focus_taking_role(&target.role)
-            || is_cell_role(&target.role)
+        requires_real_pointer_press(target.has_editable, &target.role)
     }
 
     /// Focus this retained Component, never a new tree ordinal. A successful
@@ -5054,6 +5062,11 @@ pub fn perform_action_at_point(pid: u32, win_x: i32, win_y: i32) -> Result<Optio
                 return Ok(None);
             };
             let target = &visited[idx];
+            // Same rule as the element route: never fire the action of a node
+            // that takes a real press. Nothing has been sent at this point.
+            if requires_real_pointer_press(target.has_editable, &target.role) {
+                return Err(super::ElementClickNeedsForeground.into());
+            }
             let ap = target
                 .acc
                 .proxies()
@@ -5178,6 +5191,11 @@ pub fn perform_action_at_screen_point(
                 return Ok(None);
             };
             let target = action_nodes[idx];
+            // Same rule as the element route: never fire the action of a node
+            // that takes a real press. Nothing has been sent at this point.
+            if requires_real_pointer_press(target.has_editable, &target.role) {
+                return Err(super::ElementClickNeedsForeground.into());
+            }
             let ap = target
                 .acc
                 .proxies()
@@ -7544,6 +7562,66 @@ mod at_point_rules_tests {
             "table row",
         ] {
             assert!(!is_cell_role(role), "{role}");
+        }
+    }
+
+    #[test]
+    fn real_press_rule_covers_editable_text_focus_controls_and_cells() {
+        for role in [
+            "text",
+            "entry",
+            "password text",
+            "spin button",
+            "slider",
+            "combo box",
+            "table cell",
+            "cell",
+        ] {
+            assert!(requires_real_pointer_press(false, role), "{role}");
+        }
+        // Any node that advertises EditableText, whatever its role.
+        assert!(requires_real_pointer_press(true, "document web"));
+        for role in [
+            "push button",
+            "toggle button",
+            "check box",
+            "menu item",
+            "list item",
+            "link",
+        ] {
+            assert!(!requires_real_pointer_press(false, role), "{role}");
+        }
+    }
+
+    #[test]
+    fn point_actions_refuse_nodes_that_take_a_real_press_before_firing() {
+        let source = include_str!("native.rs");
+        for (start, end) in [
+            (
+                concat!("pub fn perform_action_", "at_point("),
+                concat!("invoke_live_", "activation(&ap"),
+            ),
+            (
+                concat!("pub fn perform_action_", "at_screen_point("),
+                concat!("invoke_exact_live_", "activation("),
+            ),
+        ] {
+            let body = &source[source.find(start).expect(start)..];
+            let body = &body[..body.find(end).expect(end)];
+            let hit = body
+                .find(concat!("select_click_", "target(&frames"))
+                .expect("hit test");
+            let guard = body
+                .find(concat!(
+                    "requires_real_pointer_",
+                    "press(target.has_editable, &target.role)"
+                ))
+                .unwrap_or_else(|| panic!("{start}: missing real-press guard"));
+            assert!(hit < guard, "{start}: the guard must follow the hit test");
+            assert!(
+                body[guard..].contains(concat!("ElementClick", "NeedsForeground.into()")),
+                "{start}: the guard must refuse with the no-input error"
+            );
         }
     }
 
