@@ -1528,6 +1528,51 @@ mod tests {
     }
 
     #[test]
+    fn wayland_backend_route_is_inherited_but_cannot_be_overridden() {
+        let name = "CUA_DRIVER_RS_ENABLE_WAYLAND";
+        assert!(inherited_runtime_environment_name(name));
+        assert!(!allowed_environment_name(name));
+        for inherited_value in ["0", "1"] {
+            let overrides = [EmbeddedEnvironmentVariable {
+                name: name.into(),
+                value: if inherited_value == "1" { "0" } else { "1" }.into(),
+            }];
+            let embedded = merge_safe_environment(
+                [(name.to_ascii_lowercase(), inherited_value.into())],
+                &overrides,
+            );
+            let worker = merge_private_worker_environment(
+                [(name.to_ascii_lowercase().into(), inherited_value.into())],
+                &overrides,
+                None,
+                None,
+            )
+            .unwrap();
+            for values in [embedded, worker] {
+                assert_eq!(values.len(), 1);
+                assert_eq!(values[0].name, name);
+                assert_eq!(values[0].value, inherited_value);
+            }
+            assert!(merge_safe_environment(std::iter::empty(), &overrides).is_empty());
+            assert!(
+                merge_private_worker_environment(std::iter::empty(), &overrides, None, None,)
+                    .unwrap()
+                    .is_empty()
+            );
+
+            let mut options = options(EmbeddedPermissionMode::Standard);
+            options.environment = overrides.to_vec();
+            match validate_options(options) {
+                Err(EmbeddedDriverError::Configuration { reason }) => assert_eq!(
+                    reason,
+                    format!("environment variable {name} is not in the embedded safe allowlist")
+                ),
+                _ => panic!("caller-provided Wayland route must be refused"),
+            }
+        }
+    }
+
+    #[test]
     fn runtime_isolation_environment_is_inherited_but_never_overridden() {
         for name in [
             "CUA_BROWSER_PROFILE_DIR",

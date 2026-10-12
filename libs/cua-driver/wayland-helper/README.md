@@ -9,11 +9,11 @@ normal Wayland client cannot do these things globally.
 
 It exposes `org.cua.WinRects` on the session bus:
 
-- `GetVersion() -> uint` — the upstream helper API version (v8 for semantic
-  cursor/session-badge rendering). The driver accepts it only after resolving
+- `GetVersion() -> uint` — this fork's helper API version (v14, with the v8
+  semantic cursor/session-badge API). The driver accepts it only after resolving
   the helper's immutable D-Bus owner and proving that owner is the current
   user's system-installed `gnome-shell` process.
-- `GetCapabilities() -> json` — an independent exact-target protocol version,
+- `GetCapabilities() -> json` — an independent exact-target protocol version (4),
   helper epoch, and exact-target capabilities. Driver/helper version skew fails
   closed.
 - `GetRects() -> json` — every window's epoch-qualified target id, workspace,
@@ -82,6 +82,38 @@ cua-driver auto-detects it at runtime (`wayland::shell_helper`). AX operations
 still work when it is absent. With an incompatible installed helper, exact
 enumeration/capture fail closed rather than silently dropping to PID/title or
 active-stage guessing. Background mode never authorizes foreground input.
+
+## Deferred upstream 0.34.1 changes
+
+This merge retains the fork's v14/protocol-4 implementation. Upstream v9/v10
+`CaptureWindow(id,pid)` and `CaptureWindowPreview(id,pid,max_dimension)` use
+raw Shell ordinals rather than epoch-qualified targets. Actor capture of covered
+windows, its expiring transparent clones, GPU preview downscaling, and PNG
+`Creation Time` removal are deferred together. A future port must preserve
+atomic target/epoch/geometry binding and the fork's refusal gates; previews
+currently use the same exact-target capture route and resize in the driver.
+The upstream enumeration reorder is also deferred: private-compositor routing
+and refusal of a present incompatible helper retain their existing precedence.
+
+The driver retains its authenticated, connection-owned, bounded transport and
+fail-closed parser. The upstream `shell_helper/transport.rs` is not included;
+adopting that transport requires preserving connection ownership, deadlines,
+queue bounds, and epoch/native identity.
+
+Upstream libei `ei_connection.sync` acknowledgement is deferred. Its pending
+reply map and independent five-second timer do not carry this fork's shared
+command deadline or action lease. Completion continues to mean native socket
+drain or connection discard, not compositor acknowledgement. Any ACK port must
+retain the lease through terminal completion even for cancelled callers, and
+must not reconnect or replay input; only readiness may initialize a connection.
+
+Upstream installers assume every higher helper version is an additive superset
+and keep it based on the version integer alone. That assumption is incompatible
+with this fork's exact-target protocol. The hardened, atomic, complete-runtime
+installation and stage-only default remain; upstream automatic enablement,
+version-only keep-newer behavior, and `--force` replacement are not adopted.
+
+## Other compositors
 
 wlroots compositors such as Sway and labwc do not need it: cua-driver uses
 foreign-toplevel activation, virtual-pointer input, and layer-shell there.
