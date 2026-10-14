@@ -74,6 +74,12 @@ impl Harness {
                             "text": {"type": "string"},
                             "fail": {"type": "boolean"},
                             "include_screenshot": {"type": "boolean"},
+                            "since": {"type": "string"},
+                            "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+                            "amount": {"type": "integer", "minimum": 1, "maximum": 50},
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                            "full_output": {"type": "boolean"},
                             "max_elements": {"type": "integer", "minimum": 1}
                         },
                         "additionalProperties": false
@@ -209,8 +215,8 @@ async fn validates_every_step_before_running_any() {
     let harness = Harness::new();
     let cases = [
         (
-            json!({"tool": "get_window_state", "args": {}}),
-            "cannot run in a batch",
+            json!({"tool": "zoom", "args": {}}),
+            "reads state and a batch only acts",
         ),
         (
             json!({"tool": "run_actions", "args": {}}),
@@ -292,7 +298,14 @@ async fn observation_inherits_the_window_and_stays_bounded() {
     assert_eq!(observed["pid"], 42);
     assert_eq!(observed["window_id"], 7);
     assert_eq!(observed["include_screenshot"], false);
-    assert_eq!(observed["max_elements"], 200);
+    assert_eq!(
+        observed["max_elements"], 250,
+        "the plain-read budget, so `latest` finds it"
+    );
+    assert_eq!(
+        observed["since"], "latest",
+        "the observation is a diff by default"
+    );
 
     harness
         .run(json!({
@@ -394,8 +407,20 @@ async fn token_only_steps_reach_dispatch_without_bypassing_authorization() {
     }]});
     let plan = super::Plan::parse(&harness.registry, &args)
         .unwrap_or_else(|error| panic!("token-only shape is valid: {}", error.message));
-    assert!(plan.steps[0].args.get("pid").is_none());
-    assert!(plan.steps[0].args.get("window_id").is_none());
+    assert!(plan.steps[0]
+        .action
+        .as_ref()
+        .unwrap()
+        .args
+        .get("pid")
+        .is_none());
+    assert!(plan.steps[0]
+        .action
+        .as_ref()
+        .unwrap()
+        .args
+        .get("window_id")
+        .is_none());
     let manifest = "version: 2\nmode: bounded\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [run_actions]\n";
     let result = harness
         .registry
@@ -419,8 +444,8 @@ async fn the_batch_is_advertised_with_its_schema() {
         .get_def(super::RUN_ACTIONS_TOOL)
         .expect("registered");
     assert_eq!(def.input_schema["required"], json!(["steps"]));
-    let listed: Vec<_> = def.input_schema["properties"]["steps"]["items"]["properties"]["tool"]
-        ["enum"]
+    let listed: Vec<_> = def.input_schema["properties"]["steps"]["items"]["anyOf"][0]["properties"]
+        ["tool"]["enum"]
         .as_array()
         .unwrap()
         .iter()
@@ -481,6 +506,158 @@ fn typed_target_plans_preserve_original_args_with_required_legacy_fields() {
             ]}),
         )
         .unwrap_or_else(|error| panic!("{args}: {}", error.message));
-        assert_eq!(plan.steps[0].args, args);
+        assert_eq!(plan.steps[0].action.as_ref().unwrap().args, args);
     }
+}
+
+#[tokio::test]
+async fn observe_true_reads_a_diff_and_since_null_reads_in_full() {
+    let harness = Harness::new();
+    let step = json!([{"tool": "click", "args": {"pid": 42, "window_id": 7}}]);
+
+    let result = harness.run(json!({"steps": step, "observe": true})).await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let observed = harness.last("get_window_state");
+    assert_eq!(observed["window_id"], 7);
+    assert_eq!(observed["since"], "latest");
+
+    harness
+        .run(json!({"steps": step, "observe": {"since": null}}))
+        .await;
+    assert!(harness.last("get_window_state").get("since").is_none());
+
+    harness
+        .run(json!({"steps": step, "observe": {"full_output": true}}))
+        .await;
+    assert!(harness.last("get_window_state").get("since").is_none());
+
+    harness
+        .run(json!({"steps": step, "observe": {"since": "s0000002a"}}))
+        .await;
+    assert_eq!(harness.last("get_window_state")["since"], "s0000002a");
+
+    harness.run(json!({"steps": step, "observe": false})).await;
+    assert_eq!(
+        harness.hits("get_window_state"),
+        4,
+        "observe:false reads nothing"
+    );
+}
+
+#[tokio::test]
+async fn common_tool_name_slips_map_to_the_batchable_tool() {
+    let harness = Harness::new();
+    let result = harness
+        .run(json!({"steps": [
+            {"tool": "press", "args": {"pid": 1}},
+            {"tool": "type", "args": {"pid": 1, "text": "x"}},
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    assert_eq!(harness.hits("press_key"), 1);
+    assert_eq!(harness.hits("type_text"), 1);
+
+    let refused = harness
+        .run(json!({"steps": [{"tool": "get_window_state", "args": {"pid": 1}}]}))
+        .await;
+    assert_eq!(refused.is_error, Some(true));
+}
+
+#[tokio::test]
+async fn scroll_steps_accept_dx_dy_like_a_direct_call() {
+    let harness = Harness::new();
+    // The live-check shape: {"dy": 500} in a batch step.
+    let result = harness
+        .run(json!({"steps": [
+            {"tool": "scroll", "args": {"pid": 1, "window_id": 2, "x": 600, "y": 500, "dy": 500}},
+            {"tool": "scroll", "args": {"pid": 1, "window_id": 2, "x": 600, "y": 500, "dx": "-4"}},
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let calls = harness.calls["scroll"].lock().unwrap().clone();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        (calls[0]["direction"].clone(), calls[0]["amount"].clone()),
+        (json!("down"), json!(5))
+    );
+    assert_eq!(
+        (calls[1]["direction"].clone(), calls[1]["amount"].clone()),
+        (json!("left"), json!(4))
+    );
+    assert!(calls
+        .iter()
+        .all(|c| c.get("dy").is_none() && c.get("dx").is_none()));
+
+    let refused = harness
+        .run(json!({"steps": [{"tool": "scroll", "args": {"pid": 1, "dx": 1, "dy": 1}}]}))
+        .await;
+    assert_eq!(refused.is_error, Some(true));
+    assert!(
+        text(&refused).contains("one axis per call"),
+        "{}",
+        text(&refused)
+    );
+    assert_eq!(harness.hits("scroll"), 2, "a refused batch runs nothing");
+}
+
+#[tokio::test]
+async fn a_trailing_read_becomes_the_observation_and_a_middle_one_points_to_observe() {
+    let harness = Harness::new();
+    // The v035 / live-check shape: act, act, then get_window_state as a step.
+    let result = harness
+        .run(json!({"steps": [
+            {"tool": "click", "args": {"pid": 7, "window_id": 3}},
+            {"tool": "click", "args": {"pid": 7, "window_id": 3, "text": "x"}},
+            {"tool": "get_window_state", "args": {"pid": 7, "window_id": 3, "max_elements": 70}},
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let structured = result.structured_content.unwrap();
+    assert_eq!(structured["total"], 2, "the read is not counted as a step");
+    assert_eq!(structured["observation"]["ok"], true);
+    let observed = harness.last("get_window_state");
+    assert_eq!(observed["max_elements"], 70);
+    assert_eq!(observed["since"], "latest");
+    assert_eq!(harness.hits("click"), 2);
+
+    let refused = harness
+        .run(json!({"steps": [
+            {"tool": "click", "args": {"pid": 7, "window_id": 3}},
+            {"tool": "get_window_state", "args": {"pid": 7, "window_id": 3}},
+            {"tool": "click", "args": {"pid": 7, "window_id": 3}},
+        ]}))
+        .await;
+    assert_eq!(refused.is_error, Some(true));
+    let message = text(&refused);
+    assert!(message.contains("step 2 of the batch"), "{message}");
+    assert!(
+        message.contains("Put get_window_state arguments in `observe`"),
+        "{message}"
+    );
+
+    // With an explicit observe, a trailing read is not silently dropped.
+    let both = harness
+        .run(json!({"steps": [
+            {"tool": "click", "args": {"pid": 7, "window_id": 3}},
+            {"tool": "get_window_state", "args": {"pid": 7, "window_id": 3}},
+        ], "observe": true}))
+        .await;
+    assert_eq!(both.is_error, Some(true));
+    assert_eq!(harness.hits("get_window_state"), 1);
+}
+
+#[tokio::test]
+async fn inherited_window_does_not_rewrite_later_explicit_typed_target() {
+    let harness = Harness::with_required_click_target(true);
+    let result = harness
+        .run(json!({"steps":[
+            {"press_key":{"pid":42,"window_id":7}},
+            {"click":{"target":{"kind":"window","pid":43,"window_id":8},"x":10,"y":10}}
+        ]}))
+        .await;
+    assert_ne!(result.is_error, Some(true), "{}", text(&result));
+    let clicked = harness.last("click");
+    assert_eq!(clicked["pid"], 43);
+    assert_eq!(clicked["window_id"], 8);
+    assert_eq!(harness.hits("get_window_state"), 0);
 }

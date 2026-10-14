@@ -3,6 +3,7 @@ use crate::element_token::{self, MutationPermit, RegistryError, ResolvedElement}
 use crate::protocol::ToolResult;
 use std::any::Any;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::Duration;
 
@@ -14,6 +15,10 @@ pub trait SnapshotPayload: Send + Sync + 'static {
     fn len(&self) -> usize;
     fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+    /// Published row membership; must not retain or touch native objects.
+    fn contains_index(&self, index: usize) -> bool {
+        index < self.len()
     }
     fn retain(&self, index: usize) -> Option<Self::Element>;
 }
@@ -55,6 +60,8 @@ struct SnapshotMetadata {
     window_id: u64,
     screenshot_owner: Option<String>,
     screenshot_scale: Option<f64>,
+    screenshot_window_size: Option<(f64, f64)>,
+    frame_revision: Arc<AtomicU64>,
     zoom: Option<ZoomContext>,
     semantic: bool,
 }
@@ -129,8 +136,36 @@ pub enum ScreenshotContextError {
     ReplacedOrUnavailable,
 }
 
+/// A weak revision witness does not extend native payload lifetime.
+#[derive(Clone, Debug)]
+pub struct ScreenshotFrameBinding {
+    revision: Weak<AtomicU64>,
+    expected: u64,
+}
+impl ScreenshotFrameBinding {
+    pub(crate) fn is_current(&self) -> bool {
+        self.revision
+            .upgrade()
+            .is_some_and(|r| r.load(Ordering::Acquire) == self.expected)
+    }
+}
+#[derive(Clone)]
+pub struct ScreenshotRefreshTicket {
+    store: Weak<Mutex<SnapshotStoreState>>,
+    pid: i32,
+    window_id: u64,
+    owner: Option<String>,
+    runtime_scope: String,
+    epoch: u64,
+    expected: Option<(element_token::SnapshotIdentity, u64)>,
+}
+fn valid_window_size(size: Option<(f64, f64)>) -> Option<(f64, f64)> {
+    size.filter(|(w, h)| w.is_finite() && h.is_finite() && *w > 0.0 && *h > 0.0)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScreenshotContext {
+    pub frame_revision: u64,
     pub snapshot_id: u32,
     pub window_id: u64,
     pub scale: f64,
@@ -239,7 +274,16 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         session: Option<&str>,
         screenshot_scale: Option<f64>,
     ) -> Result<Option<(u32, Vec<u32>)>, RegistryError> {
-        self.try_publish_snapshot(pid, window_id, payload, session, screenshot_scale, true)
+        self.try_publish_snapshot(
+            pid,
+            window_id,
+            payload,
+            session,
+            screenshot_scale,
+            None,
+            true,
+            None,
+        )
     }
 
     pub fn publish_capture_for_session(
@@ -262,7 +306,181 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         session: Option<&str>,
         screenshot_scale: Option<f64>,
     ) -> Result<Option<(u32, Vec<u32>)>, RegistryError> {
-        self.try_publish_snapshot(pid, window_id, payload, session, screenshot_scale, false)
+        self.try_publish_snapshot(
+            pid,
+            window_id,
+            payload,
+            session,
+            screenshot_scale,
+            None,
+            false,
+            None,
+        )
+    }
+
+    pub fn try_publish_sized_for_session(
+        &self,
+        pid: i32,
+        window_id: u64,
+        payload: S,
+        session: Option<&str>,
+        screenshot_scale: Option<f64>,
+        window_size: Option<(f64, f64)>,
+    ) -> Result<Option<(u32, Vec<u32>)>, RegistryError> {
+        self.try_publish_snapshot(
+            pid,
+            window_id,
+            payload,
+            session,
+            screenshot_scale,
+            window_size,
+            true,
+            None,
+        )
+    }
+
+    /// Capture this ticket before image work. Commit never adopts a newer tree,
+    /// another owner's generation, or an image published while the work ran.
+    pub fn screenshot_refresh_ticket(
+        &self,
+        pid: i32,
+        window_id: u64,
+        session: Option<&str>,
+    ) -> Result<ScreenshotRefreshTicket, RegistryError> {
+        let ended = Self::session_ended(session);
+        let inner = self.inner.lock().unwrap();
+        if ended
+            || current_runtime_scope() != self.runtime_scope
+            || Self::session_retired(&inner, session)
+            || inner.retired_screenshot_overflowed
+            || inner.sessions_overflowed
+            || inner.missing_screenshot_is_retired(pid, Some(window_id))
+        {
+            return Err(RegistryError::NotCurrent);
+        }
+        let snapshot = inner
+            .snapshots
+            .get(&pid)
+            .into_iter()
+            .flatten()
+            .find(|s| s.window_id == window_id);
+        if snapshot.is_some_and(|s| {
+            !self.metadata_live(pid, s) || s.screenshot_owner.as_deref() != session
+        }) {
+            return Err(RegistryError::NotCurrent);
+        }
+        Ok(ScreenshotRefreshTicket {
+            store: Arc::downgrade(&self.inner),
+            pid,
+            window_id,
+            owner: session.map(str::to_owned),
+            runtime_scope: self.runtime_scope.clone(),
+            epoch: inner.retirement_epoch,
+            expected: snapshot.map(|s| (s.identity, s.frame_revision.load(Ordering::Acquire))),
+        })
+    }
+
+    pub fn refresh_screenshot_for_session(
+        &self,
+        ticket: ScreenshotRefreshTicket,
+        screenshot_scale: f64,
+        window_size: Option<(f64, f64)>,
+    ) -> Result<Option<ScreenshotContext>, RegistryError> {
+        let session = ticket.owner.as_deref();
+        let ended = Self::session_ended(session);
+        let mut inner = self.inner.lock().unwrap();
+        if ended
+            || current_runtime_scope() != self.runtime_scope
+            || !ticket.store.ptr_eq(&Arc::downgrade(&self.inner))
+            || ticket.runtime_scope != self.runtime_scope
+            || ticket.epoch != inner.retirement_epoch
+            || Self::session_retired(&inner, session)
+            || inner.retired_screenshot_overflowed
+            || inner.sessions_overflowed
+            || !screenshot_scale.is_finite()
+            || screenshot_scale <= 0.0
+        {
+            return Err(RegistryError::NotCurrent);
+        }
+        let snapshot = inner
+            .snapshots
+            .get_mut(&ticket.pid)
+            .into_iter()
+            .flatten()
+            .find(|s| s.window_id == ticket.window_id);
+        let actual = snapshot
+            .as_ref()
+            .map(|s| (s.identity, s.frame_revision.load(Ordering::Acquire)));
+        if actual != ticket.expected {
+            return Err(RegistryError::NotCurrent);
+        }
+        let Some(snapshot) = snapshot else {
+            return Ok(None);
+        };
+        if !self.metadata_live(ticket.pid, snapshot)
+            || snapshot.screenshot_owner.as_deref() != session
+        {
+            return Err(RegistryError::NotCurrent);
+        }
+        let permit = element_token::global().try_acquire_mutation(snapshot.identity)?;
+        let payload = permit.payload::<S>().ok_or(RegistryError::NotCurrent)?;
+        if !snapshot.semantic || payload.is_empty() {
+            return Ok(None);
+        }
+        let revision = snapshot
+            .frame_revision
+            .load(Ordering::Acquire)
+            .checked_add(1)
+            .ok_or(RegistryError::NotCurrent)?;
+        snapshot.frame_revision.store(revision, Ordering::Release);
+        snapshot.screenshot_scale = Some(screenshot_scale);
+        snapshot.screenshot_window_size = valid_window_size(window_size);
+        snapshot.zoom = None;
+        self.screenshot(ticket.pid, snapshot, session, false)
+            .map(Some)
+            .ok_or(RegistryError::NotCurrent)
+    }
+
+    pub fn try_publish_capture_for_refresh(
+        &self,
+        ticket: ScreenshotRefreshTicket,
+        payload: S,
+        scale: f64,
+    ) -> Result<Option<(u32, Vec<u32>)>, RegistryError> {
+        self.try_publish_snapshot(
+            ticket.pid,
+            ticket.window_id,
+            payload,
+            ticket.owner.as_deref(),
+            Some(scale),
+            None,
+            false,
+            Some(&ticket),
+        )
+    }
+
+    pub fn frame_binding(
+        &self,
+        pid: i32,
+        session: Option<&str>,
+        expected: ScreenshotContext,
+    ) -> Result<ScreenshotFrameBinding, ToolResult> {
+        let ended = Self::session_ended(session);
+        let inner = self.inner.lock().unwrap();
+        let snapshot = inner
+            .snapshots
+            .get(&pid)
+            .into_iter()
+            .flatten()
+            .find(|s| {
+                !Self::session_retired(&inner, session)
+                    && self.screenshot(pid, s, session, ended) == Some(expected)
+            })
+            .ok_or_else(|| screenshot_context_refusal(Some(pid), Some(expected.window_id)))?;
+        Ok(ScreenshotFrameBinding {
+            revision: Arc::downgrade(&snapshot.frame_revision),
+            expected: expected.frame_revision,
+        })
     }
 
     fn try_publish_snapshot(
@@ -272,7 +490,9 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         payload: S,
         session: Option<&str>,
         screenshot_scale: Option<f64>,
+        window_size: Option<(f64, f64)>,
         semantic: bool,
+        refresh: Option<&ScreenshotRefreshTicket>,
     ) -> Result<Option<(u32, Vec<u32>)>, RegistryError> {
         if current_runtime_scope() != self.runtime_scope {
             return Err(RegistryError::NotCurrent);
@@ -280,12 +500,56 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         if session.is_some_and(crate::session::is_session_ended) {
             return Ok(None);
         }
-        let epoch = {
+        let (epoch, inherited) = {
             let inner = self.inner.lock().unwrap();
             if Self::session_retired(&inner, session) {
                 return Ok(None);
             }
-            inner.retirement_epoch
+            if let Some(ticket) = refresh {
+                let current = inner
+                    .snapshots
+                    .get(&pid)
+                    .into_iter()
+                    .flatten()
+                    .find(|s| s.window_id == window_id)
+                    .map(|s| (s.identity, s.frame_revision.load(Ordering::Acquire)));
+                if !ticket.store.ptr_eq(&Arc::downgrade(&self.inner))
+                    || ticket.epoch != inner.retirement_epoch
+                    || ticket.expected != current
+                    || ticket.runtime_scope != self.runtime_scope
+                    || ticket.owner.as_deref() != session
+                {
+                    return Err(RegistryError::NotCurrent);
+                }
+            }
+            let inherited = inner
+                .snapshots
+                .get(&pid)
+                .into_iter()
+                .flatten()
+                .find(|s| {
+                    s.window_id == window_id
+                        && self.metadata_live(pid, s)
+                        && s.screenshot_owner.as_deref() == session
+                })
+                .filter(
+                    |s| match (valid_window_size(window_size), s.screenshot_window_size) {
+                        (Some((w, h)), Some((old_w, old_h))) => {
+                            (w - old_w).abs() < 0.5 && (h - old_h).abs() < 0.5
+                        }
+                        _ => false,
+                    },
+                )
+                .and_then(|s| {
+                    Some((
+                        s.screenshot_scale?,
+                        s.screenshot_window_size?,
+                        s.frame_revision.clone(),
+                        s.frame_revision.load(Ordering::Acquire),
+                        s.identity,
+                    ))
+                });
+            (inner.retirement_epoch, inherited)
         };
         let registry = element_token::global();
         // Both prepare (eviction) and publish (replacement) can destroy native
@@ -293,7 +557,21 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         let candidate =
             registry.prepare_current(pid, window_id, payload.len(), Arc::new(payload))?;
         let identity = candidate.identity();
-        let id = registry.publish(candidate, Duration::from_secs(2))?;
+        let id = if let Some(ticket) = refresh {
+            registry.publish_replacing(
+                candidate,
+                Duration::from_secs(2),
+                ticket.expected.map(|(identity, _)| identity),
+            )?
+        } else if screenshot_scale.is_none() && inherited.is_some() {
+            registry.publish_replacing(
+                candidate,
+                Duration::from_secs(2),
+                inherited.as_ref().map(|(_, _, _, _, identity)| *identity),
+            )?
+        } else {
+            registry.publish(candidate, Duration::from_secs(2))?
+        };
         let mut invalidated = Vec::new();
         let accepted = {
             let mut inner = self.inner.lock().unwrap();
@@ -302,6 +580,9 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             } else if !registry.is_current_generation(pid, window_id, identity) {
                 false
             } else {
+                let inherited = inherited.filter(|(_, _, revision, expected, _)| {
+                    revision.load(Ordering::Acquire) == *expected
+                });
                 let mut stale = Vec::new();
                 for (entry_pid, lane) in &mut inner.snapshots {
                     lane.retain(|entry| {
@@ -333,7 +614,14 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                     screenshot_owner: session.map(str::to_owned),
                     zoom: None,
                     semantic,
+                    screenshot_window_size: if screenshot_scale.is_some() {
+                        valid_window_size(window_size)
+                    } else {
+                        inherited.as_ref().map(|(_, size, _, _, _)| *size)
+                    },
+                    frame_revision: Arc::new(AtomicU64::new(1)),
                     screenshot_scale: screenshot_scale
+                        .or(inherited.as_ref().map(|(scale, _, _, _, _)| *scale))
                         .filter(|scale| scale.is_finite() && *scale > 0.0),
                 });
                 true
@@ -385,6 +673,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             return None;
         }
         Some(ScreenshotContext {
+            frame_revision: snapshot.frame_revision.load(Ordering::Acquire),
             snapshot_id: snapshot.id,
             window_id: snapshot.window_id,
             scale: snapshot.screenshot_scale?,
@@ -675,12 +964,36 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         let (snapshot_id, _) = element_token::parse_token(token)?;
         let inner = self.inner.lock().unwrap();
         inner.snapshots.iter().find_map(|(pid, lane)| {
-            lane.iter().any(|snapshot| {
-                snapshot.id == snapshot_id
-                    && self.metadata_live(*pid, snapshot)
-                    && !Self::session_retired(&inner, snapshot.screenshot_owner.as_deref())
-            }).then_some(*pid)
+            lane.iter()
+                .any(|snapshot| {
+                    snapshot.id == snapshot_id
+                        && self.metadata_live(*pid, snapshot)
+                        && !Self::session_retired(&inner, snapshot.screenshot_owner.as_deref())
+                })
+                .then_some(*pid)
         })
+    }
+
+    fn canonical_row(&self, pid: i32, window_id: Option<u64>, row: usize) -> Option<(String, u64)> {
+        let inner = self.inner.lock().unwrap();
+        let mut matching = inner.snapshots.get(&pid).into_iter().flatten().filter(|s| {
+            s.semantic
+                && window_id.is_none_or(|w| w == s.window_id)
+                && self.metadata_live(pid, s)
+                && !Self::session_retired(&inner, s.screenshot_owner.as_deref())
+        });
+        let snapshot = matching.next()?;
+        if matching.next().is_some() {
+            return None;
+        }
+        let token = element_token::token_for(snapshot.id, row);
+        let (generation, _) = element_token::global()
+            .resolve_generation(pid, &token)
+            .ok()?;
+        if !generation.payload::<S>()?.contains_index(row) {
+            return None;
+        }
+        Some((token, snapshot.window_id))
     }
 
     pub fn resolve(
@@ -812,8 +1125,12 @@ impl<S: SnapshotPayload> Drop for SnapshotStore<S> {
 }
 trait RuntimeStore: Any + Send + Sync {
     fn retire(&self) -> usize;
+    fn canonical_row(&self, pid: i32, window: Option<u64>, row: usize) -> Option<(String, u64)>;
 }
 impl<S: SnapshotPayload> RuntimeStore for SnapshotStore<S> {
+    fn canonical_row(&self, pid: i32, window: Option<u64>, row: usize) -> Option<(String, u64)> {
+        self.canonical_row(pid, window, row)
+    }
     fn retire(&self) -> usize {
         self.inner.lock().unwrap().runtime_retired = true;
         self.clear()
@@ -847,6 +1164,51 @@ pub fn current_runtime_store<S: SnapshotPayload>() -> Option<Arc<SnapshotStore<S
     let erased: Arc<dyn Any + Send + Sync> = cache;
     erased.downcast().ok()
 }
+/// Pin a bare row to a full token and exact target before policy or queuing.
+/// Full-token refusal remains at the existing post-authorization boundary.
+pub(crate) fn canonicalize_bare_row(args: &mut serde_json::Value) -> Result<(), ToolResult> {
+    let Some(raw) = args
+        .get("element_token")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(());
+    };
+    if element_token::parse_token(raw).is_some() {
+        return Ok(());
+    }
+    let Some(row) = raw.trim().parse::<usize>().ok() else {
+        return Ok(());
+    };
+    let invalid = || {
+        element_token::refusal("invalid_element_token", "A bare row requires a pid and one current window containing that published row; use the full token from get_window_state.".into())
+    };
+    let pid = args
+        .get("pid")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|p| i32::try_from(p).ok())
+        .ok_or_else(invalid)?;
+    let window = args.get("window_id").and_then(serde_json::Value::as_u64);
+    let stores: Vec<_> = runtime_stores()
+        .lock()
+        .unwrap()
+        .get(&current_runtime_scope())
+        .into_iter()
+        .flatten()
+        .filter_map(Weak::upgrade)
+        .collect();
+    let mut matches = stores
+        .iter()
+        .filter_map(|store| store.canonical_row(pid, window, row));
+    let (token, window) = matches.next().ok_or_else(invalid)?;
+    if matches.any(|found| found != (token.clone(), window)) {
+        return Err(invalid());
+    }
+    args["element_token"] = token.into();
+    args["pid"] = pid.into();
+    args["window_id"] = window.into();
+    Ok(())
+}
+
 pub fn retire_runtime_scope(runtime_scope: &str) -> usize {
     let caches = runtime_stores()
         .lock()
@@ -1862,6 +2224,7 @@ mod hardened_tests {
                     .unwrap();
                 let context = ZoomContext {
                     screenshot: ScreenshotContext {
+                        frame_revision: 1,
                         snapshot_id: snapshot,
                         window_id: 20,
                         scale: 7.35,
@@ -1926,6 +2289,7 @@ mod hardened_tests {
                     (
                         std::process::id() as i32,
                         ScreenshotContext {
+                            frame_revision: 1,
                             snapshot_id: first,
                             window_id: 20,
                             scale: 2.0,
@@ -1980,6 +2344,7 @@ mod hardened_tests {
                     .unwrap();
                 let slow_a = ZoomContext {
                     screenshot: ScreenshotContext {
+                        frame_revision: 1,
                         snapshot_id: snapshot_a,
                         window_id: 20,
                         scale: 2.0,
@@ -2001,6 +2366,7 @@ mod hardened_tests {
                     .unwrap();
                 let valid_b = ZoomContext {
                     screenshot: ScreenshotContext {
+                        frame_revision: 1,
                         snapshot_id: snapshot_b,
                         window_id: 20,
                         scale: 1.0,
@@ -2042,6 +2408,7 @@ mod hardened_tests {
                     .unwrap();
                 let context = ZoomContext {
                     screenshot: ScreenshotContext {
+                        frame_revision: 1,
                         snapshot_id: snapshot,
                         window_id: 20,
                         scale: 7.35,
@@ -2107,6 +2474,7 @@ mod hardened_tests {
                         Some("client-a"),
                         ZoomContext {
                             screenshot: ScreenshotContext {
+                                frame_revision: 1,
                                 snapshot_id: snapshot,
                                 window_id: 20,
                                 scale: 7.35,
@@ -2352,9 +2720,12 @@ mod tests {
             assert_eq!(cache.pid_for_token(&serde_json::json!({})), None);
             let unknown = serde_json::json!({ "element_token": token_for(id + 1000, 0) });
             assert_eq!(cache.pid_for_token(&unknown), None);
-            crate::tool::with_runtime_scope(format!("snapshot-other-{}", uuid::Uuid::new_v4()), || {
-                assert_eq!(cache.pid_for_token(&args), None);
-            });
+            crate::tool::with_runtime_scope(
+                format!("snapshot-other-{}", uuid::Uuid::new_v4()),
+                || {
+                    assert_eq!(cache.pid_for_token(&args), None);
+                },
+            );
             // A different store can replace the registry generation while this
             // store still contains its old metadata. Never route on that row.
             let other = SnapshotStore::new();
@@ -2368,8 +2739,10 @@ mod tests {
         crate::tool::with_runtime_scope(format!("snapshot-test-{}", uuid::Uuid::new_v4()), || {
             let cache = SnapshotStore::new();
             let pid = std::process::id() as i32;
-            let (id, _) = cache.try_publish_for_session(pid, 7, Payload(vec![10]), Some("owner"), None)
-                .unwrap().unwrap();
+            let (id, _) = cache
+                .try_publish_for_session(pid, 7, Payload(vec![10]), Some("owner"), None)
+                .unwrap()
+                .unwrap();
             let args = serde_json::json!({ "element_token": token_for(id, 0) });
             assert_eq!(cache.pid_for_token(&args), Some(pid));
             cache.retire_session_screenshots("owner");
@@ -2632,6 +3005,7 @@ mod tests {
     fn zoom_on(snapshot: u32, scale: f64) -> ZoomContext {
         ZoomContext {
             screenshot: ScreenshotContext {
+                frame_revision: 1,
                 snapshot_id: snapshot,
                 window_id: 20,
                 scale,
@@ -3068,6 +3442,7 @@ mod tests {
                 (
                     std::process::id() as i32,
                     ScreenshotContext {
+                        frame_revision: 1,
                         snapshot_id: first,
                         window_id: 20,
                         scale: 2.0,
@@ -3378,6 +3753,333 @@ mod tests {
     fn default_impl_matches_new() {
         crate::tool::with_runtime_scope(format!("snapshot-test-{}", uuid::Uuid::new_v4()), || {
             let _cache: SnapshotStore<Payload> = SnapshotStore::default();
+        });
+    }
+}
+
+#[cfg(test)]
+mod refresh_regressions {
+    use super::*;
+    use crate::snapshot_test_support::Payload;
+    fn isolated(f: impl FnOnce()) {
+        crate::tool::with_runtime_scope(format!("refresh-{}", uuid::Uuid::new_v4()), f);
+    }
+    fn publish(cache: &SnapshotStore<Payload>, owner: &str) -> u32 {
+        cache
+            .try_publish_sized_for_session(
+                std::process::id() as i32,
+                81,
+                Payload(vec![17]),
+                Some(owner),
+                Some(2.0),
+                Some((100.0, 80.0)),
+            )
+            .unwrap()
+            .unwrap()
+            .0
+    }
+    #[test]
+    fn refresh_retains_native_payload_and_permit_but_rejects_old_frame_and_zoom() {
+        isolated(|| {
+            let cache = SnapshotStore::new();
+            let pid = std::process::id() as i32;
+            let id = publish(&cache, "owner");
+            let identity = cache.identity_for_snapshot(pid, id).unwrap();
+            let permit = Arc::new(
+                element_token::global()
+                    .try_acquire_mutation(identity)
+                    .unwrap(),
+            );
+            let payload = permit.payload::<Payload>().unwrap();
+            let old = cache
+                .screenshot_context(pid, Some(81), Some("owner"))
+                .unwrap();
+            let binding = cache.frame_binding(pid, Some("owner"), old).unwrap();
+            let zoom = ZoomContext {
+                screenshot: old,
+                origin_x: 0.0,
+                origin_y: 0.0,
+                scale_inv: 1.0,
+            };
+            cache.set_zoom(pid, Some("owner"), zoom).unwrap();
+            let first = cache
+                .screenshot_refresh_ticket(pid, 81, Some("owner"))
+                .unwrap();
+            let racing = cache
+                .screenshot_refresh_ticket(pid, 81, Some("owner"))
+                .unwrap();
+            let fresh = cache
+                .refresh_screenshot_for_session(first, 2.0, Some((100.0, 80.0)))
+                .unwrap()
+                .unwrap();
+            assert_eq!(fresh.snapshot_id, id);
+            assert_eq!(fresh.frame_revision, old.frame_revision + 1);
+            assert_eq!(cache.identity_for_snapshot(pid, id), Some(identity));
+            assert!(Arc::ptr_eq(&payload, &permit.payload::<Payload>().unwrap()));
+            assert_eq!(permit.identity(), identity);
+            assert!(!binding.is_current());
+            assert!(cache
+                .with_valid_screenshot_context(pid, Some("owner"), old, || panic!(
+                    "old PNG published"
+                ))
+                .is_err());
+            assert_eq!(
+                cache
+                    .set_zoom(pid, Some("owner"), zoom)
+                    .unwrap_err()
+                    .structured_content
+                    .unwrap()["code"],
+                "zoom_context_missing"
+            );
+            assert_eq!(
+                cache
+                    .zoom(pid, Some(81), Some("owner"))
+                    .unwrap_err()
+                    .structured_content
+                    .unwrap()["code"],
+                "zoom_context_missing"
+            );
+            assert!(matches!(
+                cache.refresh_screenshot_for_session(racing, 2.0, None),
+                Err(RegistryError::NotCurrent)
+            ));
+            assert!(cache
+                .resolve(
+                    pid,
+                    &serde_json::json!({"element_token":element_token::token_for(id,0)})
+                )
+                .is_ok());
+        });
+    }
+    #[test]
+    fn refresh_refuses_foreign_retired_replaced_and_closed_authority() {
+        isolated(|| {
+            let cache = Arc::new(SnapshotStore::new());
+            register_runtime_store(&cache);
+            let pid = std::process::id() as i32;
+            publish(&cache, "owner");
+            assert!(matches!(
+                cache.screenshot_refresh_ticket(pid, 81, Some("foreign")),
+                Err(RegistryError::NotCurrent)
+            ));
+            let old = cache
+                .screenshot_refresh_ticket(pid, 81, Some("owner"))
+                .unwrap();
+            publish(&cache, "owner");
+            assert!(matches!(
+                cache.refresh_screenshot_for_session(old, 1.0, None),
+                Err(RegistryError::NotCurrent)
+            ));
+            let old = cache
+                .screenshot_refresh_ticket(pid, 81, Some("owner"))
+                .unwrap();
+            cache.retire_session_screenshots("owner");
+            assert!(matches!(
+                cache.refresh_screenshot_for_session(old, 1.0, None),
+                Err(RegistryError::NotCurrent)
+            ));
+            assert!(matches!(
+                cache.screenshot_refresh_ticket(pid, 81, Some("owner")),
+                Err(RegistryError::NotCurrent)
+            ));
+            retire_runtime_scope(&current_runtime_scope());
+            assert!(matches!(
+                cache.screenshot_refresh_ticket(pid, 82, None),
+                Err(RegistryError::NotCurrent)
+            ));
+        });
+    }
+    #[test]
+    fn empty_refresh_fallback_keeps_pre_image_lifecycle_ticket() {
+        isolated(|| {
+            let cache = SnapshotStore::new();
+            let pid = std::process::id() as i32;
+            let ticket = cache
+                .screenshot_refresh_ticket(pid, 81, Some("owner"))
+                .unwrap();
+            let other = SnapshotStore::<Payload>::new();
+            assert!(matches!(
+                other.refresh_screenshot_for_session(ticket.clone(), 1.0, None),
+                Err(RegistryError::NotCurrent)
+            ));
+            assert!(cache
+                .refresh_screenshot_for_session(ticket.clone(), 1.0, None)
+                .unwrap()
+                .is_none());
+            let competing = element_token::global()
+                .prepare_current(pid, 81, 1, Arc::new(Payload(vec![2])))
+                .unwrap();
+            element_token::global()
+                .publish(competing, Duration::ZERO)
+                .unwrap();
+            assert!(matches!(
+                cache.try_publish_capture_for_refresh(ticket.clone(), Payload(vec![]), 1.0),
+                Err(RegistryError::NotCurrent)
+            ));
+            cache.clear();
+            assert!(matches!(
+                cache.try_publish_capture_for_refresh(ticket, Payload(vec![]), 1.0),
+                Err(RegistryError::NotCurrent)
+            ));
+        });
+    }
+    #[test]
+    fn refresh_fallback_is_compatible_but_overflow_and_stale_lane_stay_closed() {
+        isolated(|| {
+            let cache = SnapshotStore::new();
+            let pid = std::process::id() as i32;
+            let ticket = cache
+                .screenshot_refresh_ticket(pid, 81, Some("owner"))
+                .unwrap();
+            assert!(cache
+                .refresh_screenshot_for_session(ticket.clone(), 1.0, None)
+                .unwrap()
+                .is_none());
+            let id = cache
+                .try_publish_capture_for_refresh(ticket, Payload(vec![]), 1.0)
+                .unwrap()
+                .unwrap()
+                .0;
+            assert_eq!(
+                cache
+                    .screenshot_context(pid, Some(81), Some("owner"))
+                    .unwrap()
+                    .snapshot_id,
+                id
+            );
+            publish(&cache, "owner");
+            let key = element_token::global()
+                .lane_key_for_current_runtime(pid, 81)
+                .unwrap();
+            assert!(element_token::global().mark_stale(&key));
+            assert!(matches!(
+                cache.screenshot_refresh_ticket(pid, 81, Some("owner")),
+                Err(RegistryError::NotCurrent)
+            ));
+            for index in 0..=RETIRED_SCREENSHOT_CAPACITY {
+                cache.retire_session_screenshots(&format!("retired-{index}"));
+            }
+            assert!(matches!(
+                cache.screenshot_refresh_ticket(pid, 82, None),
+                Err(RegistryError::NotCurrent)
+            ));
+        });
+    }
+
+    #[test]
+    fn tree_only_inheritance_requires_same_owner_known_size_and_retires_old_frame() {
+        isolated(|| {
+            let cache = SnapshotStore::new();
+            let pid = std::process::id() as i32;
+            let id = publish(&cache, "owner");
+            let old = cache
+                .screenshot_context(pid, Some(81), Some("owner"))
+                .unwrap();
+            let frame = cache.frame_binding(pid, Some("owner"), old).unwrap();
+            let new = cache
+                .try_publish_sized_for_session(
+                    pid,
+                    81,
+                    Payload(vec![22]),
+                    Some("owner"),
+                    None,
+                    Some((100.1, 80.0)),
+                )
+                .unwrap()
+                .unwrap()
+                .0;
+            assert_ne!(new, id);
+            assert_eq!(
+                cache
+                    .screenshot_context(pid, Some(81), Some("owner"))
+                    .unwrap()
+                    .scale,
+                2.0
+            );
+            assert!(!frame.is_current());
+            assert!(cache
+                .resolve(
+                    pid,
+                    &serde_json::json!({"element_token":element_token::token_for(id,0)})
+                )
+                .is_err());
+            cache
+                .try_publish_sized_for_session(
+                    pid,
+                    81,
+                    Payload(vec![22]),
+                    Some("owner"),
+                    None,
+                    Some((100.5, 80.0)),
+                )
+                .unwrap();
+            // Size is the new tree's known size; the inherited image's dimensions
+            // must remain its original dimensions, never drift by repeated reads.
+            assert!(cache
+                .screenshot_context(pid, Some(81), Some("owner"))
+                .is_err());
+            publish(&cache, "owner");
+            cache
+                .try_publish_sized_for_session(
+                    pid,
+                    81,
+                    Payload(vec![22]),
+                    Some("foreign"),
+                    None,
+                    Some((100.0, 80.0)),
+                )
+                .unwrap();
+            assert!(cache
+                .screenshot_context(pid, Some(81), Some("foreign"))
+                .is_err());
+        });
+    }
+    struct Sparse;
+    impl SnapshotPayload for Sparse {
+        type Element = usize;
+        fn len(&self) -> usize {
+            12
+        }
+        fn contains_index(&self, row: usize) -> bool {
+            matches!(row, 0 | 11)
+        }
+        fn retain(&self, row: usize) -> Option<usize> {
+            matches!(row, 0 | 11).then_some(row)
+        }
+    }
+    #[test]
+    fn bare_rows_pin_sparse_membership_exact_window_and_do_not_retarget_queued_args() {
+        isolated(|| {
+            let cache = Arc::new(SnapshotStore::new());
+            register_runtime_store(&cache);
+            let pid = std::process::id() as i32;
+            let id = cache.publish(pid, 81, Sparse);
+            let mut args = serde_json::json!({"pid":pid,"element_token":" +011 "});
+            canonicalize_bare_row(&mut args).unwrap();
+            assert_eq!(args["element_token"], element_token::token_for(id, 11));
+            assert_eq!(args["window_id"], 81);
+            let mut hole = serde_json::json!({"pid":pid,"element_token":"3"});
+            assert_eq!(
+                canonicalize_bare_row(&mut hole)
+                    .unwrap_err()
+                    .structured_content
+                    .unwrap()["refusal"]["code"],
+                "invalid_element_token"
+            );
+            cache.publish(pid, 82, Sparse);
+            let mut ambiguous = serde_json::json!({"pid":pid,"element_token":"0"});
+            assert!(canonicalize_bare_row(&mut ambiguous).is_err());
+            cache.publish(pid, 81, Sparse);
+            canonicalize_bare_row(&mut args).unwrap();
+            assert_eq!(args["element_token"], element_token::token_for(id, 11));
+            assert_eq!(
+                cache
+                    .resolve(pid, &args)
+                    .unwrap_err()
+                    .structured_content
+                    .unwrap()["refusal"]["code"],
+                "stale_element_token"
+            );
         });
     }
 }

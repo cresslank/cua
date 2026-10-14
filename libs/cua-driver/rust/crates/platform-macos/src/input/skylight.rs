@@ -780,6 +780,13 @@ fn foreground_turn() -> ForegroundTurn {
     }
 }
 
+/// Keep Cocoa activation, exact-window input, and restoration in the same
+/// serialized turn. Nested foreground helpers retain this outer ownership.
+pub(crate) fn with_foreground_transaction<R>(body: impl FnOnce() -> R) -> R {
+    let _turn = foreground_turn();
+    body()
+}
+
 /// Tool-agnostic foreground-assist: briefly front `window_id`, wait for the
 /// activation to actually land, run `body` (which posts the synthetic input),
 /// then restore the prior frontmost process.

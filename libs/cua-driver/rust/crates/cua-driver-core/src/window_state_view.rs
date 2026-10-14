@@ -81,7 +81,7 @@ pub fn schema_properties() -> Value {
         },
         "since": {
             "type": "string",
-            "description": "A `snapshot_id` from an earlier get_window_state of the same window. Returns only what changed against that snapshot: `+` added rows, `~` changed rows, `-` removed rows (removed ids are the old snapshot's), or `no change`. Falls back to a full read when the snapshot is unknown, expired, belongs to another window, or was read with a different query/max_elements/max_depth; `since_status` says which. The response still carries a NEW snapshot_id and its element_tokens; rows not listed keep their previous [N] unless a `reindexed:` line says otherwise."
+            "description": "A `snapshot_id` from an earlier get_window_state of the same window, or \"latest\" for this window's most recent read with the same query/max_elements/max_depth. Use it on every re-read after acting. Returns only what changed against that snapshot: `+` added rows, `~` changed rows, `-` removed rows (removed ids are the old snapshot's), or `no change`. Falls back to a full read when the snapshot is unknown, expired, belongs to another window, or was read with a different query/max_elements/max_depth; `since_status` says which. The response still carries a NEW snapshot_id and its element_tokens; rows not listed keep their previous [N] unless a `reindexed:` line says otherwise."
         },
         "verbose": {
             "type": "boolean",
@@ -135,7 +135,13 @@ impl ViewOptions {
         };
         let since = match args.get("since") {
             None | Some(Value::Null) => None,
-            Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_owned()),
+            // Models sometimes spell "no baseline" as the string "null".
+            Some(Value::String(s))
+                if matches!(s.trim().to_ascii_lowercase().as_str(), "" | "null" | "none") =>
+            {
+                None
+            }
+            Some(Value::String(s)) => Some(s.trim().to_owned()),
             Some(_) => {
                 return Err(ToolResult::error(
                     "since must be a snapshot_id string from an earlier get_window_state.",
@@ -217,10 +223,21 @@ pub fn apply(
         .and_then(Value::as_str)
         .map(str::to_owned);
 
-    let outcome = opts
-        .since
-        .as_deref()
-        .map(|since| resolve_since(since, snapshot_id.as_deref(), &md, ctx));
+    // `since:"latest"` names this window's most recent read of the same view.
+    let since_resolved = opts.since.as_deref().map(|since| {
+        if since.eq_ignore_ascii_case(SINCE_LATEST) {
+            latest_snapshot(ctx, snapshot_id.as_deref()).unwrap_or_default()
+        } else {
+            since.to_owned()
+        }
+    });
+    let outcome = since_resolved.as_deref().map(|since| {
+        if since.is_empty() {
+            SinceOutcome::Fallback("no_baseline")
+        } else {
+            resolve_since(since, snapshot_id.as_deref(), &md, ctx)
+        }
+    });
     if let Some(sid) = &snapshot_id {
         remember(sid, ctx, &md);
     }
@@ -238,7 +255,7 @@ pub fn apply(
     let body;
     match outcome {
         Some(SinceOutcome::Diff(report)) => {
-            let since = opts.since.as_deref().unwrap_or_default();
+            let since = since_resolved.as_deref().unwrap_or_default();
             let focus = if report.is_empty() {
                 ctx.focus_probe.and_then(|probe| probe())
             } else {
@@ -270,11 +287,25 @@ pub fn apply(
             if let Some(obj) = structured.as_object_mut() {
                 obj.remove("tree_markdown");
             }
+            if structured.get("truncated").and_then(Value::as_bool) == Some(true) {
+                if let (Some(sid), Some(last)) = (
+                    &snapshot_id,
+                    parse_rows(&md).iter().filter_map(|row| row.index).max(),
+                ) {
+                    header_extra.push_str(&format!(
+                        "\nthis read stops at row [{last}]: rows past it from a larger read are not in {sid}"
+                    ));
+                }
+            }
             body = text;
         }
         other => {
             if let Some(SinceOutcome::Fallback(reason)) = &other {
                 let since = opts.since.as_deref().unwrap_or_default();
+                let since = match since_resolved.as_deref() {
+                    Some(resolved) if !resolved.is_empty() => resolved,
+                    _ => since,
+                };
                 structured["since"] = json!(since);
                 structured["since_status"] = json!(reason);
                 header_extra.push_str(&format!(
@@ -297,9 +328,9 @@ pub fn apply(
                     body = md.clone();
                 }
             }
-            if opts.tree_format == TreeFormat::Markdown && snapshot_id.is_some() {
-                header_extra
-                    .push_str("\nelement_token for row [N] = <snapshot_id>:N (e.g. s0000002a:N)");
+            if let (TreeFormat::Markdown, Some(sid)) = (opts.tree_format, &snapshot_id) {
+                let truncated = structured.get("truncated").and_then(Value::as_bool) == Some(true);
+                header_extra.push_str(&token_hint(sid, &md, truncated));
             }
         }
     }
@@ -320,6 +351,50 @@ pub fn apply(
     rewrite_tree_block(content, &md, &header_extra, &body);
 }
 
+/// `since` value that names the window's most recent read of the same view.
+pub const SINCE_LATEST: &str = "latest";
+
+/// The header line telling the caller how to address rows, with this read's
+/// real snapshot id and, for a truncated read, where its rows end.
+fn token_hint(snapshot_id: &str, md: &str, truncated: bool) -> String {
+    let rows = parse_rows(md);
+    let example = rows
+        .iter()
+        .filter_map(|row| row.index)
+        .find(|index| *index > 0)
+        .unwrap_or(0);
+    let mut hint = format!(
+        "\nelement_token for row [N] = {snapshot_id}:N (row [{example}] is \"{snapshot_id}:{example}\")"
+    );
+    if truncated {
+        if let Some(last) = rows.iter().filter_map(|row| row.index).max() {
+            hint.push_str(&format!(
+                "; this read stops at row [{last}], so rows past it from a larger read are not in {snapshot_id}"
+            ));
+        }
+    }
+    hint
+}
+
+/// The most recent remembered read of this window with the same view key,
+/// other than the read being shaped now.
+fn latest_snapshot(ctx: &ViewContext<'_>, current_id: Option<&str>) -> Option<String> {
+    let runtime_scope = runtime_scope();
+    let guard = store().lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .iter()
+        .rev()
+        .find(|s| {
+            s.runtime_scope == runtime_scope
+                && s.pid == ctx.pid
+                && s.window_id == ctx.window_id
+                && s.key == ctx.key
+                && Some(s.snapshot_id.as_str()) != current_id
+                && s.at.elapsed() <= STORE_TTL
+        })
+        .map(|s| s.snapshot_id.clone())
+}
+
 fn fallback_text(reason: &str) -> &'static str {
     match reason {
         "unknown_snapshot" => "unknown or expired snapshot_id",
@@ -328,6 +403,9 @@ fn fallback_text(reason: &str) -> &'static str {
         "too_much_changed" => "most of the tree changed",
         "diff_too_large" => "the trees are too large to compare",
         "no_snapshot" => "this read produced no snapshot to compare against",
+        "no_baseline" => {
+            "no earlier read of this window with the same query, max_elements and max_depth"
+        }
         _ => "cannot diff",
     }
 }
@@ -640,7 +718,9 @@ fn diff_markdown(old_md: &str, new_md: &str) -> Result<DiffReport, DiffError> {
                 if let (Some(oi), Some(ni)) = (old[o].index, new[n].index) {
                     let delta = ni as i64 - oi as i64;
                     match (&mut run, delta) {
-                        (Some((_, last_old, d)), delta2) if *d == delta2 && delta2 != 0 && oi == *last_old + 1 => {
+                        (Some((_, last_old, d)), delta2)
+                            if *d == delta2 && delta2 != 0 && oi == *last_old + 1 =>
+                        {
                             *last_old = oi;
                         }
                         _ => {
@@ -872,11 +952,19 @@ mod tests {
         data["invalidated_snapshot_ids"] = json!(["old-view"]);
         data["capture_id"] = json!("exact-capture");
         data["elements"] = json!([{"element_index": 2}, {"element_index": 9}]);
-        apply(&opts(json!({"tree_format": "elements"})), &ctx(7011), &mut content, &mut data);
+        apply(
+            &opts(json!({"tree_format": "elements"})),
+            &ctx(7011),
+            &mut content,
+            &mut data,
+        );
         assert_eq!(data["collapsed_rows"], 12);
         assert_eq!(data["invalidated_snapshot_ids"], json!(["old-view"]));
         assert_eq!(data["capture_id"], "exact-capture");
-        assert_eq!(data["elements"], json!([{"element_index": 2}, {"element_index": 9}]));
+        assert_eq!(
+            data["elements"],
+            json!([{"element_index": 2}, {"element_index": 9}])
+        );
     }
 
     #[test]
@@ -972,8 +1060,92 @@ mod tests {
         assert_eq!(s["tree_format"], "markdown");
         let text = text_of(&content);
         assert!(text.starts_with("window_id=7 pid=9 size=10x10 elements=4 snapshot_id=s000000a1\n"));
-        assert!(text.contains("<snapshot_id>:N"));
+        assert!(text.contains("element_token for row [N] = s000000a1:N"));
+        assert!(text.contains("row [1] is \"s000000a1:1\""));
+        assert!(!text.contains("this read stops at row"));
         assert!(text.ends_with(OLD));
+    }
+
+    #[test]
+    fn truncated_read_names_its_last_row() {
+        let (mut content, mut s) = payload("s000000f4", OLD);
+        s["truncated"] = json!(true);
+        s["truncation_reason"] = json!("timeout");
+        apply(&opts(json!({})), &ctx(7101), &mut content, &mut s);
+        let last = parse_rows(OLD)
+            .iter()
+            .filter_map(|row| row.index)
+            .max()
+            .unwrap();
+        assert!(text_of(&content).contains(&format!(
+            "this read stops at row [{last}], so rows past it from a larger read are not in s000000f4"
+        )));
+    }
+
+    #[test]
+    fn since_null_strings_mean_no_baseline_and_truncated_diffs_say_where_they_stop() {
+        for spelled in ["null", "None", " "] {
+            assert_eq!(opts(json!({ "since": spelled })).since, None, "{spelled:?}");
+        }
+        let window = 7103;
+        let (mut c1, mut s1) = payload("s000000f5", OLD);
+        apply(&opts(json!({})), &ctx(window), &mut c1, &mut s1);
+        let (mut c2, mut s2) = payload("s000000f6", OLD);
+        s2["truncated"] = json!(true);
+        apply(
+            &opts(json!({"since": "latest"})),
+            &ctx(window),
+            &mut c2,
+            &mut s2,
+        );
+        assert_eq!(s2["since_status"], "no_change");
+        assert!(text_of(&c2).contains(
+            "this read stops at row [3]: rows past it from a larger read are not in s000000f6"
+        ));
+    }
+
+    #[test]
+    fn since_latest_diffs_against_the_last_read_of_the_same_view() {
+        let window = 7102;
+        // No earlier read: full read, stated.
+        let (mut c0, mut s0) = payload("s000000f0", OLD);
+        apply(
+            &opts(json!({"since": "latest"})),
+            &ctx(window),
+            &mut c0,
+            &mut s0,
+        );
+        assert_eq!(s0["since_status"], "no_baseline");
+        assert_eq!(s0["tree_markdown"], OLD);
+        assert!(text_of(&c0).contains("since=latest: no earlier read of this window"));
+
+        // A read with another view is not the baseline; the last same-view read is.
+        let mut narrow = ctx(window);
+        narrow.key.query = Some("Save".into());
+        let (mut c1, mut s1) = payload("s000000f1", OLD);
+        apply(&opts(json!({})), &narrow, &mut c1, &mut s1);
+
+        let edited = OLD.replace("\"a\"", "\"ab\"");
+        let (mut c2, mut s2) = payload("s000000f2", &edited);
+        apply(
+            &opts(json!({"since": "latest"})),
+            &ctx(window),
+            &mut c2,
+            &mut s2,
+        );
+        assert_eq!(s2["since_status"], "diff");
+        assert_eq!(s2["since"], "s000000f0");
+        assert!(text_of(&c2).contains("since s000000f0:"));
+
+        let (mut c3, mut s3) = payload("s000000f3", &edited);
+        apply(
+            &opts(json!({"since": "LATEST"})),
+            &ctx(window),
+            &mut c3,
+            &mut s3,
+        );
+        assert_eq!(s3["since_status"], "no_change");
+        assert_eq!(s3["since"], "s000000f2");
     }
 
     #[test]
@@ -1078,7 +1250,12 @@ mod tests {
         // Matching pid/window and snapshot id do not grant cross-runtime access.
         with_runtime_scope(other, || {
             let (mut content, mut data) = payload(&sid, OLD);
-            apply(&opts(json!({"since": sid})), &ctx(7010), &mut content, &mut data);
+            apply(
+                &opts(json!({"since": sid})),
+                &ctx(7010),
+                &mut content,
+                &mut data,
+            );
             assert_eq!(data["since_status"], "unknown_snapshot");
             assert_eq!(data["tree_markdown"], OLD);
         });
@@ -1088,10 +1265,49 @@ mod tests {
             apply(&opts(json!({})), &ctx(7010), &mut content, &mut data);
             let edited = OLD.replace("\"a\"", "\"ab\"");
             let (mut content, mut data) = payload("latest-runtime-view", &edited);
-            apply(&opts(json!({"since": sid})), &ctx(7010), &mut content, &mut data);
+            apply(
+                &opts(json!({"since": sid})),
+                &ctx(7010),
+                &mut content,
+                &mut data,
+            );
             assert_eq!(data["since_status"], "diff");
             assert_eq!(data["diff_counts"]["changed"], 1);
         });
+    }
+
+    #[test]
+    fn stage5_latest_baselines_stay_in_the_current_runtime() {
+        use crate::tool::with_runtime_scope;
+        let a = uuid::Uuid::new_v4().to_string();
+        let b = uuid::Uuid::new_v4().to_string();
+        let empty = uuid::Uuid::new_v4().to_string();
+        let edited = OLD.replace("\"a\"", "\"ab\"");
+        for (scope, id, tree) in [
+            (&a, "a1", OLD),
+            (&b, "b1", edited.as_str()),
+            (&a, "a2", OLD),
+            (&b, "b2", edited.as_str()),
+        ] {
+            with_runtime_scope(scope.clone(), || {
+                let (mut c, mut s) = payload(id, tree);
+                apply(&opts(json!({})), &ctx(7099), &mut c, &mut s);
+            });
+        }
+        for (scope, id, tree, baseline, status) in [
+            (&a, "a3", OLD, Some("a2"), "no_change"),
+            (&b, "b3", OLD, Some("b2"), "diff"),
+            (&empty, "empty1", OLD, None, "no_baseline"),
+        ] {
+            with_runtime_scope(scope.clone(), || {
+                let (mut c, mut s) = payload(id, tree);
+                apply(&opts(json!({"since":"latest"})), &ctx(7099), &mut c, &mut s);
+                assert_eq!(s["since_status"], status, "{s}");
+                if let Some(baseline) = baseline {
+                    assert_eq!(s["since"], baseline);
+                }
+            });
+        }
     }
 
     #[test]

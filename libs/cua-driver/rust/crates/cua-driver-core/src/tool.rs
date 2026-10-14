@@ -202,25 +202,170 @@ impl ToolDef {
     }
 }
 
-/// First argument name absent from the tool's advertised closed schema.
+/// The argument names absent from the tool's advertised closed schema, as one
+/// refusal message that also lists the accepted names, so the caller can fix
+/// every name in one retry instead of guessing one at a time.
 fn unknown_argument(def: &ToolDef, args: &Value) -> Option<String> {
     let schema = advertised_runtime_input_schema(&def.name, &def.input_schema);
     if schema["additionalProperties"] != false {
         return None;
     }
     let properties = schema.get("properties").and_then(Value::as_object);
-    args.as_object()?
+    let unknown: Vec<&str> = args
+        .as_object()?
         .keys()
-        .find(|name| {
-            // Fork compatibility shim: Hermes sends both fields. Dispatch
-            // validates the pair before any platform can take a pixel path;
-            // snapshot resolution still proves the token's live identity.
+        .filter(|name| {
             let paired_index = name.as_str() == "element_index"
                 && properties.is_some_and(|p| p.contains_key("element_token"))
                 && args.get("element_token").and_then(Value::as_str).is_some();
             !paired_index && !properties.is_some_and(|p| p.contains_key(*name))
         })
-        .cloned()
+        .map(String::as_str)
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    let accepted: Vec<&str> = properties
+        .map(|properties| {
+            properties
+                .keys()
+                .map(String::as_str)
+                .filter(|name| *name != "session")
+                .collect()
+        })
+        .unwrap_or_default();
+    // Preserve the closed, empty-schema refusal used by configuration calls.
+    if accepted.is_empty() {
+        return Some(format!("argument {}", unknown[0]));
+    }
+    let noun = if unknown.len() == 1 {
+        "argument"
+    } else {
+        "arguments"
+    };
+    Some(format!(
+        "{noun} {}; accepted: {}",
+        unknown.join(", "),
+        accepted.join(", ")
+    ))
+}
+
+/// Rewrite argument spellings models guess into the advertised ones, before
+/// the closed schema is checked. Shared by dispatch and `run_actions` step
+/// validation, so a batch step accepts what a direct call accepts. `Err` is a
+/// refusal detail for an alias that cannot be translated.
+pub(crate) fn normalize_argument_aliases(tool_name: &str, args: &mut Value) -> Result<(), String> {
+    normalize_zoom_args(tool_name, args);
+    normalize_scroll_args(tool_name, args)
+}
+
+/// A larger `dx`/`dy` magnitude than this many notches is read as pixels.
+const SCROLL_MAX_NOTCHES: f64 = 50.0;
+/// Pixels per wheel notch when `dx`/`dy` is given in pixels (a Chromium
+/// wheel notch scrolls about 100 px).
+const SCROLL_PIXELS_PER_NOTCH: f64 = 100.0;
+
+/// `scroll` takes `direction` plus `amount` (wheel notches) on every platform.
+/// Models reach for signed `dx`/`dy` deltas (sometimes as strings), so
+/// translate them: positive `dy` scrolls down and positive `dx` right, as in
+/// DOM `scrollBy` and wheel `deltaY`. A magnitude up to 50 counts notches; a
+/// larger one is pixels at 100 px per notch, clamped to 50 notches. An
+/// explicit `direction` (and `amount`) wins over `dx`/`dy`.
+fn normalize_scroll_args(tool_name: &str, args: &mut Value) -> Result<(), String> {
+    if tool_name != "scroll" {
+        return Ok(());
+    }
+    let Some(arguments) = args.as_object_mut() else {
+        return Ok(());
+    };
+    let read = |value: Option<Value>| -> Result<f64, String> {
+        match value {
+            None | Some(Value::Null) => Ok(0.0),
+            Some(value) => value
+                .as_f64()
+                .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+                .filter(|number: &f64| number.is_finite())
+                .ok_or_else(|| format!("dx/dy must be numbers, got {value}")),
+        }
+    };
+    if !arguments.contains_key("dx") && !arguments.contains_key("dy") {
+        return Ok(());
+    }
+    let dx = read(arguments.remove("dx"))?;
+    let dy = read(arguments.remove("dy"))?;
+    if arguments.contains_key("direction") {
+        return Ok(());
+    }
+    let (direction, delta) = match (dx != 0.0, dy != 0.0) {
+        (true, true) => {
+            return Err(format!(
+                "scroll moves along one axis per call, got dx={dx} and dy={dy}. Pass only dx or                  dy (or direction and amount), or use two scroll steps in run_actions."
+            ))
+        }
+        (false, false) => {
+            return Err("dx and dy are both 0, so there is nothing to scroll. Pass direction                  (up, down, left or right) and amount (wheel notches)."
+                .to_owned())
+        }
+        (false, true) => (if dy > 0.0 { "down" } else { "up" }, dy),
+        (true, false) => (if dx > 0.0 { "right" } else { "left" }, dx),
+    };
+    let magnitude = delta.abs();
+    let notches = if magnitude <= SCROLL_MAX_NOTCHES {
+        magnitude
+    } else {
+        magnitude / SCROLL_PIXELS_PER_NOTCH
+    };
+    let notches = notches.round().clamp(1.0, SCROLL_MAX_NOTCHES) as u64;
+    arguments.insert("direction".to_owned(), Value::String(direction.to_owned()));
+    arguments
+        .entry("amount")
+        .or_insert_with(|| serde_json::json!(notches));
+    Ok(())
+}
+
+/// `zoom` takes a region as two corners (`x1,y1`-`x2,y2`). Models reach for
+/// `x, y, width, height` (and pass numbers as strings), so rewrite that shape
+/// into corners before the closed schema is checked. Explicit corners win.
+fn normalize_zoom_args(tool_name: &str, args: &mut Value) {
+    if tool_name != "zoom" {
+        return;
+    }
+    let Some(arguments) = args.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "x1", "y1", "x2", "y2", "x", "y", "width", "height", "w", "h",
+    ] {
+        if let Some(number) = arguments
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|text| text.trim().parse::<f64>().ok())
+        {
+            arguments.insert(key.to_owned(), serde_json::json!(number));
+        }
+    }
+    for (short, long) in [("w", "width"), ("h", "height")] {
+        if !arguments.contains_key(long) {
+            if let Some(value) = arguments.remove(short) {
+                arguments.insert(long.to_owned(), value);
+            }
+        }
+    }
+    let num = |arguments: &serde_json::Map<String, Value>, key: &str| {
+        arguments.get(key).and_then(Value::as_f64)
+    };
+    for (origin, extent, first, second) in [("x", "width", "x1", "x2"), ("y", "height", "y1", "y2")]
+    {
+        if arguments.contains_key(first) || arguments.contains_key(second) {
+            continue;
+        }
+        if let (Some(start), Some(size)) = (num(arguments, origin), num(arguments, extent)) {
+            arguments.remove(origin);
+            arguments.remove(extent);
+            arguments.insert(first.to_owned(), serde_json::json!(start));
+            arguments.insert(second.to_owned(), serde_json::json!(start + size));
+        }
+    }
 }
 
 pub(crate) fn advertised_runtime_input_schema(tool_name: &str, schema: &Value) -> Value {
@@ -1301,6 +1446,15 @@ impl ToolRegistry {
         // Normalize deprecated public argument spellings before any policy,
         // consent, recording, or implementation layer interprets the call.
         normalize_delivery_mode_args(tool.def(), &mut args);
+        if let Err(detail) = normalize_argument_aliases(resolved_name, &mut args) {
+            return ToolResult::error(format!("{resolved_name}: {detail}")).with_structured(
+                serde_json::json!({
+                    "code": "invalid_arguments",
+                    "tool": resolved_name,
+                    "detail": detail,
+                }),
+            );
+        }
         let unknown_argument = unknown_argument(tool.def(), &args);
         // Explicit typed targets must be flattened first; inferred legacy
         // fields must not turn a valid typed target into a mixed-shape error.
@@ -1308,14 +1462,20 @@ impl ToolRegistry {
         {
             return result;
         }
+        // Pin successful row routing before policy, but preserve authorization,
+        // legacy-index and desktop-target refusal precedence for failed routing.
+        let bare_row_refusal = crate::snapshot_store::canonicalize_bare_row(&mut args).err();
         // Token-only platform routing must not happen after policy or leasing:
         // set_value would otherwise be admitted as an untargeted observation.
         // Enrich only missing fields; explicit conflicting targets are never
         // repaired and still fail the platform's retained-generation resolver.
-        if tool.def().input_schema["properties"].get("element_token").is_some()
+        if tool.def().input_schema["properties"]
+            .get("element_token")
+            .is_some()
             && args.get("pid").is_none_or(Value::is_null)
         {
-            if let Some((pid, window_id)) = args.get("element_token")
+            if let Some((pid, window_id)) = args
+                .get("element_token")
                 .and_then(Value::as_str)
                 .and_then(|token| crate::element_token::global().target_for_token(token))
             {
@@ -1479,17 +1639,18 @@ impl ToolRegistry {
             );
         }
 
-        if let Some(name) = unknown_argument {
+        if let Some(detail) = unknown_argument {
             return protected_refusal(
                 "invalid_arguments",
-                &if name == "element_index"
+                &if args.get("element_index").is_some()
+                    && args.get("element_token").and_then(Value::as_str).is_none()
                     && tool.def().input_schema["properties"]
                         .get("element_token")
                         .is_some()
                 {
                     format!("{resolved_name}: element_index requires the element_token from get_window_state")
                 } else {
-                    format!("{resolved_name}: unknown argument {name}")
+                    format!("{resolved_name}: unknown {detail}")
                 },
             );
         }
@@ -1525,12 +1686,30 @@ impl ToolRegistry {
             );
         }
 
+        if args
+            .get("element_token")
+            .is_some_and(|token| !token.is_null() && !token.is_string())
+        {
+            return crate::element_token::refusal(
+                "invalid_element_token",
+                "element_token must be a string".into(),
+            );
+        }
+
+        if let Some(refusal) = bare_row_refusal {
+            return refusal;
+        }
+
         // Current token routing was enriched before policy above. Refuse an
         // unresolved token before adapters, leases or native work, but retain
         // authorization and malformed/desktop-target refusal precedence.
-        if tool.def().input_schema["properties"].get("element_token").is_some()
+        if tool.def().input_schema["properties"]
+            .get("element_token")
+            .is_some()
             && args.get("pid").is_none_or(Value::is_null)
-            && args.get("element_token").is_some_and(|token| !token.is_null())
+            && args
+                .get("element_token")
+                .is_some_and(|token| !token.is_null())
         {
             return crate::element_token::stale_token_without_pid();
         }
@@ -3280,19 +3459,36 @@ mod runtime_isolation_tests {
                 let _ = self.0.wait();
             }
         }
-        let target = OwnedChild(std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "tool::runtime_isolation_tests::token_action_process_fixture"])
-            .env("CUA_TOKEN_ACTION_TEST_CHILD", "1")
-            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null()).spawn().unwrap());
+        let target = OwnedChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tool::runtime_isolation_tests::token_action_process_fixture",
+                ])
+                .env("CUA_TOKEN_ACTION_TEST_CHILD", "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
         let context = standard_context();
         let pid = target.0.id() as i32;
-        let window = ExactWindow { pid: pid.into(), window_id: 837201 };
-        let (cache, token) = DISPATCH_RUNTIME_SCOPE.scope(context.runtime_scope_key(), async {
-            let cache = crate::snapshot_store::SnapshotStore::new();
-            let id = cache.publish(pid, window.window_id, crate::snapshot_test_support::Payload(vec![1]));
-            (cache, crate::element_token::token_for(id, 0))
-        }).await;
+        let window = ExactWindow {
+            pid: pid.into(),
+            window_id: 837201,
+        };
+        let (cache, token) = DISPATCH_RUNTIME_SCOPE
+            .scope(context.runtime_scope_key(), async {
+                let cache = crate::snapshot_store::SnapshotStore::new();
+                let id = cache.publish(
+                    pid,
+                    window.window_id,
+                    crate::snapshot_test_support::Payload(vec![1]),
+                );
+                (cache, crate::element_token::token_for(id, 0))
+            })
+            .await;
         let (started, running) = tokio::sync::oneshot::channel();
         let (release, worker_release) = std::sync::mpsc::channel();
         let mut registry = super::ToolRegistry::new();
@@ -3304,18 +3500,29 @@ mod runtime_isolation_tests {
                     "pid": {"type": "integer"}, "window_id": {"type": "integer"},
                     "element_token": {"type": "string"}, "value": {"type": "string"}
                 }}),
-                read_only: false, destructive: false, idempotent: false, open_world: false,
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
             },
             worker: Mutex::new(Some((started, worker_release))),
         }));
         // A stale token must stop at canonical dispatch, before an untargeted
         // action can reach this native worker or a platform PID fallback.
-        let stale = tokio::time::timeout(Duration::from_secs(1), registry.invoke_with_context(
-            "set_value",
-            serde_json::json!({"element_token": "not-a-token", "value": "fixture"}),
-            context.clone(),
-        )).await.expect("stale token must not start native work");
-        assert_eq!(stale.structured_content.unwrap()["refusal"]["code"], "stale_element_token");
+        let stale = tokio::time::timeout(
+            Duration::from_secs(1),
+            registry.invoke_with_context(
+                "set_value",
+                serde_json::json!({"element_token": "not-a-token", "value": "fixture"}),
+                context.clone(),
+            ),
+        )
+        .await
+        .expect("stale token must not start native work");
+        assert_eq!(
+            stale.structured_content.unwrap()["refusal"]["code"],
+            "stale_element_token"
+        );
         let args = serde_json::json!({"element_token": token, "value": "fixture"});
         let mut invocation = Box::pin(registry.invoke_with_context("set_value", args, context));
         tokio::select! {
@@ -3323,12 +3530,328 @@ mod runtime_isolation_tests {
             started = tokio::time::timeout(Duration::from_secs(5), running) => started.unwrap().unwrap(),
         }
         drop(invocation);
-        let blocked = global().acquire(LeaseRequest::window_semantic(window, Duration::from_millis(25))).await;
+        let blocked = global()
+            .acquire(LeaseRequest::window_semantic(
+                window,
+                Duration::from_millis(25),
+            ))
+            .await;
         release.send(()).unwrap();
-        assert_eq!(blocked.expect_err("token-only native work must retain its target lease").code(), "target_busy");
-        global().acquire(LeaseRequest::window_semantic(window, Duration::from_secs(2))).await
+        assert_eq!(
+            blocked
+                .expect_err("token-only native work must retain its target lease")
+                .code(),
+            "target_busy"
+        );
+        global()
+            .acquire(LeaseRequest::window_semantic(
+                window,
+                Duration::from_secs(2),
+            ))
+            .await
             .expect("native exit releases target lease");
         drop(cache);
+    }
+
+    #[tokio::test]
+    async fn bare_row_is_pinned_before_waiting_for_target_lease() {
+        use crate::action_lease::{ExactWindow, LeaseRequest};
+        use crate::snapshot_store::{register_runtime_store, SnapshotStore};
+        use crate::snapshot_test_support::Payload;
+        struct ResolveProbe {
+            def: super::ToolDef,
+            cache: Arc<SnapshotStore<Payload>>,
+            seen: Arc<Mutex<Option<serde_json::Value>>>,
+        }
+        #[async_trait::async_trait]
+        impl super::Tool for ResolveProbe {
+            fn def(&self) -> &super::ToolDef {
+                &self.def
+            }
+            async fn invoke(&self, args: serde_json::Value) -> ToolResult {
+                *self.seen.lock().unwrap() = Some(args.clone());
+                match self
+                    .cache
+                    .resolve(args["pid"].as_i64().unwrap() as i32, &args)
+                {
+                    Err(error) => error,
+                    Ok(_) => ToolResult::error("unexpected retarget"),
+                }
+            }
+        }
+        let context = standard_context();
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let target = OwnedChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tool::runtime_isolation_tests::token_action_process_fixture",
+                ])
+                .env("CUA_TOKEN_ACTION_TEST_CHILD", "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = target.0.id() as i32;
+        let window_id = 872193;
+        let (cache, id) = DISPATCH_RUNTIME_SCOPE
+            .scope(context.runtime_scope_key(), async {
+                let cache = Arc::new(SnapshotStore::new());
+                register_runtime_store(&cache);
+                let id = cache.publish(pid, window_id, Payload(vec![1]));
+                (cache, id)
+            })
+            .await;
+        let seen = Arc::new(Mutex::new(None));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(ResolveProbe {
+            cache: cache.clone(),
+            seen: seen.clone(),
+            def: super::ToolDef {
+                name: "set_value".into(),
+                description: "hermetic row dispatch".into(),
+                input_schema: serde_json::json!({"type":"object","properties":{
+                    "pid":{"type":"integer"},"window_id":{"type":"integer"},
+                    "element_token":{"type":"string"},"value":{"type":"string"}
+                }}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        let held = crate::action_lease::global()
+            .acquire(LeaseRequest::window_semantic(
+                ExactWindow {
+                    pid: pid.into(),
+                    window_id,
+                },
+                Duration::from_secs(1),
+            ))
+            .await
+            .unwrap();
+        let mut invocation = Box::pin(registry.invoke_with_context(
+            "set_value",
+            serde_json::json!({"pid":pid,"window_id":window_id,"element_token":"0","value":"new"}),
+            context.clone(),
+        ));
+        tokio::select! {
+            result = &mut invocation => panic!("did not queue: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        assert!(seen.lock().unwrap().is_none());
+        DISPATCH_RUNTIME_SCOPE
+            .scope(context.runtime_scope_key(), async {
+                cache.publish(pid, window_id, Payload(vec![2]));
+            })
+            .await;
+        drop(held);
+        let result = invocation.await;
+        assert_eq!(
+            result.structured_content.unwrap()["refusal"]["code"],
+            "stale_element_token"
+        );
+        let seen = seen.lock().unwrap();
+        let args = seen
+            .as_ref()
+            .expect("pinned request reaches resolver after queue");
+        assert_eq!(
+            args["element_token"],
+            crate::element_token::token_for(id, 0)
+        );
+        assert_eq!(args["pid"], pid);
+        assert_eq!(args["window_id"], window_id);
+    }
+
+    #[tokio::test]
+    async fn stage5_batch_bare_rows_use_production_schema_and_pin_queued_targets() {
+        use crate::action_lease::{ExactWindow, LeaseRequest};
+        use crate::snapshot_store::{register_runtime_store, SnapshotStore};
+        struct Sparse;
+        impl crate::snapshot_store::SnapshotPayload for Sparse {
+            type Element = usize;
+            fn len(&self) -> usize {
+                12
+            }
+            fn contains_index(&self, row: usize) -> bool {
+                matches!(row, 0 | 11)
+            }
+            fn retain(&self, row: usize) -> Option<usize> {
+                self.contains_index(row).then_some(row)
+            }
+        }
+        struct ResolveProbe {
+            def: super::ToolDef,
+            cache: Arc<SnapshotStore<Sparse>>,
+            seen: Arc<Mutex<Option<serde_json::Value>>>,
+            mutations: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl super::Tool for ResolveProbe {
+            fn def(&self) -> &super::ToolDef {
+                &self.def
+            }
+            async fn invoke(&self, args: serde_json::Value) -> ToolResult {
+                *self.seen.lock().unwrap() = Some(args.clone());
+                match self
+                    .cache
+                    .resolve(args["pid"].as_i64().unwrap() as i32, &args)
+                {
+                    Err(error) => error,
+                    Ok(_) => {
+                        self.mutations.fetch_add(1, Ordering::SeqCst);
+                        ToolResult::text("mutation completed")
+                    }
+                }
+            }
+        }
+        let context = standard_context();
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let target = OwnedChild(
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tool::runtime_isolation_tests::token_action_process_fixture",
+                ])
+                .env("CUA_TOKEN_ACTION_TEST_CHILD", "1")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = target.0.id() as i32;
+        let window_id = 872193;
+        let (cache, id) = DISPATCH_RUNTIME_SCOPE
+            .scope(context.runtime_scope_key(), async {
+                let cache = Arc::new(SnapshotStore::new());
+                register_runtime_store(&cache);
+                let id = cache.publish(pid, window_id, Sparse);
+                (cache, id)
+            })
+            .await;
+        let seen = Arc::new(Mutex::new(None));
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(ResolveProbe {
+            cache: cache.clone(),
+            seen: seen.clone(),
+            mutations: mutations.clone(),
+            def: super::ToolDef {
+                name: "set_value".into(),
+                description: "hermetic row dispatch".into(),
+                input_schema: serde_json::json!({"type":"object","properties":{
+                    "pid":{"type":"integer"},"window_id":{"type":"integer"},
+                    "element_token":crate::tool_schema::element_token_schema(),"value":{"type":"string"}
+                }}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        registry.register_session_tools();
+        let registry = Arc::new(registry);
+        registry.init_self_weak();
+        let batch = |row: &str| {
+            serde_json::json!({"steps":[{"tool":"set_value","args":{
+                "pid":pid,"window_id":window_id,"element_token":row,"value":"new"
+            }}]})
+        };
+        for row in ["11", " +011 "] {
+            let result = registry
+                .invoke_with_context("run_actions", batch(row), context.clone())
+                .await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            let args = seen.lock().unwrap().take().unwrap();
+            assert_eq!(
+                args["element_token"],
+                crate::element_token::token_for(id, 11)
+            );
+            assert_eq!(args["value"], "new");
+        }
+        let hole = registry
+            .invoke_with_context("run_actions", batch("5"), context.clone())
+            .await;
+        assert_eq!(
+            hole.structured_content.unwrap()["steps"][0]["code"],
+            "invalid_element_token"
+        );
+        assert!(seen.lock().unwrap().is_none());
+        for invalid in ["-1", "11x", "", "99999999999999999999999999999999999999"] {
+            let mut plan = batch("11");
+            plan["steps"]
+                .as_array_mut()
+                .unwrap()
+                .push(batch(invalid)["steps"][0].clone());
+            let result = registry
+                .invoke_with_context("run_actions", plan, context.clone())
+                .await;
+            assert_eq!(result.is_error, Some(true), "{invalid}");
+            assert_eq!(result.structured_content.unwrap()["code"], "invalid_batch");
+            assert!(
+                seen.lock().unwrap().is_none(),
+                "whole plan must reject invalid strings"
+            );
+        }
+        assert_eq!(mutations.swap(0, Ordering::SeqCst), 2);
+        let held = crate::action_lease::global()
+            .acquire(LeaseRequest::window_semantic(
+                ExactWindow {
+                    pid: pid.into(),
+                    window_id,
+                },
+                Duration::from_secs(1),
+            ))
+            .await
+            .unwrap();
+        let mut invocation =
+            Box::pin(registry.invoke_with_context("run_actions", batch("11"), context.clone()));
+        tokio::select! {
+            result = &mut invocation => panic!("did not queue: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(30)) => {}
+        }
+        assert!(seen.lock().unwrap().is_none());
+        DISPATCH_RUNTIME_SCOPE
+            .scope(context.runtime_scope_key(), async {
+                cache.publish(pid, window_id, Sparse);
+            })
+            .await;
+        drop(held);
+        let result = invocation.await;
+        assert_eq!(
+            result.structured_content.unwrap()["steps"][0]["code"],
+            "stale_element_token"
+        );
+        assert_eq!(
+            mutations.load(Ordering::SeqCst),
+            0,
+            "queued replacement must not mutate"
+        );
+        let seen = seen.lock().unwrap();
+        let args = seen
+            .as_ref()
+            .expect("pinned request reaches resolver after queue");
+        assert_eq!(
+            args["element_token"],
+            crate::element_token::token_for(id, 11)
+        );
+        assert_eq!(args["pid"], pid);
+        assert_eq!(args["window_id"], window_id);
     }
 
     struct ReplayProbe {
@@ -6672,5 +7195,137 @@ mod capability_tests {
             .any(|adapter| {
                 adapter["id"] == "browser_prepare.existing_profile" && adapter["state"] == "active"
             }));
+    }
+}
+
+#[cfg(test)]
+mod argument_shape_tests {
+    use super::{normalize_argument_aliases, normalize_zoom_args, unknown_argument, ToolDef};
+    use serde_json::json;
+
+    fn zoom_def() -> ToolDef {
+        ToolDef {
+            name: "zoom".into(),
+            description: String::new(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "window_id": {"type": "integer"}, "pid": {"type": "integer"},
+                    "x1": {"type": "number"}, "y1": {"type": "number"},
+                    "x2": {"type": "number"}, "y2": {"type": "number"}
+                },
+                "additionalProperties": false
+            }),
+            read_only: true,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
+        }
+    }
+
+    #[test]
+    fn zoom_accepts_origin_and_size_as_corners() {
+        // The exact shape models sent in the v035 bench (numbers as strings).
+        let mut args = json!({"pid": 1, "window_id": 928, "x": "0", "y": "100", "width": "1180", "height": "640"});
+        normalize_zoom_args("zoom", &mut args);
+        assert_eq!(
+            args,
+            json!({"pid": 1, "window_id": 928, "x1": 0.0, "y1": 100.0, "x2": 1180.0, "y2": 740.0})
+        );
+        assert_eq!(unknown_argument(&zoom_def(), &args), None);
+
+        let mut short = json!({"window_id": 1, "x": 10, "y": 20, "w": 5, "h": 6});
+        normalize_zoom_args("zoom", &mut short);
+        assert_eq!(
+            short,
+            json!({"window_id": 1, "x1": 10.0, "y1": 20.0, "x2": 15.0, "y2": 26.0})
+        );
+
+        let mut corners = json!({"window_id": 1, "x1": "1", "y1": 2, "x2": 3, "y2": 4});
+        normalize_zoom_args("zoom", &mut corners);
+        assert_eq!(
+            corners,
+            json!({"window_id": 1, "x1": 1.0, "y1": 2, "x2": 3, "y2": 4})
+        );
+
+        let mut other_tool = json!({"x": 1, "width": 2});
+        normalize_zoom_args("click", &mut other_tool);
+        assert_eq!(other_tool, json!({"x": 1, "width": 2}));
+    }
+
+    fn scroll(args: serde_json::Value) -> Result<serde_json::Value, String> {
+        let mut args = args;
+        normalize_argument_aliases("scroll", &mut args).map(|()| args)
+    }
+
+    #[test]
+    fn scroll_translates_signed_deltas_into_direction_and_notches() {
+        // Shapes models sent in the v035 bench and the live check of #4812.
+        let base = json!({"pid": 1, "window_id": 2, "x": 450, "y": 500});
+        let with = |extra: serde_json::Value| {
+            let mut args = base.clone();
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            args
+        };
+        for (delta, direction, amount) in [
+            (json!({"dy": "10"}), "down", 10),
+            (json!({"dy": 20}), "down", 20),
+            (json!({"dy": -3}), "up", 3),
+            (json!({"dy": 500}), "down", 5),
+            (json!({"dy": "1500"}), "down", 15),
+            (json!({"dy": "2000"}), "down", 20),
+            (json!({"dy": 99999}), "down", 50),
+            (json!({"dy": 0.2}), "down", 1),
+            (json!({"dx": 5, "dy": 0}), "right", 5),
+            (json!({"dx": "-120"}), "left", 1),
+        ] {
+            let out = scroll(with(delta.clone())).unwrap();
+            assert_eq!(out["direction"], direction, "{delta}");
+            assert_eq!(out["amount"], amount, "{delta}");
+            assert!(
+                out.get("dx").is_none() && out.get("dy").is_none(),
+                "{delta}"
+            );
+            assert_eq!(out["x"], 450);
+        }
+    }
+
+    #[test]
+    fn scroll_keeps_explicit_direction_and_amount_and_refuses_what_it_cannot_translate() {
+        let out = scroll(json!({"direction": "up", "amount": 2, "dy": 900})).unwrap();
+        assert_eq!(out, json!({"direction": "up", "amount": 2}));
+        let out = scroll(json!({"dy": 400, "amount": 7})).unwrap();
+        assert_eq!(out, json!({"direction": "down", "amount": 7}));
+        let both = scroll(json!({"dx": 3, "dy": 4})).unwrap_err();
+        assert!(both.contains("one axis per call"), "{both}");
+        let zero = scroll(json!({"dx": 0, "dy": "0"})).unwrap_err();
+        assert!(zero.contains("nothing to scroll"), "{zero}");
+        let junk = scroll(json!({"dy": "lots"})).unwrap_err();
+        assert!(junk.contains("must be numbers"), "{junk}");
+        let untouched = json!({"direction": "down", "amount": 3});
+        assert_eq!(scroll(untouched.clone()).unwrap(), untouched);
+        let mut click = json!({"dy": 4});
+        normalize_argument_aliases("click", &mut click).unwrap();
+        assert_eq!(click, json!({"dy": 4}));
+    }
+
+    #[test]
+    fn unknown_arguments_are_all_named_with_the_accepted_ones() {
+        let detail = unknown_argument(
+            &zoom_def(),
+            &json!({"window_id": 1, "height": 2, "width": 3}),
+        )
+        .unwrap();
+        assert_eq!(
+            detail,
+            "arguments height, width; accepted: pid, window_id, x1, x2, y1, y2"
+        );
+        let detail = unknown_argument(&zoom_def(), &json!({"window_id": 1, "height": 2})).unwrap();
+        assert!(
+            detail.starts_with("argument height; accepted: "),
+            "{detail}"
+        );
     }
 }

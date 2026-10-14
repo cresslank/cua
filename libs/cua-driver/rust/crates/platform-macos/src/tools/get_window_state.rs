@@ -31,9 +31,9 @@ fn def() -> &'static ToolDef {
             \n\
             START NARROW: a read walks at most 250 nodes by default and says `Tree truncated at max_elements=…` (`truncated:true`) when it stops; raise `max_elements`, or use `query` (case-insensitive substring; matching rows plus ancestors) and `max_depth`. Indices and tokens stay valid for the whole snapshot. `verbose:true` adds `_note` and the full `background_input` report; `full_output:true` restores the previous full response (both representations, all metadata, ≤2 000 nodes).\n\
             \n\
-            DIFF READS: `since:<snapshot_id>` from an earlier read of the same window returns only what changed: `+` added, `~` changed, `-` removed rows (removed ids are the old snapshot's), a `reindexed:` line if indices shifted, or `no change since …; focused element is …`. The response carries a NEW snapshot_id: use it in tokens. An unknown, expired, other-window or differently-scoped (query/max_elements/max_depth) `since` falls back to a full read; `since_status` says why.\n\
+            DIFF READS (use them for every re-read after acting): `since:\"latest\"`, or `since:<snapshot_id>` from an earlier read of the same window, returns only what changed: `+` added, `~` changed, `-` removed rows (removed ids are the old snapshot's), a `reindexed:` line if indices shifted, or `no change since …; focused element is …`. The response carries a NEW snapshot_id: use it in tokens. An unknown, expired, other-window or differently-scoped (query/max_elements/max_depth) `since` falls back to a full read; `since_status` says why.\n\
             \n\
-            A new snapshot of the same (pid, window_id) replaces the previous one and stales its tokens (`invalidated_snapshot_ids`). `include_screenshot:false` returns the tree only; `include_accessibility_tree:false` returns only the screenshot and window metadata. Scrolling containers may leave non-visible, non-selected rows unread (`collapsed_rows`); scroll or search to reveal them. The tree can lie on some surfaces (Electron, Catalyst, virtualized rows with `h:1` frames): cross-check the screenshot, and use pixel x,y at action time only for elements missing from the tree.\n\
+            A new snapshot of the same (pid, window_id) replaces the previous one and stales its tokens (`invalidated_snapshot_ids`). `include_screenshot:false` returns the tree only and keeps a valid same-session screenshot frame at the same known window size; `include_accessibility_tree:false` refreshes the screenshot while preserving live same-session rows and tokens. Other platforms may replace tokens on screenshot-only reads. Scrolling containers may leave non-visible, non-selected rows unread (`collapsed_rows`); scroll or search to reveal them. The tree can lie on some surfaces (Electron, Catalyst, virtualized rows with `h:1` frames): cross-check the screenshot, and use pixel x,y at action time only for elements missing from the tree.\n\
             \n\
             Refusals: `window_id_not_found`; `window_owner_pid_mismatch` names the real `owner_pid` (sandboxed Open/Save panels belong to a panel service). `degraded_reason` `ax_window_unresolved` or `ax_app_launching` (the latter with `truncation_reason: app_lookup_timeout`) means an empty tree: re-snapshot, or act with `delivery_mode:\"foreground\"`. `px_frame_mismatch` / `px_capture_unavailable` omit the unprovable screenshot; the AX payload stays valid.".into(),
         input_schema: cua_driver_core::window_state_view::extend_input_schema(serde_json::json!({
@@ -337,11 +337,27 @@ impl Tool for GetWindowStateTool {
         // this tool never does — so treat that as resolved.
         let scope_matched = window_scope.as_ref().is_none_or(|s| s.is_matched());
 
-        let removed = if (!scope_matched || !want_tree) && !observation_only {
+        let removed = if !scope_matched && !observation_only {
             match invalidate_capture_only_authority(&self.state.snapshots, pid, window_id) {
                 Ok(invalidated) => Some(invalidated),
                 Err(error) => return ToolResult::error(format!("snapshot invalidation failed: {error}"))
                     .with_structured(serde_json::json!({"status":"refused","refusal":{"code":"snapshot_invalidation_failed","message":error.to_string()}})),
+            }
+        } else {
+            None
+        };
+
+        let refresh_ticket = if !want_tree && should_capture && scope_matched && !observation_only {
+            match self.state.snapshots.screenshot_refresh_ticket(
+                pid,
+                u64::from(window_id),
+                session_id.as_deref(),
+            ) {
+                Ok(ticket) => Some(ticket),
+                Err(error) => {
+                    return ToolResult::error(format!("screenshot refresh refused: {error}"))
+                        .with_structured(serde_json::json!({"code":"snapshot_publication_failed"}))
+                }
             }
         } else {
             None
@@ -518,19 +534,54 @@ impl Tool for GetWindowStateTool {
             .map(|r| r.tree_markdown.clone())
             .unwrap_or_default();
 
-        // Capture-only observations also replace the authoritative generation.
+        let window_size = if let Some((bounds, _)) = screenshot_frame.as_ref() {
+            Some((bounds.width, bounds.height))
+        } else if prepared_snapshot.is_some() && !observation_only {
+            match cua_driver_core::blocking::spawn(move || {
+                crate::windows::window_bounds_by_id(window_id)
+            })
+            .await
+            {
+                Ok(bounds) => bounds.map(|b| (b.width, b.height)),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let refreshed = match (refresh_ticket.clone(), screenshot_resize_scale) {
+            (Some(ticket), Some(scale)) => match self
+                .state
+                .snapshots
+                .refresh_screenshot_for_session(ticket, scale, window_size)
+            {
+                Ok(context) => context,
+                Err(error) => {
+                    return ToolResult::error(format!("screenshot refresh refused: {error}"))
+                        .with_structured(serde_json::json!({"code":"snapshot_publication_failed"}))
+                }
+            },
+            _ => None,
+        };
+
         let snapshot_payload =
             prepared_snapshot.unwrap_or_else(|| crate::ax::snapshot::AxSnapshot::from_nodes(&[]));
-        let publication = if observation_only {
+        let publication = if let Some(context) = refreshed {
+            Ok(Some((context.snapshot_id, vec![])))
+        } else if observation_only {
             Ok(None)
         } else if scope_matched && want_tree {
-            self.state.snapshots.try_publish_for_session(
+            self.state.snapshots.try_publish_sized_for_session(
                 pid,
                 u64::from(window_id),
                 snapshot_payload,
                 session_id.as_deref(),
                 screenshot_resize_scale,
+                window_size,
             )
+        } else if let (Some(ticket), Some(scale)) = (refresh_ticket, screenshot_resize_scale) {
+            self.state
+                .snapshots
+                .try_publish_capture_for_refresh(ticket, snapshot_payload, scale)
         } else {
             self.state.snapshots.try_publish_capture_for_session(
                 pid,
@@ -557,17 +608,16 @@ impl Tool for GetWindowStateTool {
                     return ToolResult::error("capture snapshot was replaced")
                         .with_structured(serde_json::json!({"code":"screenshot_context_missing"}));
                 };
-                let context = match cache.screenshot_context_or_refusal(
-                    pid,
-                    u64::from(window_id),
-                    session_id.as_deref(),
-                ) {
-                    Ok(context) if context.snapshot_id == snapshot_id => context,
-                    _ => {
-                        return ToolResult::error("capture snapshot was replaced").with_structured(
-                            serde_json::json!({"code":"screenshot_context_missing"}),
-                        )
-                    }
+                let context =
+                    refreshed.unwrap_or(cua_driver_core::snapshot_store::ScreenshotContext {
+                        snapshot_id,
+                        window_id: u64::from(window_id),
+                        scale: screenshot_resize_scale.unwrap_or(1.0),
+                        frame_revision: 1,
+                    });
+                let frame = match cache.frame_binding(pid, session_id.as_deref(), context) {
+                    Ok(frame) => frame,
+                    Err(error) => return error,
                 };
                 let publication = cache.with_valid_screenshot_context(
                     pid,
@@ -582,6 +632,7 @@ impl Tool for GetWindowStateTool {
                             (*width, *height),
                             (*native_width, *native_height),
                             identity,
+                            frame,
                         )
                     },
                 );
@@ -662,7 +713,9 @@ impl Tool for GetWindowStateTool {
         // embedded in every `element_token` emitted in `elements[]` above.
         // Additive — old consumers ignore it. Absent when no snapshot was
         // registered (unresolved window scope).
-        if let Some(sid) = snapshot_id.filter(|_| scope_matched && want_tree) {
+        if let Some(sid) =
+            snapshot_id.filter(|_| scope_matched && (want_tree || refreshed.is_some()))
+        {
             structured["snapshot_id"] =
                 serde_json::json!(cua_driver_core::element_token::format_snapshot_id(sid));
         }
@@ -681,6 +734,15 @@ impl Tool for GetWindowStateTool {
         }
         if let Some(capture_id) = capture_id {
             structured["capture_id"] = serde_json::json!(capture_id);
+        }
+        if let Some(context) = refreshed {
+            let id = context.snapshot_id;
+            let sid = cua_driver_core::element_token::format_snapshot_id(id);
+            content.push(Content::text(format!(
+                "Screenshot only: snapshot {sid} keeps its rows, and its element_tokens \
+                 ({sid}:N) stay valid."
+            )));
+            structured["screenshot_refreshed_snapshot"] = serde_json::json!(true);
         }
         // Best-effort-background ladder, rung (2). Both rungs point the agent at
         // the same next move: an empty AX tree means element_index has nothing

@@ -72,6 +72,9 @@ impl SnapshotPayload for AtspiSnapshot {
     fn len(&self) -> usize {
         self.elements.keys().max().map_or(0, |i| i + 1)
     }
+    fn contains_index(&self, index: usize) -> bool {
+        self.elements.contains_key(&index)
+    }
     fn retain(&self, index: usize) -> Option<CachedElement> {
         self.elements.get(&index).cloned()
     }
@@ -381,6 +384,10 @@ mod tests {
         let payload =
             AtspiSnapshot::try_from_nodes(&[node(11, 111), unindexed, node(7, 107)]).unwrap();
         assert_eq!(payload.elements.len(), 2);
+        assert!(payload.contains_index(7));
+        assert!(payload.contains_index(11));
+        assert!(!payload.contains_index(8));
+        assert!(!payload.contains_index(0));
         assert!(payload.retain(8).is_none());
         assert!(payload.retain(0).is_none());
         // The fork rejects duplicate identities instead of silently deduplicating them.

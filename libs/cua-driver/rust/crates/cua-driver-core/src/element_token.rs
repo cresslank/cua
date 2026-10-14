@@ -510,8 +510,28 @@ impl TokenRegistry {
 
     pub fn publish(
         &self,
+        candidate: SnapshotCandidate,
+        timeout: Duration,
+    ) -> Result<u32, RegistryError> {
+        self.publish_checked(candidate, timeout, None)
+    }
+
+    /// Image work may replace only the generation observed before it began.
+    /// The comparison and transition to Closing share the lane mutex.
+    pub(crate) fn publish_replacing(
+        &self,
+        candidate: SnapshotCandidate,
+        timeout: Duration,
+        expected: Option<SnapshotIdentity>,
+    ) -> Result<u32, RegistryError> {
+        self.publish_checked(candidate, timeout, Some(expected))
+    }
+
+    fn publish_checked(
+        &self,
         mut candidate: SnapshotCandidate,
         timeout: Duration,
+        expected: Option<Option<SnapshotIdentity>>,
     ) -> Result<u32, RegistryError> {
         let generation = candidate.generation.as_ref().unwrap().clone();
         let live = self.live_incarnation(generation.lane.pid)?; // I/O before locks.
@@ -542,6 +562,11 @@ impl TokenRegistry {
             }
             if candidate.ticket != inner.latest_ticket || inner.candidates == 0 {
                 return Err(RegistryError::Superseded);
+            }
+            if expected
+                .is_some_and(|expected| inner.current.as_ref().map(|g| g.identity) != expected)
+            {
+                return Err(RegistryError::NotCurrent);
             }
             match &inner.state {
                 GenerationState::Poisoned { reason } => {

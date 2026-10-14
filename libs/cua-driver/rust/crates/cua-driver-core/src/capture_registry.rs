@@ -554,6 +554,7 @@ pub fn admission_error_code(error: &anyhow::Error) -> &'static str {
 
 #[derive(Clone)]
 struct StoredCapture {
+    frame: Option<crate::snapshot_store::ScreenshotFrameBinding>,
     snapshot_identity: Option<crate::element_token::SnapshotIdentity>,
     id: CaptureId,
     png_bytes: Arc<[u8]>,
@@ -569,6 +570,9 @@ struct StoredCapture {
 
 impl StoredCapture {
     fn validate_snapshot(&self) -> Result<(), CaptureLookupError> {
+        if self.frame.as_ref().is_some_and(|frame| !frame.is_current()) {
+            return Err(CaptureLookupError::GenerationMismatch);
+        }
         if let Some(identity) = self.snapshot_identity {
             let CaptureTarget::Window { pid, window_id } = self.target else {
                 return Err(CaptureLookupError::TargetMismatch);
@@ -728,13 +732,14 @@ impl CaptureRegistry {
     }
 
     pub fn store(&self, registration: CaptureRegistration) -> Result<CaptureId, CaptureStoreError> {
-        self.store_bound(registration, None)
+        self.store_bound(registration, None, None)
     }
 
     fn store_bound(
         &self,
         registration: CaptureRegistration,
         snapshot_identity: Option<crate::element_token::SnapshotIdentity>,
+        frame: Option<crate::snapshot_store::ScreenshotFrameBinding>,
     ) -> Result<CaptureId, CaptureStoreError> {
         registration.target.validate()?;
         if registration.png_bytes.len() > self.config.max_total_bytes {
@@ -793,6 +798,7 @@ impl CaptureRegistry {
             sequence,
         };
         let capture = StoredCapture {
+            frame,
             snapshot_identity,
             id,
             png_bytes,
@@ -927,6 +933,7 @@ impl CaptureRegistry {
             native_action_dimensions: capture.native_action_dimensions,
             digest: capture.digest,
         };
+        capture.validate_snapshot()?;
         self.remove_capture(&mut inner, request.capture_id);
         Ok(admission)
     }
@@ -1210,7 +1217,7 @@ impl CaptureService {
     }
 
     pub fn publish(&self, publication: CapturePublication) -> Result<CaptureId, CaptureStoreError> {
-        self.publish_bound(publication, None)
+        self.publish_bound(publication, None, None)
     }
 
     pub fn publish_for_snapshot(
@@ -1218,13 +1225,23 @@ impl CaptureService {
         publication: CapturePublication,
         identity: crate::element_token::SnapshotIdentity,
     ) -> Result<CaptureId, CaptureStoreError> {
-        self.publish_bound(publication, Some(identity))
+        self.publish_bound(publication, Some(identity), None)
+    }
+
+    pub fn publish_for_frame(
+        &self,
+        publication: CapturePublication,
+        identity: crate::element_token::SnapshotIdentity,
+        frame: crate::snapshot_store::ScreenshotFrameBinding,
+    ) -> Result<CaptureId, CaptureStoreError> {
+        self.publish_bound(publication, Some(identity), Some(frame))
     }
 
     fn publish_bound(
         &self,
         publication: CapturePublication,
         identity: Option<crate::element_token::SnapshotIdentity>,
+        frame: Option<crate::snapshot_store::ScreenshotFrameBinding>,
     ) -> Result<CaptureId, CaptureStoreError> {
         // Serialize retirement with the complete registration, including PNG validation.
         let mut generations = self
@@ -1251,6 +1268,7 @@ impl CaptureService {
                 binding,
             },
             identity,
+            frame,
         )
     }
 
@@ -1372,6 +1390,88 @@ mod tests {
     use super::*;
     use crate::image_utils::encode_rgba_to_png;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn refreshed_frame_rejects_old_capture_publication_and_admission() {
+        crate::tool::with_runtime_scope(
+            format!("capture-refresh-{}", uuid::Uuid::new_v4()),
+            || {
+                use crate::snapshot_store::SnapshotStore;
+                use crate::snapshot_test_support::Payload;
+                let cache = SnapshotStore::new();
+                let pid = std::process::id() as i32;
+                let service = CaptureService::default();
+                let binding = service.current_binding("owner").unwrap();
+                let id = cache
+                    .try_publish_for_session(pid, 81, Payload(vec![1]), Some("owner"), Some(1.0))
+                    .unwrap()
+                    .unwrap()
+                    .0;
+                let identity = cache.identity_for_snapshot(pid, id).unwrap();
+                let context = cache
+                    .screenshot_context(pid, Some(81), Some("owner"))
+                    .unwrap();
+                let frame = cache.frame_binding(pid, Some("owner"), context).unwrap();
+                let publication = || CapturePublication {
+                    png_bytes: png(2, 2, 1),
+                    target: CaptureTarget::Window {
+                        pid: pid as u32,
+                        window_id: 81,
+                    },
+                    encoded_dimensions: EncodedScreenshotDimensions::new(2, 2).unwrap(),
+                    native_action_dimensions: NativeActionDimensions::new(2, 2).unwrap(),
+                    screenshot_to_action: ScreenshotToActionTransform::identity(),
+                    session_id: Arc::from(binding.session_id()),
+                    session_generation: binding.session_generation(),
+                };
+                let capture = service
+                    .publish_for_frame(publication(), identity, frame.clone())
+                    .unwrap();
+                let admitted_capture = service
+                    .publish_for_frame(publication(), identity, frame.clone())
+                    .unwrap();
+                let request = |capture_id| CaptureActionRequest {
+                    capture_id,
+                    binding: binding.clone(),
+                    target: publication().target,
+                    current_native_action_dimensions: NativeActionDimensions::new(2, 2).unwrap(),
+                    screenshot_x: 1.0,
+                    screenshot_y: 1.0,
+                };
+                let admitted = service.admit_action(request(admitted_capture)).unwrap();
+                let ticket = cache
+                    .screenshot_refresh_ticket(pid, 81, Some("owner"))
+                    .unwrap();
+                cache
+                    .refresh_screenshot_for_session(ticket, 1.0, None)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    service.read_for_perception(capture, &binding).unwrap_err(),
+                    CaptureLookupError::GenerationMismatch
+                );
+                assert_eq!(
+                    service.admit_action(request(capture)).unwrap_err(),
+                    CaptureActionError::Lookup(CaptureLookupError::GenerationMismatch)
+                );
+                assert_eq!(
+                    service.publish_for_frame(publication(), identity, frame),
+                    Err(CaptureStoreError::InvalidBinding)
+                );
+                assert_eq!(
+                    admitted
+                        .snapshot_permit
+                        .as_ref()
+                        .unwrap()
+                        .0
+                        .as_ref()
+                        .unwrap()
+                        .identity(),
+                    identity
+                );
+            },
+        );
+    }
 
     #[test]
     fn window_capture_uses_exact_native_snapshot_generation() {

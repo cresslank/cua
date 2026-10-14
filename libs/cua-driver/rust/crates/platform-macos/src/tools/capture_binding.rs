@@ -31,6 +31,7 @@ impl MacCaptureBindings {
         encoded_dimensions: (u32, u32),
         native_dimensions: (u32, u32),
         snapshot_identity: cua_driver_core::element_token::SnapshotIdentity,
+        frame: cua_driver_core::snapshot_store::ScreenshotFrameBinding,
     ) -> Result<String, ToolResult> {
         let target = CaptureTarget::Window {
             pid: u32::try_from(pid)
@@ -44,6 +45,7 @@ impl MacCaptureBindings {
             encoded_dimensions,
             native_dimensions,
             Some(snapshot_identity),
+            Some(frame),
         )
     }
 
@@ -61,6 +63,7 @@ impl MacCaptureBindings {
             encoded_dimensions,
             native_dimensions,
             None,
+            None,
         )
     }
 
@@ -72,6 +75,7 @@ impl MacCaptureBindings {
         encoded_dimensions: (u32, u32),
         native_dimensions: (u32, u32),
         snapshot_identity: Option<cua_driver_core::element_token::SnapshotIdentity>,
+        frame: Option<cua_driver_core::snapshot_store::ScreenshotFrameBinding>,
     ) -> Result<String, ToolResult> {
         let binding = self
             .service
@@ -91,9 +95,12 @@ impl MacCaptureBindings {
             session_id: Arc::<str>::from(binding.session_id()),
             session_generation: binding.session_generation(),
         };
-        match snapshot_identity {
-            Some(identity) => self.service.publish_for_snapshot(publication, identity),
-            None => self.service.publish(publication),
+        match (snapshot_identity, frame) {
+            (Some(identity), Some(frame)) => {
+                self.service.publish_for_frame(publication, identity, frame)
+            }
+            (Some(identity), None) => self.service.publish_for_snapshot(publication, identity),
+            (None, _) => self.service.publish(publication),
         }
         .map(|capture_id| capture_id.to_string())
         .map_err(|error| capture_error("capture_publication_failed", error))
@@ -464,6 +471,15 @@ mod tests {
                 (4, 3),
                 (8, 6),
                 cache.identity_for_snapshot(pid, snapshot).unwrap(),
+                cache
+                    .frame_binding(
+                        pid,
+                        Some("resize-session"),
+                        cache
+                            .screenshot_context(pid, Some(13), Some("resize-session"))
+                            .unwrap(),
+                    )
+                    .unwrap(),
             )
             .unwrap();
         let mut dispatches = 0;
