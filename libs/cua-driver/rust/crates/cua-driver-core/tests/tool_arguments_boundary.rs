@@ -168,11 +168,16 @@ impl Drop for OwnedTarget {
 async fn legacy_element_index_only_cross_checks_a_current_token() {
     // Token-only routing now exposes the true target to protected-process
     // policy. Use an owned child, not the authorization process itself.
-    let target = OwnedTarget(std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "owned_target_process"])
-        .env("CUA_TOKEN_BOUNDARY_TEST_CHILD", "1")
-        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null()).spawn().unwrap());
+    let target = OwnedTarget(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "owned_target_process"])
+            .env("CUA_TOKEN_BOUNDARY_TEST_CHILD", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     let pid = target.0.id() as i32;
     let context = unrestricted_context();
     let (snapshots, token) =
@@ -247,11 +252,20 @@ async fn legacy_element_index_only_cross_checks_a_current_token() {
     }
     // An explicit typed target wins over inference, but cannot redirect the
     // retained element to a different window.
-    let result = registry.invoke_with_context("click", json!({
-        "target":{"kind":"window","pid":pid,"window_id":99},
-        "element_token":token
-    }), context.clone()).await;
-    assert_eq!(result.structured_content.unwrap()["refusal"]["code"], "conflicting_element_target");
+    let result = registry
+        .invoke_with_context(
+            "click",
+            json!({
+                "target":{"kind":"window","pid":pid,"window_id":99},
+                "element_token":token
+            }),
+            context.clone(),
+        )
+        .await;
+    assert_eq!(
+        result.structured_content.unwrap()["refusal"]["code"],
+        "conflicting_element_target"
+    );
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
         3,
@@ -263,25 +277,37 @@ async fn legacy_element_index_only_cross_checks_a_current_token() {
 async fn token_only_target_cannot_hide_the_authorization_process() {
     let context = unrestricted_context();
     let pid = std::process::id() as i32;
-    let (snapshots, token) = cua_driver_core::tool::with_runtime_scope(context.runtime_scope_key(), || {
-        let snapshots = cua_driver_core::snapshot_store::SnapshotStore::new();
-        let id = snapshots.publish(pid, 42, ElementPayload);
-        (snapshots, cua_driver_core::element_token::token_for(id, 1))
-    });
+    let (snapshots, token) =
+        cua_driver_core::tool::with_runtime_scope(context.runtime_scope_key(), || {
+            let snapshots = cua_driver_core::snapshot_store::SnapshotStore::new();
+            let id = snapshots.publish(pid, 42, ElementPayload);
+            (snapshots, cua_driver_core::element_token::token_for(id, 1))
+        });
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(ElementAction {
         def: ToolDef {
-            name: "set_value".into(), description: "protected token target".into(),
+            name: "set_value".into(),
+            description: "protected token target".into(),
             input_schema: json!({"type":"object", "properties": {
                 "element_token": {"type":"string"}
             }}),
-            read_only: false, destructive: false, idempotent: true, open_world: false,
+            read_only: false,
+            destructive: false,
+            idempotent: true,
+            open_world: false,
         },
-        pid, snapshots, calls: calls.clone(),
+        pid,
+        snapshots,
+        calls: calls.clone(),
     }));
-    let result = registry.invoke_with_context("set_value", json!({"element_token": token}), context).await;
-    assert_eq!(result.structured_content.unwrap()["refusal"]["code"], "permission_denied");
+    let result = registry
+        .invoke_with_context("set_value", json!({"element_token": token}), context)
+        .await;
+    assert_eq!(
+        result.structured_content.unwrap()["refusal"]["code"],
+        "permission_denied"
+    );
     assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 

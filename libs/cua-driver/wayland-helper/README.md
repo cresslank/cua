@@ -9,14 +9,14 @@ normal Wayland client cannot do these things globally.
 
 It exposes `org.cua.WinRects` on the session bus:
 
-- `GetVersion() -> uint` — this fork's helper API version (v14, with the v8
+- `GetVersion() -> uint`: this fork's helper API version (v14, with the v8
   semantic cursor/session-badge API). The driver accepts it only after resolving
   the helper's immutable D-Bus owner and proving that owner is the current
   user's system-installed `gnome-shell` process.
-- `GetCapabilities() -> json` — an independent exact-target protocol version (4),
+- `GetCapabilities() -> json`: an independent exact-target protocol version (4),
   helper epoch, and exact-target capabilities. Driver/helper version skew fails
   closed.
-- `GetRects() -> json` — every window's epoch-qualified target id, workspace,
+- `GetRects() -> json`: every window's epoch-qualified target id, workspace,
   monitor, sticky/visibility state, frame geometry, and surface-buffer
   origin. cua-driver combines the buffer origin with AT-SPI
   `CoordType::Window` per-widget coords: `screen = origin + window_xy`. This is
@@ -24,7 +24,7 @@ It exposes `org.cua.WinRects` on the session bus:
   `CoordType::Screen` is `(0,0)` for every widget on Mutter). Keeping the frame
   and buffer origins separate accounts for GTK client-side shadows.
 - `BeginForeground(transaction,target) -> json` / `QueryForeground(transaction)` /
-  `AbortForeground(transaction)` / `EndForeground(transaction)` — the caller
+  `AbortForeground(transaction)` / `EndForeground(transaction)`: the caller
   allocates the transaction ID before activation, so a lost or delayed reply can
   be queried and reconciled before the host-wide raw-input lease is released.
   Activate one exact current-workspace target even when another ordinary window
@@ -35,14 +35,14 @@ It exposes `org.cua.WinRects` on the session bus:
   keep-focused action. A Shell input grab means an active Shell modal count or
   key focus inside `Main.uiGroup`; ordinary application-surface key focus is not
   misclassified as Shell chrome.
-- `CaptureTarget(target) -> capture_json` — capture only the
+- `CaptureTarget(target) -> capture_json`: capture only the
   exact target rectangle when it is painted, unoccluded by higher-stacked
   windows, and free of Shell modal/input grabs. The JSON result binds target
   id, epoch, geometry, stage size, and target-only PNG bytes to one Shell-side
   operation; no caller receives a broader stage image. Cua's in-process cursor
   actor is explicitly non-occluding. Unsafe requests fail closed.
 - `MoveCursorFor(owner,target,x,y)` / `ClickPulseFor` / `HideCursorFor` /
-  `RemoveCursor` — render independently owned cursors and hide them whenever
+  `RemoveCursor`: render independently owned cursors and hide them whenever
   their target is not actually visible on the active workspace. The D-Bus
   connection's unique owner, not the caller label alone, owns those actors;
   `NameOwnerChanged` cleanup reaps them after normal or abnormal process exit.
