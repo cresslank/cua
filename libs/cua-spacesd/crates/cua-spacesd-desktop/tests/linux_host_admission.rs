@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: FSL-1.1-MIT
+// Copyright (c) 2026 Cua AI, Inc.
+
 //! Admission tests run in fresh, env-cleared processes: no host display or bus.
 #![cfg(target_os = "linux")]
 
