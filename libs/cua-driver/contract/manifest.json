@@ -997,7 +997,11 @@
                 "enum": [
                   "native",
                   "fitts",
-                  "fixed"
+                  "fixed",
+                  "relaxed",
+                  "steady",
+                  "calm",
+                  "deliberate"
                 ],
                 "type": "string"
               },
@@ -4295,7 +4299,7 @@
             "type": "number"
           },
           "glide_duration_ms": {
-            "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` timing also fixes the duration. Clamped to 0..5000.",
+            "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` or the default `steady` timing also fixes the duration.\nExplicit zero uses speed-based motion unless a timing preset was selected.\nClamped to 0..5000.",
             "type": "number"
           },
           "idle_hide_ms": {
@@ -4327,11 +4331,15 @@
             "type": "string"
           },
           "timing": {
-            "description": "`native` uses the style's own timing; `fitts` scales the move time with distance and\ntarget size; `fixed` uses glide_duration_ms (1430 ms when 0).",
+            "description": "`steady` (default) keeps the style's timing but makes every move take at least 600 ms,\nwith a gentler ease; `relaxed` and `calm` do the same with a 450 or 750 ms floor.\n`native` uses the style's own timing; `fitts` scales the move time with distance and\ntarget size; `deliberate` is a slower Fitts curve (450..1300 ms); `fixed` uses\nglide_duration_ms (1430 ms when 0).",
             "enum": [
               "native",
               "fitts",
-              "fixed"
+              "fixed",
+              "relaxed",
+              "steady",
+              "calm",
+              "deliberate"
             ],
             "type": "string"
           },
@@ -4419,7 +4427,11 @@
                 "enum": [
                   "native",
                   "fitts",
-                  "fixed"
+                  "fixed",
+                  "relaxed",
+                  "steady",
+                  "calm",
+                  "deliberate"
                 ],
                 "type": "string"
               },
@@ -4898,7 +4910,7 @@
                 "type": "number"
               },
               "glide_duration_ms": {
-                "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` timing also fixes the duration. Clamped to 0..5000.",
+                "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` or the default `steady` timing also fixes the duration.\nExplicit zero uses speed-based motion unless a timing preset was selected.\nClamped to 0..5000.",
                 "type": "number"
               },
               "idle_hide_ms": {
@@ -4926,11 +4938,15 @@
                 "type": "string"
               },
               "timing": {
-                "description": "`native` uses the style's own timing; `fitts` scales the move time with distance and\ntarget size; `fixed` uses glide_duration_ms (1430 ms when 0).",
+                "description": "`steady` (default) keeps the style's timing but makes every move take at least 600 ms,\nwith a gentler ease; `relaxed` and `calm` do the same with a 450 or 750 ms floor.\n`native` uses the style's own timing; `fitts` scales the move time with distance and\ntarget size; `deliberate` is a slower Fitts curve (450..1300 ms); `fixed` uses\nglide_duration_ms (1430 ms when 0).",
                 "enum": [
                   "native",
                   "fitts",
-                  "fixed"
+                  "fixed",
+                  "relaxed",
+                  "steady",
+                  "calm",
+                  "deliberate"
                 ],
                 "type": "string"
               },
@@ -5101,7 +5117,11 @@
                 "enum": [
                   "native",
                   "fitts",
-                  "fixed"
+                  "fixed",
+                  "relaxed",
+                  "steady",
+                  "calm",
+                  "deliberate"
                 ],
                 "type": "string"
               },

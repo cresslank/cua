@@ -26,6 +26,7 @@
 
 import { NEW_SPACE_COVERAGE } from "./ops/new-space";
 import { SHARE_COVERAGE } from "./ops/share";
+import { AGENT_DETAIL_COVERAGE } from "./ops/agent-detail";
 import { AGENT_KEYS_COVERAGE } from "./ops/agent-keys";
 import { KEYVAULT_MANAGE_COVERAGE } from "./ops/keyvault-manage";
 import { KEYVAULT_SETUP_COVERAGE } from "./ops/keyvault-setup";
@@ -39,6 +40,7 @@ import { HOST_SETUP_COVERAGE } from "./ops/host-setup";
 import { SPACE_DETAIL_COVERAGE } from "./ops/space-detail";
 import { STREAM_COVERAGE } from "./ops/stream";
 import { RELAY_USAGE_COVERAGE } from "./ops/relay-usage";
+import { PRESENCE_COVERAGE } from "./ops/presence";
 import { TELEMETRY_COVERAGE } from "./ops/telemetry";
 import { STARTUP_COVERAGE } from "./ops/startup";
 
@@ -79,7 +81,7 @@ export const HOST_COVERAGE = {
   },
   "keyvault.overview": { webkit: { methods: ["keyvault.get"] }, tauri: ["keyvault_overview"] },
   "keyvault.unlock": {
-    webkit: { methods: ["keyvault.unlockVault"], byDesign: "a passphrase never crosses the bridge: native_only" },
+    webkit: { methods: ["keyvault.unlockVault"], byDesign: "the host asks for the passphrase itself: native_only" },
     tauri: ["keyvault_unlock", "keyvault_unlock_passphrase"],
   },
   "keyvault.setUnattended": {
@@ -119,6 +121,7 @@ export const HOST_COVERAGE = {
   "agents.resume": { webkit: { methods: ["agents.resume"] }, tauri: ["agents_tool"] },
   "agents.setup": { webkit: { methods: ["agents.setup"] }, tauri: ["agent_setup_detect"] },
   "agents.configure": { webkit: { methods: ["agents.configure"] }, tauri: ["agent_setup_configure"] },
+  ...AGENT_DETAIL_COVERAGE,
   ...NEW_SPACE_COVERAGE,
   ...TELEPORT_COVERAGE,
   ...SHARE_COVERAGE,
@@ -157,6 +160,7 @@ export const HOST_COVERAGE = {
   ...STARTUP_COVERAGE,
   ...STREAM_COVERAGE,
   ...RELAY_USAGE_COVERAGE,
+  ...PRESENCE_COVERAGE,
 } as const satisfies Record<OpName, OpCoverage>;
 
 /**

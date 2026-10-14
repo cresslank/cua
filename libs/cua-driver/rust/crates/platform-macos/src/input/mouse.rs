@@ -105,6 +105,14 @@ impl WindowClickDelivery {
     }
 }
 
+/// Write exactly `flags` on a posted mouse event. An event made from the
+/// HID-state source otherwise keeps whatever modifiers the HID state holds,
+/// so a held or stuck Control would turn a background click into a
+/// Control-click (a context menu instead of a click).
+fn set_explicit_flags(event: &CGEvent, flags: CGEventFlags) {
+    event.set_flags(flags);
+}
+
 /// Left-click at `(x, y)` screen coordinates, posted to `pid`.
 ///
 /// Window-local coordinates for backgrounded targets: if `window_local` is
@@ -462,9 +470,7 @@ fn click_at_xy_inner(
                 CGMouseButton::Left,
             )
             .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
-            if flags != CGEventFlags::CGEventFlagNull {
-                down.set_flags(flags);
-            }
+            set_explicit_flags(&down, flags);
 
             post_mouse_event_with_mode(
                 pid,
@@ -489,9 +495,7 @@ fn click_at_xy_inner(
                 CGMouseButton::Left,
             )
             .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
-            if flags != CGEventFlags::CGEventFlagNull {
-                up.set_flags(flags);
-            }
+            set_explicit_flags(&up, flags);
 
             post_mouse_event_with_mode(
                 pid,
@@ -713,9 +717,7 @@ pub fn click_at_xy_chromium(
             step.skylight_window_location.0,
             step.skylight_window_location.1,
         );
-        if flags != CGEventFlags::CGEventFlagNull {
-            event.set_flags(flags);
-        }
+        set_explicit_flags(event, flags);
     };
 
     let post = |event: &CGEvent, _step: &ChromiumClickRouteStep| {
@@ -914,9 +916,7 @@ where
     // MouseDown at start.
     let down = CGEvent::new_mouse_event(source.clone(), down_type, from_pt, cg_button)
         .map_err(|_| anyhow::anyhow!("drag mouseDown failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        down.set_flags(flags);
-    }
+    set_explicit_flags(&down, flags);
     post_mouse_event(
         pid,
         &down,
@@ -946,9 +946,7 @@ where
         let drag_pt = CGPoint::new(ix, iy);
         let drag = CGEvent::new_mouse_event(source.clone(), dragged_type, drag_pt, cg_button)
             .map_err(|_| anyhow::anyhow!("drag mouseDragged failed"))?;
-        if flags != CGEventFlags::CGEventFlagNull {
-            drag.set_flags(flags);
-        }
+        set_explicit_flags(&drag, flags);
         post_mouse_event(pid, &drag, il, wid, click_group_id, 1, button_number, 0);
         release_point = drag_pt;
         release_local = il;
@@ -965,9 +963,7 @@ where
     let to_pt = release_point;
     let up = CGEvent::new_mouse_event(source.clone(), up_type, to_pt, cg_button)
         .map_err(|_| anyhow::anyhow!("drag mouseUp failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        up.set_flags(flags);
-    }
+    set_explicit_flags(&up, flags);
     post_mouse_event(
         pid,
         &up,
@@ -1007,9 +1003,7 @@ fn post_drag_mouse_event(
     debug_assert_eq!(mode, MousePostMode::HidOnly);
     let event = new_global_mouse_event(event_type, point, button)
         .map_err(|_| anyhow::anyhow!(error_context.to_owned()))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        event.set_flags(flags);
-    }
+    set_explicit_flags(&event, flags);
     post_mouse_event_with_mode(
         pid,
         &event,
@@ -1422,9 +1416,7 @@ fn middle_click_at_xy_inner(
         CGMouseButton::Center,
     )
     .map_err(|_| anyhow::anyhow!("middle mouse down failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        down.set_flags(flags);
-    }
+    set_explicit_flags(&down, flags);
     post_mouse_event(pid, &down, window_local, None, None, 1, 2, 3);
     std::thread::sleep(std::time::Duration::from_millis(16));
 
@@ -1435,9 +1427,7 @@ fn middle_click_at_xy_inner(
         CGMouseButton::Center,
     )
     .map_err(|_| anyhow::anyhow!("middle mouse up failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        up.set_flags(flags);
-    }
+    set_explicit_flags(&up, flags);
     post_mouse_event(pid, &up, window_local, None, None, 1, 2, 3);
 
     Ok(())
@@ -1516,9 +1506,7 @@ fn right_click_at_xy_inner(
         CGMouseButton::Right,
     )
     .map_err(|_| anyhow::anyhow!("right mouse down failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        down.set_flags(flags);
-    }
+    set_explicit_flags(&down, flags);
     // button_number = 1 (right). Stamping 0 here routes the event as a left
     // button-number on the receiving side even though the type is rightMouseDown.
     post_mouse_event_with_mode(
@@ -1541,9 +1529,7 @@ fn right_click_at_xy_inner(
         CGMouseButton::Right,
     )
     .map_err(|_| anyhow::anyhow!("right mouse up failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        up.set_flags(flags);
-    }
+    set_explicit_flags(&up, flags);
     post_mouse_event_with_mode(
         pid,
         &up,
@@ -2258,5 +2244,28 @@ mod tests {
         let expected =
             CGEventFlags::CGEventFlagCommand.bits() | CGEventFlags::CGEventFlagShift.bits();
         assert_eq!(&modifiers[1..], [expected, expected]);
+    }
+}
+
+#[cfg(test)]
+mod explicit_flags_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_flags_clear_an_inherited_modifier() {
+        let source = CGEventSource::new(CGEventSourceStateID::Private).expect("event source");
+        let event = CGEvent::new_mouse_event(
+            source,
+            CGEventType::LeftMouseDown,
+            core_graphics::geometry::CGPoint::new(10.0, 10.0),
+            CGMouseButton::Left,
+        )
+        .expect("mouse event");
+        // As if the HID state had Control down when the event was made.
+        event.set_flags(CGEventFlags::CGEventFlagControl);
+        set_explicit_flags(&event, CGEventFlags::CGEventFlagNull);
+        assert_eq!(event.get_flags(), CGEventFlags::CGEventFlagNull);
+        set_explicit_flags(&event, CGEventFlags::CGEventFlagCommand);
+        assert_eq!(event.get_flags(), CGEventFlags::CGEventFlagCommand);
     }
 }

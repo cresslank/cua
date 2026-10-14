@@ -247,7 +247,7 @@ impl<S: RenderEntry, P> RenderMap<S, P> {
     pub fn state_for_key(&self, key: &str) -> S {
         let mut config = keyed_config(&self.template, key);
         if let Some(value) = self.session_glide_defaults.get(key) {
-            config.motion.glide_duration_ms = *value;
+            config.motion.apply_glide_default(Some(*value));
         }
         S::from_config(config)
     }
@@ -261,7 +261,7 @@ impl<S: RenderEntry, P> RenderMap<S, P> {
             .unwrap_or_else(|| {
                 let mut motion = keyed_config(&self.template, key).motion;
                 if let Some(value) = self.session_glide_defaults.get(key) {
-                    motion.glide_duration_ms = *value;
+                    motion.apply_glide_default(Some(*value));
                 }
                 motion
             })
@@ -269,6 +269,9 @@ impl<S: RenderEntry, P> RenderMap<S, P> {
 
     /// Apply a config default live without overwriting explicit motion calls.
     pub fn set_default_glide_duration(&mut self, session: Option<&str>, value: f64) {
+        if !value.is_finite() {
+            return;
+        }
         let value = value.clamp(0.0, 5000.0);
         if let Some(key) = session {
             if key.is_empty() || self.ended.contains(key) {
@@ -276,7 +279,7 @@ impl<S: RenderEntry, P> RenderMap<S, P> {
             }
             self.session_glide_defaults.insert(key.to_owned(), value);
         } else {
-            self.template.motion.glide_duration_ms = value;
+            self.template.motion.apply_glide_default(Some(value));
         }
         for (key, cursor) in &mut self.cursors {
             if session.is_some_and(|session| session != key) {
@@ -284,11 +287,12 @@ impl<S: RenderEntry, P> RenderMap<S, P> {
             }
             let motion = &mut cursor.core_mut().motion;
             if !motion.glide_duration_explicit {
-                motion.glide_duration_ms = self
+                let value = self
                     .session_glide_defaults
                     .get(key)
                     .copied()
                     .unwrap_or(value);
+                motion.apply_glide_default(Some(value));
             }
         }
     }
@@ -334,6 +338,7 @@ impl<S: RenderEntry, P> RenderMap<S, P> {
             if !motion.glide_duration_explicit {
                 motion.glide_duration_ms = cursor.core().motion.glide_duration_ms;
                 motion.glide_duration_explicit = cursor.core().motion.glide_duration_explicit;
+                motion.glide_duration_configured = cursor.core().motion.glide_duration_configured;
             }
         }
         let dirty = cursor.apply_command(cmd);
@@ -418,6 +423,110 @@ mod tests {
     use crate::ReducedMotion;
 
     type Map = RenderMap<RenderStateCore>;
+
+    #[test]
+    fn startup_and_live_glide_precedence_preserve_zero_and_runtime_choices() {
+        use crate::{MotionConfig, MotionTiming};
+        use serde_json::json;
+
+        for persisted in [None, Some(0.0), Some(180.0)] {
+            for explicit in [None, Some(0.0), Some(320.0)] {
+                let args = explicit
+                    .map(|value| vec!["--glide-ms".into(), format!("{value}")])
+                    .unwrap_or_default();
+                let mut config = CursorConfig::parse(&args);
+                config.motion.apply_glide_default(persisted);
+                let mut map = Map::new(config, ());
+                let expected = explicit.or(persisted).unwrap_or(0.0);
+                let timing = if explicit.or(persisted) == Some(0.0) {
+                    MotionTiming::Native
+                } else {
+                    MotionTiming::Steady
+                };
+                for key in ["default", "existing", "future"] {
+                    let motion = map.motion_for_key(key);
+                    assert_eq!(motion.glide_duration_ms, expected);
+                    assert_eq!(motion.params().timing, timing);
+                }
+                map.cursor_mut("existing").unwrap();
+                for live in [0.0, 410.0] {
+                    map.set_default_glide_duration(None, live);
+                    map.set_default_glide_duration(Some("scoped"), live);
+                    for key in ["default", "existing", "future", "scoped"] {
+                        let motion = map.motion_for_key(key);
+                        assert_eq!(motion.glide_duration_ms, explicit.unwrap_or(live));
+                        assert_eq!(
+                            motion.params().timing,
+                            if explicit.unwrap_or(live) == 0.0 {
+                                MotionTiming::Native
+                            } else {
+                                MotionTiming::Steady
+                            }
+                        );
+                    }
+                }
+                // A per-cursor update outranks both startup and future live defaults.
+                for value in [0.0, 260.0] {
+                    let motion = map
+                        .motion_for_key("per-call")
+                        .with_motion_args(&json!({"glide_duration_ms":value}))
+                        .unwrap();
+                    map.apply_command("per-call".into(), OverlayCommand::SetMotion(motion));
+                    map.set_default_glide_duration(None, 850.0);
+                    map.set_default_glide_duration(Some("per-call"), 900.0);
+                    assert_eq!(map.motion_for_key("per-call").glide_duration_ms, value);
+                    assert_eq!(
+                        map.motion_for_key("per-call").params().timing,
+                        if value == 0.0 {
+                            MotionTiming::Native
+                        } else {
+                            MotionTiming::Steady
+                        }
+                    );
+                }
+            }
+        }
+        // A specifically selected timing retains its semantics even with legacy zero.
+        let mut motion = MotionConfig::default();
+        motion.apply_glide_default(Some(0.0));
+        for timing in ["steady", "fitts", "calm", "native"] {
+            let selected = motion.with_motion_args(&json!({"timing":timing})).unwrap();
+            assert_eq!(selected.params().timing.as_str(), timing);
+        }
+    }
+
+    #[test]
+    fn duration_defaults_are_finite_and_zero_changes_actual_planned_timing() {
+        use crate::trajectory::{plan_move, MoveRequest, Pt};
+        let mut config = CursorConfig::default();
+        let request = MoveRequest::new(Pt::new(0.0, 0.0), Pt::new(20.0, 0.0));
+        let absent = plan_move(&config.motion, &request);
+        config.motion.apply_glide_default(Some(0.0));
+        let zero = plan_move(&config.motion, &request);
+        assert!(
+            zero.duration() < absent.duration(),
+            "zero must not inherit the steady floor"
+        );
+        config.motion.apply_glide_default(Some(180.0));
+        let positive = plan_move(&config.motion, &request);
+        assert!(
+            (positive.arrival_t - 0.180).abs() < 0.06,
+            "arrival={}, settle ends={}",
+            positive.arrival_t,
+            positive.duration()
+        );
+        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            config.motion.apply_glide_default(Some(value));
+            assert_eq!(config.motion.glide_duration_ms, 180.0);
+            let parsed = CursorConfig::parse(&["--glide-ms".into(), value.to_string()]);
+            assert!(!parsed.motion.glide_duration_explicit);
+        }
+        let mut map = Map::new(config, ());
+        map.cursor_mut("existing").unwrap();
+        map.set_default_glide_duration(None, f64::NAN);
+        assert_eq!(map.motion_for_key("existing").glide_duration_ms, 180.0);
+        assert_eq!(map.motion_for_key("future").glide_duration_ms, 180.0);
+    }
 
     #[test]
     fn glide_defaults_update_existing_and_future_cursors_but_preserve_explicit_overrides() {

@@ -22,7 +22,7 @@
  * contract test fails when it is out of date.
  */
 
-import type { AgentEventsPage, AgentSetupRow, PersistentAgent, SpaceAgentRun } from "./agents";
+import type { AgentDetailInput, AgentEventsPage, AgentOpenFile, AgentSetupRow, PersistentAgent, SpaceAgentRun } from "./agents";
 import type { DeviceInput, DevicesInput, EnrollResult, MachineAccessNotice, PairingCode } from "./devices";
 import type {
   CancelOutcome,
@@ -59,9 +59,10 @@ import type { AgentSetupOutcome, DriveGrantInput, DriveMountInput, DriveRequestI
 import type { AgentKeysReport } from "../ops/agent-keys";
 import type { SentFileInfo, SpaceThumbnail, SpaceUsage, SpaceWindows } from "../ops/space-detail";
 import type { RelayUsage } from "../ops/relay-usage";
+import type { PresenceCursorWire, PresenceJoinInfo, PresenceParticipantWire } from "../ops/presence";
 import type { StartupState } from "../ops/startup";
 import type { StreamTicket } from "../ops/stream";
-import type { HostSettings, HostSignIn, OpName, SessionSnapshot, SettingsSnapshot, SettingsValues } from "../protocol";
+import type { GlobalShortcut, HostSettings, HostSignIn, OpName, SessionSnapshot, SettingsSnapshot, SettingsValues } from "../protocol";
 import type { WebkitMethod, WkHostState, WkMachines, WkSession, WkSettings, WkSettingsRow, WkSpace, WkSpaces } from "../webkit-protocol";
 import { Defs, any, bool, dict, list, nul, nullable, num, obj, object, oneOf, opt, optNull, str, union, type Schema } from "./schema";
 
@@ -217,8 +218,17 @@ const SettingsShape = ref(
       obj<TelemetryView>()({ enabled: bool, source: str, sourceKind: str, noticeShown: bool, noticeText: str, docsUrl: str }),
     ),
     hostSettings: opt(
-      obj<HostSettings>()({ lumeSource: optNull(str), linuxSource: optNull(str), autoConnect: optNull(bool), keyvaultAutoWipe: optNull(bool) }),
+      obj<HostSettings>()({
+        lumeSource: optNull(str),
+        linuxSource: optNull(str),
+        autoConnect: optNull(bool),
+        keyvaultAutoWipe: optNull(bool),
+        keyvaultUnlockPrompt: optNull(bool),
+        keyvaultSiteIcons: optNull(bool),
+        keyvaultProtection: optNull(list(obj<{ label: string; value: string }>()({ label: str, value: str }))),
+      }),
     ),
+    globalShortcut: optNull(obj<GlobalShortcut>()({ label: str, registered: bool })),
   }),
 );
 
@@ -559,7 +569,45 @@ const KvGrantShape = ref(
 
 const hostStatusOrNull = HostStatusShape;
 const agentSetupRows = list(AgentSetupRowShape);
+const AgentDetailShape = ref(
+  "AgentDetailInput",
+  obj<AgentDetailInput>()({
+    home: list(object({ path: str, name: str, size: num })),
+    routines: list(object({ id: str, title: str, label: str, enabled: bool })),
+    grants: list(object({ agent: str, machine: str, revoked: bool })),
+    audit: list(object({ tsMs: num, action: str, principal: str, path: str, detail: str })),
+    thisMachine: nullable(str),
+  }),
+);
+const AgentOpenFileShape = ref(
+  "AgentOpenFile",
+  obj<AgentOpenFile>()({
+    path: str,
+    text: str,
+    binary: bool,
+    versions: list(object({ version: str, modifiedMs: num, deleted: bool, latest: bool })),
+  }),
+);
 const shares = list(ShareShape);
+const PresenceParticipantShape = ref(
+  "PresenceParticipant",
+  obj<PresenceParticipantWire>()({ participantId: str, principalId: str, displayName: str, color: str, kind: str }),
+);
+const PresenceCursorShape = ref(
+  "PresenceCursor",
+  obj<PresenceCursorWire>()({
+    displayId: str,
+    windowId: opt(str),
+    x: num,
+    y: num,
+    visible: bool,
+    pressed: bool,
+    shape: str,
+    shapeSource: str,
+    atMs: num,
+    receivedMs: num,
+  }),
+);
 
 export const OP_SHAPES: Record<OpName, Schema> = {
   "spaces.list": list(SpaceRowShape),
@@ -626,6 +674,14 @@ export const OP_SHAPES: Record<OpName, Schema> = {
   "agents.resume": nul,
   "agents.setup": agentSetupRows,
   "agents.configure": agentSetupRows,
+  "agents.detail": AgentDetailShape,
+  "agents.readFile": AgentOpenFileShape,
+  "agents.restoreFile": nul,
+  "agents.addRoutine": nul,
+  "agents.setRoutine": nul,
+  "agents.removeRoutine": nul,
+  "agents.allowComputer": nul,
+  "agents.revokeComputer": nul,
 
   "spaces.createOptions": NewSpaceOptionsShape,
   "spaces.add": SpaceRowShape,
@@ -720,6 +776,15 @@ export const OP_SHAPES: Record<OpName, Schema> = {
       upgradeUrl: nullable(str),
     }),
   ),
+  "presence.join": obj<PresenceJoinInfo>()({
+    handle: str,
+    me: PresenceParticipantShape,
+    members: list(object({ participant: PresenceParticipantShape, cursor: opt(PresenceCursorShape) })),
+    delayMs: num,
+    datagrams: bool,
+  }),
+  "presence.publish": nul,
+  "presence.leave": nul,
 
   "about.get": AboutShape,
   "about.set": AboutShape,
@@ -856,6 +921,7 @@ const WkSettingsShape = ref(
               label: str,
               enabled: bool,
               help: optNull(str),
+              value: optNull(str),
               options: list(object({ id: str, label: str, active: bool })),
             }),
           ),
@@ -863,6 +929,7 @@ const WkSettingsShape = ref(
       ),
     }),
     updateChannel: optNull(oneOf("stable", "beta")),
+    globalShortcut: optNull(object({ label: str, registered: bool })),
   }),
 );
 
@@ -988,6 +1055,14 @@ export const WEBKIT_SHAPES: Partial<Record<WebkitMethod, Schema>> = {
   "agents.setup": agentSetupRows,
   "agents.configure": agentSetupRows,
   "agents.setupDriver": OP_SHAPES["agents.setupDriver"],
+  "agents.detail": AgentDetailShape,
+  "agents.readFile": AgentOpenFileShape,
+  "agents.restoreFile": nul,
+  "agents.addRoutine": nul,
+  "agents.setRoutine": nul,
+  "agents.removeRoutine": nul,
+  "agents.allowComputer": nul,
+  "agents.revokeComputer": nul,
   "agentKeys.list": AgentKeysWire,
   "agentKeys.set": AgentKeysWire,
   "agentKeys.remove": AgentKeysWire,
@@ -1066,6 +1141,7 @@ export const WEBKIT_SHAPES: Partial<Record<WebkitMethod, Schema>> = {
   "window.setDragRegions": nul,
   "startup.get": StartupShape,
   "startup.act": StartupShape,
+  "relay.usage": OP_SHAPES["relay.usage"],
 };
 
 /** Methods whose answer has no shape here, and why (none today: keep the

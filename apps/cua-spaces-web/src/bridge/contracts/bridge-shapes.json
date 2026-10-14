@@ -54,6 +54,124 @@
         "checking"
       ]
     },
+    "AgentDetailInput": {
+      "type": "object",
+      "properties": {
+        "home": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "size": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "path",
+              "name",
+              "size"
+            ]
+          }
+        },
+        "routines": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "label": {
+                "type": "string"
+              },
+              "enabled": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "id",
+              "title",
+              "label",
+              "enabled"
+            ]
+          }
+        },
+        "grants": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "agent": {
+                "type": "string"
+              },
+              "machine": {
+                "type": "string"
+              },
+              "revoked": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "agent",
+              "machine",
+              "revoked"
+            ]
+          }
+        },
+        "audit": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "tsMs": {
+                "type": "number"
+              },
+              "action": {
+                "type": "string"
+              },
+              "principal": {
+                "type": "string"
+              },
+              "path": {
+                "type": "string"
+              },
+              "detail": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tsMs",
+              "action",
+              "principal",
+              "path",
+              "detail"
+            ]
+          }
+        },
+        "thisMachine": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "home",
+        "routines",
+        "grants",
+        "audit",
+        "thisMachine"
+      ]
+    },
     "AgentKeysReport": {
       "type": "object",
       "properties": {
@@ -128,6 +246,52 @@
         "providers",
         "available",
         "unavailable"
+      ]
+    },
+    "AgentOpenFile": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "binary": {
+          "type": "boolean"
+        },
+        "versions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "version": {
+                "type": "string"
+              },
+              "modifiedMs": {
+                "type": "number"
+              },
+              "deleted": {
+                "type": "boolean"
+              },
+              "latest": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "version",
+              "modifiedMs",
+              "deleted",
+              "latest"
+            ]
+          }
+        }
+      },
+      "required": [
+        "path",
+        "text",
+        "binary",
+        "versions"
       ]
     },
     "AgentSetupRow": {
@@ -1592,6 +1756,79 @@
         "machine"
       ]
     },
+    "PresenceCursor": {
+      "type": "object",
+      "properties": {
+        "displayId": {
+          "type": "string"
+        },
+        "windowId": {
+          "type": "string"
+        },
+        "x": {
+          "type": "number"
+        },
+        "y": {
+          "type": "number"
+        },
+        "visible": {
+          "type": "boolean"
+        },
+        "pressed": {
+          "type": "boolean"
+        },
+        "shape": {
+          "type": "string"
+        },
+        "shapeSource": {
+          "type": "string"
+        },
+        "atMs": {
+          "type": "number"
+        },
+        "receivedMs": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "displayId",
+        "x",
+        "y",
+        "visible",
+        "pressed",
+        "shape",
+        "shapeSource",
+        "atMs",
+        "receivedMs"
+      ]
+    },
+    "PresenceParticipant": {
+      "type": "object",
+      "properties": {
+        "participantId": {
+          "type": "string"
+        },
+        "principalId": {
+          "type": "string"
+        },
+        "displayName": {
+          "type": "string"
+        },
+        "color": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "participantId",
+        "principalId",
+        "displayName",
+        "color",
+        "kind"
+      ]
+    },
     "RemoteWindow": {
       "type": "object",
       "properties": {
@@ -1910,8 +2147,59 @@
                 "boolean",
                 "null"
               ]
+            },
+            "keyvaultUnlockPrompt": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "keyvaultSiteIcons": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "keyvaultProtection": {
+              "type": [
+                "array",
+                "null"
+              ],
+              "items": {
+                "type": "object",
+                "properties": {
+                  "label": {
+                    "type": "string"
+                  },
+                  "value": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "label",
+                  "value"
+                ]
+              }
             }
           }
+        },
+        "globalShortcut": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "registered": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "label",
+            "registered"
+          ]
         }
       },
       "required": [
@@ -3205,6 +3493,12 @@
                             "null"
                           ]
                         },
+                        "value": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
                         "options": {
                           "type": "array",
                           "items": {
@@ -3255,6 +3549,24 @@
             "stable",
             "beta",
             null
+          ]
+        },
+        "globalShortcut": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "label": {
+              "type": "string"
+            },
+            "registered": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "label",
+            "registered"
           ]
         }
       },
@@ -3527,11 +3839,20 @@
     "agentKeys.set": {
       "$ref": "#/$defs/AgentKeysReport"
     },
+    "agents.addRoutine": {
+      "type": "null"
+    },
+    "agents.allowComputer": {
+      "type": "null"
+    },
     "agents.configure": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/AgentSetupRow"
       }
+    },
+    "agents.detail": {
+      "$ref": "#/$defs/AgentDetailInput"
     },
     "agents.events": {
       "type": "object",
@@ -3651,7 +3972,19 @@
     "agents.pause": {
       "type": "null"
     },
+    "agents.readFile": {
+      "$ref": "#/$defs/AgentOpenFile"
+    },
+    "agents.removeRoutine": {
+      "type": "null"
+    },
+    "agents.restoreFile": {
+      "type": "null"
+    },
     "agents.resume": {
+      "type": "null"
+    },
+    "agents.revokeComputer": {
       "type": "null"
     },
     "agents.runs": {
@@ -3704,6 +4037,9 @@
           "turn"
         ]
       }
+    },
+    "agents.setRoutine": {
+      "type": "null"
     },
     "agents.setup": {
       "type": "array",
@@ -3947,6 +4283,53 @@
       }
     },
     "notifications.markAllRead": {
+      "type": "null"
+    },
+    "presence.join": {
+      "type": "object",
+      "properties": {
+        "handle": {
+          "type": "string"
+        },
+        "me": {
+          "$ref": "#/$defs/PresenceParticipant"
+        },
+        "members": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "participant": {
+                "$ref": "#/$defs/PresenceParticipant"
+              },
+              "cursor": {
+                "$ref": "#/$defs/PresenceCursor"
+              }
+            },
+            "required": [
+              "participant"
+            ]
+          }
+        },
+        "delayMs": {
+          "type": "number"
+        },
+        "datagrams": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "handle",
+        "me",
+        "members",
+        "delayMs",
+        "datagrams"
+      ]
+    },
+    "presence.leave": {
+      "type": "null"
+    },
+    "presence.publish": {
       "type": "null"
     },
     "relay.usage": {
@@ -4860,11 +5243,20 @@
         "available"
       ]
     },
+    "agents.addRoutine": {
+      "type": "null"
+    },
+    "agents.allowComputer": {
+      "type": "null"
+    },
     "agents.configure": {
       "type": "array",
       "items": {
         "$ref": "#/$defs/AgentSetupRow"
       }
+    },
+    "agents.detail": {
+      "$ref": "#/$defs/AgentDetailInput"
     },
     "agents.events": {
       "type": "object",
@@ -4982,7 +5374,19 @@
       }
     },
     "agents.pause": {},
+    "agents.readFile": {
+      "$ref": "#/$defs/AgentOpenFile"
+    },
+    "agents.removeRoutine": {
+      "type": "null"
+    },
+    "agents.restoreFile": {
+      "type": "null"
+    },
     "agents.resume": {},
+    "agents.revokeComputer": {
+      "type": "null"
+    },
     "agents.runs": {
       "type": "array",
       "items": {
@@ -5033,6 +5437,9 @@
           "turn"
         ]
       }
+    },
+    "agents.setRoutine": {
+      "type": "null"
     },
     "agents.setup": {
       "type": "array",
@@ -5327,6 +5734,91 @@
     },
     "notifications.markAllRead": {
       "type": "null"
+    },
+    "relay.usage": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "properties": {
+        "metered": {
+          "type": "boolean"
+        },
+        "period": {
+          "type": "string"
+        },
+        "plan": {
+          "type": "string"
+        },
+        "team": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "seats": {
+              "type": "number"
+            }
+          },
+          "required": [
+            "id",
+            "seats"
+          ]
+        },
+        "liveSessions": {
+          "type": "number"
+        },
+        "liveSessionsLimit": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "hoursUsed": {
+          "type": "number"
+        },
+        "hoursLimit": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "myHoursUsed": {
+          "type": "number"
+        },
+        "softLimitReached": {
+          "type": "boolean"
+        },
+        "reasons": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "upgradeUrl": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "metered",
+        "period",
+        "plan",
+        "team",
+        "liveSessions",
+        "liveSessionsLimit",
+        "hoursUsed",
+        "hoursLimit",
+        "myHoursUsed",
+        "softLimitReached",
+        "reasons",
+        "upgradeUrl"
+      ]
     },
     "session.get": {
       "$ref": "#/$defs/WkSession"

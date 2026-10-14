@@ -16,6 +16,8 @@ export const METHODS = [
   "machines.list", "host.status",
   "agents.list", "agents.runs", "agents.events", "agents.pause", "agents.resume",
   "agents.setup", "agents.configure",
+  "agents.detail", "agents.readFile", "agents.restoreFile", "agents.addRoutine", "agents.setRoutine",
+  "agents.removeRoutine", "agents.allowComputer", "agents.revokeComputer",
   "agentKeys.list", "agentKeys.set", "agentKeys.remove",
   "spaces.add", "clouds.status", "clouds.test", "clouds.connect",
   "teleport.catalog", "teleport.entryForPath", "teleport.windows", "teleport.remoteWindows",
@@ -40,11 +42,12 @@ export const METHODS = [
   "keyvault.showItems", "keyvault.delete", "keyvault.run", "keyvault.dismiss",
   "window.setBackgroundColor", "window.setDragRegions",
   "startup.get", "startup.act",
+  "relay.usage",
 ] as const;
 
 /** A live desktop's media ticket for the page's WebCodecs player, the
- * first run's state (the SwiftUI app draws its first run natively), and the
- * account's relay allowance. */
-export const ELECTRON_METHODS = ["onboarding.get", "onboarding.complete", "spaces.openStream", "relay.usage"] as const;
+ * first run's state (the SwiftUI app draws its first run natively), and
+ * presence over the page's video (the SwiftUI app draws it natively). */
+export const ELECTRON_METHODS = ["onboarding.get", "onboarding.complete", "spaces.openStream", "presence.join", "presence.publish", "presence.leave"] as const;
 
 export type Method = (typeof METHODS)[number] | (typeof ELECTRON_METHODS)[number];

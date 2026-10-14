@@ -231,14 +231,11 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) -> Option<CursorKey> {
 
 /// Initialise global overlay state (call once, before run_on_main_thread).
 pub fn init(mut cfg: CursorConfig) {
-    if !cfg.motion.glide_duration_explicit {
-        cfg.motion.glide_duration_ms = pip_preview::read_config_value(
-            cua_driver_core::agent_cursor::GLIDE_DURATION_CONFIG_KEY,
-        )
-        .as_ref()
-        .and_then(|v| cua_driver_core::agent_cursor::parse_glide_duration(v).ok())
-        .unwrap_or(0.0);
-    }
+    cfg.motion.apply_glide_default(
+        pip_preview::read_config_value(cua_driver_core::agent_cursor::GLIDE_DURATION_CONFIG_KEY)
+            .as_ref()
+            .and_then(|value| cua_driver_core::agent_cursor::parse_glide_duration(value).ok()),
+    );
     static INITIALIZED: OnceLock<()> = OnceLock::new();
     INITIALIZED.get_or_init(|| {
         let (tx, rx) = std::sync::mpsc::sync_channel(4096);

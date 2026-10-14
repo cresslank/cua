@@ -29,6 +29,7 @@ export {
   type SpacesHook,
 } from "./hooks";
 
+export { useAgentDetail, type AgentDetailHook } from "./agent-detail";
 export type { BridgeMode, DataAdapter } from "./adapter";
 export { HostError, UnsupportedOperationError, isNativeHost, isUnsupported } from "./adapter";
 export { createAdapter, createDemoAdapter, createElectronAdapter, createTauriAdapter, createWebkitAdapter } from "./adapters";
@@ -70,6 +71,7 @@ export {
   type AppearanceTheme,
   type HostEvent,
   type HostOperations,
+  type GlobalShortcut,
   type HostSettings,
   type OpName,
   type SettingKey,
@@ -90,7 +92,7 @@ export type * from "./contracts/settings";
 export type * from "./contracts/devices";
 export type * from "./contracts/notifications";
 export * from "./settings-hooks";
-export { NATIVE_ONLY_STEPS, signInCodeText, type SavedOnboarding } from "./onboarding";
+export { hasNotch, passedSteps, signInCodeText, type SavedOnboarding } from "./onboarding";
 export { useConnectCloud, useFirstSpaceOffers, useNewSpaceRequests, useNewSpaceWizard, type ConnectCloudHook, type FirstSpaceHook, type NewSpaceWizardHook } from "./new-space-hooks";
 export { createFailedText, emptyHome, type EmptyHome, type EmptyTile, type FirstSpaceOffer } from "./new-space";
 export type * from "./contracts/volume";
@@ -107,10 +109,19 @@ export { expiresInText, PAIRING_POLL_MS, pairingUnsupported, usePairingCode, typ
 export { READY_STARTUP, type StartupAction, type StartupPhase, type StartupState } from "./ops/startup";
 export {
   CHECKLIST_STEPS,
-  checklistComplete,
   useChecklist,
   type ChecklistHook,
+  type ChecklistRow,
   type ChecklistState,
   type ChecklistStep,
+  type ChecklistView,
 } from "./checklist";
-export { formatHours, relayUsageLine, useRelayUsage, RELAY_USAGE_FOCUS_MS, RELAY_USAGE_POLL_MS, type RelayUsage } from "./relay-usage";
+export {
+  useRelayUsage,
+  useRelayUsageView,
+  RELAY_USAGE_FOCUS_MS,
+  RELAY_USAGE_POLL_MS,
+  type RelayAllowanceNotice,
+  type RelayUsage,
+  type RelayUsageView,
+} from "./relay-usage";

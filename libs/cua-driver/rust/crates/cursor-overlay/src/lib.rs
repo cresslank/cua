@@ -149,8 +149,12 @@ impl CursorConfig {
                 }
                 "--no-overlay" => cfg.enabled = false,
                 "--glide-ms" => {
-                    if let Some(v) = args.get(i + 1).and_then(|s| s.parse().ok()) {
-                        cfg.motion.glide_duration_ms = v;
+                    if let Some(v) = args
+                        .get(i + 1)
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .filter(|v| v.is_finite())
+                    {
+                        cfg.motion.glide_duration_ms = v.clamp(0.0, 5000.0);
                         cfg.motion.glide_duration_explicit = true;
                         i += 1;
                     }

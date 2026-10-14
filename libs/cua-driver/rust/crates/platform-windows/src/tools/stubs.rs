@@ -235,7 +235,14 @@ stub_tool!(
     SetConfigTool,
     "set_config",
     "Update cua-driver-rs configuration.",
-    serde_json::json!({"type":"object","properties":{"capture_mode":{"type":"string","enum":["ax","vision"]},"max_image_dimension":{"type":"integer"},"agent_cursor_glide_duration_ms":cua_driver_core::agent_cursor::glide_duration_config_schema()},"additionalProperties":false})
+    {
+        let mut schema = serde_json::json!({"type":"object","properties":{"capture_mode":{"type":"string","enum":["ax","vision"]},"max_image_dimension":{"type":"integer"},"agent_cursor_glide_duration_ms":cua_driver_core::agent_cursor::glide_duration_config_schema()},"additionalProperties":false});
+        schema["properties"]
+            .as_object_mut()
+            .unwrap()
+            .extend(cursor_overlay::motion_defaults::config_schema_properties());
+        schema
+    }
 );
 
 stub_tool!(get_ax_tree_m, GetAccessibilityTreeTool, "get_accessibility_tree",

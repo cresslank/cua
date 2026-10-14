@@ -39,6 +39,12 @@ pub struct MotionConfig {
     /// Whether set_agent_cursor_motion explicitly selected the glide duration.
     #[serde(skip)]
     pub glide_duration_explicit: bool,
+    /// A persisted duration was present, including an explicit speed-based zero.
+    #[serde(skip)]
+    pub glide_duration_configured: bool,
+    /// A saved or per-cursor timing preset was selected instead of the built-in.
+    #[serde(skip)]
+    pub timing_explicit: bool,
     /// Post-click dwell in milliseconds. [0, 5000]
     pub dwell_after_click_ms: f64,
     /// Auto-hide delay in milliseconds. 0 = never hide. [0, 60000]
@@ -72,6 +78,8 @@ impl Default for MotionConfig {
             spring: 0.72,
             glide_duration_ms: 0.0, // 0 = speed-based mode
             glide_duration_explicit: false,
+            glide_duration_configured: false,
+            timing_explicit: false,
             dwell_after_click_ms: 80.0,
             // The shared agent idle timeout (presence drops an idle agent then too).
             idle_hide_ms: cua_driver_core::agent_cursor::default_idle_hide_ms(),
@@ -88,6 +96,29 @@ impl Default for MotionConfig {
 }
 
 impl MotionConfig {
+    /// Apply startup or live persisted configuration without replacing a runtime override.
+    pub fn apply_glide_default(&mut self, value: Option<f64>) {
+        if self.glide_duration_explicit {
+            return;
+        }
+        if let Some(value) = value.filter(|value| value.is_finite()) {
+            self.glide_duration_ms = value.clamp(0.0, 5000.0);
+            self.glide_duration_configured = true;
+        }
+    }
+
+    fn effective_timing(&self) -> MotionTiming {
+        if !self.timing_explicit
+            && self.timing == MotionTiming::default()
+            && self.glide_duration_ms == 0.0
+            && (self.glide_duration_explicit || self.glide_duration_configured)
+        {
+            MotionTiming::Native
+        } else {
+            self.timing
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn with_overrides(
         &self,
@@ -102,6 +133,7 @@ impl MotionConfig {
         press_duration_ms: Option<f64>,
         turn_radius: Option<f64>,
     ) -> Self {
+        let glide_duration_ms = glide_duration_ms.filter(|value| value.is_finite());
         fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
             v.clamp(lo, hi)
         }
@@ -117,6 +149,8 @@ impl MotionConfig {
                 5000.0,
             ),
             glide_duration_explicit: self.glide_duration_explicit || glide_duration_ms.is_some(),
+            glide_duration_configured: self.glide_duration_configured,
+            timing_explicit: self.timing_explicit,
             dwell_after_click_ms: clamp(
                 dwell_after_click_ms.unwrap_or(self.dwell_after_click_ms),
                 0.0,
@@ -179,9 +213,11 @@ impl MotionConfig {
         match args.get("timing") {
             None | Some(Value::Null) => {}
             Some(Value::String(name)) => {
+                out.timing_explicit = true;
                 out.timing = MotionTiming::parse(name).ok_or_else(|| {
                     format!(
-                        "unknown cursor motion timing `{name}`; expected native, fitts or fixed"
+                        "unknown cursor motion timing `{name}`; expected one of {}",
+                        MotionTiming::names()
                     )
                 })?;
             }
@@ -221,7 +257,7 @@ impl MotionConfig {
     pub fn params(&self) -> cua_cursor_motion::MotionParams {
         cua_cursor_motion::MotionParams {
             style: self.style,
-            timing: self.timing,
+            timing: self.effective_timing(),
             effects: self.effects,
             start_handle: self.start_handle,
             end_handle: self.end_handle,
@@ -251,7 +287,7 @@ impl MotionConfig {
             "idle_hide_ms": self.idle_hide_ms,
             "turn_radius": self.turn_radius,
             "style": self.style.as_str(),
-            "timing": self.timing.as_str(),
+            "timing": self.effective_timing().as_str(),
             "effects": {
                 "trail": effects.trail,
                 "glow": effects.glow,
