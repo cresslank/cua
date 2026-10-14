@@ -461,7 +461,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6bf601cccedfffec598ec2db1f9d6745885458bccc0e8916d7023f017c94b3d0"
 dependencies = [
  "atspi-common",
- "atspi-connection",
  "atspi-proxies",
  "zbus",
 ]
@@ -1409,16 +1408,19 @@ dependencies = [
  "cua-driver-contract",
  "cua-driver-core",
  "cursor-overlay",
+ "libc",
  "platform-linux",
  "platform-macos",
  "platform-windows",
  "serde",
  "serde_json",
+ "socket2",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
  "uniffi",
  "uuid",
+ "windows 0.58.0",
 ]
 
 [[package]]
@@ -4412,6 +4414,7 @@ dependencies = [
  "ashpd",
  "async-trait",
  "atspi",
+ "atspi-connection",
  "base64 0.22.1",
  "bitflags 2.13.1",
  "clipboard-rs",
