@@ -4,25 +4,48 @@ extern crate self as core_foundation;
 use std::cell::RefCell;
 pub mod base {
     pub type CFTypeRef = *const std::ffi::c_void;
-    pub unsafe fn CFRelease(_: CFTypeRef) {}
+    pub unsafe fn CFRelease(p: CFTypeRef) {
+        super::SCENE.with(|s| {
+            let mut s = s.borrow_mut();
+            let refs = &mut s.refs[p as usize - 1];
+            assert!(*refs > 0, "releasing an unowned AX object");
+            *refs -= 1;
+        });
+    }
     pub unsafe fn CFRetain(p: CFTypeRef) -> CFTypeRef {
+        super::SCENE.with(|s| s.borrow_mut().refs[p as usize - 1] += 1);
         p
     }
 }
 #[derive(Clone)]
 struct Scene {
-    owners: [Option<u32>; 3],
+    owners: [Option<u32>; 5],
     clamped: bool,
     mutations: usize,
     reparent: Option<usize>,
+    inner: bool,
+    inner_moves: bool,
+    recipients: Vec<usize>,
+    refs: [usize; 5],
 }
-thread_local! { static SCENE: RefCell<Scene> = const { RefCell::new(Scene { owners: [Some(7); 3], clamped: false, mutations: 0, reparent: None }) }; }
+thread_local! { static SCENE: RefCell<Scene> = const { RefCell::new(Scene { owners: [Some(7); 5], clamped: false, mutations: 0, reparent: None, inner: false, inner_moves: true, recipients: Vec::new(), refs: [0; 5] }) }; }
 mod bindings {
     pub type AXUIElementRef = *const std::ffi::c_void;
     pub unsafe fn element_at_screen_position(_: i32, _: f64, _: f64) -> Option<AXUIElementRef> {
+        super::base::CFRetain(1 as _);
         Some(1 as _)
     }
     pub unsafe fn copy_string_attr(p: AXUIElementRef, _: &str) -> Option<String> {
+        if super::SCENE.with(|s| s.borrow().inner) {
+            return Some(
+                match p as usize {
+                    2 => "AXGroup",
+                    4 => "AXWebArea",
+                    _ => "AXStaticText",
+                }
+                .into(),
+            );
+        }
         Some(
             if p as usize == 2 {
                 "AXScrollArea"
@@ -33,7 +56,15 @@ mod bindings {
         )
     }
     pub unsafe fn copy_element_attr(p: AXUIElementRef, _: &str) -> Option<AXUIElementRef> {
-        (p as usize == 1).then_some(2 as _)
+        let parent = match p as usize {
+            1 => Some(2 as _),
+            2 if super::SCENE.with(|s| s.borrow().inner) => Some(4 as _),
+            _ => None,
+        };
+        if let Some(parent) = parent {
+            super::base::CFRetain(parent);
+        }
+        parent
     }
     pub unsafe fn copy_children(p: AXUIElementRef) -> Vec<AXUIElementRef> {
         if p as usize == 2 {
@@ -43,7 +74,11 @@ mod bindings {
                     s.owners[index] = Some(8);
                 }
             });
+            super::base::CFRetain(3 as _);
             vec![3 as _]
+        } else if p as usize == 4 && super::SCENE.with(|s| s.borrow().inner) {
+            super::base::CFRetain(5 as _);
+            vec![5 as _]
         } else {
             vec![]
         }
@@ -51,6 +86,14 @@ mod bindings {
     pub unsafe fn element_screen_rect(p: AXUIElementRef) -> Option<[f64; 4]> {
         super::SCENE.with(|s| {
             let s = s.borrow();
+            if s.inner {
+                return Some(match p as usize {
+                    2 | 4 => [0., 0., 100., 100.],
+                    3 if s.inner_moves && s.recipients.contains(&3) => [0., 40., 50., 20.],
+                    5 if s.recipients.contains(&5) => [0., 40., 50., 20.],
+                    _ => [0., 120., 50., 20.],
+                });
+            }
             Some(if p as usize == 2 {
                 [0., 0., 100., 100.]
             } else if s.mutations > 0 {
@@ -62,9 +105,13 @@ mod bindings {
             })
         })
     }
-    pub unsafe fn perform_action(_: AXUIElementRef, action: &str) -> bool {
+    pub unsafe fn perform_action(p: AXUIElementRef, action: &str) -> bool {
         assert_eq!(action, "AXScrollToVisible");
-        super::SCENE.with(|s| s.borrow_mut().mutations += 1);
+        super::SCENE.with(|s| {
+            let mut s = s.borrow_mut();
+            s.mutations += 1;
+            s.recipients.push(p as usize);
+        });
         true
     }
 }
@@ -85,15 +132,20 @@ fn run_reparenting(
 ) -> (bool, usize) {
     SCENE.with(|s| {
         *s.borrow_mut() = Scene {
-            owners,
+            owners: [owners[0], owners[1], owners[2], Some(7), Some(7)],
             clamped,
             mutations: 0,
             reparent,
+            inner: false,
+            inner_moves: true,
+            recipients: Vec::new(),
+            refs: [0; 5],
         }
     });
     let outcome = unsafe {
         reveal_scroll::reveal_scroll(42, 7, (50., 50.), Some([0., 0., 100., 100.]), "down", 60.)
     };
+    SCENE.with(|s| assert_eq!(s.borrow().refs, [0; 5], "all retained AX objects released"));
     (outcome.is_some(), SCENE.with(|s| s.borrow().mutations))
 }
 #[test]
@@ -128,4 +180,43 @@ fn authority_is_rechecked_after_traversal_in_both_mutation_branches() {
             );
         }
     }
+}
+
+fn inner_case(inner_moves: bool, wrong_owner: Option<usize>) -> Vec<usize> {
+    SCENE.with(|s| {
+        let mut scene = s.borrow_mut();
+        *scene = Scene {
+            owners: [Some(7); 5],
+            clamped: false,
+            mutations: 0,
+            reparent: None,
+            inner: true,
+            inner_moves,
+            recipients: Vec::new(),
+            refs: [0; 5],
+        };
+        if let Some(index) = wrong_owner {
+            scene.owners[index] = Some(8);
+        }
+    });
+    unsafe {
+        reveal_scroll::reveal_scroll(42, 7, (50., 50.), Some([0., 0., 100., 100.]), "down", 60.);
+    }
+    SCENE.with(|s| {
+        assert_eq!(s.borrow().refs, [0; 5], "all candidates and hit released");
+        s.borrow().recipients.clone()
+    })
+}
+
+#[test]
+fn electron_inner_group_wins_before_outer_web_area() {
+    assert_eq!(inner_case(true, None), vec![3]);
+}
+
+#[test]
+fn electron_outer_fallback_revalidates_its_own_recipient() {
+    assert_eq!(inner_case(false, None), vec![3, 5]);
+    assert_eq!(inner_case(false, Some(3)), vec![3]);
+    assert_eq!(inner_case(false, Some(4)), vec![3]);
+    assert_eq!(inner_case(false, Some(0)), Vec::<usize>::new());
 }

@@ -4155,17 +4155,36 @@ fn unavailable_webkit_keyboard_background(
         })
 }
 
+/// Add accessibility setup details without admitting a disabled keyboard route.
+fn background_keyboard_refusal(atspi_ok: bool) -> ToolResult {
+    let mut refusal = crate::input::delivery::background_unavailable_error(
+        crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
+    );
+    if !atspi_ok {
+        let bus = crate::health_report::START_ATSPI_BUS_HINT;
+        refusal
+            .content
+            .push(cua_driver_core::protocol::Content::text(format!(
+                "AT-SPI is unavailable. {bus} Or use delivery_mode \"foreground\"."
+            )));
+    }
+    refusal
+}
+
+fn atspi_up() -> bool {
+    // The probe builds its own runtime; join on every platform so it cannot
+    // outlive the refusal. A Wayland session does not prove bus availability.
+    std::thread::spawn(crate::health_report::probe_a11y_bus)
+        .join()
+        .unwrap_or(false)
+}
+
 fn unavailable_gtk_keyboard_background(
     pid: u32,
     delivery: crate::input::delivery::DeliveryMode,
 ) -> Option<ToolResult> {
-    (!delivery.is_foreground() && is_gtk_process(pid) && !crate::wayland::is_inject_mode()).then(
-        || {
-            crate::input::delivery::background_unavailable_error(
-                crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
-            )
-        },
-    )
+    (!delivery.is_foreground() && is_gtk_process(pid) && !crate::wayland::is_inject_mode())
+        .then(|| background_keyboard_refusal(atspi_up()))
 }
 
 /// Refusal for a background element click that falls back to an X11
@@ -5092,6 +5111,46 @@ fn keyboard_retained_errors_preserve_stale_refusal() {
         observed_keyboard_error(anyhow::anyhow!("write timed out; refusing replay"));
     assert_eq!(indeterminate.is_error, Some(true));
     assert!(indeterminate.structured_content.is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn background_keyboard_refusal_names_missing_atspi_bus() {
+    let plain = crate::input::delivery::background_unavailable_error(
+        crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
+    );
+    let text = |refusal: &ToolResult| -> String {
+        refusal
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                cua_driver_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    };
+    let (missing, reachable) = (
+        background_keyboard_refusal(false),
+        background_keyboard_refusal(true),
+    );
+    for needle in [
+        "AT-SPI is unavailable",
+        "at-spi-bus-launcher",
+        "delivery_mode \"foreground\"",
+    ] {
+        assert!(
+            text(&missing).contains(needle),
+            "{needle} missing from {}",
+            text(&missing)
+        );
+    }
+    assert!(!text(&reachable).contains("AT-SPI is unavailable"));
+    for refusal in [missing, reachable] {
+        let structured = refusal.structured_content.unwrap();
+        let expected = plain.structured_content.as_ref().unwrap();
+        assert_eq!(structured["code"], expected["code"]);
+        assert_eq!(structured["escalation"], expected["escalation"]);
+    }
 }
 
 #[cfg(test)]
@@ -7923,11 +7982,7 @@ impl Tool for TypeTextTool {
                 })
                 .await;
             return match result {
-                Ok(Ok("background_unavailable")) => {
-                    crate::input::delivery::background_unavailable_error(
-                        crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
-                    )
-                }
+                Ok(Ok("background_unavailable")) => background_keyboard_refusal(atspi_up()),
                 Ok(Ok(path)) => ToolResult::text(format!(
                     "Typed {text_len} character(s) (terminal emulator: pty/XTest key events)."
                 ))
@@ -7978,9 +8033,7 @@ impl Tool for TypeTextTool {
         .flatten();
         if focus_kind == Some(false) {
             if !delivery.is_foreground() {
-                return crate::input::delivery::background_unavailable_error(
-                    crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
-                );
+                return background_keyboard_refusal(atspi_up());
             }
             let text_f = text.clone();
             let result = cua_driver_core::blocking::spawn(move || {
@@ -8107,11 +8160,7 @@ impl Tool for TypeTextTool {
                 text_len,
                 &format!("via X11, delivery_mode={mode_label}"),
             ),
-            Ok(Ok("background_unavailable")) => {
-                crate::input::delivery::background_unavailable_error(
-                    crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
-                )
-            }
+            Ok(Ok("background_unavailable")) => background_keyboard_refusal(atspi_up()),
             Ok(Ok(path)) => ToolResult::text(format!(
                 "Typed {text_len} character(s) (via X11, delivery_mode={mode_label})."
             ))
