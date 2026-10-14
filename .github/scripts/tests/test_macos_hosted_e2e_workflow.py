@@ -194,7 +194,15 @@ def test_hosted_macos_probe_is_manual_exact_sha_and_least_privilege() -> None:
     assert "permissions:\n  actions: read\n  contents: read\n  pull-requests: read\n" in workflow
     assert "id-token: write" not in workflow
     assert "secrets." not in workflow
-    assert "runs-on: macos-26" in workflow
+    import runpy
+
+    fork_macos_runner = runpy.run_path(
+        str(Path(__file__).with_name("test_fork_macos_routing.py"))
+    )["expression"]
+
+    for job in ("probe", "matrix"):
+        expected = fork_macos_runner(f"e2e-rust-macos/{job}", "macos-26")
+        assert f"runs-on: {expected}" in workflow
     assert "ref: ${{ inputs.source_sha }}" in workflow
     assert "CUA_E2E_WORKFLOW_SHA: ${{ github.sha }}" in workflow
     assert "source_sha must match the selected workflow ref tip" in workflow

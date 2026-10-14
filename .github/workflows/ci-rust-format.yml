@@ -31,7 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (matrix.os == 'macos-latest' || matrix.os == 'macos-26') && vars.FORK_MACOS_CI_ENABLED == 'true' && vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'ci-rust-format/format') && fromJSON(vars.FORK_MACOS_RUNNER) || matrix.os }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

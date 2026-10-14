@@ -59,7 +59,7 @@ jobs:
   probe:
     if: inputs.mode != 'lume'
     name: hosted environment probe
-    runs-on: macos-26
+    runs-on: ${{ vars.FORK_MACOS_CI_ENABLED == 'true' && vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.workflow_ref == format('{0}/.github/workflows/e2e-rust-macos.yml@{1}', github.repository, github.ref) && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'e2e-rust-macos/probe') && fromJSON(vars.FORK_MACOS_RUNNER) || 'macos-26' }}
     timeout-minutes: 20
     env:
       CUA_E2E_SOURCE_SHA: ${{ inputs.source_sha }}
@@ -129,7 +129,7 @@ jobs:
     if: inputs.mode != 'lume'
     needs: probe
     name: hosted ${{ matrix.lane }} lane
-    runs-on: macos-26
+    runs-on: ${{ vars.FORK_MACOS_CI_ENABLED == 'true' && vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && github.workflow_ref == format('{0}/.github/workflows/e2e-rust-macos.yml@{1}', github.repository, github.ref) && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'e2e-rust-macos/matrix') && fromJSON(vars.FORK_MACOS_RUNNER) || 'macos-26' }}
     timeout-minutes: 180
     strategy:
       fail-fast: false

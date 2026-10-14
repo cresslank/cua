@@ -48,7 +48,7 @@ env:
 jobs:
   platform-linux-off-linux:
     name: platform-linux compiles on macOS
-    runs-on: macos-latest
+    runs-on: ${{ vars.FORK_MACOS_CI_ENABLED == 'true' && vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'ci-platform-linux-portability/platform-linux-off-linux') && fromJSON(vars.FORK_MACOS_RUNNER) || 'macos-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5

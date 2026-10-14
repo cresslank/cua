@@ -75,7 +75,7 @@ jobs:
         # macOS 26: the ScreenCaptureKit dependency compiles Metal bindings for
         # macOS 26 APIs and needs that SDK.
         os: [ubuntu-latest, macos-26, windows-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (matrix.os == 'macos-latest' || matrix.os == 'macos-26') && vars.FORK_MACOS_CI_ENABLED == 'true' && vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'ci-cua-spacesd/test') && fromJSON(vars.FORK_MACOS_RUNNER) || matrix.os }}
     timeout-minutes: 60
     defaults:
       run:

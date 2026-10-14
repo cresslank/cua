@@ -4,6 +4,12 @@ from pathlib import Path
 
 import yaml
 
+import runpy
+
+fork_macos_runner = runpy.run_path(
+    str(Path(__file__).with_name("test_fork_macos_routing.py"))
+)["expression"]
+
 
 ROOT = Path(__file__).resolve().parents[3]
 WORKFLOW = ROOT / ".github/workflows/ci-jev-use.yml"
@@ -33,9 +39,11 @@ def test_workflow_is_read_only_and_never_reads_secrets() -> None:
     assert "pull_request_target" not in workflow[True]
 
 
-def test_released_driver_jobs_run_on_hosted_macos_and_windows() -> None:
+def test_released_driver_jobs_keep_hosted_defaults_and_owner_only_macos_opt_in() -> None:
     jobs = load()["jobs"]
-    assert jobs["released-driver-macos"]["runs-on"].startswith("macos-")
+    assert jobs["released-driver-macos"]["runs-on"] == fork_macos_runner(
+        "ci-jev-use/released-driver-macos", "macos-26"
+    )
     assert jobs["released-driver-windows"]["runs-on"].startswith("windows-")
 
 
@@ -115,7 +123,9 @@ def test_macos_seeds_tcc_only_for_the_released_app_identity() -> None:
 def test_native_appkit_job_uses_released_driver_and_source_harness() -> None:
     """RFC #4268 Phase 1: native tasks on the AppKit harness with the mock provider."""
     jobs = load()["jobs"]
-    assert jobs["native-appkit-macos"]["runs-on"].startswith("macos-")
+    assert jobs["native-appkit-macos"]["runs-on"] == fork_macos_runner(
+        "ci-jev-use/native-appkit-macos", "macos-26"
+    )
     native = job_text("native-appkit-macos")
     assert "https://cua.ai/driver/install.sh" in native
     assert "cargo build" not in native

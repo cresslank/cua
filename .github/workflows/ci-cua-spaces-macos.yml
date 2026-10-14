@@ -77,7 +77,7 @@ jobs:
   swift:
     name: SwiftUI app (swift test, bundle, XCUITest)
     needs: core
-    runs-on: macos-26
+    runs-on: ${{ vars.FORK_MACOS_CI_ENABLED == 'true' && vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'ci-cua-spaces-macos/swift') && fromJSON(vars.FORK_MACOS_RUNNER) || 'macos-26' }}
     env:
       CARGO_BUILD_JOBS: 4
     steps:

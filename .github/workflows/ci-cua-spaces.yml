@@ -87,7 +87,7 @@ jobs:
           - name: linux-deb-appimage
             os: ubuntu-22.04
             bundles: deb,appimage
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (matrix.os == 'macos-latest' || matrix.os == 'macos-26') && vars.FORK_MACOS_CI_ENABLED == 'true' && vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'ci-cua-spaces/bundle') && fromJSON(vars.FORK_MACOS_RUNNER) || matrix.os }}
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_BUILD_JOBS: 4
