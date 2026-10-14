@@ -45,7 +45,9 @@ env:
 jobs:
   link:
     name: Fresh macOS link without duplicate symbols
-    runs-on: macos-latest
+    # Only owner-originated work may opt into the fork's disposable VM pool.
+    # Keep hosted runners for external contributions and when the variable is unset.
+    runs-on: ${{ vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.FORK_MACOS_RUNNER) || 'macos-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
