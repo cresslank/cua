@@ -2266,12 +2266,12 @@ mod hardened_tests {
         });
     }
 
-    #[cfg(unix)]
     #[test]
     fn window_only_screenshot_lookup_requires_one_current_owned_snapshot() {
         crate::tool::with_runtime_scope(format!("snapshot-test-{}", uuid::Uuid::new_v4()), || {
             isolated(|| {
                 let cache = SnapshotStore::new();
+                let mut other_process = super::tests::LiveProcess::new();
                 let first = cache
                     .publish_for_session(
                         std::process::id() as i32,
@@ -2313,7 +2313,7 @@ mod hardened_tests {
 
                 cache
                     .publish_for_session(
-                        unsafe { libc::getppid() },
+                        other_process.pid(),
                         20,
                         Payload(vec![]),
                         Some("client-a"),
@@ -2708,13 +2708,67 @@ mod tests {
     use crate::snapshot_test_support::Payload;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    // Re-execute only this test to own a real, distinct process on every platform.
+    // The environment marker is confined to the child test binary, not production.
+    #[test]
+    fn live_process_fixture() {
+        if std::env::var_os("CUA_SNAPSHOT_STORE_TEST_CHILD").is_some() {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    pub(super) struct LiveProcess(std::process::Child);
+
+    impl LiveProcess {
+        pub(super) fn new() -> Self {
+            let child = Self(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "snapshot_store::tests::live_process_fixture"])
+                    .env("CUA_SNAPSHOT_STORE_TEST_CHILD", "1")
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("spawn snapshot identity fixture"),
+            );
+            assert_ne!(child.0.id(), std::process::id());
+            child
+        }
+
+        pub(super) fn pid(&mut self) -> i32 {
+            assert!(self.0.try_wait().expect("query identity fixture").is_none());
+            i32::try_from(self.0.id()).expect("fixture PID fits registry PID")
+        }
+    }
+
+    impl Drop for LiveProcess {
+        fn drop(&mut self) {
+            // Kill and reap even during assertion unwinding. The child also has a
+            // bounded lifetime if the parent itself is terminated before Drop.
+            let _ = self.0.kill();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match self.0.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    result => {
+                        panic!("identity fixture did not reap within five seconds: {result:?}")
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn pid_for_token_finds_the_owning_process() {
         crate::tool::with_runtime_scope(format!("snapshot-test-{}", uuid::Uuid::new_v4()), || {
             let cache = SnapshotStore::new();
+            let mut other_process = super::tests::LiveProcess::new();
             let pid = std::process::id() as i32;
             let id = cache.publish(pid, 7, Payload(vec![10, 20]));
-            cache.publish(unsafe { libc::getppid() }, 8, Payload(vec![1]));
+            cache.publish(other_process.pid(), 8, Payload(vec![1]));
             let args = serde_json::json!({ "element_token": token_for(id, 1) });
             assert_eq!(cache.pid_for_token(&args), Some(pid));
             assert_eq!(cache.pid_for_token(&serde_json::json!({})), None);
@@ -2835,6 +2889,7 @@ mod tests {
     fn semantic_membership_ignores_capture_only_publication() {
         crate::tool::with_runtime_scope(format!("snapshot-test-{}", uuid::Uuid::new_v4()), || {
             let cache = SnapshotStore::new();
+            let mut other_process = super::tests::LiveProcess::new();
             assert!(!cache.contains_window(std::process::id() as i32, 99));
             assert!(!cache.contains_semantic_window(std::process::id() as i32, 99));
 
@@ -2853,7 +2908,7 @@ mod tests {
             cache.publish(std::process::id() as i32, 99, Payload(vec![]));
             assert!(cache.contains_semantic_window(std::process::id() as i32, 99));
             assert!(!cache.contains_semantic_window(std::process::id() as i32, 100));
-            assert!(!cache.contains_semantic_window(unsafe { libc::getppid() }, 99));
+            assert!(!cache.contains_semantic_window(other_process.pid(), 99));
 
             cache.remove(std::process::id() as i32, 99);
             assert!(!cache.contains_window(std::process::id() as i32, 99));
@@ -2885,11 +2940,11 @@ mod tests {
     fn tokens_in_different_pids_dont_collide() {
         crate::tool::with_runtime_scope(format!("snapshot-test-{}", uuid::Uuid::new_v4()), || {
             let cache = SnapshotStore::new();
+            let mut other_process = super::tests::LiveProcess::new();
             let first = cache.publish(std::process::id() as i32, 11, Payload(vec![0]));
-            cache.publish(unsafe { libc::getppid() }, 22, Payload(vec![0]));
+            cache.publish(other_process.pid(), 22, Payload(vec![0]));
             assert_eq!(
-                token_refusal(&cache, unsafe { libc::getppid() }, &token_for(first, 0))["refusal"]
-                    ["code"],
+                token_refusal(&cache, other_process.pid(), &token_for(first, 0))["refusal"]["code"],
                 "stale_element_token"
             );
         });
@@ -3425,6 +3480,7 @@ mod tests {
     fn window_only_screenshot_lookup_requires_one_current_owned_snapshot() {
         crate::tool::with_runtime_scope(format!("snapshot-test-{}", uuid::Uuid::new_v4()), || {
             let cache = SnapshotStore::new();
+            let mut other_process = super::tests::LiveProcess::new();
             let first = cache
                 .publish_for_session(
                     std::process::id() as i32,
@@ -3465,7 +3521,7 @@ mod tests {
                 .is_err());
 
             cache.publish_for_session(
-                unsafe { libc::getppid() },
+                other_process.pid(),
                 20,
                 Payload(vec![]),
                 Some("client-a"),

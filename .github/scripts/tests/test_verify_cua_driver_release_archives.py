@@ -28,6 +28,10 @@ CURRENT_HELPER_MEMBERS = (
     "wayland-helper/README.md",
     "wayland-helper/install.sh",
     "wayland-helper/tests/gnome_devkit.mjs",
+    "wayland-helper/tests/gnome_no_x11.sh",
+    "wayland-helper/tests/gnome_session_bus.conf",
+    "wayland-helper/tests/policy.test.mjs",
+    "wayland-helper/tests/run_gnome_devkit.sh",
     "wayland-helper/winrects@cua/extension.js",
     "wayland-helper/winrects@cua/metadata.json",
     "wayland-helper/winrects@cua/policy.js",
@@ -84,8 +88,7 @@ def _write_helper_source(root: Path, members: tuple[str, ...]) -> Path:
         path = source / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"payload for {member}\n", encoding="utf-8")
-        if relative == "install.sh":
-            path.chmod(0o755)
+        path.chmod(0o755 if relative.endswith(".sh") else 0o644)
     return source
 
 
@@ -145,6 +148,9 @@ def _write_linux_archives_like_workflow(
         path.write_bytes((b"\x7fELF" if name != "cua_driver_abi.h" else b"") + f"payload for {name}\n".encode())
         path.chmod(0o755 if name in {"cua-driver", "cua-cursor-theme"} else 0o644)
     (stage / "LICENSE").write_text("MIT license\n")
+    (stage / "LICENSE").chmod(0o644)
+    (stage / "THIRD_PARTY_NOTICES.md").write_text("Third-party notices\n")
+    (stage / "THIRD_PARTY_NOTICES.md").chmod(0o644)
     shutil.copytree(helper_source, stage / "wayland-helper")
 
     subprocess.run(
@@ -175,6 +181,43 @@ def _write_linux_archives_like_workflow(
         env={**os.environ, "COPYFILE_DISABLE": "1"},
         check=True,
     )
+    # Independently pin the producer's runtime sidecars and full-archive licenses.
+    # Do not populate this expectation from the verifier's contract.
+    runtime_members = {
+        "cua-driver",
+        "cua-cursor-theme",
+        "libcua_driver_sdk.so",
+        "cua_driver_node_runtime.node",
+        "cua_driver_abi.h",
+        *helper_members,
+    }
+    executable_members = {
+        "cua-driver",
+        "cua-cursor-theme",
+        "wayland-helper/install.sh",
+        "wayland-helper/tests/gnome_no_x11.sh",
+        "wayland-helper/tests/run_gnome_devkit.sh",
+    }
+    for suffix, prefix, members in (
+        (
+            ".tar.gz",
+            f"{stage_name}/",
+            runtime_members | {"LICENSE", "THIRD_PARTY_NOTICES.md"},
+        ),
+        ("-binary.tar.gz", "", runtime_members),
+    ):
+        with tarfile.open(release / f"{stage_name}{suffix}", "r:gz") as archive:
+            files = [member for member in archive.getmembers() if not member.isdir()]
+            assert len(files) == len(members)
+            assert {member.name for member in files} == {
+                prefix + name for name in members
+            }
+            for member in files:
+                assert member.isfile()
+                name = member.name.removeprefix(prefix)
+                assert stat.S_IMODE(member.mode) == (
+                    0o755 if name in executable_members else 0o644
+                )
     return tuple(
         contract
         for contract in release_contracts(VERSION, helper_members)
@@ -235,12 +278,44 @@ def test_historical_0_14_contract_comes_from_exact_candidate_source(
 def test_current_linux_producer_and_source_contract_are_closed(tmp_path: Path) -> None:
     source = Path(__file__).resolve().parents[3] / "libs/cua-driver/wayland-helper"
     helper_members = _wayland_helper_members(source)
+    assert set(helper_members) == set(CURRENT_HELPER_MEMBERS)
     contracts = _write_linux_archives_like_workflow(tmp_path, source, helper_members)
 
     for contract in contracts:
         _verify_tar(tmp_path / "release" / contract.filename, contract)
 
     assert len(contracts) == 2
+
+
+@pytest.mark.parametrize(
+    "helper_members", (HISTORICAL_0_14_HELPER_MEMBERS, CURRENT_HELPER_MEMBERS)
+)
+@pytest.mark.parametrize("missing", ("LICENSE", "THIRD_PARTY_NOTICES.md"))
+def test_linux_producer_missing_license_member_fails_closed(
+    tmp_path: Path, helper_members: tuple[str, ...], missing: str
+) -> None:
+    source = _write_helper_source(tmp_path, helper_members)
+    contracts = _write_linux_archives_like_workflow(tmp_path, source, helper_members)
+    target = next(
+        contract
+        for contract in contracts
+        if not contract.filename.endswith("-binary.tar.gz")
+    )
+    path = tmp_path / "release" / target.filename
+    missing_member = f"cua-driver-rs-{VERSION}-linux-x86_64/{missing}"
+    with tarfile.open(path, "r:gz") as archive:
+        kept = [
+            (member, archive.extractfile(member).read() if member.isfile() else None)
+            for member in archive.getmembers()
+            if member.name != missing_member
+        ]
+    with tarfile.open(path, "w:gz") as archive:
+        for member, payload in kept:
+            archive.addfile(member, BytesIO(payload) if payload is not None else None)
+
+    with pytest.raises(ContractError) as error:
+        _verify_tar(path, target)
+    assert str(error.value) == f"{target.filename} is missing {missing_member}"
 
 
 def test_missing_cursor_theme_fails_with_archive_and_member(
