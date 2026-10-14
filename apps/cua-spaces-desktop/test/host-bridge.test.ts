@@ -476,14 +476,14 @@ describe.skipIf(!built)("This machine, Devices and Settings on the app core", ()
 
   // MARK: Settings
 
-  it("lays out General with the Teams waitlist, Welcome and What is collected, and the runtimes", async () => {
+  it("lays out General with Teams, Welcome and What is collected, and the runtimes", async () => {
     const s = (await call("settings.get")) as {
       page: { sections: { id: string; rows: { id: string }[] }[] };
       updateChannel: unknown;
       globalShortcut: unknown;
     };
     const rows = s.page.sections.flatMap((x) => x.rows.map((r) => r.id));
-    expect(rows).toEqual(expect.arrayContaining(["account", "notch", "auto-connect", "welcome", "teams", "telemetry", "telemetry-note", "launch-at-login"]));
+    expect(rows).toEqual(expect.arrayContaining(["account", "notch", "auto-connect", "welcome", "teams", "teams-manage", "teams-billing", "telemetry", "telemetry-note", "launch-at-login"]));
     expect(rows).toEqual(expect.arrayContaining(["macos-runtime", "linux-runtime"]));
     expect(s.updateChannel).toBe("stable");
     // Another app holds ⌘⇧Space: the page says so.
@@ -497,6 +497,8 @@ describe.skipIf(!built)("This machine, Devices and Settings on the app core", ()
     expect(model.settings.menuBar).toBe(true);
     await call("settings.choose", { row: "auto-connect", option: "off" });
     expect(model.settings.autoConnect).toBe(false);
+    await call("settings.choose", { row: "team-current", option: "org-2" });
+    expect(model.settings.currentTeamId).toBe("org-2");
     await call("settings.choose", { row: "default-location", option: "cloud" });
     expect(model.settings.defaultLocation).toBe(native.AppLocation.Cloud);
     await call("settings.choose", { row: "telemetry", option: "off" });
@@ -513,12 +515,14 @@ describe.skipIf(!built)("This machine, Devices and Settings on the app core", ()
     expect(settingsEvents).toBeGreaterThan(0);
   });
 
-  it("offers every experiment but the New UI preview, which this app is", async () => {
+  it("offers every experiment but the New UI switch (Use classic UI), which this app is", async () => {
     const s = (await call("settings.get")) as { experiments: { sections: { rows: { id: string }[] }[] } };
     const rows = s.experiments.sections.flatMap((x) => x.rows.map((r) => r.id));
     expect(rows).toEqual(expect.arrayContaining(["experiment:cua_volume", "experiment:your_cloud", "experiment:sharing"]));
     expect(rows).not.toContain("experiment:web_ui");
+    expect(rows).not.toContain("experiment:classic_ui");
     expect(await code("settings.choose", { row: "experiment:web_ui", option: "off" })).toBe("unsupported");
+    expect(await code("settings.choose", { row: "experiment:classic_ui", option: "on" })).toBe("unsupported");
   });
 
   it("New Space's \u201cUse built-in Lume\u201d and \u201cUse built-in runtime\u201d change the Runtimes rows", async () => {

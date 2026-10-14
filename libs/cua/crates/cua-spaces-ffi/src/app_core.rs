@@ -1737,11 +1737,21 @@ fn default_cua_home(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> PathBuf
     if let Some(h) = set("CUA_HOME") {
         return PathBuf::from(h);
     }
-    set("HOME")
+    let base = set("HOME")
         .or_else(|| set("USERPROFILE"))
         .map(PathBuf::from)
         .unwrap_or_default()
-        .join(".cua")
+        .join(".cua");
+    // A non-production `CUA_ENV` has its own home, where its daemon serves
+    // the Keyvault (`~/.cua/envs/staging`).
+    let env = var("CUA_ENV").and_then(|v| v.into_string().ok());
+    match cua_home::env::CuaEnv::try_from_value(env.as_deref())
+        .unwrap_or_default()
+        .home_subdir()
+    {
+        Some(sub) => base.join(sub),
+        None => base,
+    }
 }
 
 #[uniffi::export]
@@ -1904,6 +1914,62 @@ fn relay_usage(u: cua_host::RelayUsage) -> AppRelayUsage {
     })
 }
 
+/// The account's Teams (the organizations of `GET /v1/me` on the Spaces
+/// API for this environment, `api.cua.ai` or `api.staging.cua.ai`), each
+/// with its members and pending invites, read with `account_token`.
+/// Both Spaces apps read Teams here; Settings words them
+/// (`app_settings_page`'s `teams`).
+#[uniffi::export]
+pub async fn app_teams(account_token: String) -> Result<AppTeamsInput> {
+    cua_sdk::support::run(async move {
+        let snapshot = cua_host::spaces_api::SpacesApiClient::current()?
+            .teams(&account_token)
+            .await?;
+        Ok(teams_input(snapshot, cua_home::env::account_app_url()))
+    })
+    .await
+}
+
+fn teams_input(s: cua_host::spaces_api::TeamsSnapshot, account_app_url: String) -> AppTeamsInput {
+    core::teams::TeamsInput {
+        account_app_url,
+        state: core::teams::TeamsState::Ready {
+            teams: s
+                .teams
+                .into_iter()
+                .map(|t| core::teams::TeamInput {
+                    id: t.org.id,
+                    alias: t.org.alias,
+                    name: t.org.name,
+                    role: t.org.role,
+                    plan: t.org.plan,
+                    seats: t.org.seats,
+                    members: t
+                        .members
+                        .into_iter()
+                        .map(|m| core::teams::TeamPersonInput {
+                            email: m.email,
+                            role: m.role,
+                        })
+                        .collect(),
+                    invites: t.invites.into_iter().map(|i| i.email).collect(),
+                })
+                .collect(),
+        },
+        // The apps fill the saved team in from their settings.
+        current_team_id: None,
+    }
+}
+
+/// The account app for this environment (`CUA_ACCOUNT_APP_URL`, else
+/// `https://app.cua.ai`, or `https://app.staging.cua.ai` under
+/// `CUA_ENV=staging`): billing, plans and team administration, which the
+/// apps open in the browser.
+#[uniffi::export]
+pub fn app_account_app_url() -> String {
+    cua_home::env::account_app_url()
+}
+
 /// Settings' "Relay usage" row and the notice past the allowance; none
 /// when the relay meters nothing.
 #[uniffi::export]
@@ -1922,6 +1988,35 @@ pub fn app_settings_load(path: String) -> AppSettings {
 pub fn app_settings_save(path: String, settings: AppSettings) -> Result<()> {
     core::settings::save(std::path::Path::new(&path), &settings)
         .map_err(|e| CuaError::Internal(e.to_string()))
+}
+
+/// The settings with the New UI as a launch of `version` shows it: the
+/// user's choice, else the default for the update channel and version
+/// (again after the channel changes).
+#[uniffi::export]
+pub fn app_settings_resolve_new_ui(settings: AppSettings, version: String) -> AppSettings {
+    core::settings::resolve_new_ui(&settings, &version)
+}
+
+/// The update channel of an install's first launch, from the file's
+/// `channel`: Beta for a prerelease, else unchanged.
+#[uniffi::export]
+pub fn app_settings_first_launch_channel(
+    channel: AppUpdateChannel,
+    version: String,
+) -> AppUpdateChannel {
+    core::settings::first_launch_channel(channel, &version)
+}
+
+/// The settings after a Settings, Experiments row's choice (the switches,
+/// and the New UI's "Use classic UI" saved as the user's choice).
+#[uniffi::export]
+pub fn app_settings_choose_experiment(
+    settings: AppSettings,
+    row: String,
+    option: String,
+) -> AppSettings {
+    core::settings::choose_experiment(&settings, &row, &option)
 }
 
 /// The Settings page.
@@ -2458,6 +2553,31 @@ pub fn app_checklist_reduce(
     core::checklist::reduce(&state, &action)
 }
 
+/// What the app shows as the checklist's `Observe` (every UI the same).
+#[uniffi::export]
+pub fn app_checklist_observe_from(seen: AppChecklistSeen) -> AppChecklistAction {
+    core::checklist::observe_from(&seen)
+}
+
+/// The Machines page's rows: this machine, your machines, your devices of
+/// their own, each computer once.
+#[uniffi::export]
+pub fn app_machines_page_rows(input: AppMachinesPageInput) -> Vec<AppMachinePageRow> {
+    core::machines::page_rows(&input)
+}
+
+/// Machines page input from JSON (fixtures, parity flows).
+#[uniffi::export]
+pub fn app_machines_page_input_from_json(json: String) -> Result<AppMachinesPageInput> {
+    from_json("machines page input", &json)
+}
+
+/// Checklist state from JSON, steps as words (fixtures, parity flows).
+#[uniffi::export]
+pub fn app_checklist_state_from_json(json: String) -> Result<AppChecklistState> {
+    from_json("checklist state", &json)
+}
+
 /// The getting-started checklist as drawn.
 #[uniffi::export]
 pub fn app_checklist_view(state: AppChecklistState) -> AppChecklistView {
@@ -2709,6 +2829,64 @@ mod keyvault_home_tests {
             home(&[("HOME", ""), ("USERPROFILE", r"C:\Users\ada")]),
             PathBuf::from(r"C:\Users\ada").join(".cua")
         );
+    }
+
+    /// Under `CUA_ENV=staging` the daemon (and so its Keyvault) lives in
+    /// `~/.cua/envs/staging`; the client must look there, not in the prod
+    /// home (CUA-1528).
+    #[test]
+    fn the_keyvault_follows_cua_env() {
+        assert_eq!(
+            home(&[("HOME", "/home/ada"), ("CUA_ENV", "staging")]),
+            PathBuf::from("/home/ada/.cua").join("envs/staging")
+        );
+        assert_eq!(
+            home(&[("HOME", "/home/ada"), ("CUA_ENV", "prod")]),
+            PathBuf::from("/home/ada/.cua")
+        );
+        assert_eq!(
+            home(&[("CUA_HOME", "/srv/cua"), ("CUA_ENV", "staging")]),
+            PathBuf::from("/srv/cua")
+        );
+    }
+}
+
+#[cfg(test)]
+mod teams_tests {
+    use super::*;
+    use cua_host::spaces_api::{ApiInvite, ApiMember, ApiOrg, TeamDetail, TeamsSnapshot};
+
+    #[test]
+    fn a_snapshot_becomes_the_cores_teams_input() {
+        let snapshot = TeamsSnapshot {
+            email: "ada@example.com".into(),
+            plan: "pro".into(),
+            teams: vec![TeamDetail {
+                org: ApiOrg {
+                    id: "o1".into(),
+                    alias: "acme".into(),
+                    name: "".into(),
+                    role: "admin".into(),
+                    plan: "teams".into(),
+                    status: "active".into(),
+                    seats: 3,
+                },
+                members: vec![ApiMember {
+                    sub: "u1".into(),
+                    email: "ada@example.com".into(),
+                    role: "admin".into(),
+                }],
+                invites: vec![ApiInvite {
+                    id: "i1".into(),
+                    email: "cy@example.com".into(),
+                }],
+            }],
+        };
+        let input = teams_input(snapshot, "https://app.cua.ai".into());
+        let rows = core::teams::rows(&input);
+        assert_eq!(rows[0].label, "acme");
+        assert_eq!(rows[2].label, "cy@example.com");
+        assert_eq!(rows[2].value.as_deref(), Some("(Invited)"));
     }
 }
 

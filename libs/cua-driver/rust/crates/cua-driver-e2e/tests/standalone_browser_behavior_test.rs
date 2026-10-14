@@ -626,8 +626,21 @@ fn navigate_initial_page(port: u16, server: &BrowserFixtureServer) {
     let mut last_error = None;
     let mut last_navigate = None;
     loop {
-        let targets = browser_http_json(port, "/json/list")
-            .unwrap_or_else(|error| panic!("read harness CDP targets: {error}"));
+        // A freshly launched browser's DevTools HTTP server can stall or
+        // drop one request while it finishes first-run setup (seen on Windows
+        // Edge). Retry inside the same bounded deadline instead of failing the
+        // case on a single transient read.
+        let targets = match browser_http_json(port, "/json/list") {
+            Ok(targets) => targets,
+            Err(error) => {
+                assert!(
+                    Instant::now() < deadline,
+                    "read harness CDP targets: {error}"
+                );
+                thread::sleep(Duration::from_millis(250));
+                continue;
+            }
+        };
         let pages = targets
             .as_array()
             .into_iter()
@@ -2432,7 +2445,7 @@ fn run_trusted_click(spec: &BrowserSpec) {
         std::env::consts::OS,
         spec.name
     );
-    let case = if cfg!(any(target_os = "linux", target_os = "macos")) {
+    let case = if cfg!(target_os = "linux") {
         refusal_case(
             &spec.name,
             "trusted_click",
@@ -2459,7 +2472,7 @@ fn run_trusted_click(spec: &BrowserSpec) {
                     "session": session,
                 }),
             );
-            if cfg!(any(target_os = "linux", target_os = "macos")) {
+            if cfg!(target_os = "linux") {
                 assert_eq!(click.action_effect(), Some("refused"), "{}", click.raw);
                 assert!(
                     click.text().contains("browser_input_trust_unavailable"),
@@ -3536,7 +3549,7 @@ fn run_multi_tab(spec: &BrowserSpec) {
                     "session": session,
                 }),
             );
-            let trusted_clicks = if cfg!(target_os = "windows") {
+            let trusted_clicks = if !cfg!(target_os = "linux") {
                 assert_eq!(
                     trusted.action_effect(),
                     Some("unverifiable"),

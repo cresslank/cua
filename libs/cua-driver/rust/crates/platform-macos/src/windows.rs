@@ -352,6 +352,7 @@ fn get_bounds_num(
                 None
             }
         })
+        .filter(|v| v.is_finite())
 }
 
 /// Look up a window by its CGWindowID across every layer.
@@ -577,6 +578,39 @@ mod tests {
             assert!(decode_onscreen_property(Some(Some(true)), options).unwrap());
             assert!(!decode_onscreen_property(Some(Some(false)), options).unwrap());
         }
+    }
+
+    #[test]
+    fn bounds_numbers_preserve_finite_values_and_refuse_non_finite_or_missing_values() {
+        use core_foundation::{
+            base::TCFType, dictionary::CFDictionary, number::CFNumber, string::CFString,
+        };
+
+        let bounds = CFDictionary::from_CFType_pairs(&[
+            (
+                CFString::new("X").as_CFType(),
+                CFNumber::from(12.5).as_CFType(),
+            ),
+            (
+                CFString::new("Y").as_CFType(),
+                CFNumber::from(f64::INFINITY).as_CFType(),
+            ),
+            (
+                CFString::new("Width").as_CFType(),
+                CFNumber::from(f64::NAN).as_CFType(),
+            ),
+            (
+                CFString::new("Height").as_CFType(),
+                CFNumber::from(f64::NEG_INFINITY).as_CFType(),
+            ),
+        ]);
+        let bounds = unsafe { CFDictionary::wrap_under_get_rule(bounds.as_concrete_TypeRef()) };
+
+        assert_eq!(get_bounds_num(&bounds, "X"), Some(12.5));
+        assert_eq!(get_bounds_num(&bounds, "Y"), None);
+        assert_eq!(get_bounds_num(&bounds, "Width"), None);
+        assert_eq!(get_bounds_num(&bounds, "Height"), None);
+        assert_eq!(get_bounds_num(&bounds, "Missing"), None);
     }
 
     #[test]

@@ -127,3 +127,59 @@ async fn cancellation_mpx_motion_retains_button_release() {
 async fn cancellation_mpx_wheel_retains_button_release() {
     cancelled_route(5).await;
 }
+
+#[tokio::test]
+async fn text_preflight_cancellation_stops_remapping_and_emission() {
+    for during_remap in [true, false] {
+        let (started, ready) = mpsc::channel();
+        let (resume, wait) = mpsc::channel();
+        let (done, finished) = mpsc::channel();
+        let task = cua_driver_core::blocking::spawn(move || {
+            let mut mapping = GetKeyboardMappingReply {
+                keysyms_per_keycode: 1,
+                sequence: 0,
+                keysyms: vec![0; 248],
+            };
+            if !during_remap {
+                mapping.keysyms[0] = 'a' as u32;
+                mapping.keysyms[1] = 'b' as u32;
+            }
+            let mut remaps = Vec::new();
+            let mut emitted = Vec::new();
+            let result = type_text_with_preflight::<()>(
+                "ab",
+                &mapping,
+                |ch, _| {
+                    remaps.push(ch);
+                    started.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok((8, None))
+                },
+                |key, _| {
+                    emitted.push(key);
+                    started.send(()).unwrap();
+                    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                    Ok(())
+                },
+            );
+            done.send((result.unwrap_err().to_string(), remaps, emitted))
+                .unwrap();
+        });
+        tokio::task::yield_now().await;
+        ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(task);
+        resume.send(()).unwrap();
+        let (error, remaps, emitted) = finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            error,
+            "native worker deadline expired or its waiter was cancelled"
+        );
+        if during_remap {
+            assert_eq!(remaps, ['a']);
+            assert!(emitted.is_empty());
+        } else {
+            assert!(remaps.is_empty());
+            assert_eq!(emitted, [8]);
+        }
+    }
+}

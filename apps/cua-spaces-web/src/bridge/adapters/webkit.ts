@@ -23,14 +23,16 @@
  * resolves without a call; the Electron shell's is this page's
  * (`onboarding.get`, `onboarding.complete`). Appearance and the hotkey are page-side; an appearance change sets
  * the window's background (`window.setBackgroundColor`). The page tells the
- * window where it drags (`window.setDragRegions`, `../drag-regions.ts`).
+ * window where it drags (`window.setDragRegions`, `../drag-regions.ts`), and
+ * where its Space tiles are for a real window dragged onto one
+ * (`window.setDropTargets`, `../window-drop.ts`).
  */
 
 import { Emitter, HostError, type DataAdapter } from "../adapter";
 import { hostOs, THIS_MACHINE, type HostOs } from "../host-os";
 import { electronTransport, webkitTransport, type HostTransport } from "../transport";
 import type { AgentEventsPage, AgentSetupRow, PersistentAgent, SpaceAgentRun } from "../contracts/agents";
-import type { CancelOutcome, DefaultLocation, HostStatus, MachineRow, SpacePowerReport } from "../contracts/host";
+import type { CancelOutcome, DefaultLocation, HostStatus, MachinePageRow, MachineRow, SpacePowerReport } from "../contracts/host";
 import type { HostWindow } from "../detect";
 import {
   DEFAULT_SETTINGS,
@@ -45,6 +47,7 @@ import {
 import type { KeyvaultOverview, KvGrant, KvPending } from "../contracts/keyvault";
 import type { CreateProgress } from "../contracts/host";
 import { syncDragRegions } from "../drag-regions";
+import { setWindowDropTarget, syncDropTargets, WINDOW_DROP_EVENT, windowDropTargetOf } from "../window-drop";
 import { requestNewSpace } from "../new-space";
 import { STOPPED_SHARING_ERROR, stoppedSharingLine, withNotSharing } from "../sharing";
 import { teleportProgressFromWk, webkitPageOps } from "../ops/webkit-pages";
@@ -56,6 +59,7 @@ import { webkitSettingsOps } from "../ops/settings";
 import { startupFromHost, webkitStartupOps } from "../ops/startup";
 import { unsupportedStreamOps, type StreamTicket } from "../ops/stream";
 import type { RelayUsage } from "../ops/relay-usage";
+import type { HostChecklistState } from "../ops/checklist";
 import { unsupportedPresenceOps, type PresenceJoinInfo } from "../ops/presence";
 import type { SpaceRow } from "../contracts/spaces";
 import {
@@ -131,12 +135,17 @@ export function spaceToRow(s: WkSpace): SpaceRow {
  * the store lists a machine and the device on it once
  * (`mergeMachineRows`). */
 export function toMachineRows(spaces: WkSpaces, machines: WkMachines | null, os: HostOs = "macos"): MachineRow[] {
+  if (machines?.rows?.length) return fromPageRows(spaces, machines, machines.rows);
   const self: MachineRow = { id: "this-mac", name: THIS_MACHINE[os], via: "local", online: true, os, current: true, limits: [] };
   if (machines?.thisMachine?.detail) self.detail = machines.thisMachine.detail;
   if (machines?.host) self.host = toHostStatus(machines.host);
   if (machines?.accessNotice) self.accessNotice = machines.accessNotice;
   const rows: MachineRow[] = [self];
   const byId = new Map(rows.map((r) => [r.id, r] as const));
+  // This computer is also on the relay under its own machine id once it is set
+  // up for access: that is the same row, not a second machine.
+  const hostMachineId = machines?.host?.machineId || undefined;
+  if (hostMachineId) byId.set(hostMachineId, self);
   const add = (row: MachineRow) => {
     byId.set(row.id, row);
     rows.push(row);
@@ -144,6 +153,8 @@ export function toMachineRows(spaces: WkSpaces, machines: WkMachines | null, os:
   for (const { space } of spaces.spaces) {
     // A machine's own desktop: `relay:<machine>` with no host above it.
     const own = space.provider === "relay" && !space.host && space.id.startsWith("relay:") ? space.id.slice(6) : undefined;
+    // A Space registered on the relay (`space-…`) is a Space, not a machine.
+    if (own?.startsWith("space-")) continue;
     if (own && !own.includes("/")) {
       // The list's connect probe was refused by a machine that stopped
       // sharing: it is connected (that is how it refused), not offline.
@@ -151,6 +162,8 @@ export function toMachineRows(spaces: WkSpaces, machines: WkMachines | null, os:
       const online = space.status === "running" || space.status === "local" || stopped;
       const limits = stopped ? withNotSharing([], stoppedSharingLine(space.name)) : [];
       const known = byId.get(own);
+      // This computer keeps its own name and system ("This computer", Linux).
+      if (known === self) continue;
       if (known) Object.assign(known, { name: space.name, os: space.os, online, limits });
       else add({ id: own, name: space.name, via: "relay", online, os: space.os, detail: space.detail || undefined, limits });
       continue;
@@ -182,6 +195,42 @@ export function toMachineRows(spaces: WkSpaces, machines: WkMachines | null, os:
     });
   }
   return rows;
+}
+
+/** The host's rows from the core (`machines.pageRows`, as the SwiftUI
+ * Machines page lists them), with what the page draws beside them: this
+ * machine's host status and summary, a device's state and detail, and why
+ * a machine that stopped sharing is not reachable. */
+function fromPageRows(spaces: WkSpaces, machines: WkMachines, rows: MachinePageRow[]): MachineRow[] {
+  const devices = new Map((machines.devices?.rows ?? []).map((d) => [d.id, d] as const));
+  const spaceById = new Map(spaces.spaces.map(({ space }) => [space.id, space] as const));
+  return rows.map((r): MachineRow => {
+    const dev = r.device ? devices.get(r.device) : undefined;
+    const own = r.spaceId ? spaceById.get(r.spaceId) : undefined;
+    const row: MachineRow = {
+      id: r.id,
+      name: r.name,
+      via: r.via,
+      online: r.online,
+      os: r.os,
+      limits: r.stoppedSharing ? withNotSharing([], stoppedSharingLine(r.name)) : [],
+      merged: true,
+    };
+    const detail = r.current ? machines.thisMachine?.detail : r.deviceOnly ? dev?.detail : own?.detail || dev?.detail;
+    if (detail) row.detail = detail;
+    if (r.lastSeen != null) row.lastSeen = r.lastSeen;
+    if (r.current) {
+      row.current = true;
+      if (machines.host) row.host = toHostStatus(machines.host);
+      if (machines.accessNotice) row.accessNotice = machines.accessNotice;
+    }
+    if (r.deviceOnly) {
+      row.device = true;
+      const state = machines.deviceStates?.[r.id];
+      if (state) row.deviceState = state;
+    }
+    return row;
+  });
 }
 
 const rowsById = (s: WkSettings) => new Map(s.page.sections.flatMap((sec) => sec.rows).map((r) => [r.id, r] as const));
@@ -363,6 +412,7 @@ const EVENTS: Record<string, HostEvent[]> = {
   "spaces.changed": [{ type: "spaces.changed" }, { type: "machines.changed" }],
   "machines.changed": [{ type: "machines.changed" }],
   "agents.changed": [{ type: "agents.changed" }],
+  "checklist.changed": [{ type: "checklist.changed" }],
   "keyvault.changed": [{ type: "keyvault.changed" }],
   "settings.changed": [{ type: "settings.changed" }],
   "session.changed": [{ type: "session.changed" }],
@@ -586,6 +636,8 @@ export function createWebkitAdapter(
       ? { "spaces.openStream": (target: OpArgs<"spaces.openStream">) => request<StreamTicket>("spaces.openStream", { ...target }) }
       : unsupportedStreamOps("webkit")),
     "relay.usage": () => request<RelayUsage | null>("relay.usage"),
+    "checklist.get": () => request<{ state: HostChecklistState }>("checklist.get"),
+    "checklist.send": ({ action }) => request<{ state: HostChecklistState }>("checklist.send", { action }),
     // Presence over the page's own video: the Mac app draws it natively.
     ...(electron
       ? {
@@ -618,6 +670,11 @@ export function createWebkitAdapter(
       events.emit({ type: "startup.changed", state: startupFromHost(detail.payload) });
       return;
     }
+    // A real window dragged over a Space tile (the host follows the drag).
+    if (detail?.event === WINDOW_DROP_EVENT) {
+      setWindowDropTarget(windowDropTargetOf(detail.payload));
+      return;
+    }
     if (detail?.event === "teleport.progress") {
       const ev = teleportProgressFromWk(detail.payload);
       if (ev) events.emit(ev);
@@ -634,6 +691,12 @@ export function createWebkitAdapter(
     !electron && dom.document && dom.requestAnimationFrame && typeof MutationObserver !== "undefined"
       ? syncDragRegions(dom as Window, (rects) => void request("window.setDragRegions", { rects }).catch(() => {}))
       : null;
+  // Where the Space tiles are, for a real window dragged onto one (both
+  // hosts: neither sees such a drag in the page; `../window-drop.ts`).
+  const stopDropTargets =
+    dom.document && dom.requestAnimationFrame && typeof MutationObserver !== "undefined"
+      ? syncDropTargets(dom as Window, (targets) => void request("window.setDropTargets", { targets }).catch(() => {}))
+      : null;
 
   return {
     mode: electron ? "electron" : "webkit",
@@ -648,6 +711,8 @@ export function createWebkitAdapter(
       events.clear();
       stopEvents();
       stopDragRegions?.();
+      stopDropTargets?.();
+      setWindowDropTarget(null);
     },
   };
 }

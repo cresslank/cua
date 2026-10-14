@@ -73,7 +73,14 @@ fn inherited_host_options(host_bundle_id: &str) -> EmbeddedDriverHostOptions {
 }
 
 fn assert_home_overrides_rejected(host_bundle_id: &str) {
-    for name in ["HOME", "hOmE"] {
+    for name in [
+        "HOME",
+        "hOmE",
+        "CUA_DRIVER_RS_HOME",
+        "cua_driver_rs_home",
+        "CUA_DRIVER_RS_TELEMETRY_ENABLED",
+        "CUA_TELEMETRY_ENABLED",
+    ] {
         let mut hostile = inherited_host_options(host_bundle_id);
         hostile.environment = vec![EmbeddedEnvironmentVariable {
             name: name.into(),

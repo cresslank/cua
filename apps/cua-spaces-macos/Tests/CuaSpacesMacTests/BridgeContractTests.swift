@@ -201,6 +201,7 @@ struct BridgeContractTests {
         [
             // The relay allowance before the sign-out below (signed out, it is null).
             ("app.info", [:]), ("session.get", [:]), ("relay.usage", [:]), ("session.signOut", [:]),
+            ("checklist.get", [:]), ("checklist.send", ["action": ["type": "done", "step": "teleport"]]),
             ("spaces.list", [:]),
             ("spaces.createOptions", [:]), ("spaces.cancelCreate", ["pendingId": "pending:none"]),
             ("spaces.setPower", ["id": space, "on": true]),
@@ -245,6 +246,7 @@ struct BridgeContractTests {
             ("teleport.remembered", ["providerId": "chrome", "spaceId": space]),
             ("window.setBackgroundColor", ["color": "#16181c"]),
             ("window.setDragRegions", ["rects": [["x": 78, "y": 0, "width": 400, "height": 38]]]),
+            ("window.setDropTargets", ["targets": [["spaceId": space, "x": 20, "y": 60, "width": 232, "height": 180]]]),
             ("startup.get", [:]),
         ]
     }

@@ -40,9 +40,10 @@ export const METHODS = [
   "keyvault.unlockVault", "keyvault.setup", "keyvault.setDisabled",
   "keyvault.approve", "keyvault.deny", "keyvault.revokeGrant",
   "keyvault.showItems", "keyvault.delete", "keyvault.run", "keyvault.dismiss",
-  "window.setBackgroundColor", "window.setDragRegions",
+  "window.setBackgroundColor", "window.setDragRegions", "window.setDropTargets",
   "startup.get", "startup.act",
   "relay.usage",
+  "checklist.get", "checklist.send",
 ] as const;
 
 /** A live desktop's media ticket for the page's WebCodecs player, the

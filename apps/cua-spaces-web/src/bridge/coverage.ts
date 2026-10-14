@@ -40,6 +40,7 @@ import { HOST_SETUP_COVERAGE } from "./ops/host-setup";
 import { SPACE_DETAIL_COVERAGE } from "./ops/space-detail";
 import { STREAM_COVERAGE } from "./ops/stream";
 import { RELAY_USAGE_COVERAGE } from "./ops/relay-usage";
+import { CHECKLIST_COVERAGE } from "./ops/checklist";
 import { PRESENCE_COVERAGE } from "./ops/presence";
 import { TELEMETRY_COVERAGE } from "./ops/telemetry";
 import { STARTUP_COVERAGE } from "./ops/startup";
@@ -160,6 +161,7 @@ export const HOST_COVERAGE = {
   ...STARTUP_COVERAGE,
   ...STREAM_COVERAGE,
   ...RELAY_USAGE_COVERAGE,
+  ...CHECKLIST_COVERAGE,
   ...PRESENCE_COVERAGE,
 } as const satisfies Record<OpName, OpCoverage>;
 
@@ -169,4 +171,5 @@ export const HOST_COVERAGE = {
  */
 export const WEBKIT_HOST_ONLY: Partial<Record<WebkitMethod, string>> = {
   "window.setDragRegions": "the webkit adapter sends the page's drag regions itself whenever the layout changes (drag-regions.ts)",
+  "window.setDropTargets": "the webkit adapter sends the Space tiles' boxes itself whenever the layout changes, for a real window dragged onto one (window-drop.ts)",
 };

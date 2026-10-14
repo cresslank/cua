@@ -32,6 +32,11 @@
 //! the user nothing. Arming the guard never moves key focus: a steal on every
 //! action used to route a user keystroke that arrived in that instant to the
 //! driver, which dropped it.
+//!
+//! The driver's steal tells the current key-focus holder, the target whose
+//! menu is open, that it lost key focus, and AppKit ends menu tracking on that
+//! notice. So the guard also taps each guarded target and drops the notices
+//! whose thief is the driver itself; the menu stays open through the lookup.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -41,6 +46,11 @@ use std::time::{Duration, Instant};
 
 use crate::input::skylight;
 
+/// How long a guarded target's tap hides the driver's own theft after an id
+/// lookup starts. Outside that window the notice passes: the target may be the
+/// frontmost app by then, and dropping a key-focus change there leaves AppKit
+/// with a stale key window.
+const LOOKUP_WINDOW: Duration = Duration::from_millis(500);
 /// How long a target stays guarded after the action that armed it ends.
 /// AppKit opens a pressed popup's menu from a delayed perform that runs just
 /// after the accessibility call returns.
@@ -244,6 +254,17 @@ fn ensure_cleanup_worker() {
                     }
                     guard.leases > 0 || now < guard.until || guard.pending_release
                 });
+                let idle: Vec<i32> = st
+                    .target_taps
+                    .keys()
+                    .filter(|pid| !st.guarded.contains_key(pid))
+                    .copied()
+                    .collect();
+                for pid in idle {
+                    if let Some(tap) = st.target_taps.remove(&pid) {
+                        stop_tap(tap);
+                    }
+                }
                 if st.guarded.is_empty() {
                     if let Some(tap) = st.tap.take() {
                         stop_tap(tap);
@@ -321,7 +342,8 @@ pub struct Stats {
 }
 
 struct Tap {
-    front_pid: i32,
+    /// The process the tap sits on.
+    pid: i32,
     port: usize,
     run_loop: usize,
 }
@@ -363,6 +385,7 @@ const MAX_GUARDS: usize = 256;
 #[derive(Default)]
 struct State {
     tap: Option<Tap>,
+    target_taps: HashMap<i32, Tap>,
     /// Guarded pid -> (live leases, end of the tail after the last lease).
     guarded: HashMap<i32, Guard>,
 }
@@ -464,14 +487,31 @@ pub fn protect(target_pid: i32) -> Option<Lease> {
     if !ensure_tap(front) {
         return None;
     }
+    // Arming this tap does not move key focus either. Without it, the
+    // driver's id lookup would close the target's menu.
+    if !ensure_target_tap(target_pid) {
+        tracing::warn!(target_pid, "key-focus guard: target event tap unavailable");
+    }
     Some(lease)
 }
 
+/// Whether key-focus thefts by `pid` are background menu thefts to release.
+/// Not once the driver itself has activated an app since the guard was armed
+/// (bring_to_front, launch_app, foreground delivery): the target taking key
+/// focus then is that activation, and releasing it would leave the target
+/// active without a key window (0.35.4 gate: bring_to_front within the tail
+/// of a refused background invoke_menu, then the foreground invoke_menu found
+/// its key-window-gated item disabled).
 fn is_guarded(pid: i32) -> bool {
+    let epoch = crate::window_change_detector::intentional_epoch();
     let st = lock();
     st.guarded
         .get(&pid)
-        .is_some_and(|g| g.leases > 0 || Instant::now() < g.until)
+        .is_some_and(|g| guard_applies(g.leases, g.until, g.epoch, Instant::now(), epoch))
+}
+
+fn guard_applies(leases: usize, until: Instant, armed: u64, now: Instant, epoch: u64) -> bool {
+    armed == epoch && (leases > 0 || now < until)
 }
 
 /// Release the theft a guarded target just made. Only called once the tap
@@ -479,6 +519,12 @@ fn is_guarded(pid: i32) -> bool {
 /// steal on the driver's own connection takes the next id, and the target's
 /// theft is the newest live one below it.
 fn release_target_theft() -> bool {
+    *lookup_window()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
+        Instant::now() + LOOKUP_WINDOW,
+        crate::window_change_detector::intentional_epoch(),
+    ));
     let Some(own) = skylight::steal_key_focus() else {
         return false;
     };
@@ -581,25 +627,121 @@ fn ensure_tap(front_pid: i32) -> bool {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     {
         let mut st = lock();
-        if st
-            .tap
-            .as_ref()
-            .is_some_and(|tap| tap.front_pid == front_pid)
-        {
+        if st.tap.as_ref().is_some_and(|tap| tap.pid == front_pid) {
             return true;
         }
         if let Some(old) = st.tap.take() {
             stop_tap(old);
         }
     }
+    let Some(tap) = spawn_tap(front_pid, tap_callback) else {
+        tracing::warn!(front_pid, "key-focus guard: event tap unavailable");
+        return false;
+    };
+    if let Some(old) = lock().tap.replace(tap) {
+        stop_tap(old);
+    }
+    true
+}
+
+/// Make sure a guarded target has a tap that hides the driver's own theft.
+fn ensure_target_tap(target_pid: i32) -> bool {
+    static CREATION: Mutex<()> = Mutex::new(());
+    let _creation = CREATION
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if lock().target_taps.contains_key(&target_pid) {
+        return true;
+    }
+    let Some(tap) = spawn_tap(target_pid, target_tap_callback) else {
+        return false;
+    };
+    let mut st = lock();
+    if !st.guarded.contains_key(&target_pid) {
+        stop_tap(tap);
+        return false;
+    }
+    if let Some(old) = st.target_taps.insert(target_pid, tap) {
+        stop_tap(old);
+    }
+    true
+}
+
+/// Tap on a guarded target: drop the "lost key focus" notice the driver's id
+/// lookup sends it while its menu holds the keyboard. AppKit ends menu
+/// tracking on that notice, which closed popups and context menus the action
+/// had just opened. Every other event passes, including the driver's own
+/// key-focus changes outside a lookup: the tap outlives the action by the
+/// tail, and a foreground action that follows (bring_to_front, then
+/// invoke_menu) needs AppKit to see them, or its menu items validate against
+/// a stale key window (0.35.4 gate, harness_appkit_invoke_menu_live_path).
+extern "C" fn target_tap_callback(
+    _proxy: *mut c_void,
+    event_type: u32,
+    event: *mut c_void,
+    _user_info: *mut c_void,
+) -> *mut c_void {
+    if event_type == TAP_DISABLED_BY_TIMEOUT || event_type == TAP_DISABLED_BY_USER_INPUT {
+        let st = lock();
+        for tap in st.target_taps.values() {
+            unsafe { CGEventTapEnable(tap.port as *mut c_void, true) };
+        }
+        return event;
+    }
+    if event.is_null() {
+        return event;
+    }
+    let (subtype, thief) = unsafe {
+        (
+            CGEventGetIntegerValueField(event, FIELD_SUBTYPE),
+            CGEventGetIntegerValueField(event, FIELD_THIEF_PID),
+        )
+    };
+    let in_lookup = lookup_window()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_some_and(|(until, epoch)| {
+            lookup_applies(
+                until,
+                epoch,
+                Instant::now(),
+                crate::window_change_detector::intentional_epoch(),
+            )
+        });
+    if in_lookup && is_own_theft_notice(event_type, subtype, thief, std::process::id() as i32) {
+        std::ptr::null_mut()
+    } else {
+        event
+    }
+}
+
+// Independent of State: native cleanup owns State while the tap handles notices.
+fn lookup_window() -> &'static Mutex<Option<(Instant, u64)>> {
+    static LOOKUP: OnceLock<Mutex<Option<(Instant, u64)>>> = OnceLock::new();
+    LOOKUP.get_or_init(|| Mutex::new(None))
+}
+
+fn lookup_applies(until: Instant, armed: u64, now: Instant, epoch: u64) -> bool {
+    armed == epoch && now < until
+}
+
+/// Whether a notice tells its receiver that the driver itself took key focus.
+fn is_own_theft_notice(event_type: u32, subtype: i64, thief_pid: i64, own_pid: i32) -> bool {
+    classify_notice(event_type, subtype, thief_pid, own_pid, |_| false) == NoticeAction::DropOwn
+}
+
+/// Install a focus-notice tap on `pid` on its own run-loop thread.
+fn spawn_tap(
+    pid: i32,
+    callback: extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) -> *mut c_void,
+) -> Option<Tap> {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Option<(usize, usize)>>(0);
     let spawned = std::thread::Builder::new()
         .name("cua-key-focus-guard".into())
         .spawn(move || unsafe {
             let mask = 1u64 << FOCUS_NOTICE_TYPE;
             // kCGHeadInsertEventTap = 0, kCGEventTapOptionDefault = 0.
-            let port =
-                CGEventTapCreateForPid(front_pid, 0, 0, mask, tap_callback, std::ptr::null_mut());
+            let port = CGEventTapCreateForPid(pid, 0, 0, mask, callback, std::ptr::null_mut());
             if port.is_null() {
                 let _ = tx.send(None);
                 return;
@@ -622,24 +764,15 @@ fn ensure_tap(front_pid: i32) -> bool {
             CFRelease(port);
         });
     if spawned.is_err() {
-        return false;
+        return None;
     }
     match rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(Some((port, run_loop))) => {
-            let mut st = lock();
-            if let Some(old) = st.tap.replace(Tap {
-                front_pid,
-                port,
-                run_loop,
-            }) {
-                stop_tap(old);
-            }
-            true
-        }
-        _ => {
-            tracing::warn!(front_pid, "key-focus guard: event tap unavailable");
-            false
-        }
+        Ok(Some((port, run_loop))) => Some(Tap {
+            pid,
+            port,
+            run_loop,
+        }),
+        _ => None,
     }
 }
 
@@ -737,6 +870,43 @@ mod tests {
         assert!(!target_above_front_in(&menu_only, 42, 7));
         // Without a window of either app there is nothing to restore.
         assert!(!target_above_front_in(&[win(42, 0, 9)], 42, 7));
+    }
+
+    /// The target's tap hides only the driver's own id lookup: AppKit closes
+    /// an open menu when its app is told it lost key focus (0.35.3 release
+    /// gate: popup click, popup set_value and context menu all closed).
+    #[test]
+    fn the_target_tap_drops_only_the_drivers_own_theft_notice() {
+        assert!(is_own_theft_notice(21, 0x4000, OWN as i64, OWN));
+        // Another app taking key focus still closes the menu, as it should.
+        assert!(!is_own_theft_notice(21, 0x4000, 42, OWN));
+        // Other notices and event types pass.
+        assert!(!is_own_theft_notice(21, 0x2000, OWN as i64, OWN));
+        assert!(!is_own_theft_notice(10, 0x4000, OWN as i64, OWN));
+    }
+
+    #[test]
+    fn lookup_suppression_ends_on_timeout_or_intentional_activation() {
+        let now = Instant::now();
+        let until = now + LOOKUP_WINDOW;
+        assert!(lookup_applies(until, 5, now, 5));
+        assert!(!lookup_applies(until, 5, now, 6));
+        assert!(!lookup_applies(until, 5, until, 5));
+    }
+
+    #[test]
+    fn an_intentional_activation_ends_the_guard() {
+        let now = Instant::now();
+        let later = now + Duration::from_secs(3);
+        // Live lease or tail, same epoch: guarded.
+        assert!(guard_applies(1, now, 5, now, 5));
+        assert!(guard_applies(0, later, 5, now, 5));
+        // The driver activated an app since (bring_to_front in the tail):
+        // the target's key-focus change is that activation, not a menu.
+        assert!(!guard_applies(0, later, 5, now, 6));
+        assert!(!guard_applies(1, later, 5, now, 6));
+        // Tail over.
+        assert!(!guard_applies(0, now, 5, later, 5));
     }
 
     #[test]
