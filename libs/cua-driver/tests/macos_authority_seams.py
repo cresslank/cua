@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Cua AI, Inc.
 """Host-free regression harness: extracts production Rust and supplies fake APIs.
 
 Generate into explicit scratch storage, copy the workspace Cargo.lock there,
@@ -31,6 +33,11 @@ use std::cell::RefCell;
 type CFTypeRef=*const ();
 type AXUIElementRef=*const ();
 const kAXErrorSuccess:i32=0;
+#[derive(Debug,PartialEq)] enum BackgroundPressError {Disabled {message:String,is_save:bool},Other(String)}
+impl From<String> for BackgroundPressError {fn from(s:String)->Self{Self::Other(s)}}
+impl From<&str> for BackgroundPressError {fn from(s:&str)->Self{Self::Other(s.into())}}
+#[derive(Debug,PartialEq)] struct PressedItem{is_save:bool}
+unsafe fn item_is_save(_:AXUIElementRef)->bool{false}
 #[derive(Default)] struct World { key:u32, refuse:bool, ignored_window_focus:bool, enabled:bool, a:usize, b:usize, focused:usize, sibling_deletes:usize, ignored:bool, swap:bool, keys:usize }
 thread_local! {static W:RefCell<World>=RefCell::new(World::default());}
 fn setup(){ W.with(|w| *w.borrow_mut()=World{key:2,enabled:true,focused:1,..World::default()}); }
@@ -166,3 +173,13 @@ assert gws.index("observation_only |= !capture_actionable;") < gws.index("let re
 assert "let capture_id = match (snapshot_id, screenshot.as_ref())" in gws
 assert "(Some(sid), Some(r)) => build_elements_array_with_token" in gws
 assert 'serde_json::json!(!observation_only)' in gws
+
+# Scripting routes use exact application identity and readback, never a missing
+# observation as evidence that a write happened. Exercise the production predicates.
+script_source = (root / 'apple_events.rs').read_text()
+with (out / 'src/lib.rs').open('a') as f:
+ f.write('\n' + block(script_source, 'fn unique_app_matches(') + '\n' + block(script_source, 'fn mtime_advanced('))
+ f.write(r'''
+#[test] fn script_target_is_one_exact_process(){assert!(unique_app_matches(7,&[7]));for pids in [&[][..],&[8][..],&[7,8][..],&[7,7][..]]{assert!(!unique_app_matches(7,pids));}}
+#[test] fn unreadable_mtime_is_not_write_evidence(){let a=std::time::SystemTime::UNIX_EPOCH;let b=a+Duration::from_secs(1);assert!(mtime_advanced(Some(a),Some(b)));assert!(!mtime_advanced(None,Some(b)));assert!(!mtime_advanced(Some(a),None));assert!(!mtime_advanced(Some(a),Some(a)));assert!(!mtime_advanced(Some(b),Some(a)));}
+''')

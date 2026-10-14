@@ -39,7 +39,13 @@ fn def() -> &'static ToolDef {
                fronting or raising it — uses the macOS 14+ auth-message envelope so \
                Chromium/Electron accept it as trusted live input. With an AX target, \
                focus that exact element first. No top-level focus steal. \
-               `window_id` here only targets the combo; it does not raise.\n\
+               `window_id` here only targets the combo; it does not raise. Background \
+               key events never reach a native app's menus, so when the combo is a \
+               menu item's key equivalent (cmd+s, cmd+w, ...) and the app is not in \
+               front, that menu item runs through accessibility instead (a disabled \
+               Save is saved through the app's scripting interface and verified on \
+               disk); a menu item macOS keeps disabled in the background is refused \
+               with `background_unavailable`, and no keys are sent.\n\
              • `foreground`: briefly front the window (NSMenu path, < 1 ms via \
                SLPSSetFrontProcessWithOptions) so native menu key-equivalents \
                (Cmd+Z, Cmd+W) dispatch, then restore the prior frontmost — the \
@@ -110,9 +116,10 @@ fn is_modifier(k: &str) -> bool {
 const HOTKEY_FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 const HOTKEY_FOCUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
-fn focus_hotkey_element(pid: i32, element_ptr: usize) -> anyhow::Result<()> {
+pub(super) fn focus_hotkey_element(pid: i32, element_ptr: usize) -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + HOTKEY_FOCUS_TIMEOUT;
     loop {
+        cua_driver_core::blocking::check_cancelled()?;
         crate::input::ax_actions::focus_element(element_ptr)?;
         if crate::input::ax_actions::is_element_focused(pid, element_ptr) {
             return Ok(());
@@ -273,6 +280,46 @@ impl Tool for HotkeyTool {
             window_id,
         ) {
             return error;
+        }
+
+        // ── Menu key equivalents in a background app ──
+        // Background key events reach a window's views but never its app's
+        // menu key equivalents, so a background cmd+s to TextEdit saved
+        // nothing while reporting "Pressed". When the combo is a menu item's
+        // key equivalent in a native app that is not in front, run that menu
+        // item in the background instead (verified for Save), or refuse when
+        // macOS keeps it disabled. No key events are sent on this route.
+        if !fg && px.is_none() {
+            if let (Some(wid), Some(combo)) = (
+                window_id,
+                super::menu_equivalent::Combo::parse(&modifiers, &key),
+            ) {
+                let menu_item = cua_driver_core::blocking::spawn(move || {
+                    let native = !super::type_text::is_browser_pid(pid)
+                        && !crate::browser::electron_js::ElectronJs::is_electron(pid);
+                    let in_front = apps::frontmost_pid() == Some(pid);
+                    if native && !in_front {
+                        super::menu_equivalent::find(pid, &combo)
+                    } else {
+                        None
+                    }
+                })
+                .await;
+                let menu_item = match menu_item {
+                    Ok(item) => item,
+                    Err(error) => return ToolResult::error(format!("Task error: {error}")),
+                };
+                if let Some(item) = menu_item {
+                    return super::invoke_menu::run_in_background(
+                        pid,
+                        wid,
+                        item.path,
+                        super::invoke_menu::MenuRequest::KeyEquivalent(key_display),
+                        element_guard.clone(),
+                    )
+                    .await;
+                }
+            }
         }
 
         // ── Exact-target background gate (macOS background input v1) ──

@@ -249,6 +249,9 @@ fn assert_tools_list_schema_shape(mut d: RawDriver) {
         "browser_prepare",
         // The batch's default for its steps' own delivery_mode.
         "run_steps",
+        // Desktop hover over a background macOS app requires foreground delivery.
+        #[cfg(target_os = "macos")]
+        "move_cursor",
         // set_value has no delivery ladder on macOS or on the hardened Linux
         // adapter, which writes through AT-SPI only and never falls back to
         // pointer and keyboard input.

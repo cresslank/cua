@@ -48,7 +48,7 @@ fn def() -> &'static ToolDef {
         name: "set_value".into(),
         description: "Set an element's value by `element_token`. A popup button / select dropdown: selects the menu item whose title or value matches `value` (case-insensitive). Safari `<select>` is set through the DOM; AppKit and Chromium popups list items only while open, so the menu is opened, the item pressed and the menu closed again (in the background the user's front window keeps key focus). An unknown value lists the options. Any other element: writes AXValue (sliders, steppers, date pickers, native text fields).\n\
             \n\
-            A Finder file name (list row or Get Info `Name` field, not being edited) is refused with `file_name_needs_rename`; the refusal names the keyboard route. For free-form text in web inputs use `type_text_chars`: WebKit ignores AXValue writes.".into(),
+            A Finder file name cell (list or icon view, not being edited) is renamed through Finder's scripting interface with Finder left in the background, and the new name is read back from disk; the value is the full new name with its extension. macOS asks the user once to allow Cua Driver to control Finder. Finder's Get Info `Name` field is refused with `file_name_needs_rename`. For free-form text in web inputs use `type_text_chars`: WebKit ignores AXValue writes.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["value"],
@@ -136,22 +136,79 @@ impl Tool for SetValueTool {
         // A file's name as Finder lists it takes an AXValue write and reads it
         // back, but the file is never renamed. Refuse before anything moves.
         // Finder's Get Info Name field does the same.
+        // In Finder, the file is renamed through Finder's scripting interface
+        // instead, with Finder left in the background, and read back from
+        // disk.
         let name_guard = element_guard.clone();
-        match cua_driver_core::blocking::spawn(move || unsafe {
+        let name_target = match cua_driver_core::blocking::spawn(move || unsafe {
             let element = name_guard.as_ptr() as AXUIElementRef;
             if file_name_cell(element) {
-                Some(LIST_RENAME_ROUTE)
+                let finder =
+                    crate::apps::bundle_id_for_pid(pid).as_deref() == Some("com.apple.finder");
+                match copy_url_attr(element)
+                    .as_deref()
+                    .and_then(crate::apple_events::file_url_to_path)
+                {
+                    Some(path) if finder => Some(NameTarget::FinderItem(path)),
+                    _ => Some(NameTarget::Refuse(LIST_RENAME_ROUTE)),
+                }
             } else if get_info_name_field(pid, element) {
-                Some(GET_INFO_RENAME_ROUTE)
+                Some(NameTarget::Refuse(GET_INFO_RENAME_ROUTE))
             } else {
                 None
             }
         })
         .await
         {
-            Ok(Some(reason)) => return file_name_needs_rename(pid, window_id, reason),
-            Ok(None) => {}
+            Ok(target) => target,
             Err(error) => return ToolResult::error(format!("Task error: {error}")),
+        };
+        match name_target {
+            Some(NameTarget::Refuse(reason)) => {
+                return file_name_needs_rename(pid, window_id, reason)
+            }
+            Some(NameTarget::FinderItem(path)) => {
+                let new_name = value.clone();
+                let rename_path = path.clone();
+                let rename_guard = element_guard.clone();
+                let rename_lease = mutation_lease.clone();
+                let mutation = crate::apple_events::ScriptMutation::default();
+                let worker_mutation = mutation.clone();
+                let renamed = cua_driver_core::blocking::spawn(move || {
+                    // Retain the admitted native payload, mutation permit and per-PID
+                    // coordinator until the scripting request and readback finish.
+                    let current_path =
+                        unsafe { copy_url_attr(rename_guard.as_ptr() as AXUIElementRef) }
+                            .as_deref()
+                            .and_then(crate::apple_events::file_url_to_path);
+                    if current_path.as_deref() != Some(rename_path.as_path()) {
+                        return Err(crate::apple_events::ScriptRefusal {
+                            mutation_possible: false,
+                            code: "automation_target_unqualified",
+                            reason:
+                                "the retained Finder element no longer identifies the same file"
+                                    .into(),
+                        });
+                    }
+                    let _keepalive = (rename_guard, rename_lease);
+                    crate::apple_events::require_exact_app(pid, "com.apple.finder")?;
+                    crate::apple_events::finder_rename_tracked(
+                        &rename_path,
+                        &new_name,
+                        &worker_mutation,
+                    )
+                })
+                .await;
+                return finder_rename_result(
+                    pid,
+                    window_id,
+                    &path,
+                    &value,
+                    renamed,
+                    mutation.possible(),
+                );
+            }
+            None => {}
         }
 
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
@@ -306,6 +363,88 @@ fn is_get_info_name_field(
         && focused != Some(true)
 }
 
+/// What a write to a file-name element turns into.
+enum NameTarget {
+    /// A Finder item at this path: rename it through Finder.
+    FinderItem(std::path::PathBuf),
+    /// Refuse with this route.
+    Refuse(&'static str),
+}
+
+/// A rename read back from disk: the new name is listed, the old one gone.
+fn rename_record() -> cua_driver_core::action_record::ActionExecutionRecord {
+    use cua_driver_core::action_record::{
+        ActionEffect, ActionEvidence, ActionExecutionRecord, ActionTransport, ActualDelivery,
+        EvidenceKind, RequestedDelivery,
+    };
+    ActionExecutionRecord::builder(
+        ActionEffect::Confirmed,
+        ActionTransport::MacosAppleEvent,
+        RequestedDelivery::Background,
+    )
+    .actual_delivery(ActualDelivery::Background)
+    .evidence(ActionEvidence {
+        kind: EvidenceKind::ValueReadback,
+        detail: "The folder on disk lists the new name and not the old one".into(),
+    })
+    .build()
+    .expect("rename record is valid")
+}
+
+fn finder_rename_result(
+    pid: i32,
+    window_id: u32,
+    path: &std::path::Path,
+    new_name: &str,
+    renamed: Result<
+        Result<std::path::PathBuf, crate::apple_events::ScriptRefusal>,
+        tokio::task::JoinError,
+    >,
+    mutation_possible: bool,
+) -> ToolResult {
+    let old_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match renamed {
+        Ok(Ok(new_path)) => ToolResult::text(format!(
+            "✅ Renamed \"{old_name}\" to \"{new_name}\" through Finder's scripting interface, \
+             with Finder left in the background (not activated). Verified on disk: {} exists \
+             and the old name is gone. Take a fresh get_window_state before addressing the \
+             item again.",
+            new_path.display()
+        ))
+        .with_structured(serde_json::json!({
+            "path": "apple_events",
+            "verified": true,
+            "effect": "confirmed",
+            "renamed_from": path.display().to_string(),
+            "renamed_to": new_path.display().to_string(),
+        }))
+        .with_action_record(rename_record()),
+        Ok(Err(refusal)) => {
+            let mut result = crate::apple_events::script_failure_result(
+                "Finder rename",
+                refusal.code,
+                &refusal.reason,
+                refusal.mutation_possible,
+            );
+            if let Some(detail) = result.structured_content.as_mut() {
+                detail["code"] = serde_json::json!(FILE_NAME_NEEDS_RENAME);
+                detail["pid"] = serde_json::json!(pid);
+                detail["window_id"] = serde_json::json!(window_id);
+            }
+            result
+        }
+        Err(error) => crate::apple_events::script_failure_result(
+            "Finder rename task",
+            "automation_task_failed",
+            &error.to_string(),
+            mutation_possible,
+        ),
+    }
+}
+
 const LIST_RENAME_ROUTE: &str = "This is a file's name as the list shows it. Writing its AXValue \
     changes only what the list shows, never the file, so nothing was written. To rename the \
     file: click this element to select the item, then with Finder frontmost send press_key \
@@ -315,8 +454,9 @@ const LIST_RENAME_ROUTE: &str = "This is a file's name as the list shows it. Wri
 
 const GET_INFO_RENAME_ROUTE: &str = "This is the Name & Extension field of Finder's Get Info \
     window. Writing its AXValue changes only what the field shows, never the file, so nothing \
-    was written. To rename the file: take a fresh get_window_state of this window and click the \
-    field's centre in its screenshot pixels (pass its capture_id), then hotkey cmd+a, type_text \
+    was written. To rename the file in the background, call set_value with the new name on the \
+    file's name cell in a Finder window that lists it. Otherwise take a fresh get_window_state \
+    of this window and click the field's centre in its screenshot pixels (pass its capture_id), then hotkey cmd+a, type_text \
     the full new name with its extension, and press_key return, each with \
     delivery_mode:\"foreground\" on this window. A changed extension makes Finder ask for \
     confirmation in a dialog first. Then check the new name in a fresh listing of the folder; \
@@ -381,7 +521,9 @@ fn apply_verification_label(outcome: &mut SetValueOutcome) {
 }
 
 fn set_value_blocking(
-    element_guard: cua_driver_core::snapshot_store::AdmittedElement<crate::ax::snapshot::RetainedElement>,
+    element_guard: cua_driver_core::snapshot_store::AdmittedElement<
+        crate::ax::snapshot::RetainedElement,
+    >,
     mutation_lease: Arc<super::BackgroundMutationLease>,
     element_index: usize,
     pid: i32,
@@ -394,14 +536,20 @@ fn set_value_blocking(
     if role == "AXPopUpButton" {
         let element_title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
         // Menu-item selection, not an AXValue write — no read-back to report.
-        select_popup_option(&element_guard, &mutation_lease, element_index, pid, value, &element_title).map(|detail| {
-            SetValueOutcome {
-                detail,
-                verified: None,
-                changed: None,
-                not_applied: false,
-                document_edited: None,
-            }
+        select_popup_option(
+            &element_guard,
+            &mutation_lease,
+            element_index,
+            pid,
+            value,
+            &element_title,
+        )
+        .map(|detail| SetValueOutcome {
+            detail,
+            verified: None,
+            changed: None,
+            not_applied: false,
+            document_edited: None,
         })
     } else {
         // Default path: write AXValue directly. Numeric controls (AXSlider /
@@ -776,7 +924,9 @@ fn dismiss_popup_menu(popup: AXUIElementRef, pid: i32) {
 }
 
 fn select_popup_option(
-    element_guard: &cua_driver_core::snapshot_store::AdmittedElement<crate::ax::snapshot::RetainedElement>,
+    element_guard: &cua_driver_core::snapshot_store::AdmittedElement<
+        crate::ax::snapshot::RetainedElement,
+    >,
     mutation_lease: &Arc<super::BackgroundMutationLease>,
     element_index: usize,
     pid: i32,
@@ -1075,6 +1225,33 @@ mod tests {
         let url = Some("file:///Users/me/lab/charlie.bin");
         assert!(is_file_name_cell(Some("charlie.bin"), url, Some(false)));
         assert!(is_file_name_cell(Some("charlie.bin"), url, None));
+    }
+
+    #[test]
+    fn a_finder_rename_publishes_a_confirmed_system_api_record() {
+        let record = super::rename_record();
+        assert!(record.validate().is_ok());
+        let path = std::path::Path::new("/tmp/a.txt");
+        let ok =
+            super::finder_rename_result(7, 42, path, "b.txt", Ok(Ok("/tmp/b.txt".into())), false);
+        assert_eq!(ok.is_error, None);
+        assert!(ok.action_record.is_some());
+        let refused = super::finder_rename_result(
+            7,
+            42,
+            path,
+            "b.txt",
+            Ok(Err(crate::apple_events::ScriptRefusal {
+                mutation_possible: false,
+                code: "automation_denied",
+                reason: "off".into(),
+            })),
+            false,
+        );
+        assert_eq!(refused.is_error, Some(true));
+        let data = refused.structured_content.unwrap();
+        assert_eq!(data["code"], "file_name_needs_rename");
+        assert_eq!(data["cause"], "automation_denied");
     }
 
     #[test]

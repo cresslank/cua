@@ -30,6 +30,7 @@ pub struct WindowInfo {
     pub space_ids: Option<Vec<u64>>,
 }
 
+#[derive(Default)]
 pub(crate) struct WindowEnumeration {
     pub(crate) windows: Vec<WindowInfo>,
     pub(crate) current_space_id: Option<u64>,
@@ -71,6 +72,7 @@ pub fn all_windows() -> Vec<WindowInfo> {
 
 pub(crate) fn all_windows_with_space_snapshot() -> WindowEnumeration {
     enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::ZeroOnly)
+        .unwrap_or_default()
 }
 
 /// Enumerate only on-screen windows.
@@ -83,6 +85,18 @@ pub(crate) fn visible_windows_with_space_snapshot() -> WindowEnumeration {
         kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
         LayerFilter::ZeroOnly,
     )
+    .unwrap_or_default()
+}
+
+/// Error-aware observation for pointer qualification. A failed read is never
+/// evidence that a desktop point is unoccupied. Legacy display callers retain
+/// their empty-list adapter above; authority decisions must use this API.
+pub(crate) fn visible_windows_checked() -> anyhow::Result<Vec<WindowInfo>> {
+    Ok(enumerate_windows(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        LayerFilter::ZeroOnly,
+    )?
+    .windows)
 }
 
 /// Enumerate windows on every CGWindow layer, including the accessory layers
@@ -95,7 +109,9 @@ pub(crate) fn visible_windows_with_space_snapshot() -> WindowEnumeration {
 /// `get_window_state` tell "no such window" apart from "exists, but is not a
 /// layer-0 window" (issue #2237).
 pub(crate) fn all_windows_any_layer() -> Vec<WindowInfo> {
-    enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::AnyLayer).windows
+    enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::AnyLayer)
+        .unwrap_or_default()
+        .windows
 }
 
 /// Which CGWindow layers an enumeration admits.
@@ -107,10 +123,21 @@ enum LayerFilter {
     AnyLayer,
 }
 
-fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
+fn decode_onscreen_property(value: Option<Option<bool>>, options: u32) -> anyhow::Result<bool> {
+    match value {
+        Some(Some(value)) => Ok(value),
+        Some(None) => anyhow::bail!("invalid kCGWindowIsOnscreen"),
+        // This is an optional CGWindow key. OnScreenOnly itself qualifies
+        // visibility; an unfiltered record without the hint retains the
+        // legacy off-screen default without invalidating unrelated windows.
+        None => Ok(options & kCGWindowListOptionOnScreenOnly != 0),
+    }
+}
+
+fn enumerate_windows(options: u32, layers: LayerFilter) -> anyhow::Result<WindowEnumeration> {
     use core_foundation::{
         array::CFArray,
-        base::{CFGetTypeID, CFTypeRef, TCFType},
+        base::{CFGetTypeID, CFRelease, CFTypeRef, TCFType},
         boolean::CFBoolean,
         dictionary::CFDictionary,
         number::CFNumber,
@@ -127,12 +154,13 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
 
     let raw_ref = unsafe { CGWindowListCopyWindowInfo(options, kCGNullWindowID) };
     if raw_ref.is_null() {
-        return WindowEnumeration {
-            windows: vec![],
-            current_space_id,
-        };
+        return Err(anyhow::anyhow!("CGWindowListCopyWindowInfo returned null"));
     }
 
+    if unsafe { CFGetTypeID(raw_ref as _) } != CFArray::<CFTypeRef>::type_id() {
+        unsafe { CFRelease(raw_ref as _) };
+        anyhow::bail!("CGWindowListCopyWindowInfo did not return an array");
+    }
     let raw: CFArray<CFTypeRef> = unsafe { CFArray::wrap_under_create_rule(raw_ref as _) };
     let total = raw.len() as usize;
     let mut results = Vec::new();
@@ -141,15 +169,18 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
         let item = *item;
         // Each item should be a CFDictionary.
         let dict_type = CFDictionary::<*const c_void, *const c_void>::type_id();
+        if item.is_null() {
+            anyhow::bail!("CGWindowList entry {idx} is null");
+        }
         if unsafe { CFGetTypeID(item) } != dict_type {
-            continue;
+            anyhow::bail!("CGWindowList entry {idx} is not a dictionary");
         }
 
         let dict: CFDictionary<*const c_void, *const c_void> =
             unsafe { CFDictionary::wrap_under_get_rule(item as _) };
 
         // Helper: get number from dict by key string.
-        let get_num = |key: &str| -> i64 {
+        let get_num = |key: &str| -> anyhow::Result<i64> {
             let k = CFString::new(key);
             dict.find(k.as_concrete_TypeRef() as *const c_void)
                 .and_then(|v| unsafe {
@@ -160,7 +191,7 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
                         None
                     }
                 })
-                .unwrap_or(0)
+                .ok_or_else(|| anyhow::anyhow!("CGWindowList entry {idx}: invalid {key}"))
         };
 
         let get_str = |key: &str| -> String {
@@ -177,31 +208,26 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
                 .unwrap_or_default()
         };
 
-        let get_bool = |key: &str| -> bool {
+        let get_bool = |key: &str| -> Option<Option<bool>> {
             let k = CFString::new(key);
             dict.find(k.as_concrete_TypeRef() as *const c_void)
                 .map(|v| unsafe {
                     let v = *v;
-                    if CFGetTypeID(v) == CFBoolean::type_id() {
-                        bool::from(CFBoolean::wrap_under_get_rule(v as _))
+                    if !v.is_null() && CFGetTypeID(v) == CFBoolean::type_id() {
+                        Some(bool::from(CFBoolean::wrap_under_get_rule(v as _)))
                     } else {
-                        false
+                        None
                     }
                 })
-                .unwrap_or(false)
         };
 
-        let window_id = get_num("kCGWindowNumber") as u32;
-        let pid = get_num("kCGWindowOwnerPID") as i32;
+        let window_id = u32::try_from(get_num("kCGWindowNumber")?)?;
+        let pid = i32::try_from(get_num("kCGWindowOwnerPID")?)?;
+        anyhow::ensure!(window_id != 0 && pid > 0, "invalid CGWindowList identity");
         let app_name = get_str("kCGWindowOwnerName");
         let title = get_str("kCGWindowName");
-        let layer = get_num("kCGWindowLayer") as i32;
-        let is_on_screen = get_bool("kCGWindowIsOnscreen");
-
-        // Only include layer-0 windows, unless the caller asked for every layer.
-        if layer != 0 && layers == LayerFilter::ZeroOnly {
-            continue;
-        }
+        let layer = i32::try_from(get_num("kCGWindowLayer")?)?;
+        let is_on_screen = decode_onscreen_property(get_bool("kCGWindowIsOnscreen"), options)?;
 
         // Parse bounds dict.
         let bounds = {
@@ -217,22 +243,33 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
                         let w = get_bounds_num(&bd, "Width");
                         let h = get_bounds_num(&bd, "Height");
                         Some(WindowBounds {
-                            x,
-                            y,
-                            width: w,
-                            height: h,
+                            x: x?,
+                            y: y?,
+                            width: w?,
+                            height: h?,
                         })
                     } else {
                         None
                     }
                 })
-                .unwrap_or(WindowBounds {
-                    x: 0.,
-                    y: 0.,
-                    width: 0.,
-                    height: 0.,
-                })
+                .ok_or_else(|| anyhow::anyhow!("CGWindowList entry {idx}: invalid bounds"))?
         };
+
+        anyhow::ensure!(
+            [bounds.x, bounds.y, bounds.width, bounds.height]
+                .iter()
+                .all(|v| v.is_finite())
+                && bounds.width >= 0.
+                && bounds.height >= 0.
+                && (bounds.x + bounds.width).is_finite()
+                && (bounds.y + bounds.height).is_finite(),
+            "CGWindowList entry {idx}: invalid geometry"
+        );
+
+        // Only include layer-0 windows, unless the caller asked for every layer.
+        if layer != 0 && layers == LayerFilter::ZeroOnly {
+            continue;
+        }
 
         // z_index: CGWindowList front-to-back → assign reverse index.
         let z_index = cua_driver_core::window_target::z_index_from_front_to_back(total, idx);
@@ -254,10 +291,10 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
 
     if layers == LayerFilter::ZeroOnly {
         let Some(query) = &space_query else {
-            return WindowEnumeration {
+            return Ok(WindowEnumeration {
                 windows: results,
                 current_space_id,
-            };
+            });
         };
         for window in &mut results {
             let space_ids = query.window_space_ids(window.window_id);
@@ -268,10 +305,10 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
         }
     }
 
-    WindowEnumeration {
+    Ok(WindowEnumeration {
         windows: results,
         current_space_id,
-    }
+    })
 }
 
 fn apply_window_space_metadata(
@@ -297,7 +334,7 @@ fn get_bounds_num(
         *const std::os::raw::c_void,
     >,
     key: &str,
-) -> f64 {
+) -> Option<f64> {
     use core_foundation::{
         base::{CFGetTypeID, TCFType},
         number::CFNumber,
@@ -315,7 +352,6 @@ fn get_bounds_num(
                 None
             }
         })
-        .unwrap_or(0.0)
 }
 
 /// Look up a window by its CGWindowID across every layer.
@@ -477,8 +513,10 @@ const MENU_WINDOW_LAYER: i32 = 101;
 /// The ids of the menu windows `pid` has on screen; `None` when
 /// WindowServer's window list could not be read (unknown, never "no menu").
 pub(crate) fn menu_window_ids(pid: i32) -> Option<Vec<u32>> {
-    let windows = all_windows_any_layer();
-    (!windows.is_empty()).then(|| {
+    let windows = enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::AnyLayer)
+        .ok()?
+        .windows;
+    Some({
         windows
             .iter()
             .filter(|w| w.pid == pid && w.is_on_screen && w.layer == MENU_WINDOW_LAYER)
@@ -522,6 +560,24 @@ fn poll_until_no_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_onscreen_property_preserves_valid_records() {
+        for options in [0, kCGWindowListExcludeDesktopElements] {
+            assert!(!decode_onscreen_property(None, options).unwrap());
+        }
+        for options in [
+            kCGWindowListOptionOnScreenOnly,
+            kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        ] {
+            assert!(decode_onscreen_property(None, options).unwrap());
+        }
+        for options in [0, kCGWindowListOptionOnScreenOnly] {
+            assert!(decode_onscreen_property(Some(None), options).is_err());
+            assert!(decode_onscreen_property(Some(Some(true)), options).unwrap());
+            assert!(!decode_onscreen_property(Some(Some(false)), options).unwrap());
+        }
+    }
 
     #[test]
     fn space_membership_checks_all_spaces_for_a_window() {
