@@ -47,7 +47,7 @@
    "read_only": true
   },
   {
-   "description": "Snapshot a window: the accessibility tree plus a screenshot. By default the tree is ONE compact Markdown rendering (`tree_format:\"markdown\"`): a row `[N]` is addressed with `element_token` `<snapshot_id>:N`, where `snapshot_id` is in the response header and in structuredContent. `tree_format:\"elements\"` returns the structured `elements` array instead (`element_index`, `element_token`, `role`, `label`, `value`, `actions`, `frame`, `parent_index`, `depth`); `\"both\"` returns both (about twice the size). Pass the token to click, type_text, press_key, etc.\n\nSTART NARROW: a read walks at most 250 nodes by default and says `Tree truncated at max_elements=…` (`truncated:true`) when it stops; raise `max_elements`, or use `query` (case-insensitive substring; matching rows plus ancestors) and `max_depth`. Indices and tokens stay valid for the whole snapshot. `verbose:true` adds `_note` and the full `background_input` report; `full_output:true` restores the previous full response (both representations, all metadata, ≤2 000 nodes).\n\nDIFF READS (use them for every re-read after acting): `since:\"latest\"`, or `since:<snapshot_id>` from an earlier read of the same window, returns only what changed: `+` added, `~` changed, `-` removed rows (removed ids are the old snapshot's), a `reindexed:` line if indices shifted, or `no change since …; focused element is …`. The response carries a NEW snapshot_id: use it in tokens. An unknown, expired, other-window or differently-scoped (query/max_elements/max_depth) `since` falls back to a full read; `since_status` says why.\n\nA new snapshot of the same (pid, window_id) replaces the previous one and stales its tokens (`invalidated_snapshot_ids`). `include_screenshot:false` returns the tree only and keeps the last screenshot's pixel frame while the window keeps its size; `include_accessibility_tree:false` returns only the screenshot and keeps the current snapshot's rows and tokens valid (use it, not `max_elements:1`, when you just need to look); adding `display_only:true` (live previews) also leaves the pixel frame alone. The tree can lie on some surfaces (Electron, Catalyst, virtualized rows with `h:1` frames): cross-check the screenshot, and use pixel x,y at action time only for elements missing from the tree.\n\nRefusals: `window_id_not_found`; `window_owner_pid_mismatch` names the real `owner_pid` (sandboxed Open/Save panels belong to a panel service). `degraded_reason` `ax_window_unresolved` or `ax_app_launching` (the latter with `truncation_reason: app_lookup_timeout`) means an empty tree: re-snapshot, or act with `delivery_mode:\"foreground\"`. `px_frame_mismatch` / `px_capture_unavailable` omit the unprovable screenshot; the AX payload stays valid.",
+   "description": "Snapshot a window: the accessibility tree plus a screenshot. By default the tree is ONE compact Markdown rendering (`tree_format:\"markdown\"`): a row `[N]` is addressed with `element_token` `<snapshot_id>:N`, where `snapshot_id` is in the response header and in structuredContent. `tree_format:\"elements\"` returns the structured `elements` array instead (`element_index`, `element_token`, `role`, `label`, `value`, `actions`, `frame`, `parent_index`, `depth`); `\"both\"` returns both (about twice the size). Pass the token to click, type_text, press_key, etc.\n\nSTART NARROW: a read walks at most 250 nodes by default and says `Tree truncated at max_elements=…` (`truncated:true`) when it stops; raise `max_elements`, or use `query` (case-insensitive substring; matching rows plus ancestors) and `max_depth`. Indices and tokens stay valid for the whole snapshot. `verbose:true` adds `_note` and the full `background_input` report; `full_output:true` restores the previous full response (both representations, all metadata, ≤2 000 nodes).\n\nDIFF READS (use them for every re-read after acting): `since:\"latest\"`, or `since:<snapshot_id>` from an earlier read of the same window, returns only what changed: `+` added, `~` changed, `-` removed rows (removed ids are the old snapshot's), a `reindexed:` line if indices shifted, or `no change since …; focused element is …`. The response carries a NEW snapshot_id: use it in tokens. An unknown, expired, other-window or differently-scoped (query/max_elements/max_depth) `since` falls back to a full read; `since_status` says why.\n\nA new snapshot of the same (pid, window_id) replaces the previous one and stales its tokens (`invalidated_snapshot_ids`). `include_screenshot:false` returns the tree only and keeps a valid same-session screenshot frame at the same known window size; `include_accessibility_tree:false` refreshes the screenshot while preserving live same-session rows and tokens. Scrolling containers may leave non-visible, non-selected rows unread (`collapsed_rows`); scroll or search to reveal them. The tree can lie on some surfaces (Electron, Catalyst, virtualized rows with `h:1` frames): cross-check the screenshot, and use pixel x,y at action time only for elements missing from the tree.\n\nRefusals: `window_id_not_found`; `window_owner_pid_mismatch` names the real `owner_pid` (sandboxed Open/Save panels belong to a panel service). `degraded_reason` `ax_window_unresolved` or `ax_app_launching` (the latter with `truncation_reason: app_lookup_timeout`) means an empty tree: re-snapshot, or act with `delivery_mode:\"foreground\"`. `px_frame_mismatch` / `px_capture_unavailable` omit the unprovable screenshot; the AX payload stays valid.",
    "destructive": false,
    "idempotent": false,
    "input_schema": {
@@ -1584,7 +1584,7 @@
       "type": "number"
      },
      "glide_duration_ms": {
-      "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` or the default `steady` timing also fixes the duration.\nClamped to 0..5000.",
+      "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` or the default `steady` timing also fixes the duration.\nExplicit zero uses speed-based motion unless a timing preset was selected.\nClamped to 0..5000.",
       "type": "number"
      },
      "idle_hide_ms": {
@@ -1756,7 +1756,7 @@
    "read_only": true
   },
   {
-   "description": "Return the current cua-driver-rs configuration.",
+   "description": "Return the current cua-driver-rs configuration, including the session-effective agent_cursor.glide_duration_ms default. Explicit set_agent_cursor_motion overrides are reported by get_agent_cursor_state.",
    "destructive": false,
    "idempotent": true,
    "input_schema": {
@@ -1773,12 +1773,18 @@
    "read_only": true
   },
   {
-   "description": "Update cua-driver-rs configuration. Changes to max_image_dimension take effect immediately. The experimental_pip keys are persisted to ~/.cua-driver/config.json and take effect on the next daemon restart (the PiP backend is initialised once at startup).\n\nNote: capture_mode is a per-call param (on get_window_state / click), not a stored setting. Capture modality is selected by each action's target; the old capture_scope config key is retired.\n\nCursor motion defaults: cursor.motion.style, cursor.motion.timing and cursor.motion.effects.<trail|glow|magnet|ripple|squish> are saved to ~/.cua-driver/config.json and seed sessions started afterwards. start_session cursor_motion and set_agent_cursor_motion override them; reduced motion always wins.\n\nAgent cursor badge: cursor.badges is minimal (default), verbose or off, saved to ~/.cua-driver/config.json and applied to every cursor at once.",
+   "description": "Update cua-driver-rs configuration. Prefer typed per-field arguments; legacy {key, value} remains accepted as a compatibility wire form. Changes to max_image_dimension and agent_cursor_glide_duration_ms take effect immediately. Named sessions override these in memory; anonymous CLI calls persist them. The experimental_pip keys are persisted to ~/.cua-driver/config.json and take effect on the next daemon restart (the PiP backend is initialised once at startup).\n\nNote: capture_mode is a per-call param (on get_window_state / click), not a stored setting. Capture modality is selected by each action's target; the old capture_scope config key is retired.\n\nCursor motion defaults: cursor.motion.style, cursor.motion.timing and cursor.motion.effects.<trail|glow|magnet|ripple|squish> are saved to ~/.cua-driver/config.json and seed sessions started afterwards. start_session cursor_motion and set_agent_cursor_motion override them; reduced motion always wins.\n\nAgent cursor badge: cursor.badges is minimal (default), verbose or off, saved to ~/.cua-driver/config.json and applied to every cursor at once.",
    "destructive": false,
    "idempotent": true,
    "input_schema": {
     "additionalProperties": false,
     "properties": {
+     "agent_cursor_glide_duration_ms": {
+      "description": "Default agent cursor glide duration in milliseconds (clamped to 0..5000). 0 preserves speed-based motion. Applies immediately; explicit set_agent_cursor_motion glide duration wins.",
+      "maximum": 5000,
+      "minimum": 0,
+      "type": "number"
+     },
      "cursor.badges": {
       "description": "Agent cursor badge. minimal (default): no badge at rest; a brief chip for a foreground moment or a key combo, and the session name on hover or when two or more agent cursors are on screen. verbose: the earlier badge with the session name and delivery/target chips on every action. off: no badge. Applies immediately to every cursor.",
       "enum": [
@@ -1854,7 +1860,7 @@
       "type": "string"
      },
      "cursor.motion.timing": {
-      "description": "Saved default cursor move timing for new sessions. Built-in default: steady (a 600 ms floor on every move).",
+      "description": "Saved default cursor move timing for new sessions. Built-in default: steady (a 600 ms floor when no glide duration is configured). An explicit timing preset takes precedence over speed-based zero.",
       "enum": [
        "native",
        "fitts",
@@ -2094,7 +2100,7 @@
    "read_only": true
   },
   {
-   "description": "Attach the browser tools to a browser. For a page in the user's running Chrome, Edge or Brave, call it once with pid, window_id, session and strategy {\"kind\":\"existing_profile\"} when get_browser_state refuses with browser_consent_required or browser_requires_setup; then call get_browser_state again and act with browser_click, browser_type or browser_pointer. It attaches, or refuses with nothing changed and says why. Explicitly prepare an owned DevTools endpoint for a browser. pid is required for an existing process or existing-profile attachment, and optional only for allow_launch=true with an isolated profile. Existing endpoints are detected without side effects. Acting setup for an isolated profile follows the runtime permission mode and optional capability manifest. It requires allow_launch=true, launches a separate browser, and never copies, modifies, or terminates the requested user profile. Without pid, only a platform-attested system Chrome/Edge installation (or a root-owned package payload on Linux) is eligible; redirects and user-controlled locations fail closed. Existing-profile attachment is explicit and follows the runtime's immutable permission mode: standard requires an explicit --grant existing-profile launch grant or an embedding authorization host, bounded requires a launch-approved exact resource manifest, and unrestricted requires explicit trusted startup risk acceptance. Ordinary MCP transport approval never proves profile authorization. On proven platforms, an authorized request also permits one bounded exact-window setup: open the recognized browser product's fixed remote-debugging page, toggle its uniquely matched per-instance checkbox, prove the PID-owned loopback endpoint, and close the temporary tab. Every visible effect is reported; ambiguity is refused. Where attaching would bring the browser in front of the user's app (macOS Chrome shows its own remote-debugging prompt in front for every new connection), existing-profile attachment refuses with background_unavailable unless delivery_mode is \"foreground\" (the app that was in front is brought back afterwards) or the browser window is on another Space than the user's, where it attaches in the background while the driver reverts the browser's own brief activations.",
+   "description": "Attach the browser tools to a browser. For a page in the user's running Chrome, Edge or Brave, call it once with pid, window_id, session and strategy {\"kind\":\"existing_profile\"} when get_browser_state refuses with browser_consent_required or browser_requires_setup; then call get_browser_state again and act with browser_click, browser_type or browser_pointer. It attaches, or refuses with nothing changed and says why. Explicitly prepare an owned DevTools endpoint for a browser. pid is required for an existing process or existing-profile attachment, and optional only for allow_launch=true with an isolated profile. Existing endpoints are detected without side effects. Acting setup for an isolated profile follows the runtime permission mode and optional capability manifest. It requires allow_launch=true, launches a separate browser, and never copies, modifies, or terminates the requested user profile. Without pid, only a platform-attested system Chrome/Edge installation (or a root-owned package payload on Linux) is eligible; redirects and user-controlled locations fail closed. Existing-profile attachment is explicit and follows the runtime's immutable permission mode: standard requires an explicit --grant existing-profile launch grant or an embedding authorization host, bounded requires a launch-approved exact resource manifest, and unrestricted requires explicit trusted startup risk acceptance. Ordinary MCP transport approval never proves profile authorization. On proven platforms, an authorized request also permits one bounded exact-window setup: open the recognized browser product's fixed remote-debugging page, toggle its uniquely matched per-instance checkbox, prove the PID-owned loopback endpoint, and close the temporary tab. Every visible effect is reported; ambiguity is refused. Where attaching would bring the browser in front of the user's app (macOS Chrome shows its own remote-debugging prompt in front for every new connection), existing-profile attachment refuses with background_unavailable unless delivery_mode is \"foreground\"; the app that was in front is then brought back afterwards.",
    "destructive": true,
    "idempotent": false,
    "input_schema": {
@@ -2106,7 +2112,7 @@
      },
      "delivery_mode": {
       "default": "background",
-      "description": "Existing-profile attachment only. background (default) attaches in the background when the browser window is on another Space than the user's, and otherwise refuses with background_unavailable, before any visible effect, where attaching would bring the browser in front of the user's app. foreground accepts that, for a screen nobody else is using or when the user agreed; the app that was in front is brought back afterwards.",
+      "description": "Existing-profile attachment only. background (default) refuses with background_unavailable, before any visible effect, where attaching would bring the browser in front of the user's app. foreground accepts that, for a screen nobody else is using or when the user agreed; the app that was in front is brought back afterwards.",
       "enum": [
        "background",
        "foreground"
@@ -2764,7 +2770,7 @@
         "type": "number"
        },
        "glide_duration_ms": {
-        "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` or the default `steady` timing also fixes the duration.\nClamped to 0..5000.",
+        "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` or the default `steady` timing also fixes the duration.\nExplicit zero uses speed-based motion unless a timing preset was selected.\nClamped to 0..5000.",
         "type": "number"
        },
        "idle_hide_ms": {
