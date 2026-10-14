@@ -14270,6 +14270,23 @@ mod click_button_schema_tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
+    // Snapshot lanes are bounded per runtime owner and PID. Parallel tests using
+    // the process-wide legacy owner can evict each other's valid frames even
+    // when their window IDs differ. Keep construction and async dispatch in one
+    // fresh scope, with the same current-thread runtime as #[tokio::test].
+    fn isolated_async(test: impl std::future::Future<Output = ()>) {
+        cua_driver_core::tool::with_runtime_scope(
+            format!("linux-click-route-test-{}", uuid::Uuid::new_v4()),
+            || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(test);
+            },
+        );
+    }
+
     /// Surface 5: schema must advertise the three canonical button values and
     /// describe the back-compat default. Linux already routed button=middle/right
     /// pre-Surface-5; this freezes the schema shape so the contract can't drift.
@@ -14362,65 +14379,100 @@ mod click_button_schema_tests {
         (pid, xid, SESSION)
     }
 
-    #[tokio::test]
-    async fn element_click_resolves_its_target_without_reentering_click() {
-        // A 0.30.3 merge left double_click's delegation (button left, count 2,
-        // invoke ClickTool again) at the top of ClickTool::invoke, keyed on
-        // element_token/element_index. Every element click re-entered itself
-        // until the stack overflowed and took the whole daemon down.
-        let clicks = Arc::new(AtomicUsize::new(0));
-        let clicks_for_backend = clicks.clone();
-        let state = ToolState::new_with_production_route_backend(backend_with(
-            |_proof, _, _| Ok(None),
-            move |_proof, _, _, _, _| {
-                clicks_for_backend.fetch_add(1, Ordering::SeqCst);
-                Ok(None)
-            },
-            |_, _, _| Ok(()),
-        ));
-        // (The registry refuses a bare element_index before any tool runs, so a
-        // token is the element route that reaches invoke.)
-        let (pid, xid, session) = with_screenshot_context(&state);
-        for args in [
-            serde_json::json!({"pid": pid, "element_token": "not-a-live-token", "_session_id": session}),
-            serde_json::json!({"pid": pid, "window_id": xid, "element_token": "not-a-live-token",
-                "_session_id": session}),
-        ] {
-            let result = coordinate_click(state.clone()).invoke(args).await;
-            assert_eq!(result.is_error, Some(true), "{result:?}");
-            assert_eq!(
-                result.structured_content.as_ref().unwrap()["refusal"]["code"],
-                "invalid_element_token",
-                "{result:?}"
-            );
-        }
-        assert_eq!(clicks.load(Ordering::SeqCst), 0);
+    #[test]
+    fn element_click_resolves_its_target_without_reentering_click() {
+        isolated_async(async {
+            // A 0.30.3 merge left double_click's delegation (button left, count 2,
+            // invoke ClickTool again) at the top of ClickTool::invoke, keyed on
+            // element_token/element_index. Every element click re-entered itself
+            // until the stack overflowed and took the whole daemon down.
+            let clicks = Arc::new(AtomicUsize::new(0));
+            let clicks_for_backend = clicks.clone();
+            let state = ToolState::new_with_production_route_backend(backend_with(
+                |_proof, _, _| Ok(None),
+                move |_proof, _, _, _, _| {
+                    clicks_for_backend.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                },
+                |_, _, _| Ok(()),
+            ));
+            // (The registry refuses a bare element_index before any tool runs, so a
+            // token is the element route that reaches invoke.)
+            let (pid, xid, session) = with_screenshot_context(&state);
+            for args in [
+                serde_json::json!({"pid": pid, "element_token": "not-a-live-token", "_session_id": session}),
+                serde_json::json!({"pid": pid, "window_id": xid, "element_token": "not-a-live-token",
+                    "_session_id": session}),
+            ] {
+                let result = coordinate_click(state.clone()).invoke(args).await;
+                assert_eq!(result.is_error, Some(true), "{result:?}");
+                assert_eq!(
+                    result.structured_content.as_ref().unwrap()["refusal"]["code"],
+                    "invalid_element_token",
+                    "{result:?}"
+                );
+            }
+            assert_eq!(clicks.load(Ordering::SeqCst), 0);
+        });
     }
 
-    #[tokio::test]
-    async fn click_invoke_allows_only_a_point_miss_to_reach_coordinate_delivery() {
-        let clicks = Arc::new(AtomicUsize::new(0));
-        let clicks_for_backend = clicks.clone();
-        let state = ToolState::new_with_production_route_backend(backend_with(
-            |_proof, _, _| Ok(None),
-            move |_proof, _, _, _, _| {
-                clicks_for_backend.fetch_add(1, Ordering::SeqCst);
-                Ok(None)
-            },
-            |_, _, _| Ok(()),
-        ));
-        let (pid, xid, session) = with_screenshot_context(&state);
-        let result = coordinate_click(state)
-            .invoke(serde_json::json!({"pid": pid, "window_id": xid, "x": 12, "y": 14, "_session_id": session}))
-            .await;
-        assert_ne!(result.is_error, Some(true), "{result:?}");
-        assert_eq!(clicks.load(Ordering::SeqCst), 1);
+    #[test]
+    fn click_invoke_allows_only_a_point_miss_to_reach_coordinate_delivery() {
+        isolated_async(async {
+            let clicks = Arc::new(AtomicUsize::new(0));
+            let clicks_for_backend = clicks.clone();
+            let state = ToolState::new_with_production_route_backend(backend_with(
+                |_proof, _, _| Ok(None),
+                move |_proof, _, _, _, _| {
+                    clicks_for_backend.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                },
+                |_, _, _| Ok(()),
+            ));
+            let (pid, xid, session) = with_screenshot_context(&state);
+            let result = coordinate_click(state)
+                .invoke(serde_json::json!({"pid": pid, "window_id": xid, "x": 12, "y": 14, "_session_id": session}))
+                .await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            assert_eq!(clicks.load(Ordering::SeqCst), 1);
 
-        for error in [
-            "point hit-test failed",
-            "perform_action_at_screen_point timed out; delivery is indeterminate",
-            "screen-point recipient changed at final mutation boundary",
-        ] {
+            for error in [
+                "point hit-test failed",
+                "perform_action_at_screen_point timed out; delivery is indeterminate",
+                "screen-point recipient changed at final mutation boundary",
+            ] {
+                let points = Arc::new(AtomicUsize::new(0));
+                let points_for_backend = points.clone();
+                let clicks = Arc::new(AtomicUsize::new(0));
+                let clicks_for_backend = clicks.clone();
+                let state = ToolState::new_with_production_route_backend(backend_with(
+                    move |_, _, _| {
+                        points_for_backend.fetch_add(1, Ordering::SeqCst);
+                        Err(anyhow::anyhow!(error))
+                    },
+                    move |_, _, _, _, _| {
+                        clicks_for_backend.fetch_add(1, Ordering::SeqCst);
+                        Ok(None)
+                    },
+                    |_, _, _| Ok(()),
+                ));
+                let (pid, xid, session) = with_screenshot_context(&state);
+                let result = coordinate_click(state)
+                    .invoke(serde_json::json!({"pid": pid, "window_id": xid, "x": 1, "y": 2, "_session_id": session}))
+                    .await;
+                assert_eq!(result.is_error, Some(true), "{error}");
+                // The refusal must come from the point action, not an earlier gate.
+                assert_eq!(points.load(Ordering::SeqCst), 1, "{error}: {result:?}");
+                assert_eq!(clicks.load(Ordering::SeqCst), 0, "{error} replayed");
+            }
+        });
+    }
+
+    #[test]
+    fn click_invoke_with_frame_delivers_background_point_action_without_pointer() {
+        isolated_async(async {
+            // With a session screenshot, a native Wayland background left click
+            // reaches the exact-point AT-SPI action and sends no pointer input.
             let points = Arc::new(AtomicUsize::new(0));
             let points_for_backend = points.clone();
             let clicks = Arc::new(AtomicUsize::new(0));
@@ -14428,7 +14480,7 @@ mod click_button_schema_tests {
             let state = ToolState::new_with_production_route_backend(backend_with(
                 move |_, _, _| {
                     points_for_backend.fetch_add(1, Ordering::SeqCst);
-                    Err(anyhow::anyhow!(error))
+                    Ok(Some("click".into()))
                 },
                 move |_, _, _, _, _| {
                     clicks_for_backend.fetch_add(1, Ordering::SeqCst);
@@ -14438,120 +14490,95 @@ mod click_button_schema_tests {
             ));
             let (pid, xid, session) = with_screenshot_context(&state);
             let result = coordinate_click(state)
-                .invoke(serde_json::json!({"pid": pid, "window_id": xid, "x": 1, "y": 2, "_session_id": session}))
+                .invoke(
+                    serde_json::json!({"pid": pid, "window_id": xid, "x": 5, "y": 6,
+                    "delivery_mode": "background", "_session_id": session}),
+                )
                 .await;
-            assert_eq!(result.is_error, Some(true), "{error}");
-            // The refusal must come from the point action, not an earlier gate.
-            assert_eq!(points.load(Ordering::SeqCst), 1, "{error}: {result:?}");
-            assert_eq!(clicks.load(Ordering::SeqCst), 0, "{error} replayed");
-        }
-    }
-
-    #[tokio::test]
-    async fn click_invoke_with_frame_delivers_background_point_action_without_pointer() {
-        // With a session screenshot, a native Wayland background left click
-        // reaches the exact-point AT-SPI action and sends no pointer input.
-        let points = Arc::new(AtomicUsize::new(0));
-        let points_for_backend = points.clone();
-        let clicks = Arc::new(AtomicUsize::new(0));
-        let clicks_for_backend = clicks.clone();
-        let state = ToolState::new_with_production_route_backend(backend_with(
-            move |_, _, _| {
-                points_for_backend.fetch_add(1, Ordering::SeqCst);
-                Ok(Some("click".into()))
-            },
-            move |_, _, _, _, _| {
-                clicks_for_backend.fetch_add(1, Ordering::SeqCst);
-                Ok(None)
-            },
-            |_, _, _| Ok(()),
-        ));
-        let (pid, xid, session) = with_screenshot_context(&state);
-        let result = coordinate_click(state)
-            .invoke(
-                serde_json::json!({"pid": pid, "window_id": xid, "x": 5, "y": 6,
-                "delivery_mode": "background", "_session_id": session}),
-            )
-            .await;
-        assert_ne!(result.is_error, Some(true), "{result:?}");
-        assert_eq!(
-            result.structured_content.as_ref().unwrap()["path"],
-            "wayland_atspi",
-            "{result:?}"
-        );
-        assert_eq!(points.load(Ordering::SeqCst), 1);
-        assert_eq!(clicks.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn click_invoke_never_fires_the_action_of_a_node_that_takes_a_real_press() {
-        // The point lands on a text field: the point route refuses before
-        // firing (its `activate` is Enter), and the click goes to the real
-        // pointer route this backend offers, exactly once.
-        let points = Arc::new(AtomicUsize::new(0));
-        let points_for_backend = points.clone();
-        let clicks = Arc::new(AtomicUsize::new(0));
-        let clicks_for_backend = clicks.clone();
-        let state = ToolState::new_with_production_route_backend(backend_with(
-            move |_, _, _| {
-                points_for_backend.fetch_add(1, Ordering::SeqCst);
-                Err(crate::atspi::ElementClickNeedsForeground.into())
-            },
-            move |_, _, _, _, _| {
-                clicks_for_backend.fetch_add(1, Ordering::SeqCst);
-                Ok(None)
-            },
-            |_, _, _| Ok(()),
-        ));
-        let (pid, xid, session) = with_screenshot_context(&state);
-        let result = coordinate_click(state)
-            .invoke(
-                serde_json::json!({"pid": pid, "window_id": xid, "x": 5, "y": 6,
-                "delivery_mode": "background", "_session_id": session}),
-            )
-            .await;
-        assert_ne!(result.is_error, Some(true), "{result:?}");
-        assert_eq!(
-            result.structured_content.as_ref().unwrap()["path"],
-            "wayland_cua_compositor",
-            "{result:?}"
-        );
-        assert_eq!(points.load(Ordering::SeqCst), 1);
-        assert_eq!(clicks.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn click_invoke_carries_original_epoch_identity_across_point_miss() {
-        let current = Arc::new(Mutex::new("epoch-a:target-a".to_owned()));
-        let establish_calls = Arc::new(AtomicUsize::new(0));
-        let current_at_establish = current.clone();
-        let calls_at_establish = establish_calls.clone();
-        let current_at_point = current.clone();
-        let current_at_click = current.clone();
-        let state = ToolState::new_with_production_route_backend(ProductionRouteBackend {
-            establish: Arc::new(move |pid, xid| {
-                calls_at_establish.fetch_add(1, Ordering::SeqCst);
-                Ok(fixed_proof(pid, xid, &current_at_establish.lock().unwrap()))
-            }),
-            point_action: Arc::new(move |_, _, _| {
-                *current_at_point.lock().unwrap() = "epoch-b:target-b".to_owned();
-                Ok(None)
-            }),
-            click: Arc::new(move |proof, _, _, _, _| {
-                let (_, target) = proof.production_route_test_identity();
-                if target != Some(current_at_click.lock().unwrap().as_str()) {
-                    anyhow::bail!("stale_target: immutable epoch/target identity was replaced");
-                }
-                Ok(None)
-            }),
-            set_value: Arc::new(|_, _, _| Ok(())),
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            assert_eq!(
+                result.structured_content.as_ref().unwrap()["path"],
+                "wayland_atspi",
+                "{result:?}"
+            );
+            assert_eq!(points.load(Ordering::SeqCst), 1);
+            assert_eq!(clicks.load(Ordering::SeqCst), 0);
         });
-        let (pid, xid, session) = with_screenshot_context(&state);
-        let result = coordinate_click(state)
-            .invoke(serde_json::json!({"pid": pid, "window_id": xid, "x": 3, "y": 4, "_session_id": session}))
-            .await;
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(establish_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn click_invoke_never_fires_the_action_of_a_node_that_takes_a_real_press() {
+        isolated_async(async {
+            // The point lands on a text field: the point route refuses before
+            // firing (its `activate` is Enter), and the click goes to the real
+            // pointer route this backend offers, exactly once.
+            let points = Arc::new(AtomicUsize::new(0));
+            let points_for_backend = points.clone();
+            let clicks = Arc::new(AtomicUsize::new(0));
+            let clicks_for_backend = clicks.clone();
+            let state = ToolState::new_with_production_route_backend(backend_with(
+                move |_, _, _| {
+                    points_for_backend.fetch_add(1, Ordering::SeqCst);
+                    Err(crate::atspi::ElementClickNeedsForeground.into())
+                },
+                move |_, _, _, _, _| {
+                    clicks_for_backend.fetch_add(1, Ordering::SeqCst);
+                    Ok(None)
+                },
+                |_, _, _| Ok(()),
+            ));
+            let (pid, xid, session) = with_screenshot_context(&state);
+            let result = coordinate_click(state)
+                .invoke(
+                    serde_json::json!({"pid": pid, "window_id": xid, "x": 5, "y": 6,
+                    "delivery_mode": "background", "_session_id": session}),
+                )
+                .await;
+            assert_ne!(result.is_error, Some(true), "{result:?}");
+            assert_eq!(
+                result.structured_content.as_ref().unwrap()["path"],
+                "wayland_cua_compositor",
+                "{result:?}"
+            );
+            assert_eq!(points.load(Ordering::SeqCst), 1);
+            assert_eq!(clicks.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn click_invoke_carries_original_epoch_identity_across_point_miss() {
+        isolated_async(async {
+            let current = Arc::new(Mutex::new("epoch-a:target-a".to_owned()));
+            let establish_calls = Arc::new(AtomicUsize::new(0));
+            let current_at_establish = current.clone();
+            let calls_at_establish = establish_calls.clone();
+            let current_at_point = current.clone();
+            let current_at_click = current.clone();
+            let state = ToolState::new_with_production_route_backend(ProductionRouteBackend {
+                establish: Arc::new(move |pid, xid| {
+                    calls_at_establish.fetch_add(1, Ordering::SeqCst);
+                    Ok(fixed_proof(pid, xid, &current_at_establish.lock().unwrap()))
+                }),
+                point_action: Arc::new(move |_, _, _| {
+                    *current_at_point.lock().unwrap() = "epoch-b:target-b".to_owned();
+                    Ok(None)
+                }),
+                click: Arc::new(move |proof, _, _, _, _| {
+                    let (_, target) = proof.production_route_test_identity();
+                    if target != Some(current_at_click.lock().unwrap().as_str()) {
+                        anyhow::bail!("stale_target: immutable epoch/target identity was replaced");
+                    }
+                    Ok(None)
+                }),
+                set_value: Arc::new(|_, _, _| Ok(())),
+            });
+            let (pid, xid, session) = with_screenshot_context(&state);
+            let result = coordinate_click(state)
+                .invoke(serde_json::json!({"pid": pid, "window_id": xid, "x": 3, "y": 4, "_session_id": session}))
+                .await;
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(establish_calls.load(Ordering::SeqCst), 1);
+        });
     }
 
     fn value_node(key: u64) -> crate::atspi::AtspiNode {
@@ -14586,26 +14613,28 @@ mod click_button_schema_tests {
         cua_driver_core::element_token::format_token(snapshot_id, 0)
     }
 
-    #[tokio::test]
-    async fn set_value_invoke_reports_final_ancestry_race_without_mutation_fallback() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let calls_for_backend = calls.clone();
-        let state = ToolState::new_with_production_route_backend(backend_with(
-            |_, _, _| Ok(None),
-            |_, _, _, _, _| Ok(None),
-            move |_, _, _| {
-                calls_for_backend.fetch_add(1, Ordering::SeqCst);
-                anyhow::bail!("exact window ancestry changed before mutation")
-            },
-        ));
-        let pid = std::process::id();
-        let xid = NEXT_VALUE_XID.fetch_add(1, Ordering::Relaxed);
-        let token = publish_value_snapshot(&state, pid, xid, 0x41);
-        let result = SetValueTool { state }
-            .invoke(serde_json::json!({"pid": pid, "window_id": xid, "element_token": token, "value": "new"}))
-            .await;
-        assert_eq!(result.is_error, Some(true));
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "{result:?}");
+    #[test]
+    fn set_value_invoke_reports_final_ancestry_race_without_mutation_fallback() {
+        isolated_async(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let calls_for_backend = calls.clone();
+            let state = ToolState::new_with_production_route_backend(backend_with(
+                |_, _, _| Ok(None),
+                |_, _, _, _, _| Ok(None),
+                move |_, _, _| {
+                    calls_for_backend.fetch_add(1, Ordering::SeqCst);
+                    anyhow::bail!("exact window ancestry changed before mutation")
+                },
+            ));
+            let pid = std::process::id();
+            let xid = NEXT_VALUE_XID.fetch_add(1, Ordering::Relaxed);
+            let token = publish_value_snapshot(&state, pid, xid, 0x41);
+            let result = SetValueTool { state }
+                .invoke(serde_json::json!({"pid": pid, "window_id": xid, "element_token": token, "value": "new"}))
+                .await;
+            assert_eq!(result.is_error, Some(true));
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "{result:?}");
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
