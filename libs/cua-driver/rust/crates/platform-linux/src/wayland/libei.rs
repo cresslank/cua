@@ -248,7 +248,7 @@ fn command_timeout() -> anyhow::Error {
 }
 
 fn check_deadline(deadline: Instant) -> std::io::Result<()> {
-    if Instant::now() >= deadline {
+    if Instant::now() >= deadline || cua_driver_core::blocking::check_cancelled().is_err() {
         Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "libei output drain deadline expired",

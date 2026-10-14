@@ -130,7 +130,7 @@ test('extension uses an explicit positive area and never implicit stage capture'
     );
     assert.match(
         extensionSource,
-        /screenshot_area\(\s*captureRect\.x,\s*captureRect\.y,\s*captureRect\.width,\s*captureRect\.height,\s*stream\s*\)/s,
+        /composite_to_stream\(\s*captureTexture, captureX, captureY, captureWidth, captureHeight, 1, null, 0, 0, 1, stream\)/s,
     );
     assert.doesNotMatch(extensionSource, /screenshot_area\(0, 0, width, height, stream\)/);
     assert.match(extensionSource, /target_changed_during_capture/);
@@ -261,8 +261,8 @@ test('capture protocol exposes one exact target and one atomic result', async ()
         extensionSource,
         /<method name="CaptureTarget"><arg type="s" direction="in" name="target"\/><arg type="s" direction="out" name="capture_json"\/><\/method>/,
     );
-    assert.match(extensionSource, /async CaptureTargetAsync\(\[targetId\], invocation\)/);
-    assert.match(extensionSource, /screenshot_area\(\s*captureRect\.x,/);
+    assert.match(extensionSource, /CaptureTargetAsync\(\[targetId\], invocation\)/);
+    assert.match(extensionSource, /candidate\.meta_window === target/);
     assert.match(extensionSource, /target: targetId,\s*rect: captureRect,/);
     assert.doesNotMatch(extensionSource, /screenshot_area\(\s*0,\s*0,/);
 });

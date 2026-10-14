@@ -1,4 +1,5 @@
 import ast
+import json
 import ctypes
 import os
 from pathlib import Path
@@ -42,7 +43,7 @@ def _copy_helper_source(tmp_path: Path) -> Path:
 def _write_pre_policy_destination(tmp_path: Path) -> Path:
     destination = tmp_path / "data/gnome-shell/extensions" / UUID
     destination.mkdir(parents=True)
-    (destination / "metadata.json").write_text("old metadata\n", encoding="utf-8")
+    (destination / "metadata.json").write_text('{"version": 8}\n', encoding="utf-8")
     (destination / "extension.js").write_text("old extension\n", encoding="utf-8")
     return destination
 
@@ -78,7 +79,7 @@ def test_pre_policy_helper_is_atomically_replaced_with_complete_runtime(
 ) -> None:
     destination = tmp_path / "data/gnome-shell/extensions" / UUID
     destination.mkdir(parents=True)
-    (destination / "metadata.json").write_text("old metadata\n", encoding="utf-8")
+    (destination / "metadata.json").write_text('{"version": 8}\n', encoding="utf-8")
     (destination / "extension.js").write_text("old extension\n", encoding="utf-8")
     (destination / "stale.js").write_text("stale\n", encoding="utf-8")
     old_inode = destination.stat().st_ino
@@ -131,10 +132,10 @@ def test_helper_install_refuses_symlink_destination(tmp_path: Path) -> None:
     assert not (victim / "policy.js").exists()
 
 
-def test_release_installer_delegates_complete_helper_publication() -> None:
+def test_release_installer_leaves_helper_publication_to_explicit_rollout() -> None:
     installer = RELEASE_INSTALLER.read_text(encoding="utf-8")
 
-    assert '/bin/bash "$SRC_WAYLAND_HELPER/install.sh"' in installer
+    assert '/bin/bash "$SRC_WAYLAND_HELPER/install.sh"' not in installer
     assert 'cp "$SRC_WAYLAND_HELPER/winrects@cua/metadata.json"' not in installer
     assert '"$SRC_WAYLAND_HELPER/winrects@cua/extension.js"' not in installer
 
@@ -218,3 +219,25 @@ def _source_files_from(root: Path) -> dict[Path, bytes]:
         for path in root.rglob("*")
         if path.is_file()
     }
+
+
+def test_explicit_rollout_never_downgrades_newer_helper(tmp_path: Path) -> None:
+    destination = _write_pre_policy_destination(tmp_path)
+    version = json.loads((HELPER_SOURCE / "metadata.json").read_text())["version"] + 1
+    (destination / "metadata.json").write_text(json.dumps({"version": version}))
+    before = _source_files_from(destination)
+    result = _run_installer(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert _source_files_from(destination) == before
+    assert f"Keeping the installed winrects@cua v{version}" in result.stdout
+    assert "Not enabling it automatically" in result.stdout
+
+
+def test_unknown_installed_version_refuses_replacement(tmp_path: Path) -> None:
+    destination = _write_pre_policy_destination(tmp_path)
+    (destination / "metadata.json").write_text("invalid")
+    before = _source_files_from(destination)
+    result = _run_installer(tmp_path)
+    assert result.returncode != 0
+    assert "cannot establish helper version before replacement" in result.stderr
+    assert _source_files_from(destination) == before

@@ -15,12 +15,95 @@ use std::sync::{
 
 const MAX_CONCURRENT_NATIVE_CALLS: usize = 32;
 
+tokio::task_local! {
+    static NATIVE_CANCELLATION: Vec<Arc<AtomicBool>>;
+}
+
+/// Recheck immediately before a mutation after any blocking native read.
+/// Cleanup/restoration must still run after cancellation.
+pub fn check_cancelled() -> Result<(), NativeDeadlineError> {
+    if NATIVE_CANCELLATION
+        .try_with(|flags| flags.iter().any(|flag| flag.load(Ordering::Acquire)))
+        .unwrap_or(false)
+    {
+        Err(NativeDeadlineError::TimedOut)
+    } else {
+        Ok(())
+    }
+}
+
+/// Deliver a prepared native input sequence. Cancellation stops new input,
+/// but releases already present in the sequence always run to unwind held
+/// keys/buttons. Retains the caller's native scope through the last release.
+pub fn run_input_transitions<T, E: From<NativeDeadlineError>>(
+    transitions: impl IntoIterator<Item = (bool, T)>,
+    mut post: impl FnMut(T) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut error = None;
+    for (release, event) in transitions {
+        if !release {
+            if error.is_some() {
+                continue;
+            }
+            if let Err(cancelled) = check_cancelled() {
+                error = Some(cancelled.into());
+                continue;
+            }
+        }
+        if let Err(failure) = post(event) {
+            if error.is_none() {
+                error = Some(failure);
+            }
+        }
+    }
+    match error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// Dropping a native waiter cancels queued work without releasing the worker's
+/// authority. Running work retains its closure, mutation permits and action
+/// lease until cleanup finishes; it can observe cancellation before mutations.
+pub struct NativeTask<R> {
+    handle: tokio::task::JoinHandle<R>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl<R> NativeTask<R> {
+    pub fn abort(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.handle.abort();
+    }
+}
+
+impl<R> std::future::Future for NativeTask<R> {
+    type Output = Result<R, tokio::task::JoinError>;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.handle).poll(cx)
+    }
+}
+
+impl<R> Drop for NativeTask<R> {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        // Do not abort: queued closures own native payloads and must destroy
+        // them under ActionLeaseScope even when their mutation is skipped.
+    }
+}
+
 /// Ownership of the dispatch grant across a native thread or command queue.
 /// Capture in the caller, before spawning/enqueuing, and retain through input,
 /// payload destruction and cleanup. This is not admission for another action.
 /// A long-lived worker must capture per command, never once for its lifetime.
 #[derive(Clone, Default)]
-pub struct ActionLeaseScope(Option<Arc<crate::action_lease::ActionLease>>);
+pub struct ActionLeaseScope(
+    Option<Arc<crate::action_lease::ActionLease>>,
+    Option<Vec<Arc<AtomicBool>>>,
+);
 
 impl ActionLeaseScope {
     pub fn capture() -> Self {
@@ -29,12 +112,16 @@ impl ActionLeaseScope {
                 .try_with(Clone::clone)
                 .ok()
                 .flatten(),
+            NATIVE_CANCELLATION.try_with(Clone::clone).ok(),
         )
     }
 
     /// Propagate ownership to any further native continuations started here.
     pub fn run<R>(&self, function: impl FnOnce() -> R) -> R {
-        crate::tool::DISPATCH_ACTION_LEASE.sync_scope(self.0.clone(), function)
+        crate::tool::DISPATCH_ACTION_LEASE.sync_scope(self.0.clone(), || match &self.1 {
+            Some(cancelled) => NATIVE_CANCELLATION.sync_scope(cancelled.clone(), function),
+            None => function(),
+        })
     }
 }
 
@@ -60,7 +147,10 @@ pub struct NativeDeadline {
 
 impl NativeDeadline {
     pub fn check(&self) -> Result<(), NativeDeadlineError> {
-        if self.cancelled.load(Ordering::Acquire) || std::time::Instant::now() >= self.expires {
+        if check_cancelled().is_err()
+            || self.cancelled.load(Ordering::Acquire)
+            || std::time::Instant::now() >= self.expires
+        {
             Err(NativeDeadlineError::TimedOut)
         } else {
             Ok(())
@@ -161,7 +251,7 @@ pub(crate) fn native_call_limit() -> Arc<tokio::sync::Semaphore> {
 /// admission control. The returned handle has the same output shape as
 /// `tokio::task::spawn_blocking`, so callers retain ordinary join and panic
 /// semantics.
-pub fn spawn<F, R>(function: F) -> tokio::task::JoinHandle<R>
+pub fn spawn<F, R>(function: F) -> NativeTask<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
@@ -169,31 +259,53 @@ where
     spawn_with_limit(native_call_limit(), function)
 }
 
-fn spawn_with_limit<F, R>(
-    limit: Arc<tokio::sync::Semaphore>,
-    function: F,
-) -> tokio::task::JoinHandle<R>
+fn spawn_with_limit<F, R>(limit: Arc<tokio::sync::Semaphore>, function: F) -> NativeTask<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
     let action_lease = ActionLeaseScope::capture();
-    tokio::spawn(async move {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = cancelled.clone();
+    let handle = tokio::spawn(async move {
         let permit = limit
             .acquire_owned()
             .await
             .expect("native blocking-call admission semaphore closed");
         match tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            action_lease.run(function)
+            action_lease.run(|| {
+                if check_cancelled().is_err() || worker_cancelled.load(Ordering::Acquire) {
+                    drop(function);
+                    return None;
+                }
+                let mut cancellation = NATIVE_CANCELLATION
+                    .try_with(Clone::clone)
+                    .unwrap_or_default();
+                cancellation.push(worker_cancelled);
+                NATIVE_CANCELLATION.sync_scope(cancellation, || Some(function()))
+            })
         })
         .await
         {
-            Ok(value) => value,
+            Ok(Some(value)) => value,
+            // The only consumer has dropped its waiter. All owned native
+            // resources have already been cleaned up under the lease above.
+            Ok(None) => std::panic::resume_unwind(Box::new(NativeDeadlineError::TimedOut)),
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
             Err(error) => panic!("native blocking task was cancelled by runtime shutdown: {error}"),
         }
-    })
+    });
+    // The public waiter may be aborted independently. Admission and payload
+    // cleanup continue in the worker even if it has not obtained a slot yet.
+    let handle = tokio::spawn(async move {
+        match handle.await {
+            Ok(value) => value,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => panic!("native worker cancelled during shutdown: {error}"),
+        }
+    });
+    NativeTask { handle, cancelled }
 }
 
 #[derive(Debug)]
@@ -379,6 +491,45 @@ mod tests {
             .acquire(LeaseRequest::desktop_raw(None, Duration::ZERO))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_native_work_cleans_up_under_its_lease_without_mutating() {
+        use crate::action_lease::{ActionLeaseTable, LeaseRequest};
+        use crate::tool::DISPATCH_ACTION_LEASE;
+        let table = ActionLeaseTable::new();
+        let lease = table
+            .acquire_for_dispatch(LeaseRequest::desktop_raw(None, std::time::Duration::ZERO))
+            .await
+            .unwrap();
+        let limit = Arc::new(tokio::sync::Semaphore::new(0));
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let touched = mutations.clone();
+        let worker = DISPATCH_ACTION_LEASE
+            .scope(Some(lease), async {
+                spawn_with_limit(limit.clone(), move || {
+                    touched.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .await;
+        drop(worker);
+        assert_eq!(
+            table
+                .acquire(LeaseRequest::desktop_raw(None, std::time::Duration::ZERO))
+                .await
+                .unwrap_err()
+                .code(),
+            "input_busy"
+        );
+        limit.add_permits(1);
+        let _released = table
+            .acquire(LeaseRequest::desktop_raw(
+                None,
+                std::time::Duration::from_secs(2),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(mutations.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -600,4 +751,32 @@ mod tests {
             9
         );
     }
+}
+
+#[cfg(test)]
+#[test]
+fn stage6_cancelled_input_sequence_retains_releases_and_scope() {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut posted = Vec::new();
+    let result = NATIVE_CANCELLATION.sync_scope(vec![cancelled.clone()], || {
+        let inherited = ActionLeaseScope::capture();
+        inherited.run(|| {
+            run_input_transitions(
+                [
+                    (false, "modifier-down"),
+                    (false, "key-down"),
+                    (true, "key-up"),
+                    (true, "modifier-up"),
+                    (false, "next-down"),
+                ],
+                |event| {
+                    posted.push(event);
+                    cancelled.store(true, Ordering::Release);
+                    Ok::<_, NativeDeadlineError>(())
+                },
+            )
+        })
+    });
+    assert!(matches!(result, Err(NativeDeadlineError::TimedOut)));
+    assert_eq!(posted, ["modifier-down", "key-up", "modifier-up"]);
 }

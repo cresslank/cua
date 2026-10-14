@@ -207,7 +207,7 @@ pub fn error_structured(error: &PxFrameError) -> serde_json::Value {
 /// Resolve the frame off the async path, mapping both the task error and the
 /// refusal onto a `ToolResult` the caller can return directly.
 pub async fn resolve_or_refuse(window_id: u32) -> Result<WindowPxFrame, ToolResult> {
-    match tokio::task::spawn_blocking(move || resolve_window_px_frame(window_id)).await {
+    match cua_driver_core::blocking::spawn(move || resolve_window_px_frame(window_id)).await {
         Ok(Ok(frame)) => Ok(frame),
         Ok(Err(e)) => Err(refusal(&e)),
         Err(e) => Err(ToolResult::error(format!(

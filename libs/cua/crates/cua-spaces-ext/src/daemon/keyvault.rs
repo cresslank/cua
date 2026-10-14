@@ -790,6 +790,9 @@ impl Backend for DaemonBackend {
     }
 
     async fn wipe(&self, target: &str, import_id: &str) -> KvResult<Vec<String>> {
+        // A Space that no longer exists, or one that no longer knows the
+        // import, holds nothing to wipe: report that as NotFound so the
+        // broker can finish deleting the item (see `wipe_where`).
         let space = self.open_target(target).await?;
         let resp = space
             .spacesd()
@@ -800,7 +803,14 @@ impl Backend for DaemonBackend {
                 all: false,
             })
             .await
-            .map_err(|e| backend_err("wipe import", e))?
+            .map_err(|e| {
+                // gRPC NOT_FOUND (5): the target no longer knows the import.
+                if e.code() as i32 == 5 {
+                    KvError::NotFound(format!("import {import_id:?} on {target}"))
+                } else {
+                    backend_err("wipe import", e)
+                }
+            })?
             .into_inner();
         Ok(resp.removed_paths)
     }
@@ -985,10 +995,18 @@ pub async fn serve_socket(broker: Arc<Broker>, path: std::path::PathBuf) {
             cua_keyvault::ipc::serve(listener, broker, policy).await;
         }
     }
-    // The socket verifies every peer through the kernel (a Unix socket
-    // feature); on other OSes only the in-process broker (the app and the
-    // daemon's MCP tools) reaches the vault.
-    #[cfg(not(unix))]
+    // Windows serves a named pipe in its place, open to this account only,
+    // and identifies every client by its process and Authenticode signature.
+    #[cfg(windows)]
+    {
+        match cua_keyvault::ipc::bind_pipe(&path) {
+            Ok(listener) => cua_keyvault::ipc::serve_pipe(listener, broker, policy).await,
+            Err(e) => tracing::warn!(error = %e, "keyvault: pipe not served"),
+        }
+    }
+    // On other OSes only the in-process broker (the app and the daemon's MCP
+    // tools) reaches the vault.
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (broker, policy);
         tracing::info!(path = %path.display(), "keyvault: no external socket on this OS");

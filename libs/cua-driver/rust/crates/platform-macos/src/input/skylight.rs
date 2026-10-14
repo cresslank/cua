@@ -768,6 +768,9 @@ impl Drop for ForegroundTurn {
 }
 
 fn foreground_turn() -> ForegroundTurn {
+    // An intentional activation ends the previous action's detached window
+    // watch, whose wildcard lease would otherwise revert it.
+    crate::post_action::cancel();
     if HOLDS_FOREGROUND_LOCK.with(std::cell::Cell::get) {
         return ForegroundTurn { _guard: None };
     }
@@ -824,10 +827,12 @@ pub fn with_foreground_assist(
     body: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
     let _turn = foreground_turn();
+    cua_driver_core::blocking::check_cancelled()?;
     let set_front = match set_front_process_fn() {
         Some(f) => f,
         None => {
             // SPIs unavailable — run body anyway without activation.
+            cua_driver_core::blocking::check_cancelled()?;
             body()?;
             return Ok(false);
         }
@@ -840,10 +845,12 @@ pub fn with_foreground_assist(
 
     let mut target_psn = [0u8; 8];
     if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
+        cua_driver_core::blocking::check_cancelled()?;
         body()?;
         return Ok(false);
     }
 
+    cua_driver_core::blocking::check_cancelled()?;
     crate::post_action::cancel();
     unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
     // `set_front` moves WindowServer's front process but does not make the
@@ -851,10 +858,14 @@ pub fn with_foreground_assist(
     // key window. Without this the app is "frontmost" to WindowServer while
     // remaining, from AppKit's point of view, unfocused — so the AXFocused
     // write in the body has no responder chain to attach to.
-    make_exact_window_key(target_pid, target_wid);
+    if cua_driver_core::blocking::check_cancelled().is_ok() {
+        make_exact_window_key(target_pid, target_wid);
+    }
     await_window_focused(target_pid, target_wid);
 
-    let result = body();
+    let result = cua_driver_core::blocking::check_cancelled()
+        .map_err(anyhow::Error::from)
+        .and_then(|()| body());
 
     if prev_ok {
         crate::post_action::cancel();
@@ -959,6 +970,7 @@ pub fn with_foreground_hid_activation(
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let _turn = foreground_turn();
+    cua_driver_core::blocking::check_cancelled()?;
     let set_front = set_front_process_fn()
         .ok_or_else(|| anyhow::anyhow!("foreground HID delivery is unavailable"))?;
 
@@ -979,21 +991,29 @@ pub fn with_foreground_hid_activation(
         // renderer focus even though WindowServer keeps the app frontmost.
         // The AX window proof lets us deliver directly without weakening the
         // exact-window guard or disturbing the current key target.
+        cua_driver_core::blocking::check_cancelled()?;
         return action();
     }
 
+    cua_driver_core::blocking::check_cancelled()?;
     crate::post_action::cancel();
     let activated = unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
     if activated != 0 {
         anyhow::bail!("WindowServer rejected foreground HID activation");
     }
 
-    make_exact_window_key(target_pid, target_wid);
+    if cua_driver_core::blocking::check_cancelled().is_ok() {
+        make_exact_window_key(target_pid, target_wid);
+    }
     // A slow app (LibreOffice) can take longer than one wait to install its
     // key window: ask once more before giving up.
-    if !await_window_focused(target_pid, target_wid) {
+    if !await_window_focused(target_pid, target_wid)
+        && cua_driver_core::blocking::check_cancelled().is_ok()
+    {
         unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
-        make_exact_window_key(target_pid, target_wid);
+        if cua_driver_core::blocking::check_cancelled().is_ok() {
+            make_exact_window_key(target_pid, target_wid);
+        }
     }
     if !await_window_focused(target_pid, target_wid) {
         if prev_ok {
@@ -1006,7 +1026,9 @@ pub fn with_foreground_hid_activation(
         );
     }
 
-    let result = action();
+    let result = cua_driver_core::blocking::check_cancelled()
+        .map_err(anyhow::Error::from)
+        .and_then(|()| action());
     std::thread::sleep(std::time::Duration::from_millis(40));
 
     if prev_ok {
@@ -1043,10 +1065,12 @@ pub fn with_menu_shortcut_activation(
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
     let _turn = foreground_turn();
+    cua_driver_core::blocking::check_cancelled()?;
     let set_front = match set_front_process_fn() {
         Some(f) => f,
         None => {
             // SPIs unavailable — run action anyway without activation.
+            cua_driver_core::blocking::check_cancelled()?;
             action()?;
             return Ok(false);
         }
@@ -1062,16 +1086,20 @@ pub fn with_menu_shortcut_activation(
     let mut target_psn = [0u8; 8];
     let target_ok = get_process_psn_for_window(target_wid, target_pid, &mut target_psn);
     if !target_ok {
+        cua_driver_core::blocking::check_cancelled()?;
         action()?;
         return Ok(false);
     }
 
     // Make target WindowServer-frontmost (kCPSNoWindows = 0x400).
+    cua_driver_core::blocking::check_cancelled()?;
     crate::post_action::cancel();
     unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
 
     // Run action then restore — even if action fails.
-    let result = action();
+    let result = cua_driver_core::blocking::check_cancelled()
+        .map_err(anyhow::Error::from)
+        .and_then(|()| action());
 
     // Restore prior frontmost (windowID=0, options=0x400).
     if prev_ok {

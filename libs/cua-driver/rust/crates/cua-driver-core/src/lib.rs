@@ -74,7 +74,6 @@ pub mod cursor_shape;
 pub mod daemon;
 pub mod delivery;
 pub mod desktop_capture_scale;
-pub mod display_only;
 pub mod element_frame;
 pub mod element_query;
 pub mod element_token;
@@ -101,6 +100,8 @@ pub mod recording_loader;
 pub mod recording_render;
 pub mod recording_tools;
 pub mod recording_zoom;
+#[cfg(feature = "script")]
+pub mod script_tool;
 pub mod server;
 pub mod session;
 pub mod session_authorization;

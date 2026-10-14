@@ -33,7 +33,7 @@ fn def() -> &'static ToolDef {
             \n\
             DIFF READS (use them for every re-read after acting): `since:\"latest\"`, or `since:<snapshot_id>` from an earlier read of the same window, returns only what changed: `+` added, `~` changed, `-` removed rows (removed ids are the old snapshot's), a `reindexed:` line if indices shifted, or `no change since …; focused element is …`. The response carries a NEW snapshot_id: use it in tokens. An unknown, expired, other-window or differently-scoped (query/max_elements/max_depth) `since` falls back to a full read; `since_status` says why.\n\
             \n\
-            A new snapshot of the same (pid, window_id) replaces the previous one and stales its tokens (`invalidated_snapshot_ids`). `include_screenshot:false` returns the tree only and keeps a valid same-session screenshot frame at the same known window size; `include_accessibility_tree:false` refreshes the screenshot while preserving live same-session rows and tokens. Other platforms may replace tokens on screenshot-only reads. Scrolling containers may leave non-visible, non-selected rows unread (`collapsed_rows`); scroll or search to reveal them. The tree can lie on some surfaces (Electron, Catalyst, virtualized rows with `h:1` frames): cross-check the screenshot, and use pixel x,y at action time only for elements missing from the tree.\n\
+            A new snapshot of the same (pid, window_id) replaces the previous one and stales its tokens (`invalidated_snapshot_ids`). `include_screenshot:false` returns the tree only and keeps a valid same-session screenshot frame at the same known window size; `include_accessibility_tree:false` refreshes the screenshot while preserving live same-session rows and tokens. Scrolling containers may leave non-visible, non-selected rows unread (`collapsed_rows`); scroll or search to reveal them. The tree can lie on some surfaces (Electron, Catalyst, virtualized rows with `h:1` frames): cross-check the screenshot, and use pixel x,y at action time only for elements missing from the tree.\n\
             \n\
             Refusals: `window_id_not_found`; `window_owner_pid_mismatch` names the real `owner_pid` (sandboxed Open/Save panels belong to a panel service). `degraded_reason` `ax_window_unresolved` or `ax_app_launching` (the latter with `truncation_reason: app_lookup_timeout`) means an empty tree: re-snapshot, or act with `delivery_mode:\"foreground\"`. `px_frame_mismatch` / `px_capture_unavailable` omit the unprovable screenshot; the AX payload stays valid.".into(),
         input_schema: cua_driver_core::window_state_view::extend_input_schema(serde_json::json!({
@@ -78,7 +78,6 @@ fn def() -> &'static ToolDef {
                     "minimum": 0,
                     "description": "Per-call override for the returned screenshot's long edge in pixels. An explicit value wins over the session/global setting; 0 returns native resolution. Omit to preserve configured behavior."
                 },
-                "display_only": cua_driver_core::display_only::schema()
             },
             "additionalProperties": false
         })),
@@ -147,7 +146,7 @@ impl Tool for GetWindowStateTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        let display_only = match cua_driver_core::display_only::display_only(&args) {
+        let display_only = match cua_driver_core::window_state_view::display_only(&args) {
             Ok(display_only) => display_only,
             Err(refusal) => return refusal,
         };
@@ -279,6 +278,11 @@ impl Tool for GetWindowStateTool {
             .unwrap_or(crate::ax::tree::DEFAULT_MAX_DEPTH);
         let timeout_ms = cua_driver_core::tool_schema::resolve_timeout_ms(args.get("timeout_ms"));
 
+        // A model-facing read lists the menu bar's top-level titles only; a
+        // query or full_output walks every menu as before.
+        let collapse_menus = query.as_deref().is_none_or(|q| q.trim().is_empty())
+            && !view.full_output
+            && !observation_only;
         let probe_focus = view.since.is_some() && !observation_only;
         let (tree_result, prepared_snapshot, focused_description) = if want_tree {
             let q = query.clone();
@@ -287,13 +291,15 @@ impl Tool for GetWindowStateTool {
             // for an AX call that ignores the per-element messaging timeout
             // (dropping a spawn_blocking JoinHandle cannot cancel it).
             let walk_future = cua_driver_core::blocking::spawn(move || {
-                let tree = crate::ax::tree::walk_tree_budgeted(
-                    pid,
-                    Some(window_id),
-                    q.as_deref(),
-                    max_depth,
-                    cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements),
-                );
+                let tree = crate::ax::tree::with_menus_collapsed(collapse_menus, || {
+                    crate::ax::tree::walk_tree_budgeted(
+                        pid,
+                        Some(window_id),
+                        q.as_deref(),
+                        max_depth,
+                        cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements),
+                    )
+                });
                 let payload = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
                 // Probe while the worker still owns the retained native payload.
                 let focused = if probe_focus {
@@ -885,7 +891,7 @@ impl Tool for GetWindowStateTool {
             ),
         );
         if display_only {
-            cua_driver_core::display_only::mark_display_only(&mut structured);
+            cua_driver_core::window_state_view::mark_display_only(&mut structured);
         }
         if !observation_only {
             let focus_probe = || focused_description.clone();

@@ -1111,9 +1111,11 @@ impl Tool for ListWindowsTool {
                 higher values are closer to the front; null means stacking order is unavailable \
                 and callers must not infer one). To select a frontmost candidate, take the maximum \
                 integer z_index; if every value is null, use an explicit fallback instead of \
-                relying on array order.".into(),
+                relying on array order. Filter with `app` or `pid`: an unfiltered call lists \
+                every window on the host.".into(),
             input_schema: json!({"type":"object","properties":{
                 "pid":{"type":"integer","description":"Only list windows owned by this process ID."},
+                "app":{"type":"string","description":cua_driver_core::tool_args::LIST_WINDOWS_APP_FILTER_DESCRIPTION},
                 "on_screen_only":{"type":"boolean","description":"When true, filter to visible windows only. Default false."}
             },"additionalProperties":false}),
             read_only: true, destructive: false, idempotent: true, open_world: false,
@@ -1132,6 +1134,11 @@ impl Tool for ListWindowsTool {
         // AT-SPI can retain defunct applications after exit; never expose stale targets.
         windows.retain(|window| window.pid.map_or(true, crate::proc_fs::is_process_live));
         windows = filter_on_screen_windows(windows, on_screen_only);
+        if let Some(filter) = args.opt_str("app") {
+            windows.retain(|window| {
+                cua_driver_core::tool_args::app_filter_matches(&filter, &window.app_name, None)
+            });
+        }
         if crate::wayland::is_wayland() {
             crate::wayland::remember_observed_window_origins(&windows);
         }
@@ -1888,7 +1895,6 @@ impl Tool for GetWindowStateTool {
                 "timeout_ms": cua_driver_core::tool_schema::timeout_ms_schema(),
                 "max_dimension":{"type":"integer","minimum":1,"description":"Legacy optional cap on the returned screenshot's long edge. Applied on top of the configured max_image_dimension ceiling when max_image_dimension is omitted."},
                 "max_image_dimension":{"type":"integer","minimum":0,"description":"Per-call long-edge override. This value wins over configured and legacy limits; 0 returns native-resolution PNG bytes. Omit to preserve configured behavior."},
-                "display_only": cua_driver_core::display_only::schema()
             },"additionalProperties":false})),
             // Each call mints a new snapshot and its element tokens, which
             // retires the previous ones: repeating it is not idempotent.
@@ -1897,7 +1903,7 @@ impl Tool for GetWindowStateTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        let display_only = match cua_driver_core::display_only::display_only(&args) {
+        let display_only = match cua_driver_core::window_state_view::display_only(&args) {
             Ok(display_only) => display_only,
             Err(refusal) => return refusal,
         };
@@ -2011,9 +2017,11 @@ impl Tool for GetWindowStateTool {
             view.max_elements(
                 &args,
                 LINUX_DEFAULT_MAX_ELEMENTS,
-                args.get("_observation_only")
-                    .and_then(|value| value.as_bool())
-                    == Some(true),
+                display_only
+                    || args
+                        .get("_observation_only")
+                        .and_then(|value| value.as_bool())
+                        == Some(true),
             ),
         );
         let max_depth = args
@@ -2099,6 +2107,21 @@ impl Tool for GetWindowStateTool {
         let capture_args = args.clone();
         let query_for_walk = query.clone();
 
+        // Capture ownership/revision BEFORE producing pixels. A late image
+        // must never refresh a replacement generation or retired session.
+        let refresh_ticket = if !want_tree && should_capture && !observation_only {
+            match self.state.snapshots.screenshot_refresh_ticket(
+                pid as i32,
+                xid,
+                session_id.as_deref(),
+            ) {
+                Ok(ticket) => Some(ticket),
+                Err(error) => return snapshot_publication_error(error),
+            }
+        } else {
+            None
+        };
+
         let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<_> {
             let tree_result = want_tree.then(|| crate::atspi::walk_tree_bounded_within(
                 pid, xid, query_for_walk.as_deref(), max_elements, max_depth, walk_timeout,
@@ -2129,7 +2152,17 @@ impl Tool for GetWindowStateTool {
                 window_overlays(pid, xid)
             };
             let screenshot = if should_capture {
-                let captured = if overlays.covers_window {
+                // A screenshot-only read with a size cap (a live preview) asks
+                // a GNOME helper with API 10 to downscale in the compositor,
+                // and keeps the window's full size for frame_scale.
+                let preview = if !want_tree && max_dim > 0 && crate::wayland::is_wayland() {
+                    crate::wayland::shell_helper::screenshot_window_preview(xid, pid, max_dim)
+                } else {
+                    None
+                };
+                let captured = if let Some((png, width, height)) = preview {
+                    Ok((png, Some((width, height))))
+                } else if overlays.covers_window {
                     overlays
                         .window_rect
                         .ok_or_else(|| anyhow::anyhow!("window geometry unavailable"))
@@ -2137,12 +2170,16 @@ impl Tool for GetWindowStateTool {
                             crate::capture::screenshot_root_region_png(x, y, w, h)
                         })
                         .or_else(|_| crate::wayland::screenshot_dispatch_with_pid(xid, pid))
+                        .map(|png| (png, None))
                 } else {
-                    crate::wayland::screenshot_dispatch_with_pid(xid, pid)
+                    crate::wayland::screenshot_dispatch_with_pid(xid, pid).map(|png| (png, None))
                 };
                 match captured {
-                    Ok(raw) => {
-                        let (orig_w, orig_h) = crate::capture::png_dimensions_pub(&raw)?;
+                    Ok((raw, original_size)) => {
+                        let (orig_w, orig_h) = match original_size {
+                            Some(size) => size,
+                            None => crate::capture::png_dimensions_pub(&raw)?,
+                        };
                         let png = crate::capture::resize_png_if_needed(&raw, max_dim)?;
                         let (w, h) = crate::capture::png_dimensions_pub(&png)?;
                         // An explicit per-call max_image_dimension (0 = native)
@@ -2201,6 +2238,7 @@ impl Tool for GetWindowStateTool {
                     original_w.map_or(1.0, |ow| ow as f64 / *w as f64)
                 });
                 let mut published_snapshot = None;
+                let mut refreshed_context = None;
                 let mut invalidated = Vec::new();
 
                 if let Some(tr) = tree_opt {
@@ -2431,13 +2469,40 @@ impl Tool for GetWindowStateTool {
                 if !observation_only && published_snapshot.is_none() {
                     let payload = crate::atspi::snapshot::AtspiSnapshot::try_from_nodes(&[])
                         .expect("empty payload");
-                    match state.snapshots.try_publish_capture_for_session(
-                        pid as i32,
-                        xid,
-                        payload,
-                        session_id.as_deref(),
-                        screenshot_scale,
-                    ) {
+                    let publication = if let (Some(ticket), Some(scale)) =
+                        (refresh_ticket.clone(), screenshot_scale)
+                    {
+                        match state.snapshots.refresh_screenshot_for_session(
+                            ticket.clone(),
+                            scale,
+                            None,
+                        ) {
+                            Ok(Some(context)) => {
+                                refreshed_context = Some(context);
+                                structured["snapshot_id"] =
+                                    json!(cua_driver_core::element_token::format_snapshot_id(
+                                        context.snapshot_id
+                                    ));
+                                structured["screenshot_refreshed_snapshot"] = json!(true);
+                                Ok(Some((context.snapshot_id, vec![])))
+                            }
+                            Ok(None) => state
+                                .snapshots
+                                .try_publish_capture_for_refresh(ticket, payload, scale),
+                            Err(error) => Err(error),
+                        }
+                    } else if refresh_ticket.is_some() {
+                        Err(cua_driver_core::element_token::RegistryError::NotCurrent)
+                    } else {
+                        state.snapshots.try_publish_capture_for_session(
+                            pid as i32,
+                            xid,
+                            payload,
+                            session_id.as_deref(),
+                            screenshot_scale,
+                        )
+                    };
+                    match publication {
                         Ok(Some((id, replaced))) => {
                             invalidated.extend(replaced);
                             published_snapshot = Some(id);
@@ -2471,18 +2536,48 @@ impl Tool for GetWindowStateTool {
                                 cua_driver_core::element_token::RegistryError::NotCurrent,
                             );
                         };
-                        match crate::capture_action_frame::publish_window(
-                            &state.capture_service,
-                            &capture_args,
-                            &png,
-                            pid,
-                            xid,
-                            (w, h),
-                            (native_w, native_h),
-                            identity,
+                        let context = refreshed_context.unwrap_or(
+                            cua_driver_core::snapshot_store::ScreenshotContext {
+                                snapshot_id: published_snapshot.expect("published snapshot"),
+                                window_id: xid,
+                                scale: screenshot_scale.unwrap_or(1.0),
+                                frame_revision: 1,
+                            },
+                        );
+                        let frame = match state.snapshots.frame_binding(
+                            pid as i32,
+                            session_id.as_deref(),
+                            context,
                         ) {
-                            Ok(id) => Some(id),
-                            Err(error) => {
+                            Ok(frame) => frame,
+                            Err(error) => return error,
+                        };
+                        let publication = state.snapshots.with_valid_screenshot_context(
+                            pid as i32,
+                            session_id.as_deref(),
+                            context,
+                            || {
+                                crate::capture_action_frame::publish_window(
+                                    &state.capture_service,
+                                    &capture_args,
+                                    &png,
+                                    pid,
+                                    xid,
+                                    (w, h),
+                                    (native_w, native_h),
+                                    identity,
+                                    Some(frame),
+                                )
+                            },
+                        );
+                        match publication {
+                            Err(_) => {
+                                return snapshot_publication_error(
+                                    cua_driver_core::element_token::RegistryError::NotCurrent,
+                                )
+                            }
+                            Ok(Ok(id)) => Some(id),
+                            Ok(Err(error)) => {
                                 return ToolResult::error(format!(
                                     "capture publication failed: {error}"
                                 ))
@@ -2571,7 +2666,7 @@ impl Tool for GetWindowStateTool {
                      for get_desktop_state pixels."
                 );
                 if display_only {
-                    cua_driver_core::display_only::mark_display_only(&mut structured);
+                    cua_driver_core::window_state_view::mark_display_only(&mut structured);
                 }
 
                 // The capture-only path (include_accessibility_tree:false) leaves
@@ -4501,7 +4596,7 @@ fn spawn_isolated_hyprland(
 ) -> Result<
     (
         crate::wayland::hyprland_input::CancelOnDrop,
-        tokio::task::JoinHandle<anyhow::Result<Value>>,
+        cua_driver_core::blocking::NativeTask<anyhow::Result<Value>>,
     ),
     ToolResult,
 > {
@@ -14650,7 +14745,6 @@ mod pid_window_target_tests {
 
 #[cfg(test)]
 mod display_only_tests;
-
 #[cfg(test)]
 mod window_capture_dimension_tests;
 

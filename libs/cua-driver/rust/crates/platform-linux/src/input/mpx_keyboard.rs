@@ -383,14 +383,15 @@ fn warm_up_keyboard(
             press: false,
         },
     ];
-    for step in steps {
-        let _ = device.emit(&[InputEvent::new(
+    let _ = deliver_steps(&steps, |step| {
+        device.emit(&[InputEvent::new(
             EventType::KEY,
             step.evdev_code,
             if step.press { 1 } else { 0 },
-        )]);
+        )])?;
         sleep(Duration::from_millis(KEY_DELAY_MS));
-    }
+        Ok(())
+    });
     let seen = wait_for_raw_key(
         display,
         xi_opcode,
@@ -563,6 +564,9 @@ fn deliver(
         // Retry once — a freshly mapped/raised toplevel can miss the first set.
         let mut focus_taken = false;
         for attempt in 0..2 {
+            if cua_driver_core::blocking::check_cancelled().is_err() {
+                break;
+            }
             let rc = unsafe {
                 x11::xinput2::XISetFocus(display, ids.keyboard_id, window, x11::xlib::CurrentTime)
             };
@@ -576,6 +580,7 @@ fn deliver(
             }
         }
         unsafe { x11::xlib::XSetErrorHandler(previous_handler) };
+        cua_driver_core::blocking::check_cancelled()?;
         if !focus_taken {
             bail!(
                 "virtual master keyboard could not take focus on window 0x{target_window:x} \
@@ -583,34 +588,16 @@ fn deliver(
             );
         }
 
-        let mut last = None;
-        let mut held: Vec<u16> = Vec::new();
-        for step in steps {
-            let emitted = {
-                let mut device = device.lock().unwrap();
-                device.emit(&[InputEvent::new(
-                    EventType::KEY,
-                    step.evdev_code,
-                    if step.press { 1 } else { 0 },
-                )])
-            };
-            if let Err(error) = emitted {
-                // Never abort with keys down: a held modifier would chord
-                // every later key of this session.
-                let mut device = device.lock().unwrap();
-                for code in held.iter().rev() {
-                    let _ = device.emit(&[InputEvent::new(EventType::KEY, *code, 0)]);
-                }
-                return Err(error.into());
-            }
-            if step.press {
-                held.push(step.evdev_code);
-            } else {
-                held.retain(|code| *code != step.evdev_code);
-            }
-            last = Some(*step);
+        let last = deliver_steps(steps, |step| {
+            let mut device = device.lock().unwrap();
+            device.emit(&[InputEvent::new(
+                EventType::KEY,
+                step.evdev_code,
+                if step.press { 1 } else { 0 },
+            )])?;
             sleep(Duration::from_millis(KEY_DELAY_MS));
-        }
+            Ok(())
+        })?;
         let delivery_confirmed = match last {
             Some(last) => wait_for_raw_key(
                 display,
@@ -926,4 +913,36 @@ mod tests {
         assert!(name.len() <= EVDEV_UINPUT_NAME_MAX_BYTES, "{name}");
         assert!(name.ends_with(UINPUT_KEYBOARD_SUFFIX));
     }
+}
+
+pub(super) fn deliver_steps(
+    steps: &[KeyStep],
+    mut emit: impl FnMut(KeyStep) -> Result<()>,
+) -> Result<Option<KeyStep>> {
+    let mut last = None;
+    let mut held = Vec::new();
+    for &step in steps {
+        let result = (|| {
+            if step.press {
+                cua_driver_core::blocking::check_cancelled()?;
+            }
+            emit(step)
+        })();
+        if let Err(error) = result {
+            for &code in held.iter().rev() {
+                let _ = emit(KeyStep {
+                    evdev_code: code,
+                    press: false,
+                });
+            }
+            return Err(error);
+        }
+        if step.press {
+            held.push(step.evdev_code);
+        } else {
+            held.retain(|code| *code != step.evdev_code);
+        }
+        last = Some(step);
+    }
+    Ok(last)
 }

@@ -258,7 +258,7 @@ impl Snapshots {
         identity: SnapshotIdentity,
         idx: usize,
         mutation: F,
-    ) -> Result<tokio::task::JoinHandle<R>, RegistryError>
+    ) -> Result<cua_driver_core::blocking::NativeTask<R>, RegistryError>
     where
         F: FnOnce(u64) -> R + Send + 'static,
         R: Send + 'static,
@@ -277,7 +277,7 @@ impl Snapshots {
         identity: SnapshotIdentity,
         idx: usize,
         mutation: F,
-    ) -> Result<tokio::task::JoinHandle<R>, RegistryError>
+    ) -> Result<cua_driver_core::blocking::NativeTask<R>, RegistryError>
     where
         F: FnOnce(u64, Option<AtspiIdentity>) -> R + Send + 'static,
         R: Send + 'static,

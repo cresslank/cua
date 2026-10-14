@@ -416,7 +416,7 @@ mod tests {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let (finish_tx, finish_rx) = std::sync::mpsc::channel();
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel();
-        let scan = tokio::task::spawn_blocking(move || {
+        let scan = cua_driver_core::blocking::spawn(move || {
             let mut element = node("AXButton", 0, Some("Allow"), &["AXPress"]);
             element.element_ptr = unsafe { CFRetain(ptr as CFTypeRef) } as usize;
             let owned = ConsentTrees(vec![vec![element]]);

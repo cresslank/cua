@@ -854,7 +854,6 @@ pub(crate) fn allowed_environment_name(name: &str) -> bool {
         || matches!(
             upper.as_str(),
             "PATH"
-                | "HOME"
                 | "USER"
                 | "LOGNAME"
                 | "SHELL"
@@ -866,15 +865,7 @@ pub(crate) fn allowed_environment_name(name: &str) -> bool {
                 | "WINDIR"
                 | "COMSPEC"
                 | "PATHEXT"
-                | "APPDATA"
-                | "LOCALAPPDATA"
                 | "PROGRAMDATA"
-                | "DISPLAY"
-                | "WAYLAND_DISPLAY"
-                | "XDG_RUNTIME_DIR"
-                | "XDG_SESSION_TYPE"
-                | "DBUS_SESSION_BUS_ADDRESS"
-                | "XAUTHORITY"
                 | "CUA_LOG"
                 | "CUA_DRIVER_AX_BATCH"
         )
@@ -906,7 +897,19 @@ pub(crate) fn inherited_managed_environment_name(name: &str) -> bool {
 pub(crate) fn inherited_runtime_environment_name(name: &str) -> bool {
     matches!(
         name.to_ascii_uppercase().as_str(),
-        "CUA_BROWSER_PROFILE_DIR"
+        "HOME"
+            | "USERPROFILE"
+            | "DISPLAY"
+            | "WAYLAND_DISPLAY"
+            | "XDG_RUNTIME_DIR"
+            | "XDG_SESSION_TYPE"
+            | "DBUS_SESSION_BUS_ADDRESS"
+            | "XAUTHORITY"
+            | "APPDATA"
+            | "LOCALAPPDATA"
+            | "CUA_DRIVER_DISABLE_RUN_SCRIPT"
+            | "CUA_DRIVER_EXPERIMENTAL_SCRIPT"
+            | "CUA_BROWSER_PROFILE_DIR"
             | "CUA_DRIVER_BROWSER_PROFILE_ROOT"
             | "CUA_DRIVER_CDP_PORT"
             | "CUA_DRIVER_RS_A11Y_ADVERTISE_MODE"
@@ -1437,7 +1440,7 @@ mod tests {
     #[test]
     fn environment_is_allowlisted_and_driver_controls_are_reserved() {
         assert!(allowed_environment_name("PATH"));
-        assert!(allowed_environment_name("WAYLAND_DISPLAY"));
+        assert!(!allowed_environment_name("WAYLAND_DISPLAY"));
         assert!(!allowed_environment_name("CUA_DRIVER_PERMISSION_MODE"));
         assert!(!allowed_environment_name("LD_PRELOAD"));
         assert!(!allowed_environment_name("NODE_OPTIONS"));
@@ -1570,6 +1573,34 @@ mod tests {
                 _ => panic!("caller-provided Wayland route must be refused"),
             }
         }
+    }
+
+    #[test]
+    fn script_and_desktop_controls_are_inherited_only() {
+        for name in [
+            "CUA_DRIVER_DISABLE_RUN_SCRIPT",
+            "CUA_DRIVER_EXPERIMENTAL_SCRIPT",
+            "HOME",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ] {
+            let overrides = [EmbeddedEnvironmentVariable {
+                name: name.into(),
+                value: "forged".into(),
+            }];
+            let values = merge_safe_environment([(name.into(), "trusted".into())], &overrides);
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].value, "trusted");
+            let mut options = options(EmbeddedPermissionMode::Standard);
+            options.environment = overrides.to_vec();
+            assert!(
+                matches!(validate_options(options), Err(EmbeddedDriverError::Configuration { reason }) if reason == format!("environment variable {name} is not in the embedded safe allowlist"))
+            );
+        }
+        assert!(!inherited_runtime_environment_name(
+            "CUA_UNRECOGNIZED_CONTROL"
+        ));
     }
 
     #[test]

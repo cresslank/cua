@@ -10,6 +10,7 @@ import SwiftUI
 /// sections, search, selection fallback and dimming are the core's.
 public struct MainWindow: View {
     @Bindable var model: AppModel
+    @Environment(\.openSettings) private var openSettings
 
     public init(model: AppModel) {
         self.model = model
@@ -42,6 +43,12 @@ public struct MainWindow: View {
                 }
                 .keyboardShortcut("n", modifiers: .command)
                 .help(chrome.newSpaceLabel)
+            }
+            if model.settings.experiments.webUi {
+                ToolbarItem(placement: .primaryAction) {
+                    OpenWebUIButton(model: model, label: "New UI")
+                        .help("Open New UI (preview)")
+                }
             }
         }
         .sheet(isPresented: $model.showingNewSpace) {
@@ -99,7 +106,10 @@ public struct MainWindow: View {
         case .keyvault(let selection):
             KeyvaultDetail(keyvault: model.keyvault, selection: selection)
         case .agents:
-            AgentsPageView(model: model.persistent)
+            AgentsPageView(model: model.persistent, openAgentKeys: {
+                model.settingsTab = .agents
+                openSettings()
+            })
                 .onAppear {
                     model.recordFeature("agents_page_open")
                     let id = model.sidebar.thisMachine?.id
@@ -385,15 +395,52 @@ struct KeyvaultHeader: View {
 
 struct EmptySpaces: View {
     let model: AppModel
+    @State private var stacked = false
 
     var body: some View {
         let chrome = model.chrome
+        let tiles = stacked ? AnyLayout(VStackLayout(spacing: 12)) : AnyLayout(HStackLayout(spacing: 12))
         ContentUnavailableView {
-            Text(model.rosterError == nil ? chrome.emptyTitle : "Spaces could not be loaded")
+            Label(model.rosterError == nil ? chrome.emptyTitle : "Spaces could not be loaded",
+                  systemImage: "desktopcomputer")
+        } description: {
+            if model.rosterError == nil { Text(chrome.emptyDetail) }
         } actions: {
-            Button(chrome.emptyAction) { Task { await model.openNewSpace() } }
-                .buttonStyle(.glassProminent)
+            VStack(spacing: 18) {
+                if model.rosterError == nil {
+                    tiles {
+                        tile("os-linux", chrome.emptyAction, chrome.emptyLinuxDetail, .linux)
+                        tile("os-macos", chrome.emptyMacosAction, chrome.emptyMacosDetail, .macos)
+                    }
+                }
+                Button(chrome.newSpaceLabel) { Task { await model.openNewSpace() } }
+                    .buttonStyle(.glass)
+            }
+            .padding(.top, 10)
         }
+        // Neither the actions slot nor this view reports the pane width, so measure a pane-filling frame.
+        .frame(maxWidth: .infinity)
+        .onGeometryChange(for: Bool.self) { $0.size.width < 640 } action: { stacked = $0 }
+    }
+
+    private func tile(_ icon: String, _ name: String, _ detail: String, _ os: AppSpaceOs) -> some View {
+        Button { Task { await model.openNewSpace(quick: os) } } label: {
+            HStack(spacing: 12) {
+                OsIconImage(id: icon, size: 24)
+                    .frame(width: 44, height: 44)
+                    .background(.fill.tertiary, in: .rect(cornerRadius: 10))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(name).font(.headline)
+                    Text(detail).font(.callout).foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 16)
+            .frame(width: 288, height: 80, alignment: .leading)
+            .contentShape(.rect(cornerRadius: 16))
+        }
+        .buttonStyle(.plain)
+        .glassEffect(.regular.interactive(), in: .rect(cornerRadius: 16))
+        .accessibilityLabel("\(name), \(detail)")
     }
 }
 

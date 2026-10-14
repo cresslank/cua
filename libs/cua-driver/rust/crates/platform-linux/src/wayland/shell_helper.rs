@@ -16,14 +16,14 @@
 //!
 //! Everything here is **best-effort**: if the extension isn't installed/enabled
 //! the calls return `None` / no-op and callers keep the prior behaviour (no
-//! screen coords, no Wayland cursor). Most calls use a short-lived `gdbus`
-//! subprocess. Cursor calls need one persistent D-Bus connection so Shell can
+//! screen coords, no Wayland cursor). General RPC uses a bounded persistent
+//! typed transport. Foreground transaction IDs remain independently reconciled. Cursor calls need one persistent D-Bus connection so Shell can
 //! bind actor lifetime to its unique name; a dedicated non-Tokio thread owns
 //! that blocking zbus connection and serializes those calls.
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::process::Command;
+mod transport;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -396,6 +396,10 @@ struct CapturePayload {
     rect: CaptureRect,
     logical_size: CaptureLogicalSize,
     png_base64: String,
+    #[serde(default)]
+    pixel_size: Option<CaptureLogicalSize>,
+    #[serde(default)]
+    image_size: Option<CaptureLogicalSize>,
 }
 
 #[derive(Debug)]
@@ -426,6 +430,7 @@ pub struct ForegroundTerminalOutcome {
 
 impl ForegroundTransaction {
     pub fn validate(&self) -> anyhow::Result<()> {
+        cua_driver_core::blocking::check_cancelled()?;
         let raw = gdbus_call_with_timeout(
             "ValidateForeground",
             &[gvariant_string(&self.token)],
@@ -439,6 +444,7 @@ impl ForegroundTransaction {
         if !valid {
             anyhow::bail!("stale_transaction: WinRects rejected foreground validation");
         }
+        cua_driver_core::blocking::check_cancelled()?;
         Ok(())
     }
 
@@ -575,7 +581,7 @@ fn extract_json_object(raw: &str) -> Option<&str> {
 }
 
 fn gvariant_string(value: &str) -> String {
-    serde_json::to_string(value).expect("serializing a string cannot fail")
+    value.to_owned()
 }
 
 /// Stable public Linux window ID derived from the full helper-incarnation
@@ -701,35 +707,17 @@ fn gdbus_call_target(
     args: &[String],
     timeout: Duration,
 ) -> Option<String> {
-    let mut cmd = Command::new("gdbus");
-    cmd.arg("call")
-        .arg("--session")
-        .arg("--dest")
-        .arg(dest)
-        .arg("--object-path")
-        .arg(path)
-        .arg("--method")
-        .arg(method);
-    for a in args {
-        cmd.arg(a);
-    }
-    // gdbus is local IPC; cap it so a wedged shell can't stall the caller.
-    let child = cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let out = wait_timeout(child, timeout)?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    transport::call(dest, path, method, args, timeout)
 }
 
 /// Capture one exact GNOME target using the rectangle and logical display
 /// dimensions returned by the same Shell transaction as the target-only pixels.
 pub fn screenshot_window(window_id: u64) -> anyhow::Result<Vec<u8>> {
+    if !available() {
+        anyhow::bail!(
+            "helper_protocol_mismatch: exact-target capture requires protocol 4 and API 14"
+        );
+    }
     let target = resolve_target(window_id).ok_or_else(|| {
         anyhow::anyhow!(
             "stale_target: GNOME window {window_id} belongs to another helper incarnation or no longer exists"
@@ -747,6 +735,58 @@ pub fn screenshot_window(window_id: u64) -> anyhow::Result<Vec<u8>> {
     )
     .ok_or_else(|| anyhow::anyhow!("GNOME exact-target capture failed for window {window_id}"))?;
     decode_capture_payload(&raw, &target.target_id)
+}
+
+/// GPU preview uses the same incarnation-bound authority and atomic validation
+/// as full-size capture. Refusal never authorizes a stage capture fallback.
+pub fn screenshot_window_preview(
+    window_id: u64,
+    pid: u32,
+    max_dimension: u32,
+) -> Option<(Vec<u8>, u32, u32)> {
+    if !(1..=4096).contains(&max_dimension) || !available() {
+        return None;
+    }
+    let target = resolve_target(window_id)?;
+    if target.pid != pid || !target.capture_current {
+        return None;
+    }
+    let raw = gdbus_call_with_timeout(
+        "CaptureTargetPreview",
+        &[target.target_id.clone(), max_dimension.to_string()],
+        Duration::from_secs(5),
+    )?;
+    let png = decode_capture_payload(&raw, &target.target_id).ok()?;
+    let payload: CapturePayload = serde_json::from_str(extract_json_object(&raw)?).ok()?;
+    let full = payload.pixel_size?;
+    let image = payload.image_size?;
+    if image.width.max(image.height) > max_dimension {
+        return None;
+    }
+    Some((strip_preview_timestamp(png)?, full.width, full.height))
+}
+
+/// GNOME embeds a wall-clock `Creation Time` text chunk even when the pixels
+/// are identical. Remove only that chunk, so a host can drop unchanged
+/// preview frames by comparing bytes, without decoding pixels.
+fn strip_preview_timestamp(mut png: Vec<u8>) -> Option<Vec<u8>> {
+    if !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return None;
+    }
+    let mut offset = 8usize;
+    loop {
+        let header = png.get(offset..offset.checked_add(8)?)?;
+        let size = u32::from_be_bytes(header[..4].try_into().ok()?) as usize;
+        let end = offset.checked_add(12)?.checked_add(size)?;
+        let chunk = png.get(offset..end)?;
+        if &chunk[4..8] == b"tEXt" && chunk[8..8 + size].starts_with(b"Creation Time\0") {
+            png.drain(offset..end);
+        } else if &chunk[4..8] == b"IEND" {
+            return (size == 0 && end == png.len()).then_some(png);
+        } else {
+            offset = end;
+        }
+    }
 }
 
 fn decode_capture_payload(raw: &str, expected_target: &str) -> anyhow::Result<Vec<u8>> {
@@ -782,17 +822,32 @@ fn decode_capture_payload(raw: &str, expected_target: &str) -> anyhow::Result<Ve
         .map_err(|error| anyhow::anyhow!("GNOME capture returned invalid base64: {error}"))?;
     let image = image::load_from_memory(&target_png)
         .map_err(|error| anyhow::anyhow!("GNOME exact-target PNG is invalid: {error}"))?;
-    if image.width() < payload.rect.width
-        || image.height() < payload.rect.height
-        || image.width() > payload.rect.width.saturating_mul(8)
-        || image.height() > payload.rect.height.saturating_mul(8)
+    let (full_width, full_height) = payload
+        .pixel_size
+        .as_ref()
+        .map(|size| (size.width, size.height))
+        .unwrap_or((image.width(), image.height()));
+    if full_width < payload.rect.width
+        || full_height < payload.rect.height
+        || full_width > payload.rect.width.saturating_mul(8)
+        || full_height > payload.rect.height.saturating_mul(8)
+        || (u64::from(full_width) * u64::from(payload.rect.height))
+            .abs_diff(u64::from(full_height) * u64::from(payload.rect.width))
+            > u64::from(payload.rect.width.max(payload.rect.height)) * 8
+        || image.width() == 0
+        || image.height() == 0
+        || image.width() > full_width
+        || image.height() > full_height
+        || payload
+            .image_size
+            .as_ref()
+            .is_some_and(|size| size.width != image.width() || size.height != image.height())
+        || (u64::from(image.width()) * u64::from(full_height))
+            .abs_diff(u64::from(image.height()) * u64::from(full_width))
+            > u64::from(full_width.max(full_height))
     {
         anyhow::bail!(
-            "capture_geometry_invalid: GNOME target PNG dimensions {}x{} do not match logical rectangle {}x{}",
-            image.width(),
-            image.height(),
-            payload.rect.width,
-            payload.rect.height
+            "capture_geometry_invalid: GNOME PNG dimensions do not match atomic frame metadata"
         );
     }
     Ok(target_png)
@@ -819,53 +874,6 @@ fn parse_screen_size(raw: &str) -> Option<(u32, u32)> {
     let width = values.next()?;
     let height = values.next()?;
     (width > 0 && height > 0).then_some((width, height))
-}
-
-/// `Child::wait` with a deadline (no extra crates). Kills + reaps on timeout.
-fn wait_timeout(mut child: std::process::Child, dur: Duration) -> Option<std::process::Output> {
-    use std::io::Read;
-
-    // Drain stdout while the child is running. Capture() returns a base64 PNG
-    // that readily exceeds a pipe's ~64 KiB capacity; waiting for exit before
-    // reading deadlocks the child on a full pipe and turns a healthy Shell
-    // response into a false timeout.
-    let stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut stdout = stdout;
-        let mut bytes = Vec::new();
-        stdout.read_to_end(&mut bytes).ok()?;
-        Some(bytes)
-    });
-    let deadline = std::time::Instant::now() + dur;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let status = child.wait().ok()?;
-                    let _ = reader.join();
-                    if !status.success() {
-                        return None;
-                    }
-                    return None;
-                }
-                std::thread::sleep(Duration::from_millis(15));
-            }
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = reader.join();
-                return None;
-            }
-        }
-    };
-    let stdout = reader.join().ok().flatten()?;
-    Some(std::process::Output {
-        status,
-        stdout,
-        stderr: Vec::new(),
-    })
 }
 
 /// Screen origin of the Wayland surface buffer backing `pid`.
@@ -981,6 +989,7 @@ pub fn begin_foreground(window_id: u64) -> anyhow::Result<ForegroundTransaction>
             "stale_target: GNOME window {window_id} belongs to another helper incarnation or no longer exists"
         )
     })?;
+    cua_driver_core::blocking::check_cancelled()?;
     let token = new_foreground_token();
     set_pending_foreground(Some(token.clone()));
     let input_deadline = super::foreground_deadline::Scope::begin(Instant::now());
@@ -1707,6 +1716,30 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("capture_geometry_invalid"));
+    }
+
+    #[test]
+    fn atomic_preview_rejects_mismatched_encoded_and_full_size() {
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        let mut payload = serde_json::json!({"protocol_version":4,"target":"epoch:7",
+            "rect":{"x":0,"y":0,"width":4,"height":4},"logical_size":{"width":100,"height":100},
+            "pixel_size":{"width":8,"height":8},"image_size":{"width":1,"height":1},"png_base64":png});
+        assert!(decode_capture_payload(&payload.to_string(), "epoch:7").is_ok());
+        payload["image_size"]["width"] = 2.into();
+        assert_eq!(
+            decode_capture_payload(&payload.to_string(), "epoch:7")
+                .unwrap_err()
+                .to_string(),
+            "capture_geometry_invalid: GNOME PNG dimensions do not match atomic frame metadata"
+        );
+        payload["image_size"]["width"] = 1.into();
+        payload["pixel_size"]["height"] = 40.into();
+        assert_eq!(
+            decode_capture_payload(&payload.to_string(), "epoch:7")
+                .unwrap_err()
+                .to_string(),
+            "capture_geometry_invalid: GNOME PNG dimensions do not match atomic frame metadata"
+        );
     }
 
     #[test]

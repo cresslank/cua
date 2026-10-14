@@ -178,15 +178,24 @@ impl DaemonClient {
 
     fn runtime(&self) -> RuntimeServiceClient<Chan> {
         RuntimeServiceClient::new(self.channel.clone())
+            .max_decoding_message_size(cua_spacesd_client::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(cua_spacesd_client::MAX_MESSAGE_BYTES)
     }
 
     fn daemon(&self) -> DaemonServiceClient<Chan> {
         DaemonServiceClient::new(self.channel.clone())
+            .max_decoding_message_size(cua_spacesd_client::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(cua_spacesd_client::MAX_MESSAGE_BYTES)
     }
 
-    /// The raw Spaces client.
+    /// The raw Spaces client. Messages up to
+    /// [`cua_spacesd_client::MAX_MESSAGE_BYTES`], as on the Space's own
+    /// connection: a full-size screenshot (`get_desktop_state` of a 6K
+    /// display) is larger than gRPC's 4 MiB default.
     pub fn spaces(&self) -> SpaceServiceClient<Chan> {
         SpaceServiceClient::new(self.channel.clone())
+            .max_decoding_message_size(cua_spacesd_client::MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(cua_spacesd_client::MAX_MESSAGE_BYTES)
     }
 
     fn map(e: tonic::Status) -> Error {
@@ -851,7 +860,7 @@ pub fn cua_binary() -> Option<PathBuf> {
 
 /// `major.minor.patch` of a version string; a pre-release sorts before its
 /// release. `None` when it does not parse.
-fn version_key(version: &str) -> Option<(u64, u64, u64, bool)> {
+pub(crate) fn version_key(version: &str) -> Option<(u64, u64, u64, bool)> {
     let version = version.trim().trim_start_matches('v');
     let (core, pre) = match version.split_once('-') {
         Some((core, _)) => (core, true),

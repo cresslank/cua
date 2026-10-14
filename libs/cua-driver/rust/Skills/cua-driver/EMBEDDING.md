@@ -200,6 +200,13 @@ daemon child.
 - Permission changes require destroying clients, restarting the daemon, and
   reconnecting. A connection from the old generation is never reusable.
 
+The child inherits trusted desktop routing, home roots, accessibility-bus routing,
+TTL and telemetry settings from its host. Caller environment overrides cannot
+replace those controls. `CUA_DRIVER_DISABLE_RUN_SCRIPT` and the legacy
+`CUA_DRIVER_EXPERIMENTAL_SCRIPT` opt-out are inherited explicitly; arbitrary
+`CUA_*` variables are not passed through. Private workers receive only the
+host-prepared accessibility-bus carrier.
+
 ## Bounding the post-action window observation
 
 In long-lived macOS processes (`serve`, in-process MCP, and the SDK direct

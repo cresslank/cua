@@ -4,6 +4,7 @@ import Shell from 'gi://Shell';
 import Meta from 'gi://Meta';
 import St from 'gi://St';
 import Clutter from 'gi://Clutter';
+import Cogl from 'gi://Cogl';
 import Cairo from 'cairo';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -20,7 +21,7 @@ import {
     targetTokenMatches,
 } from './policy.js';
 
-Gio._promisify(Shell.Screenshot.prototype, 'screenshot_area');
+Gio._promisify(Shell.Screenshot, 'composite_to_stream');
 
 const HELPER_API_VERSION = 14;
 const EXACT_TARGET_PROTOCOL_VERSION = 4;
@@ -31,6 +32,7 @@ const IFACE = `<node><interface name="org.cua.WinRects">
 <method name="GetVersion"><arg type="u" direction="out" name="version"/></method>
 <method name="GetCapabilities"><arg type="s" direction="out" name="json"/></method>
 <method name="GetRects"><arg type="s" direction="out" name="json"/></method>
+<method name="CaptureTargetPreview"><arg type="s" direction="in" name="target"/><arg type="u" direction="in" name="max_dimension"/><arg type="s" direction="out" name="capture_json"/></method>
 <method name="CaptureTarget"><arg type="s" direction="in" name="target"/><arg type="s" direction="out" name="capture_json"/></method>
 <method name="BeginForeground"><arg type="s" direction="in" name="transaction"/><arg type="s" direction="in" name="target"/><arg type="s" direction="out" name="json"/></method>
 <method name="QueryForeground"><arg type="s" direction="in" name="transaction"/><arg type="s" direction="out" name="json"/></method>
@@ -1151,7 +1153,20 @@ export default class WinRectsExtension extends Extension {
         return JSON.stringify(out);
     }
 
-    async CaptureTargetAsync([targetId], invocation) {
+    CaptureTargetAsync([targetId], invocation) {
+        return this._captureTarget(targetId, 0, invocation);
+    }
+
+    CaptureTargetPreviewAsync([targetId, maxDimension], invocation) {
+        if (maxDimension < 1 || maxDimension > 4096) {
+            invocation.return_dbus_error('org.cua.WinRects.InvalidSize', 'Invalid preview size');
+            return;
+        }
+        return this._captureTarget(targetId, maxDimension, invocation);
+    }
+
+    async _captureTarget(targetId, maxDimension, invocation) {
+        let stream;
         try {
             const target = this._resolveTarget(targetId);
             if (!target)
@@ -1178,21 +1193,51 @@ export default class WinRectsExtension extends Extension {
             };
             if (!captureRectangleIsSafe(captureRect, {displayWidth: width, displayHeight: height}))
                 throw new Error('capture_geometry_invalid: target rectangle is outside the captured stage');
-            const shooter = new Shell.Screenshot();
-            const stream = Gio.MemoryOutputStream.new_resizable();
-            // Never call Shell.Screenshot.screenshot() here. GNOME 50 can pass
-            // an implicit 0x0 stage view into Cogl immediately after a window
-            // activation. Capture only the exact positive target rectangle so
-            // this target API can never emit broad stage pixels to its caller.
-            await shooter.screenshot_area(
-                captureRect.x,
-                captureRect.y,
-                captureRect.width,
-                captureRect.height,
-                stream
-            );
+            const actor = global.get_window_actors().find(candidate => candidate.meta_window === target);
+            if (!actor) throw new Error('stale_target: no actor for exact target');
+            const buffer = target.get_buffer_rect();
+            const scale = actor.get_resource_scale();
+            const content = actor.paint_to_content(null);
+            const texture = content?.get_texture();
+            if (!texture || !Number.isFinite(scale) || scale <= 0)
+              throw new Error('Window content is unavailable');
+            const x = Math.round((frame.x - buffer.x) * scale);
+            const y = Math.round((frame.y - buffer.y) * scale);
+            const pixelWidth = Math.round(frame.width * scale);
+            const pixelHeight = Math.round(frame.height * scale);
+            if (x < 0 || y < 0 || pixelWidth <= 0 || pixelHeight <= 0 ||
+                x + pixelWidth > texture.get_width() || y + pixelHeight > texture.get_height())
+              throw new Error('Window content does not match its frame');
+            stream = Gio.MemoryOutputStream.new_resizable();
+            let captureTexture = texture;
+            let captureX = x, captureY = y, captureWidth = pixelWidth, captureHeight = pixelHeight;
+            if (maxDimension > 0 && Math.max(pixelWidth, pixelHeight) > maxDimension) {
+              const ratio = maxDimension / Math.max(pixelWidth, pixelHeight);
+              captureWidth = Math.max(1, Math.round(pixelWidth * ratio));
+              captureHeight = Math.max(1, Math.round(pixelHeight * ratio));
+              const context = global.stage.get_context().get_backend().get_cogl_context();
+              captureTexture = Cogl.Texture2D.new_with_size(context, captureWidth, captureHeight);
+              const framebuffer = Cogl.Offscreen.new_with_texture(captureTexture);
+              framebuffer.allocate();
+              framebuffer.set_viewport(0, 0, captureWidth, captureHeight);
+              framebuffer.orthographic(0, 0, captureWidth, captureHeight, -1, 1);
+              const pipeline = Cogl.Pipeline.new(context);
+              pipeline.set_layer_texture(0, texture);
+              framebuffer.draw_textured_rectangle(pipeline, 0, 0, captureWidth, captureHeight,
+                x / texture.get_width(), y / texture.get_height(),
+                (x + pixelWidth) / texture.get_width(), (y + pixelHeight) / texture.get_height());
+              framebuffer.finish();
+              captureX = 0;
+              captureY = 0;
+            }
+            await Shell.Screenshot.composite_to_stream(
+              captureTexture, captureX, captureY, captureWidth, captureHeight, 1, null, 0, 0, 1, stream);
             if (this._resolveTarget(targetId) !== target)
                 throw new Error('target_changed_during_capture');
+            const currentBuffer = target.get_buffer_rect();
+            if (target.get_compositor_private() !== actor || actor.get_resource_scale() !== scale ||
+                !rectanglesEqual(buffer, currentBuffer))
+                throw new Error('target_buffer_changed_during_capture');
             const currentFrame = target.get_frame_rect();
             const currentRect = {
                 x: Math.floor(currentFrame.x),
@@ -1208,6 +1253,8 @@ export default class WinRectsExtension extends Extension {
                 throw new Error('child_modal_appeared_during_capture');
             if (!this._isTargetUnoccluded(target))
                 throw new Error('target_occluded_during_capture');
+            if (stream.get_data_size() > 32 * 1024 * 1024)
+                throw new Error('Window capture is too large');
             stream.close(null);
             const encoded = GLib.base64_encode(stream.steal_as_bytes().get_data());
             invocation.return_value(new GLib.Variant('(s)', [JSON.stringify({
@@ -1215,10 +1262,14 @@ export default class WinRectsExtension extends Extension {
                 target: targetId,
                 rect: captureRect,
                 logical_size: {width, height},
+                pixel_size: {width: pixelWidth, height: pixelHeight},
+                image_size: {width: captureWidth, height: captureHeight},
                 png_base64: encoded,
             })]));
         } catch (error) {
             invocation.return_dbus_error('org.cua.WinRects.CaptureFailed', String(error));
+        } finally {
+            if (stream && !stream.is_closed()) stream.close(null);
         }
     }
 

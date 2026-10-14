@@ -303,6 +303,39 @@ pub(crate) fn background_refusal_result(
 /// Exclusive per-process ownership of one background mutation. Callers must
 /// keep this value alive through actuator dispatch, focus restoration, and
 /// target-bound verification.
+/// The window a pid-only call means: the app's focused window, else its
+/// frontmost on-screen window. Fills `window_id` for tools that need one
+/// when the caller named only the app's pid.
+pub(crate) fn default_window_for_pid(args: &mut serde_json::Value) {
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    if object
+        .get("window_id")
+        .is_some_and(|value| !value.is_null())
+    {
+        return;
+    }
+    let Some(pid) = object
+        .get("pid")
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|pid| i32::try_from(pid).ok())
+    else {
+        return;
+    };
+    let window_id = crate::ax::bindings::focused_window_id_of_pid(pid).or_else(|| {
+        crate::windows::all_windows()
+            .into_iter()
+            .filter(|window| window.pid == pid && window.is_on_screen && window.layer == 0)
+            .filter(|window| window.bounds.width >= 2.0 && window.bounds.height >= 2.0)
+            .max_by_key(|window| window.z_index)
+            .map(|window| window.window_id)
+    });
+    if let Some(window_id) = window_id {
+        object.insert("window_id".into(), serde_json::json!(window_id));
+    }
+}
+
 pub(crate) struct BackgroundMutationLease {
     pid: i32,
     _guard: tokio::sync::OwnedMutexGuard<()>,
@@ -568,11 +601,19 @@ fn point_within_rect([rx, ry, rw, rh]: [f64; 4], x: f64, y: f64) -> bool {
     rw > 0.0 && rh > 0.0 && x >= rx && x < rx + rw && y >= ry && y < ry + rh
 }
 
+/// Default long-edge cap for screenshots; see [`DriverConfig::max_image_dimension`].
+pub const DEFAULT_MAX_IMAGE_DIMENSION: u32 = 1366;
+
 /// Runtime-mutable driver configuration persisted across calls within a session.
 pub struct DriverConfig {
-    /// Max screenshot dimension (0 = no limit). Applied during screenshot/zoom.
-    /// Default 1568 matches Swift's `CuaDriverConfig.defaultMaxImageDimension` —
+    /// Max screenshot dimension (0 = no limit). Applied during screenshot/zoom:
     /// the long edge is downscaled to this before encoding.
+    ///
+    /// Default 1366. High-resolution Claude models read images up to 2576 px
+    /// at ~w*h/750 tokens each, so a 1568x882 capture costs ~1.8k tokens and a
+    /// 1366x768 one ~1.4k; Anthropic's computer-use guidance names 1366x768 as
+    /// a lower-cost size with strong performance. Callers that need more
+    /// detail use `zoom` or a per-call/session `max_image_dimension`.
     pub max_image_dimension: u32,
     pub agent_cursor_glide_duration_ms: f64,
 }
@@ -580,7 +621,7 @@ pub struct DriverConfig {
 impl Default for DriverConfig {
     fn default() -> Self {
         Self {
-            max_image_dimension: 1568,
+            max_image_dimension: DEFAULT_MAX_IMAGE_DIMENSION,
             agent_cursor_glide_duration_ms: 0.0,
         }
     }

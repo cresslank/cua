@@ -49,7 +49,7 @@ pub(crate) async fn position_keyboard_cursor(
             if cursor_overlay::keyboard_cursor_target(explicit, remembered, None, None)
                 .is_none() =>
         {
-            tokio::task::spawn_blocking(move || {
+            cua_driver_core::blocking::spawn(move || {
                 let bounds = crate::windows::window_bounds_by_id(wid)?;
                 (bounds.width > 0.0 && bounds.height > 0.0).then_some((
                     bounds.x + bounds.width / 2.0,

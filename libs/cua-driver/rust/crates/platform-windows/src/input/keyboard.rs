@@ -230,6 +230,7 @@ pub fn post_char(hwnd: u64, ch: char) -> Result<()> {
     let h_parent = HWND(hwnd as *mut _);
     let h = focused_descendant(h_parent).unwrap_or(h_parent);
     let code = ch as u32 as usize;
+    cua_driver_core::blocking::check_cancelled()?;
     unsafe {
         PostMessageW(h, WM_CHAR, WPARAM(code), LPARAM(1))?;
     }
@@ -271,6 +272,7 @@ unsafe fn post_enter_keystroke(root_hwnd: u64, h: HWND, expected_pid: Option<u32
     let lp_down = 1u32 | (scan << 16);
     let lp_up = lp_down | (1u32 << 30) | (1u32 << 31);
     prove_posted_text_recipient(root_hwnd, h, expected_pid, "posted Enter key-down")?;
+    cua_driver_core::blocking::check_cancelled()?;
     PostMessageW(
         h,
         WM_KEYDOWN,
@@ -369,6 +371,7 @@ fn post_type_text_inner(
                 let code = ch as u32 as usize;
                 prove_posted_text_recipient(hwnd, h, expected_pid, "posted character")?;
                 unsafe {
+                    cua_driver_core::blocking::check_cancelled()?;
                     PostMessageW(h, WM_CHAR, WPARAM(code), LPARAM(1))?;
                 }
                 sleep(Duration::from_millis(KEY_DELAY_MS + inter_char_ms));
@@ -442,7 +445,9 @@ fn post_key_inner(
     let mut primary_error: Option<String> = None;
     unsafe {
         for mvk in &mod_vks {
-            if let Err(error) = prove(target) {
+            if let Err(error) = prove(target)
+                .and_then(|()| cua_driver_core::blocking::check_cancelled().map_err(Into::into))
+            {
                 primary_error = Some(error.to_string());
                 break;
             }
@@ -461,7 +466,9 @@ fn post_key_inner(
             }
         }
         if primary_error.is_none() {
-            if let Err(error) = prove(target) {
+            if let Err(error) = prove(target)
+                .and_then(|()| cua_driver_core::blocking::check_cancelled().map_err(Into::into))
+            {
                 primary_error = Some(error.to_string());
             } else {
                 match PostMessageW(
@@ -618,6 +625,7 @@ pub fn send_key_synthesized_after_focus_for_pid(
         "key delivery",
         focus,
         |approved| unsafe {
+            cua_driver_core::blocking::check_cancelled()?;
             let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
             if sent as usize != events.len() {
                 let cleanup = release_events_for_inserted_prefix(&events, sent as usize);
@@ -725,6 +733,7 @@ pub fn send_text_synthesized_after_focus_for_pid(
         "text delivery",
         focus,
         |approved| unsafe {
+            cua_driver_core::blocking::check_cancelled()?;
             let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
             if sent as usize != events.len() {
                 let cleanup = release_events_for_inserted_prefix(&events, sent as usize);
@@ -968,6 +977,13 @@ impl InputQueueAttachment {
         // that displaced the approved target while the body was running.
         let actual = unsafe { GetForegroundWindow() }.0 as usize as u64;
         if !crate::win32::foreground_matches_target_or_owned_window(approved, actual) {
+            return false;
+        }
+        // Do not append a new key-down after cancellation. The already-entered
+        // SendInput batch remains atomic; retain a bounded drain settle before
+        // detaching and restoring focus.
+        if cua_driver_core::blocking::check_cancelled().is_err() {
+            sleep(Duration::from_millis(40));
             return false;
         }
         let sent = unsafe { SendInput(&sentinel, std::mem::size_of::<INPUT>() as i32) };

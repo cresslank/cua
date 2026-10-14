@@ -86,7 +86,7 @@ impl WindowsCaptureBridge {
             matches!(target, WindowsCaptureTarget::PrimaryDesktop),
             "window capture requires a snapshot identity"
         );
-        self.publish_bound(args, png_bytes, target, geometry, None)
+        self.publish_bound(args, png_bytes, target, geometry, None, None)
     }
 
     pub(crate) fn publish_window(
@@ -97,6 +97,7 @@ impl WindowsCaptureBridge {
         window_id: u64,
         geometry: CaptureGeometry,
         identity: cua_driver_core::element_token::SnapshotIdentity,
+        frame: Option<cua_driver_core::snapshot_store::ScreenshotFrameBinding>,
     ) -> anyhow::Result<Option<String>> {
         self.publish_bound(
             args,
@@ -104,6 +105,7 @@ impl WindowsCaptureBridge {
             WindowsCaptureTarget::Window { pid, window_id },
             geometry,
             Some(identity),
+            frame,
         )
     }
 
@@ -114,6 +116,7 @@ impl WindowsCaptureBridge {
         target: WindowsCaptureTarget,
         geometry: CaptureGeometry,
         identity: Option<cua_driver_core::element_token::SnapshotIdentity>,
+        frame: Option<cua_driver_core::snapshot_store::ScreenshotFrameBinding>,
     ) -> anyhow::Result<Option<String>> {
         let binding = self.service.binding_from_args(args)?;
         let encoded_dimensions =
@@ -137,9 +140,12 @@ impl WindowsCaptureBridge {
             session_id: binding.session_id().into(),
             session_generation: binding.session_generation(),
         };
-        let capture_id = match identity {
-            Some(identity) => self.service.publish_for_snapshot(publication, identity),
-            None => self.service.publish(publication),
+        let capture_id = match (identity, frame) {
+            (Some(identity), Some(frame)) => {
+                self.service.publish_for_frame(publication, identity, frame)
+            }
+            (Some(identity), None) => self.service.publish_for_snapshot(publication, identity),
+            (None, _) => self.service.publish(publication),
         }?;
         Ok(Some(capture_id.to_string()))
     }
@@ -270,7 +276,15 @@ mod tests {
                 let snapshot = cache.try_publish(pid as i32, window_id, Payload).unwrap();
                 let identity = cache.identity_for_snapshot(pid as i32, snapshot).unwrap();
                 let id = bridge
-                    .publish_window(&publication_args, png(), pid, window_id, geometry, identity)
+                    .publish_window(
+                        &publication_args,
+                        png(),
+                        pid,
+                        window_id,
+                        geometry,
+                        identity,
+                        None,
+                    )
                     .unwrap()
                     .unwrap();
                 (id, Some(cache))

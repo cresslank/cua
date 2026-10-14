@@ -87,6 +87,7 @@ impl Tool for LaunchAppTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        crate::post_action::cancel();
         let bundle_id = args.opt_str("bundle_id");
         let name = args.opt_str("name");
         let mut response_bundle_id = bundle_id.clone();

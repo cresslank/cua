@@ -18,6 +18,7 @@ fn publish(
     native_action_dimensions: (u32, u32),
     screenshot_to_action: ScreenshotToActionTransform,
     snapshot_identity: Option<cua_driver_core::element_token::SnapshotIdentity>,
+    frame: Option<cua_driver_core::snapshot_store::ScreenshotFrameBinding>,
 ) -> anyhow::Result<String> {
     let binding = service.binding_from_args(args)?;
     let publication = CapturePublication {
@@ -35,9 +36,10 @@ fn publish(
         session_id: binding.session_id().into(),
         session_generation: binding.session_generation(),
     };
-    let capture_id = match snapshot_identity {
-        Some(identity) => service.publish_for_snapshot(publication, identity),
-        None => service.publish(publication),
+    let capture_id = match (snapshot_identity, frame) {
+        (Some(identity), Some(frame)) => service.publish_for_frame(publication, identity, frame),
+        (Some(identity), None) => service.publish_for_snapshot(publication, identity),
+        (None, _) => service.publish(publication),
     }?;
     Ok(capture_id.to_string())
 }
@@ -51,6 +53,7 @@ pub fn publish_window(
     encoded_dimensions: (u32, u32),
     native_action_dimensions: (u32, u32),
     snapshot_identity: cua_driver_core::element_token::SnapshotIdentity,
+    frame: Option<cua_driver_core::snapshot_store::ScreenshotFrameBinding>,
 ) -> anyhow::Result<String> {
     publish(
         service,
@@ -61,6 +64,7 @@ pub fn publish_window(
         native_action_dimensions,
         scaled_transform(encoded_dimensions, native_action_dimensions)?,
         Some(snapshot_identity),
+        frame,
     )
 }
 
@@ -80,6 +84,7 @@ pub fn publish_desktop(
         encoded_dimensions,
         native_action_dimensions,
         scaled_transform(encoded_dimensions, native_action_dimensions)?,
+        None,
         None,
     )
 }
@@ -282,6 +287,7 @@ mod tests {
             encoded,
             native,
             snapshot(pid, window),
+            None,
         )
     }
 
@@ -302,6 +308,7 @@ mod tests {
             (4, 4),
             (4, 4),
             identity,
+            None,
         )
         .unwrap();
         let second_id = super::publish_window(
@@ -313,6 +320,7 @@ mod tests {
             (4, 4),
             (4, 4),
             identity,
+            None,
         )
         .unwrap();
         let admission = admit_with_live_dimensions(

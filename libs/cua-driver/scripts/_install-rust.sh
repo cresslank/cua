@@ -1466,11 +1466,8 @@ else
         mkdir -p "$VERSIONED_DIR/wayland-helper"
         cp -R "$SRC_WAYLAND_HELPER/." "$VERSIONED_DIR/wayland-helper/"
 
-        INSTALLED_WAYLAND_HELPER="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/winrects@cua"
-        if [[ -d "$INSTALLED_WAYLAND_HELPER" ]]; then
-            /bin/bash "$SRC_WAYLAND_HELPER/install.sh"
-            log "updated installed GNOME helper; reload the GNOME session to activate it"
-        fi
+        log "GNOME helper bundled for explicit staged rollout; installed helper unchanged"
+
     fi
     log "installed $VERSIONED_DIR/$BINARY_NAME (version $VERSION, target $TARGET)"
 

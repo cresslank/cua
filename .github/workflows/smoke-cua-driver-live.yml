@@ -1,7 +1,7 @@
 name: "Smoke: Cua Driver live agent loop"
 
 # Builds the candidate and checks lean/full reads, token-only actions, batches,
-# combo-box semantics, and local display_only token/capture safety on disposable
+# run_steps/run_script, combo-box semantics, and local display_only token/capture safety on disposable
 # Windows and Linux (Xvfb) CI desktops. See scripts/ci/cua-driver-live-smoke/smoke.py.
 
 on:
@@ -12,7 +12,8 @@ on:
       - "scripts/ci/cua-driver-live-smoke/**"
       - "libs/cua-driver/rust/crates/cua-driver-core/src/window_state_view.rs"
       - "libs/cua-driver/rust/crates/cua-driver-core/src/batch_tools.rs"
-      - "libs/cua-driver/rust/crates/cua-driver-core/src/display_only.rs"
+      - "libs/cua-driver/rust/crates/cua-driver-core/src/script_tool.rs"
+      - "libs/cua-driver/rust/crates/cua-driver-core/src/script_tool/**"
       - "libs/cua-driver/rust/crates/cua-driver-core/src/element_token.rs"
       - "libs/cua-driver/rust/crates/cua-driver-core/src/snapshot_store.rs"
       - "libs/cua-driver/rust/crates/cua-driver-core/src/tool.rs"

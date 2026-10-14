@@ -346,7 +346,11 @@ impl InteractiveInputSession {
         press: bool,
     ) -> Result<(), TargetedInputError> {
         if self.is_foreground() {
-            x::fake_motion(&state.conn, state.root, px, py)?;
+            // A release must not be blocked by cancellation of its preceding motion.
+            let motion = x::fake_motion(&state.conn, state.root, px, py);
+            if press {
+                motion?;
+            }
             return x::fake_button(&state.conn, press, button, state.root);
         }
         let (window, lx, ly) = self.local(state, px, py)?;
@@ -373,9 +377,12 @@ impl InteractiveInputSession {
             }
             if self.is_foreground() {
                 let held = x::press_modifiers(&state.conn, state.root, &state.keymap, modifiers)?;
-                let (code, shift) = x::key_code(&state.keymap, key)?;
-                x::tap(&state.conn, state.root, &state.keymap, code, shift)?;
-                return x::release_keys(&state.conn, state.root, &held);
+                let result = x::key_code(&state.keymap, key).and_then(|(code, shift)| {
+                    x::tap(&state.conn, state.root, &state.keymap, code, shift)
+                });
+                let release = x::release_keys(&state.conn, state.root, &held);
+                let completion = x::sync(&state.conn);
+                return result.and(release).and(completion);
             }
             let modifiers: Vec<&str> = modifiers.iter().map(String::as_str).collect();
             return super::send_key(u64::from(self.window()?), key, &modifiers).map_err(x::failed);

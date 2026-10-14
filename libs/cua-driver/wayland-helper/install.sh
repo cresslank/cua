@@ -3,6 +3,9 @@
 # geometry (for AT-SPI coordinate reconstruction) and renders the agent cursor
 # on GNOME Mutter Wayland, where a normal client can do neither. Best-effort:
 # cua-driver works without it (just no screen coords / no cursor on Mutter).
+#
+# Other apps bundle the same helper (same UUID, shared additive API versions),
+# so a newer installed copy is kept. Downgrades require a separately reviewed rollout.
 set -euo pipefail
 UUID="winrects@cua"
 SRC="$(cd "$(dirname "$0")" && pwd)/$UUID"
@@ -24,6 +27,7 @@ fi
 python3 - "$SRC" "$DEST" <<'PY'
 import ctypes
 import errno
+import json
 import os
 from pathlib import Path
 import shutil
@@ -55,6 +59,19 @@ if os.path.lexists(destination):
     mode = destination.lstat().st_mode
     if not stat.S_ISDIR(mode) or stat.S_ISLNK(mode):
         raise SystemExit(f"helper destination is not a real directory: {destination}")
+
+# A driver update never downgrades a helper shared with another application.
+if destination.exists():
+    try:
+        installed_version = json.loads((destination / "metadata.json").read_text())["version"]
+        bundled_version = json.loads((source / "metadata.json").read_text())["version"]
+        if not isinstance(installed_version, int) or not isinstance(bundled_version, int):
+            raise ValueError("non-integer helper version")
+    except (OSError, ValueError, KeyError) as error:
+        raise SystemExit(f"cannot establish helper version before replacement: {error}")
+    if installed_version > bundled_version:
+        print(f"Keeping the installed winrects@cua v{installed_version}: newer than bundle v{bundled_version}.")
+        raise SystemExit(0)
 
 stage = Path(tempfile.mkdtemp(prefix=f".{destination.name}.new-", dir=parent))
 published = False

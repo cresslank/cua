@@ -190,6 +190,8 @@ fn tools_list_schema_shape() {
         // Chromium); foreground accepts that.
         "browser_click",
         "browser_pointer",
+        // Batch default is passed to each concrete action.
+        "run_steps",
         // set_value has no delivery ladder on macOS or on the hardened Linux
         // adapter, which writes through AT-SPI only and never falls back to
         // pointer and keyboard input.

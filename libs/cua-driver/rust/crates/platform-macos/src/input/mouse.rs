@@ -63,6 +63,14 @@ fn skylight_available() -> bool {
 
 /// Hand one stamped event to its transport.
 fn dispatch_mouse_event(route: PostRoute, pid: i32, event: &CGEvent) {
+    // Never suppress releases: a cancelled drag/click must still unwind.
+    if !matches!(
+        event.get_type(),
+        CGEventType::LeftMouseUp | CGEventType::RightMouseUp | CGEventType::OtherMouseUp
+    ) && cua_driver_core::blocking::check_cancelled().is_err()
+    {
+        return;
+    }
     #[cfg(test)]
     if post_sink::record(route, event) {
         return;
@@ -167,7 +175,6 @@ fn click_at_xy_desktop_inner(
     preserve_cursor: bool,
 ) -> anyhow::Result<()> {
     use core_graphics::display::CGDisplay;
-    use core_graphics::event::CGEventTapLocation;
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let prior = if preserve_cursor {
@@ -202,6 +209,7 @@ fn click_at_xy_desktop_inner(
     // cursor, and AppKit hit-tests some clicks against the actual cursor
     // position, so without the warp the down/up can miss the target. Desktop
     // scope is the foreground modality, so moving the visible cursor is expected.
+    cua_driver_core::blocking::check_cancelled()?;
     let _ = CGDisplay::warp_mouse_cursor_position(point);
     // Re-couple cursor + mouse-delta so the synthesized click hit-tests at the
     // warped point, not the pre-warp one.
@@ -220,11 +228,12 @@ fn click_at_xy_desktop_inner(
             )
             .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(move) failed"))?;
             moved.set_flags(flags);
-            moved.post(CGEventTapLocation::HID);
+            dispatch_mouse_event(PostRoute::Hid, 0, &moved);
             std::thread::sleep(super::pacing::mouse_primer_settle());
         }
 
         for pair_index in 0..count.max(1) {
+            cua_driver_core::blocking::check_cancelled()?;
             let down = CGEvent::new_mouse_event(source.clone(), down_ty, point, btn)
                 .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
             down.set_flags(flags);
@@ -232,7 +241,7 @@ fn click_at_xy_desktop_inner(
                 core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
                 (pair_index + 1) as i64,
             );
-            down.post(CGEventTapLocation::HID);
+            dispatch_mouse_event(PostRoute::Hid, 0, &down);
             std::thread::sleep(super::pacing::click_gap());
             let up = CGEvent::new_mouse_event(source.clone(), up_ty, point, btn)
                 .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
@@ -241,7 +250,7 @@ fn click_at_xy_desktop_inner(
                 core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
                 (pair_index + 1) as i64,
             );
-            up.post(CGEventTapLocation::HID);
+            dispatch_mouse_event(PostRoute::Hid, 0, &up);
             if count > 1 {
                 std::thread::sleep(super::pacing::multi_click_gap());
             }
@@ -260,12 +269,39 @@ fn click_at_xy_desktop_inner(
 }
 
 /// Move the real hardware cursor to a logical desktop point.
+///
+/// A warp alone posts no mouse event. AppKit then only re-evaluates tracking
+/// areas when the pointer crosses into a different window, so a second warp
+/// inside the same window never fires `mouseEntered`/`mouseMoved`, and
+/// hover-revealed controls stay hidden. Follow the warp with a `MouseMoved`
+/// at the same point through the HID tap, as a physical mouse would.
 pub fn move_cursor_desktop(x: f64, y: f64) -> anyhow::Result<()> {
     use core_graphics::display::CGDisplay;
     let point = CGPoint::new(x, y);
+    cua_driver_core::blocking::check_cancelled()?;
     CGDisplay::warp_mouse_cursor_position(point)
         .map_err(|error| anyhow::anyhow!("CGWarpMouseCursorPosition failed: {error:?}"))?;
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
+    // Let WindowServer settle the warp first: a move posted in the same
+    // instant was occasionally dropped (1 of 5 in the VM check). A second
+    // move a moment later is harmless when the first one landed.
+    for _ in 0..2 {
+        cua_driver_core::blocking::check_cancelled()?;
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        post_pointer_moved(point)?;
+    }
+    Ok(())
+}
+
+/// Post one `MouseMoved` at `point` through the global HID tap, so AppKit
+/// re-evaluates tracking areas under the (already warped) pointer.
+fn post_pointer_moved(point: CGPoint) -> anyhow::Result<()> {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    let moved =
+        CGEvent::new_mouse_event(source, CGEventType::MouseMoved, point, CGMouseButton::Left)
+            .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(move) failed"))?;
+    dispatch_mouse_event(PostRoute::Hid, 0, &moved);
     Ok(())
 }
 
@@ -279,11 +315,12 @@ pub fn scroll_wheel_desktop(
     delta_x_per_tick: i32,
     ticks: usize,
 ) -> anyhow::Result<()> {
-    use core_graphics::event::{CGEventTapLocation, ScrollEventUnit};
+    use core_graphics::event::ScrollEventUnit;
 
     move_cursor_desktop(x, y)?;
     std::thread::sleep(std::time::Duration::from_millis(40));
     for _ in 0..ticks.max(1) {
+        cua_driver_core::blocking::check_cancelled()?;
         // AppKit does not reliably consume synthetic LINE-unit events posted
         // through the global HID queue. pynput's proven macOS desktop path uses
         // PIXEL units, a null source, and scales each logical wheel notch to ten
@@ -305,7 +342,7 @@ pub fn scroll_wheel_desktop(
             return Err(anyhow::anyhow!("CGEventCreateScrollWheelEvent2 failed"));
         }
         let event = unsafe { CGEvent::from_ptr(event_ref) };
-        event.post(CGEventTapLocation::HID);
+        dispatch_mouse_event(PostRoute::Hid, 0, &event);
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
     Ok(())
@@ -415,6 +452,7 @@ fn click_at_xy_inner(
         std::thread::sleep(super::pacing::mouse_primer_settle());
 
         for pair_index in 0..count {
+            cua_driver_core::blocking::check_cancelled()?;
             let click_state = (pair_index + 1) as i64;
 
             let down = CGEvent::new_mouse_event(
@@ -682,33 +720,37 @@ pub fn click_at_xy_chromium(
         );
     };
 
-    for step in route_plan {
-        let (event_type, error_label) = match step.kind {
-            ChromiumClickEventKind::Move => (CGEventType::MouseMoved, "mouseMoved"),
-            ChromiumClickEventKind::Down if step.phase == 1 => {
-                (CGEventType::LeftMouseDown, "primer down")
+    cua_driver_core::blocking::run_input_transitions(
+        route_plan
+            .into_iter()
+            .map(|step| (step.kind == ChromiumClickEventKind::Up, step)),
+        |step| {
+            let (event_type, error_label) = match step.kind {
+                ChromiumClickEventKind::Move => (CGEventType::MouseMoved, "mouseMoved"),
+                ChromiumClickEventKind::Down if step.phase == 1 => {
+                    (CGEventType::LeftMouseDown, "primer down")
+                }
+                ChromiumClickEventKind::Up if step.phase == 2 => {
+                    (CGEventType::LeftMouseUp, "primer up")
+                }
+                ChromiumClickEventKind::Down => (CGEventType::LeftMouseDown, "target down"),
+                ChromiumClickEventKind::Up => (CGEventType::LeftMouseUp, "target up"),
+            };
+            let event = CGEvent::new_mouse_event(
+                source.clone(),
+                event_type,
+                CGPoint::new(step.event_location.0, step.event_location.1),
+                CGMouseButton::Left,
+            )
+            .map_err(|_| anyhow::anyhow!("{error_label} event creation failed"))?;
+            stamp(&event, &step);
+            post(&event, &step);
+            if step.delay_after_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(step.delay_after_ms));
             }
-            ChromiumClickEventKind::Up if step.phase == 2 => {
-                (CGEventType::LeftMouseUp, "primer up")
-            }
-            ChromiumClickEventKind::Down => (CGEventType::LeftMouseDown, "target down"),
-            ChromiumClickEventKind::Up => (CGEventType::LeftMouseUp, "target up"),
-        };
-        let event = CGEvent::new_mouse_event(
-            source.clone(),
-            event_type,
-            CGPoint::new(step.event_location.0, step.event_location.1),
-            CGMouseButton::Left,
-        )
-        .map_err(|_| anyhow::anyhow!("{error_label} event creation failed"))?;
-        stamp(&event, &step);
-        post(&event, &step);
-        if step.delay_after_ms > 0 {
-            std::thread::sleep(std::time::Duration::from_millis(step.delay_after_ms));
-        }
-    }
-
-    Ok(())
+            Ok::<_, anyhow::Error>(())
+        },
+    )
 }
 
 /// Press-drag-release gesture from `(from_x, from_y)` to `(to_x, to_y)` in
@@ -883,7 +925,12 @@ where
     std::thread::sleep(std::time::Duration::from_millis(16));
 
     // Interpolated drag steps.
+    let mut release_point = from_pt;
+    let mut release_local = from_local;
     for i in 1..=steps {
+        if cua_driver_core::blocking::check_cancelled().is_err() {
+            break;
+        }
         let t = i as f64 / steps as f64;
         let ix = from_x + (to_x - from_x) * t;
         let iy = from_y + (to_y - from_y) * t;
@@ -897,6 +944,8 @@ where
             drag.set_flags(flags);
         }
         post_mouse_event(pid, &drag, il, wid, click_group_id, 1, button_number, 0);
+        release_point = drag_pt;
+        release_local = il;
         observe(ix, iy);
         if step_delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
@@ -907,19 +956,29 @@ where
     // Give Chromium one run-loop turn to process the final dragged event at
     // the drop point before releasing pointer capture.
     std::thread::sleep(std::time::Duration::from_millis(50));
-    let to_pt = CGPoint::new(to_x, to_y);
+    let to_pt = release_point;
     let up = CGEvent::new_mouse_event(source.clone(), up_type, to_pt, cg_button)
         .map_err(|_| anyhow::anyhow!("drag mouseUp failed"))?;
     if flags != CGEventFlags::CGEventFlagNull {
         up.set_flags(flags);
     }
-    post_mouse_event(pid, &up, to_local, wid, click_group_id, 1, button_number, 0);
+    post_mouse_event(
+        pid,
+        &up,
+        release_local,
+        wid,
+        click_group_id,
+        1,
+        button_number,
+        0,
+    );
     // Chromium may process the final pointerup on the next run-loop turn. In
     // the foreground rung the caller restores the previous app immediately
     // after this function returns, so let the target consume the release and
     // complete pointer capture before that restore.
     std::thread::sleep(std::time::Duration::from_millis(100));
 
+    cua_driver_core::blocking::check_cancelled()?;
     Ok(())
 }
 
@@ -956,6 +1015,7 @@ fn post_drag_mouse_event(
         subtype,
         mode,
     );
+    cua_driver_core::blocking::check_cancelled()?;
     Ok(())
 }
 
@@ -1019,76 +1079,87 @@ where
     let events = foreground_drag_events(from_x, from_y, to_x, to_y, steps);
 
     super::keyboard::with_global_modifier_keys(modifiers, |flags| {
-        for spec in events {
-            let (event_type, click_state, event_button, event_button_number, subtype) = match spec
-                .kind
-            {
-                ForegroundDragEventKind::Move => {
-                    (CGEventType::MouseMoved, 0, CGMouseButton::Left, 0, 3)
-                }
-                ForegroundDragEventKind::Down => (down_type, 1, cg_button, button_number, 0),
-                ForegroundDragEventKind::Dragged => (dragged_type, 1, cg_button, button_number, 0),
-                ForegroundDragEventKind::Up => (up_type, 1, cg_button, button_number, 0),
-            };
-            let local = from_local.zip(to_local).map(|((fx, fy), (tx, ty))| {
-                (
-                    fx + (tx - fx) * spec.progress,
-                    fy + (ty - fy) * spec.progress,
-                )
-            });
+        cua_driver_core::blocking::run_input_transitions(
+            events
+                .into_iter()
+                .map(|spec| (spec.kind == ForegroundDragEventKind::Up, spec)),
+            |spec| {
+                let (event_type, click_state, event_button, event_button_number, subtype) =
+                    match spec.kind {
+                        ForegroundDragEventKind::Move => {
+                            (CGEventType::MouseMoved, 0, CGMouseButton::Left, 0, 3)
+                        }
+                        ForegroundDragEventKind::Down => {
+                            (down_type, 1, cg_button, button_number, 0)
+                        }
+                        ForegroundDragEventKind::Dragged => {
+                            (dragged_type, 1, cg_button, button_number, 0)
+                        }
+                        ForegroundDragEventKind::Up => (up_type, 1, cg_button, button_number, 0),
+                    };
+                let local = from_local.zip(to_local).map(|((fx, fy), (tx, ty))| {
+                    (
+                        fx + (tx - fx) * spec.progress,
+                        fy + (ty - fy) * spec.progress,
+                    )
+                });
 
-            match spec.kind {
-                ForegroundDragEventKind::Move => {
-                    let _ = CGDisplay::warp_mouse_cursor_position(spec.point);
-                    unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
-                    std::thread::sleep(std::time::Duration::from_millis(40));
-                }
-                ForegroundDragEventKind::Dragged => {
-                    let _ = CGDisplay::warp_mouse_cursor_position(spec.point);
-                }
-                ForegroundDragEventKind::Up => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                ForegroundDragEventKind::Down => {}
-            }
-
-            post_drag_mouse_event(
-                pid,
-                event_type,
-                spec.point,
-                event_button,
-                local,
-                wid,
-                click_group_id,
-                click_state,
-                event_button_number,
-                subtype,
-                MousePostMode::HidOnly,
-                flags,
-                "foreground drag event creation failed",
-            )?;
-
-            match spec.kind {
-                ForegroundDragEventKind::Move => {
-                    std::thread::sleep(super::pacing::mouse_primer_settle());
-                }
-                ForegroundDragEventKind::Down => {
-                    observe(spec.point.x, spec.point.y);
-                    std::thread::sleep(std::time::Duration::from_millis(16));
-                }
-                ForegroundDragEventKind::Dragged => {
-                    observe(spec.point.x, spec.point.y);
-                    if step_delay_ms > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
+                match spec.kind {
+                    ForegroundDragEventKind::Move => {
+                        cua_driver_core::blocking::check_cancelled()?;
+                        let _ = CGDisplay::warp_mouse_cursor_position(spec.point);
+                        unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
+                        std::thread::sleep(std::time::Duration::from_millis(40));
                     }
+                    ForegroundDragEventKind::Dragged => {
+                        cua_driver_core::blocking::check_cancelled()?;
+                        let _ = CGDisplay::warp_mouse_cursor_position(spec.point);
+                    }
+                    ForegroundDragEventKind::Up => {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    ForegroundDragEventKind::Down => {}
                 }
-                ForegroundDragEventKind::Up => {}
-            }
-        }
-        Ok(())
+
+                post_drag_mouse_event(
+                    pid,
+                    event_type,
+                    spec.point,
+                    event_button,
+                    local,
+                    wid,
+                    click_group_id,
+                    click_state,
+                    event_button_number,
+                    subtype,
+                    MousePostMode::HidOnly,
+                    flags,
+                    "foreground drag event creation failed",
+                )?;
+
+                match spec.kind {
+                    ForegroundDragEventKind::Move => {
+                        std::thread::sleep(super::pacing::mouse_primer_settle());
+                    }
+                    ForegroundDragEventKind::Down => {
+                        observe(spec.point.x, spec.point.y);
+                        std::thread::sleep(std::time::Duration::from_millis(16));
+                    }
+                    ForegroundDragEventKind::Dragged => {
+                        observe(spec.point.x, spec.point.y);
+                        if step_delay_ms > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
+                        }
+                    }
+                    ForegroundDragEventKind::Up => {}
+                }
+                Ok::<_, anyhow::Error>(())
+            },
+        )
     })?;
 
     std::thread::sleep(std::time::Duration::from_millis(100));
+    cua_driver_core::blocking::check_cancelled()?;
     Ok(())
 }
 
@@ -1144,7 +1215,6 @@ where
     F: FnMut(f64, f64),
 {
     use core_graphics::display::CGDisplay;
-    use core_graphics::event::CGEventTapLocation;
 
     let (cg_button, down_type, dragged_type, up_type) = match button {
         DragButton::Left => (
@@ -1177,47 +1247,53 @@ where
     // Keep WindowServer's hardware cursor and event stream coupled. AppKit
     // hit-tests some pointer-capture surfaces against the actual cursor even
     // when the HID event carries an explicit location.
+    cua_driver_core::blocking::check_cancelled()?;
     let _ = CGDisplay::warp_mouse_cursor_position(CGPoint::new(from_x, from_y));
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
     observe(from_x, from_y);
     std::thread::sleep(std::time::Duration::from_millis(40));
 
     super::keyboard::with_global_modifier_keys(modifiers, |flags| {
-        for spec in events {
-            let event_type = match spec.kind {
-                ForegroundDragEventKind::Move => CGEventType::MouseMoved,
-                ForegroundDragEventKind::Down => down_type,
-                ForegroundDragEventKind::Dragged => dragged_type,
-                ForegroundDragEventKind::Up => up_type,
-            };
-            // A null source matches macOS's established global mouse-controller
-            // path. WindowServer then carries the pressed-button state from the
-            // down through every dragged event instead of treating each event as
-            // an independent HIDSystemState snapshot.
-            let event =
-                new_global_mouse_event(event_type, spec.point, cg_button).map_err(|_| {
-                    anyhow::anyhow!("foreground drag {:?} event creation failed", spec.kind)
-                })?;
-            event.set_flags(flags);
-            event.post(CGEventTapLocation::HID);
+        cua_driver_core::blocking::run_input_transitions(
+            events
+                .into_iter()
+                .map(|spec| (spec.kind == ForegroundDragEventKind::Up, spec)),
+            |spec| {
+                let event_type = match spec.kind {
+                    ForegroundDragEventKind::Move => CGEventType::MouseMoved,
+                    ForegroundDragEventKind::Down => down_type,
+                    ForegroundDragEventKind::Dragged => dragged_type,
+                    ForegroundDragEventKind::Up => up_type,
+                };
+                // A null source matches macOS's established global mouse-controller
+                // path. WindowServer then carries the pressed-button state from the
+                // down through every dragged event instead of treating each event as
+                // an independent HIDSystemState snapshot.
+                let event =
+                    new_global_mouse_event(event_type, spec.point, cg_button).map_err(|_| {
+                        anyhow::anyhow!("foreground drag {:?} event creation failed", spec.kind)
+                    })?;
+                event.set_flags(flags);
+                dispatch_mouse_event(PostRoute::Hid, 0, &event);
 
-            match spec.kind {
-                ForegroundDragEventKind::Move => {
-                    std::thread::sleep(std::time::Duration::from_millis(30));
-                }
-                ForegroundDragEventKind::Down => {
-                    std::thread::sleep(std::time::Duration::from_millis(16));
-                }
-                ForegroundDragEventKind::Dragged => {
-                    observe(spec.point.x, spec.point.y);
-                    if step_delay_ms > 0 {
-                        std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
+                match spec.kind {
+                    ForegroundDragEventKind::Move => {
+                        std::thread::sleep(std::time::Duration::from_millis(30));
                     }
+                    ForegroundDragEventKind::Down => {
+                        std::thread::sleep(std::time::Duration::from_millis(16));
+                    }
+                    ForegroundDragEventKind::Dragged => {
+                        observe(spec.point.x, spec.point.y);
+                        if step_delay_ms > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
+                        }
+                    }
+                    ForegroundDragEventKind::Up => {}
                 }
-                ForegroundDragEventKind::Up => {}
-            }
-        }
-        Ok(())
+                Ok::<_, anyhow::Error>(())
+            },
+        )
     })?;
     // The foreground wrapper restores the previous app immediately after this
     // function returns. Let the target's run loop consume the queued HID
@@ -1664,6 +1740,7 @@ pub fn scroll_wheel_at_xy(
     std::thread::sleep(super::pacing::mouse_primer_settle());
 
     for _ in 0..ticks.max(1) {
+        cua_driver_core::blocking::check_cancelled()?;
         // Fresh source per event, matching the click primitives.
         let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
             .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
@@ -1700,8 +1777,7 @@ pub fn scroll_wheel_at_xy(
 
         // Belt+suspenders post: SkyLight reaches backgrounded Chromium/Catalyst;
         // the public path lands on AppKit/WKWebView. Mouse-class → no auth envelope.
-        crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
-        event.post_to_pid(pid as libc::pid_t);
+        dispatch_mouse_event(PostRoute::SkyLightAndPublic, pid, &event);
 
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
@@ -2131,6 +2207,17 @@ mod tests {
                 Posted::new("RightMouseDown", PostRoute::PublicPid, 1),
                 Posted::new("RightMouseUp", PostRoute::PublicPid, 1),
             ]
+        );
+    }
+
+    #[test]
+    fn desktop_pointer_move_posts_one_hid_mouse_moved_at_the_target() {
+        // Only the post half: the warp half would move the host's pointer.
+        let capture = Capture::start(true);
+        post_pointer_moved(CGPoint::new(163.0, 159.0)).unwrap();
+        assert_eq!(
+            capture.posted(),
+            [Posted::new("MouseMoved", PostRoute::Hid, 0)]
         );
     }
 

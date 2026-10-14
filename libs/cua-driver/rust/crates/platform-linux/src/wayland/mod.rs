@@ -1461,6 +1461,10 @@ fn wayland_window_crop(xid: u64) -> anyhow::Result<WaylandWindowCrop> {
             window.visible,
         );
     }
+    // GNOME helpers before API 9 have no per-window capture, so the stage is
+    // cropped to the window's frame. GetRects proves geometry, not occlusion:
+    // a covering window shows in the crop. API 9+ helpers never reach this
+    // (see `screenshot_dispatch_for_pid`).
     if let Some(window) = shell_helper::list_windows(None)
         .and_then(|windows| windows.into_iter().find(|window| window.xid == xid))
     {
@@ -5031,8 +5035,13 @@ pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
         if is_inject_mode() {
             return private_session_windows(filter_pid);
         }
-        if let Some(windows) = kwin_helper::list_window_infos() {
-            return listed_windows(apply_pid_filter(windows, filter_pid));
+        // A verified GNOME helper already supplies exact IDs and ownership.
+        // Do not probe unrelated compositor protocols for every preview frame.
+        if let Some(ws) = shell_helper::list_windows(filter_pid) {
+            return listed_windows(ws);
+        }
+        if let Some(ws) = kwin_helper::list_window_infos() {
+            return listed_windows(apply_pid_filter(ws, filter_pid));
         }
         if shell_helper::present() {
             if !shell_helper::available() {

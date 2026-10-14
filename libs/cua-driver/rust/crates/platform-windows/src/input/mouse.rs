@@ -196,10 +196,12 @@ fn post_click_on(
             unsafe {
                 // WM_MOUSEMOVE first so hover state is correct before the click.
                 prove_post_recipient(root, hwnd, expected_pid, "posted click mouse-move")?;
+                cua_driver_core::blocking::check_cancelled()?;
                 PostMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), lparam)?;
                 // Win32 controls do not infer a double-click from two posted DOWN
                 // messages. The second press must use WM_*BUTTONDBLCLK.
                 prove_post_recipient(root, hwnd, expected_pid, "posted click button-down")?;
+                cua_driver_core::blocking::check_cancelled()?;
                 PostMessageW(hwnd, press_msg, wdown, lparam)?;
                 button_down_posted = true;
                 sleep(Duration::from_millis(CLICK_DELAY_MS));
@@ -312,6 +314,7 @@ pub fn post_drag_screen(
         unsafe {
             // Pre-drag MOUSEMOVE (wParam=0, no buttons down yet) then DOWN at from.
             prove_post_recipient(root_hwnd, target, expected_pid, "posted drag pre-move")?;
+            cua_driver_core::blocking::check_cancelled()?;
             PostMessageW(
                 target,
                 WM_MOUSEMOVE,
@@ -319,6 +322,7 @@ pub fn post_drag_screen(
                 make_lparam(c_from.x, c_from.y),
             )?;
             prove_post_recipient(root_hwnd, target, expected_pid, "posted drag button-down")?;
+            cua_driver_core::blocking::check_cancelled()?;
             PostMessageW(target, down_msg, wparam, make_lparam(c_from.x, c_from.y))?;
             button_down_posted = true;
         }
@@ -329,6 +333,7 @@ pub fn post_drag_screen(
             let iy = c_from.y + ((c_to.y - c_from.y) as f64 * t).round() as i32;
             prove_post_recipient(root_hwnd, target, expected_pid, "posted drag move")?;
             unsafe {
+                cua_driver_core::blocking::check_cancelled()?;
                 PostMessageW(target, WM_MOUSEMOVE, wparam, make_lparam(ix, iy))?;
             }
             last_point = POINT { x: ix, y: iy };
@@ -793,7 +798,10 @@ fn send_click_synthesized_mods_impl(
         // Move the cursor so the OS hover state matches before the click; the
         // MOUSEEVENTF_MOVE input ensures Chromium's input filter sees a
         // coordinated move event.
-        let _ = SetCursorPos(sx, sy);
+        let mut cancellation = cua_driver_core::blocking::check_cancelled().err();
+        if cancellation.is_none() {
+            let _ = SetCursorPos(sx, sy);
+        }
 
         // Hold modifier keys (ctrl/shift/alt/win) across the click — the macOS
         // `modifier` surface. Pressed via the system input queue so apps that
@@ -856,7 +864,8 @@ fn send_click_synthesized_mods_impl(
                 }
             );
         }
-        if !mod_downs.is_empty() {
+        cancellation = cancellation.or_else(|| cua_driver_core::blocking::check_cancelled().err());
+        if cancellation.is_none() && !mod_downs.is_empty() {
             let sent = SendInput(&mod_downs, std::mem::size_of::<INPUT>() as i32);
             inserted_modifier_downs = (sent as usize).min(mod_downs.len());
             sent_ok = sent as usize == mod_downs.len();
@@ -865,7 +874,7 @@ fn send_click_synthesized_mods_impl(
 
         let count = count.max(1);
         for i in 0..count {
-            if !sent_ok {
+            if !sent_ok || cancellation.is_some() {
                 break;
             }
             if expected_pid.is_some()
@@ -895,6 +904,10 @@ fn send_click_synthesized_mods_impl(
             // Only the move record carries absolute coordinates. Button-only
             // records act at the current pointer position; adding ABSOLUTE to
             // them can prevent retained-mode controls from seeing the press.
+            if let Err(error) = cua_driver_core::blocking::check_cancelled() {
+                cancellation = Some(error);
+                break;
+            }
             let events = [move_input, down_input, up_input];
             let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
             if sent as usize != events.len() {
@@ -982,7 +995,9 @@ fn send_click_synthesized_mods_impl(
         } else {
             true
         };
-        let mut action_result = if !sent_ok {
+        let mut action_result = if let Some(error) = cancellation {
+            Err(error.into())
+        } else if !sent_ok {
             Err(anyhow::anyhow!(
                 "SendInput inserted fewer modifier or mouse events than expected for the foreground click{}",
                 if cleanup_failures.is_empty() {
@@ -1187,7 +1202,9 @@ pub fn send_drag_synthesized(
         }
         let foreground_target = foreground_target.expect("exact foreground target checked above");
 
-        let mut drag_error = None;
+        let mut drag_error = cua_driver_core::blocking::check_cancelled()
+            .err()
+            .map(anyhow::Error::from);
         let mut button_down_maybe = false;
         let mut last_authorized = (sx_from, sy_from);
         if !exact_target_receives_point(target_addr, approved_pid, sx_from, sy_from) {
@@ -1198,14 +1215,21 @@ pub fn send_drag_synthesized(
 
         if drag_error.is_none() {
             let (nfx, nfy) = norm(sx_from, sy_from);
-            let _ = SetCursorPos(sx_from, sy_from);
+            if let Err(error) = cua_driver_core::blocking::check_cancelled() {
+                drag_error = Some(error.into());
+            }
+            if drag_error.is_none() {
+                let _ = SetCursorPos(sx_from, sy_from);
+            }
             let still_authorized =
                 exact_target_receives_point(target_addr, approved_pid, sx_from, sy_from)
                     && crate::win32::foreground_matches_target_or_owned_window(
                         foreground_target,
                         GetForegroundWindow().0 as usize as u64,
                     );
-            if !still_authorized {
+            if let Err(error) = cua_driver_core::blocking::check_cancelled() {
+                drag_error = Some(error.into());
+            } else if !still_authorized {
                 drag_error = Some(anyhow::anyhow!(
                     "foreground_unavailable: exact target lost foreground or drag-start recipient authority before SendInput; no input was sent"
                 ));
@@ -1263,6 +1287,10 @@ pub fn send_drag_synthesized(
                     break;
                 }
                 let (nx, ny) = norm(x, y);
+                if let Err(error) = cua_driver_core::blocking::check_cancelled() {
+                    drag_error = Some(error.into());
+                    break;
+                }
                 let _ = SetCursorPos(x, y);
                 if !exact_target_receives_point(target_addr, approved_pid, x, y) {
                     drag_error = Some(anyhow::anyhow!(
@@ -1271,6 +1299,10 @@ pub fn send_drag_synthesized(
                     break;
                 }
                 let mv = [make_input(nx, ny, MOUSEEVENTF_MOVE)];
+                if let Err(error) = cua_driver_core::blocking::check_cancelled() {
+                    drag_error = Some(error.into());
+                    break;
+                }
                 let moved = SendInput(&mv, std::mem::size_of::<INPUT>() as i32);
                 if moved as usize != mv.len() {
                     drag_error = Some(anyhow::anyhow!(
@@ -1453,6 +1485,7 @@ pub fn send_wheel_synthesized_for_target(
         }
 
         // Wheel routes to the window under the cursor — place it on the target.
+        cua_driver_core::blocking::check_cancelled()?;
         let _ = SetCursorPos(sx, sy);
 
         if let Some((hwnd, pid)) = target {
@@ -1466,13 +1499,21 @@ pub fn send_wheel_synthesized_for_target(
         }
 
         let events = [wheel_input];
-        let sent = SendInput(&events, std::mem::size_of::<INPUT>() as i32);
+        let cancellation = cua_driver_core::blocking::check_cancelled().err();
+        let sent = if cancellation.is_none() {
+            SendInput(&events, std::mem::size_of::<INPUT>() as i32)
+        } else {
+            0
+        };
         if sent as usize != events.len() {
             let restored = if let Some(cursor_target) = cursor_target {
                 crate::win32::restore_cursor_target(cursor_target)
             } else {
                 SetCursorPos(prev_cursor.x, prev_cursor.y).is_ok()
             };
+            if let Some(error) = cancellation {
+                return Err(error.into());
+            }
             bail!(
                 "SendInput inserted {sent}/{} wheel events{}",
                 events.len(),
@@ -1511,6 +1552,7 @@ pub fn foreground_window() -> Result<u64> {
 
 /// Move the real OS pointer to a desktop coordinate.
 pub fn move_cursor_desktop(x: i32, y: i32) -> Result<()> {
+    cua_driver_core::blocking::check_cancelled()?;
     unsafe { SetCursorPos(x, y) }
         .map_err(|error| anyhow::anyhow!("SetCursorPos({x}, {y}) failed: {error}"))
 }

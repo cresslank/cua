@@ -292,13 +292,12 @@ pub fn percent(permille: u32) -> String {
 }
 
 /// The selection the window shows: the chosen id if it still exists, else
-/// the first Space that is not this machine, else the first.
+/// the first Space that is not this machine (none: the empty home).
 pub fn effective_selection<'a>(spaces: &'a [Space], selected_id: &str) -> Option<&'a Space> {
     spaces
         .iter()
         .find(|s| s.id == selected_id)
         .or_else(|| spaces.iter().find(|s| s.id != THIS_MACHINE_ID))
-        .or_else(|| spaces.first())
 }
 
 /// Builds the sidebar for `spaces` filtered by `query`.
@@ -712,7 +711,7 @@ fn delete_confirm(space: &Space, remove_only: bool, delete_label: &str) -> Delet
         message: if remove_only {
             "It is only removed from the list."
         } else {
-            "Its sandbox is deleted."
+            "Everything inside it, including its files, is deleted and can't be recovered."
         }
         .into(),
         confirm_label: delete_label.into(),
@@ -829,7 +828,16 @@ fn detail_facts(
     usage: Option<&SpaceUsage>,
     host_arch: Option<&str>,
 ) -> Vec<Fact> {
-    let mut facts = vec![fact("Status", status)];
+    let hint = space
+        .power
+        .as_ref()
+        .filter(|p| p.off && p.turning_on.is_none() && space.status == SpaceStatus::Suspended)
+        .filter(|_| !space.progress.as_ref().is_some_and(|p| p.error.is_some()))
+        .map(|p| super::off_hint(p.control).to_string());
+    let mut facts = vec![Fact {
+        help: hint,
+        ..fact("Status", status)
+    }];
     if let Some(place) = space
         .cloud_place
         .as_deref()
@@ -902,6 +910,10 @@ pub fn detail_live(
         _ if deleting || powered => status_text(space),
         (_, Some(p)) => match &p.error {
             Some(_) => "Failed".to_string(),
+            // Downloading with a byte count: the bytes line under the bar
+            // says how far ("15.2 of 22.2 GB"); an overall percentage here
+            // (the whole create's, 58%) would disagree with it (68%).
+            None if p.transfer.is_some() => p.label.clone(),
             None => format!("{} {}", p.label, percent(p.permille)),
         },
         (Some(sdk), None) if !sdk.reachable => sdk
@@ -1138,6 +1150,30 @@ pub fn detail_for(
 mod tests {
     use super::*;
     use crate::model::SpaceRow;
+
+    /// Only This machine is not a Space to open: an empty id selects nothing,
+    /// choosing it does, and a real Space wins over it.
+    #[test]
+    fn this_machine_alone_selects_nothing() {
+        use crate::host::this_machine_space;
+        use crate::model::SpaceOs;
+        let machine = this_machine_space(None, 0, SpaceOs::Macos);
+        assert!(effective_selection(std::slice::from_ref(&machine), "").is_none());
+        assert_eq!(
+            effective_selection(std::slice::from_ref(&machine), "this-mac").map(|s| s.id.as_str()),
+            Some("this-mac")
+        );
+        let real = super::super::row_to_space(&local_row("local:box", None, None, None), 0);
+        let both = [machine, real];
+        assert_eq!(
+            effective_selection(&both, "").map(|s| s.id.as_str()),
+            Some("local:box")
+        );
+        assert_eq!(
+            effective_selection(&both, "this-mac").map(|s| s.id.as_str()),
+            Some("this-mac")
+        );
+    }
 
     /// Sharing off (the default): no Share button; on: Share, between
     /// Picture in picture and Delete as before.
@@ -1753,13 +1789,27 @@ mod tests {
         let off = powered("local:a", "stop", Some("stopped"), true);
         assert_eq!(
             (off.status, status_text(&off).as_str()),
-            (SpaceStatus::Suspended, "Off")
+            (SpaceStatus::Suspended, "Stopped")
         );
-        assert_eq!(off.detail, "Off");
+        assert_eq!(off.detail, "Stopped");
         let d = detail(&off);
         assert_eq!(
             (d.facts[0].value.as_str(), d.preview_text.as_str()),
-            ("Off", "Off")
+            ("Stopped", "Stopped")
+        );
+        // One word for off; how it is off is the Status fact's tooltip.
+        assert_eq!(
+            d.facts[0].help.as_deref(),
+            Some(super::super::off_hint(PowerControl::Stop))
+        );
+        let suspended = detail(&powered("local:b", "suspend", Some("suspended"), true));
+        assert_eq!(suspended.facts[0].value, "Stopped");
+        assert!(
+            suspended.facts[0]
+                .help
+                .as_deref()
+                .unwrap()
+                .starts_with("Suspended in memory")
         );
         let ids: Vec<DetailActionId> = d.actions.iter().map(|a| a.id).collect();
         assert_eq!(
@@ -1803,6 +1853,34 @@ mod tests {
             cancelling: false,
         });
         assert!(power_button(&s).is_none());
+    }
+
+    #[test]
+    fn a_download_status_has_one_measure_of_progress() {
+        let mut s = powered("pending:1", "", None, false);
+        s.power = None;
+        s.status = SpaceStatus::Provisioning;
+        let progress = |transfer: Option<&str>| crate::model::SpaceProgress {
+            phase: "pulling".into(),
+            permille: 580,
+            label: "Downloading image\u{2026}".into(),
+            error: None,
+            credit_url: None,
+            transfer: transfer.map(str::to_string),
+            cancellable: true,
+            cancelling: false,
+        };
+        // Bytes known: the bytes line says how far, not a second percentage.
+        s.progress = Some(progress(Some("15.2 of 22.2 GB \u{b7} 107 MB/s")));
+        let d = detail(&s);
+        assert_eq!(d.facts[0].value, "Downloading image\u{2026}");
+        assert_eq!(
+            d.progress_text.as_deref(),
+            Some("15.2 of 22.2 GB \u{b7} 107 MB/s")
+        );
+        // No bytes: the percentage is all there is.
+        s.progress = Some(progress(None));
+        assert_eq!(detail(&s).facts[0].value, "Downloading image\u{2026} 58%");
     }
 
     #[test]

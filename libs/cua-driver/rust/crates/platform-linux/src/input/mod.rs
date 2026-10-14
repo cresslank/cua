@@ -947,6 +947,7 @@ fn warp_master_pointer(
     x: i32,
     y: i32,
 ) -> Result<()> {
+    cua_driver_core::blocking::check_cancelled()?;
     let root = unsafe { x11::xlib::XDefaultRootWindow(display) };
     let rc = unsafe {
         x11::xinput2::XIWarpPointer(
@@ -1370,8 +1371,19 @@ fn button_code(button: u8) -> Result<Key> {
 }
 
 fn emit_button(device: &mut VirtualDevice, button: u8, press: bool) -> Result<()> {
+    emit_button_with(button, press, |events| device.emit(events))
+}
+
+fn emit_button_with(
+    button: u8,
+    press: bool,
+    mut emit: impl FnMut(&[InputEvent]) -> std::io::Result<()>,
+) -> Result<()> {
     let code = button_code(button)?;
-    device.emit(&[InputEvent::new(
+    if press {
+        cua_driver_core::blocking::check_cancelled()?;
+    }
+    emit(&[InputEvent::new(
         EventType::KEY,
         code.0,
         if press { 1 } else { 0 },
@@ -1391,6 +1403,15 @@ fn release_button_best_effort(device: &Arc<Mutex<VirtualDevice>>, button: u8) {
 }
 
 fn emit_relative_motion(device: &mut VirtualDevice, dx: i32, dy: i32) -> Result<()> {
+    emit_relative_motion_with(dx, dy, |events| device.emit(events))
+}
+
+fn emit_relative_motion_with(
+    dx: i32,
+    dy: i32,
+    mut emit: impl FnMut(&[InputEvent]) -> std::io::Result<()>,
+) -> Result<()> {
+    cua_driver_core::blocking::check_cancelled()?;
     let mut events = Vec::with_capacity(2);
     if dx != 0 {
         events.push(InputEvent::new(
@@ -1409,7 +1430,7 @@ fn emit_relative_motion(device: &mut VirtualDevice, dx: i32, dy: i32) -> Result<
     if events.is_empty() {
         return Ok(());
     }
-    device.emit(&events)?;
+    emit(&events)?;
     Ok(())
 }
 
@@ -1417,12 +1438,21 @@ fn emit_relative_motion(device: &mut VirtualDevice, dx: i32, dy: i32) -> Result<
 /// (positive = right) over REL_WHEEL (positive = up); `value` is the signed
 /// detent count. libinput translates these into the XI2 scroll events GTK reads.
 fn emit_scroll(device: &mut VirtualDevice, horizontal: bool, value: i32) -> Result<()> {
+    emit_scroll_with(horizontal, value, |events| device.emit(events))
+}
+
+fn emit_scroll_with(
+    horizontal: bool,
+    value: i32,
+    mut emit: impl FnMut(&[InputEvent]) -> std::io::Result<()>,
+) -> Result<()> {
+    cua_driver_core::blocking::check_cancelled()?;
     let axis = if horizontal {
         RelativeAxisType::REL_HWHEEL
     } else {
         RelativeAxisType::REL_WHEEL
     };
-    device.emit(&[InputEvent::new(EventType::RELATIVE, axis.0, value)])?;
+    emit(&[InputEvent::new(EventType::RELATIVE, axis.0, value)])?;
     Ok(())
 }
 
@@ -3184,6 +3214,7 @@ pub fn send_click_with_modifiers(
         // The event mask selects recipients independently of the payload type.
         // Select the press client for both payloads so a press-only toolkit
         // binding (such as Tk's <Button-1>) receives one coherent click.
+        cua_driver_core::blocking::check_cancelled()?;
         conn.send_event(false, target.window, EventMask::BUTTON_PRESS, press)?
             .check()?;
         sleep(Duration::from_millis(CLICK_DELAY_MS));
@@ -3238,10 +3269,12 @@ pub fn send_drag(
         state: KeyButMask::from(0u16),
         same_screen: true,
     };
+    cua_driver_core::blocking::check_cancelled()?;
     conn.send_event(false, press_target.window, EventMask::BUTTON_PRESS, press)?;
     conn.flush()?;
     sleep(Duration::from_millis(CLICK_DELAY_MS));
 
+    let mut cancelled = None;
     // Interpolated MotionNotify steps.
     for i in 1..=steps {
         let t = i as f64 / steps as f64;
@@ -3263,6 +3296,10 @@ pub fn send_drag(
             state: button_state_mask(button),
             same_screen: true,
         };
+        if let Err(error) = cua_driver_core::blocking::check_cancelled() {
+            cancelled = Some(error);
+            break;
+        }
         conn.send_event(false, target.window, EventMask::POINTER_MOTION, motion)?;
         conn.flush()?;
         if step_delay_ms > 0 {
@@ -3295,6 +3332,9 @@ pub fn send_drag(
     )?;
     conn.flush()?;
     settle_synthetic_events(&conn);
+    if let Some(error) = cancelled {
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -3317,6 +3357,7 @@ pub fn send_button_down(xid: u64, x: i32, y: i32, button: u8) -> Result<()> {
         state: KeyButMask::from(0u16),
         same_screen: true,
     };
+    cua_driver_core::blocking::check_cancelled()?;
     conn.send_event(false, target.window, EventMask::BUTTON_PRESS, &press)?
         .check()?;
     settle_synthetic_events(&conn);
@@ -3344,6 +3385,7 @@ pub fn send_motion(xid: u64, x: i32, y: i32, button: Option<u8>) -> Result<()> {
             .unwrap_or_else(|| KeyButMask::from(0u16)),
         same_screen: true,
     };
+    cua_driver_core::blocking::check_cancelled()?;
     conn.send_event(false, target.window, EventMask::POINTER_MOTION, motion)?;
     conn.flush()?;
     settle_synthetic_events(&conn);
@@ -3393,6 +3435,7 @@ pub fn send_type_text_with_delay(xid: u64, text: &str, inter_char_ms: u64) -> Re
     let mut remap_guards = Vec::new();
 
     for ch in text.chars() {
+        cua_driver_core::blocking::check_cancelled()?;
         // Resolve the keycode and whether Shift must be held — without it,
         // uppercase and shifted symbols would otherwise type their unshifted
         // form (e.g. "A" arriving as "a").
@@ -3449,12 +3492,13 @@ pub fn send_type_text_with_delay(xid: u64, text: &str, inter_char_ms: u64) -> Re
             same_screen: true,
         };
 
+        cua_driver_core::blocking::check_cancelled()?;
         conn.send_event(false, window, EventMask::KEY_PRESS, press)?;
         // Start the hold interval after sending the press, not while it is buffered.
         conn.flush()?;
         sleep(Duration::from_millis(KEY_DELAY_MS));
         conn.send_event(false, window, EventMask::KEY_RELEASE, release)?;
-        conn.flush()?;
+        settle_synthetic_events(&conn);
         if inter_char_ms > 0 {
             sleep(Duration::from_millis(inter_char_ms));
         }
@@ -3486,6 +3530,7 @@ pub fn send_type_text_xtest(text: &str) -> Result<()> {
     // Remap guards live until the function returns — see send_type_text_with_delay.
     let mut remap_guards = Vec::new();
     for ch in text.chars() {
+        cua_driver_core::blocking::check_cancelled()?;
         let cp = mpx_keyboard::keysym_for_char(ch);
         let (keycode, needs_shift) = match char_to_keycode_shift(&mapping, cp) {
             Some(found) => found,
@@ -3497,14 +3542,29 @@ pub fn send_type_text_xtest(text: &str) -> Result<()> {
                 Err(_) => continue,
             },
         };
-        if needs_shift {
-            conn.xtest_fake_input(KEY_PRESS_EVENT, shift_kc, 0, x11rb::NONE, 0, 0, 0)?;
-        }
-        conn.xtest_fake_input(KEY_PRESS_EVENT, keycode, 0, x11rb::NONE, 0, 0, 0)?;
-        conn.xtest_fake_input(KEY_RELEASE_EVENT, keycode, 0, x11rb::NONE, 0, 0, 0)?;
-        if needs_shift {
-            conn.xtest_fake_input(KEY_RELEASE_EVENT, shift_kc, 0, x11rb::NONE, 0, 0, 0)?;
-        }
+        let downs: Vec<u8> = needs_shift
+            .then_some(shift_kc)
+            .into_iter()
+            .chain([keycode])
+            .collect();
+        let result = send_xtest_key_sequence(&downs, |release, code| -> Result<()> {
+            conn.xtest_fake_input(
+                if release {
+                    KEY_RELEASE_EVENT
+                } else {
+                    KEY_PRESS_EVENT
+                },
+                code,
+                0,
+                x11rb::NONE,
+                0,
+                0,
+                0,
+            )?;
+            Ok(())
+        });
+        settle_synthetic_events(&conn);
+        result?;
         conn.flush()?;
         sleep(Duration::from_millis(KEY_DELAY_MS));
     }
@@ -3581,25 +3641,34 @@ pub fn send_key_xtest(key: &str, modifiers: &[&str]) -> Result<()> {
         None
     };
 
-    // Press modifiers (+ auto-Shift), tap the key, release in reverse order.
-    for &kc in &mod_keycodes {
-        conn.xtest_fake_input(KEY_PRESS_EVENT, kc, 0, x11rb::NONE, 0, 0, 0)?;
-    }
-    if let Some(sk) = auto_shift_kc {
-        conn.xtest_fake_input(KEY_PRESS_EVENT, sk, 0, x11rb::NONE, 0, 0, 0)?;
-    }
-    conn.xtest_fake_input(KEY_PRESS_EVENT, keycode, 0, x11rb::NONE, 0, 0, 0)?;
-    // Flush modifiers and key-down before measuring the delivered hold interval.
-    conn.flush()?;
-    sleep(Duration::from_millis(KEY_DELAY_MS));
-    conn.xtest_fake_input(KEY_RELEASE_EVENT, keycode, 0, x11rb::NONE, 0, 0, 0)?;
-    if let Some(sk) = auto_shift_kc {
-        conn.xtest_fake_input(KEY_RELEASE_EVENT, sk, 0, x11rb::NONE, 0, 0, 0)?;
-    }
-    for &kc in mod_keycodes.iter().rev() {
-        conn.xtest_fake_input(KEY_RELEASE_EVENT, kc, 0, x11rb::NONE, 0, 0, 0)?;
-    }
-    conn.flush()?;
+    let downs: Vec<u8> = mod_keycodes
+        .iter()
+        .copied()
+        .chain(auto_shift_kc)
+        .chain([keycode])
+        .collect();
+    let result = send_xtest_key_sequence(&downs, |release, code| -> Result<()> {
+        conn.xtest_fake_input(
+            if release {
+                KEY_RELEASE_EVENT
+            } else {
+                KEY_PRESS_EVENT
+            },
+            code,
+            0,
+            x11rb::NONE,
+            0,
+            0,
+            0,
+        )?;
+        conn.flush()?;
+        if !release && code == keycode {
+            sleep(Duration::from_millis(KEY_DELAY_MS));
+        }
+        Ok(())
+    });
+    settle_synthetic_events(&conn);
+    result?;
 
     // Round-trip so the server actually PROCESSES (delivers) the injected XTEST
     // key events before this function returns and drops its short-lived
@@ -3690,6 +3759,7 @@ pub(crate) fn send_click_xtest_acknowledged(
     let mut button_pressed = false;
     let gesture_result = (|| -> Result<()> {
         for &keycode in &modifier_keycodes {
+            cua_driver_core::blocking::check_cancelled()?;
             conn.xtest_fake_input(KEY_PRESS_EVENT, keycode, 0, x11rb::NONE, 0, 0, 0)?;
             pressed.push(keycode);
         }
@@ -3699,12 +3769,14 @@ pub(crate) fn send_click_xtest_acknowledged(
         for click_index in 0..count {
             complete_motion_before_validation(
                 || {
+                    cua_driver_core::blocking::check_cancelled()?;
                     conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, x as i16, y as i16, 0)?
                         .check()?;
                     Ok(())
                 },
                 before,
             )?;
+            cua_driver_core::blocking::check_cancelled()?;
             let press =
                 conn.xtest_fake_input(BUTTON_PRESS_EVENT, button, 0, root, x as i16, y as i16, 0)?;
             // Confirm delivery before sleeping; buffering both edges produces a zero-ms click.
@@ -3759,6 +3831,7 @@ pub fn send_move_xtest_desktop(x: i32, y: i32) -> Result<()> {
     use x11rb::protocol::xtest::ConnectionExt as _;
     let (conn, screen_num) = connect_x11_for_input()?;
     let root = conn.setup().roots[screen_num].root;
+    cua_driver_core::blocking::check_cancelled()?;
     conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, x as i16, y as i16, 0)?;
     conn.flush()?;
     let _ = conn.get_input_focus()?.reply();
@@ -3778,11 +3851,19 @@ pub fn send_scroll_xtest_desktop(x: i32, y: i32, direction: &str, amount: usize)
     };
     let (conn, screen_num) = connect_x11_for_input()?;
     let root = conn.setup().roots[screen_num].root;
-    conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, x as i16, y as i16, 0)?;
-    for _ in 0..amount.max(1) {
-        conn.xtest_fake_input(BUTTON_PRESS_EVENT, button, 0, root, x as i16, y as i16, 0)?;
-        conn.xtest_fake_input(BUTTON_RELEASE_EVENT, button, 0, root, x as i16, y as i16, 0)?;
-    }
+    let result = (|| -> Result<()> {
+        cua_driver_core::blocking::check_cancelled()?;
+        conn.xtest_fake_input(MOTION_NOTIFY_EVENT, 0, 0, root, x as i16, y as i16, 0)?;
+        for _ in 0..amount.max(1) {
+            cua_driver_core::blocking::check_cancelled()?;
+            conn.xtest_fake_input(BUTTON_PRESS_EVENT, button, 0, root, x as i16, y as i16, 0)?;
+            conn.xtest_fake_input(BUTTON_RELEASE_EVENT, button, 0, root, x as i16, y as i16, 0)?;
+        }
+        Ok(())
+    })();
+    // Complete queued releases even when the next detent was cancelled.
+    settle_synthetic_events(&conn);
+    result?;
     conn.flush()?;
     let _ = conn.get_input_focus()?.reply();
     Ok(())
@@ -3845,9 +3926,11 @@ pub fn send_drag_xtest_desktop_with_modifiers(
 
     let gesture_result = (|| -> Result<()> {
         for &keycode in &modifier_keycodes {
+            cua_driver_core::blocking::check_cancelled()?;
             conn.xtest_fake_input(KEY_PRESS_EVENT, keycode, 0, x11rb::NONE, 0, 0, 0)?;
             pressed_modifiers.push(keycode);
         }
+        cua_driver_core::blocking::check_cancelled()?;
         conn.xtest_fake_input(
             MOTION_NOTIFY_EVENT,
             0,
@@ -3857,6 +3940,7 @@ pub fn send_drag_xtest_desktop_with_modifiers(
             from_y as i16,
             0,
         )?;
+        cua_driver_core::blocking::check_cancelled()?;
         conn.xtest_fake_input(
             BUTTON_PRESS_EVENT,
             button,
@@ -3872,6 +3956,7 @@ pub fn send_drag_xtest_desktop_with_modifiers(
             let t = step as f64 / steps as f64;
             let x = from_x as f64 + (to_x - from_x) as f64 * t;
             let y = from_y as f64 + (to_y - from_y) as f64 * t;
+            cua_driver_core::blocking::check_cancelled()?;
             conn.xtest_fake_input(
                 MOTION_NOTIFY_EVENT,
                 0,
@@ -4007,31 +4092,20 @@ fn send_key_to_target(
         conn.send_event(false, window, event_mask, event)
     };
 
-    let mut state_bits = 0u16;
-    for &(modifier_keycode, modifier_mask) in &modifier_keycodes {
-        send_key_event(
-            KEY_PRESS_EVENT,
-            modifier_keycode,
-            KeyButMask::from(state_bits),
-            EventMask::KEY_PRESS,
-        )?;
-        state_bits |= u16::from(modifier_mask);
-    }
-    let state = KeyButMask::from(state_bits);
-    send_key_event(KEY_PRESS_EVENT, keycode, state, EventMask::KEY_PRESS)?;
-    // Otherwise X11 receives both transitions together after the sleep.
-    conn.flush()?;
-    sleep(Duration::from_millis(KEY_DELAY_MS));
-    send_key_event(KEY_RELEASE_EVENT, keycode, state, EventMask::KEY_RELEASE)?;
-    for &(modifier_keycode, modifier_mask) in modifier_keycodes.iter().rev() {
-        send_key_event(
-            KEY_RELEASE_EVENT,
-            modifier_keycode,
-            KeyButMask::from(state_bits),
-            EventMask::KEY_RELEASE,
-        )?;
-        state_bits &= !u16::from(modifier_mask);
-    }
+    let result = send_xsend_key_sequence(
+        &modifier_keycodes,
+        keycode,
+        |kind, code, state, mask| -> Result<()> {
+            send_key_event(kind, code, state, mask)?;
+            conn.flush()?;
+            if kind == KEY_PRESS_EVENT && code == keycode {
+                sleep(Duration::from_millis(KEY_DELAY_MS));
+            }
+            Ok(())
+        },
+    );
+    settle_synthetic_events(&conn);
+    result?;
     // Deliver releases before closing the connection, even without a key remap.
     conn.get_input_focus()?.reply()?;
 
@@ -4225,6 +4299,7 @@ fn remap_spare_keycode<'a>(
     let idx = (spare as usize - 8) * per;
     let original_keysyms = mapping.keysyms[idx..idx + per].to_vec();
     let new_keysyms = vec![keysym; per];
+    cua_driver_core::blocking::check_cancelled()?;
     conn.change_keyboard_mapping(1, spare, per as u8, &new_keysyms)?;
     // Round-trip so the server has installed the new mapping before we emit the
     // key event against it.
@@ -4748,3 +4823,91 @@ mod path_tests {
         assert_eq!(point_on_path(&path, &cum, total, 0.3), (5, 5));
     }
 }
+
+// Transport seams retain the production plan and cancellation/cleanup boundary.
+fn send_xtest_key_sequence(
+    downs: &[u8],
+    mut post: impl FnMut(bool, u8) -> Result<()>,
+) -> Result<()> {
+    let mut held = Vec::new();
+    cua_driver_core::blocking::run_input_transitions(
+        downs
+            .iter()
+            .copied()
+            .map(|code| (false, (false, code)))
+            .chain(downs.iter().rev().copied().map(|code| (true, (true, code)))),
+        |(release, code)| {
+            if release && !held.contains(&code) {
+                return Ok(());
+            }
+            if !release {
+                held.push(code);
+            }
+            post(release, code)?;
+            if release {
+                held.retain(|held| *held != code);
+            }
+            Ok(())
+        },
+    )
+}
+
+fn send_xsend_key_sequence(
+    modifier_keycodes: &[(u8, KeyButMask)],
+    keycode: u8,
+    mut post: impl FnMut(u8, u8, KeyButMask, EventMask) -> Result<()>,
+) -> Result<()> {
+    let mut state_bits = 0u16;
+    let mut transitions = Vec::new();
+    for &(code, mask) in modifier_keycodes {
+        transitions.push((
+            false,
+            (
+                KEY_PRESS_EVENT,
+                code,
+                KeyButMask::from(state_bits),
+                EventMask::KEY_PRESS,
+            ),
+        ));
+        state_bits |= u16::from(mask);
+    }
+    let state = KeyButMask::from(state_bits);
+    transitions.push((
+        false,
+        (KEY_PRESS_EVENT, keycode, state, EventMask::KEY_PRESS),
+    ));
+    transitions.push((
+        true,
+        (KEY_RELEASE_EVENT, keycode, state, EventMask::KEY_RELEASE),
+    ));
+    for &(code, mask) in modifier_keycodes.iter().rev() {
+        transitions.push((
+            true,
+            (
+                KEY_RELEASE_EVENT,
+                code,
+                KeyButMask::from(state_bits),
+                EventMask::KEY_RELEASE,
+            ),
+        ));
+        state_bits &= !u16::from(mask);
+    }
+    let mut held = Vec::new();
+    cua_driver_core::blocking::run_input_transitions(transitions, |(kind, code, state, mask)| {
+        let release = kind == KEY_RELEASE_EVENT;
+        if release && !held.contains(&code) {
+            return Ok(());
+        }
+        if !release {
+            held.push(code);
+        }
+        post(kind, code, state, mask)?;
+        if release {
+            held.retain(|held| *held != code);
+        }
+        Ok(())
+    })
+}
+
+#[cfg(test)]
+mod cancellation_tests;

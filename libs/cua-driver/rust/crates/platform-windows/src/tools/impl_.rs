@@ -969,9 +969,11 @@ impl Tool for ListWindowsTool {
                 explicit fallback instead of relying on array order. The macOS-specific \
                 on_current_space / space_ids fields are \
                 omitted on Windows; current_space_id is null.\n\n\
-                Inputs: pid (optional pid filter), on_screen_only (bool, default false).".into(),
+                Inputs: pid (optional pid filter), app (app-name filter), on_screen_only (bool, \
+                default false). Filter with app or pid: an unfiltered call lists every window.".into(),
             input_schema: json!({"type":"object","properties":{
                 "pid":{"type":"integer","description":"Optional pid filter. When set, only this pid's windows are returned."},
+                "app":{"type":"string","description":cua_driver_core::tool_args::LIST_WINDOWS_APP_FILTER_DESCRIPTION},
                 "on_screen_only":{"type":"boolean","description":"When true, drop windows that aren't currently on-screen. Default false."}
             },"additionalProperties":false}),
             read_only: true, destructive: false, idempotent: true, open_world: false,
@@ -996,6 +998,12 @@ impl Tool for ListWindowsTool {
         .unwrap_or_default();
         if on_screen_only {
             windows.retain(|w| w.is_on_screen);
+        }
+        if let Some(filter) = args.opt_str("app") {
+            windows.retain(|w| {
+                let app_name = pid_to_name.get(&w.pid).map(String::as_str).unwrap_or("");
+                cua_driver_core::tool_args::app_filter_matches(&filter, app_name, None)
+            });
         }
 
         // Swift surfaces a warning when a pid filter matches nothing.
@@ -1288,7 +1296,9 @@ impl Tool for GetWindowStateTool {
                 INVARIANT: call `get_window_state` once per turn per (pid, window_id) before \
                 any element action against that window. The next snapshot of the same \
                 (pid, window_id) replaces this one, stales its element tokens, and lists the \
-                replaced ids in `invalidated_snapshot_ids`.\n\n\
+                replaced ids in `invalidated_snapshot_ids`. A screenshot-only read \
+                (`include_accessibility_tree:false`) keeps the current snapshot's rows and \
+                tokens valid, and `display_only:true` also leaves its pixel frame alone.\n\n\
                 The UIA tree walked is the window's tree (HWND-scoped); the screenshot and \
                 window bounds reported come from the same `window_id`. This is the source of \
                 truth for which window the caller intends to reason about — the driver never \
@@ -1341,7 +1351,6 @@ impl Tool for GetWindowStateTool {
                 "timeout_ms": cua_driver_core::tool_schema::timeout_ms_schema(),
                 "max_image_dimension":{"type":"integer","minimum":0,"description":"Per-call long-edge limit for the returned screenshot, in pixels (aspect ratio preserved). Explicit values override configured behavior; 0 returns native resolution. Omit to preserve the configured default."},
                 "max_dimension":{"type":"integer","minimum":1,"description":"Legacy optional cap on the returned screenshot's long edge, in pixels (aspect ratio preserved). Applied on top of the configured max_image_dimension ceiling when max_image_dimension is omitted; the tighter wins."},
-                "display_only": cua_driver_core::display_only::schema()
             },"additionalProperties":false})),
             // Swift annotation: idempotent: false (each call is a fresh snapshot).
             read_only: true, destructive: false, idempotent: false, open_world: false,
@@ -1349,7 +1358,7 @@ impl Tool for GetWindowStateTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        let display_only = match cua_driver_core::display_only::display_only(&args) {
+        let display_only = match cua_driver_core::window_state_view::display_only(&args) {
             Ok(display_only) => display_only,
             Err(refusal) => return refusal,
         };
@@ -1454,15 +1463,20 @@ impl Tool for GetWindowStateTool {
         let query = args.opt_str("query");
         let session_id = args.opt_str("_session_id");
         let screenshot_out_file = args.opt_str("screenshot_out_file");
+        // `display_only` is the public form of the internal observation-only
+        // read: pixels for a preview, with no snapshot or capture change.
+        let observation_only = display_only
+            || args
+                .get("_observation_only")
+                .and_then(|value| value.as_bool())
+                == Some(true);
         // Optional caps — when omitted, fall back to the walker's built-in
         // defaults (#22865). minimum:1 enforced in the schema, but defend
         // against 0 here too.
         let max_elements = view.max_elements(
             &args,
             crate::uia::DEFAULT_MAX_TOTAL_ELEMENTS,
-            args.get("_observation_only")
-                .and_then(|value| value.as_bool())
-                == Some(true),
+            observation_only,
         );
         let max_depth = args
             .get("max_depth")
@@ -1481,11 +1495,7 @@ impl Tool for GetWindowStateTool {
         let include_screenshot = args.get("include_screenshot").and_then(|v| v.as_bool());
         // `display_only` is the public form of the internal observation-only
         // read: pixels for a preview, with no snapshot or capture change.
-        let observation_only = display_only
-            || args
-                .get("_observation_only")
-                .and_then(|value| value.as_bool())
-                == Some(true);
+
         // `include_accessibility_tree` (default true) mirrors include_screenshot:
         // set false to SKIP the UIA walk and return just the screenshot + window
         // metadata (the capture-only / preview path).
@@ -1501,6 +1511,21 @@ impl Tool for GetWindowStateTool {
                  screenshot_out_file to force a capture.",
             );
         }
+
+        // Capture ownership/revision BEFORE producing pixels. A late image
+        // must never refresh a replacement generation or retired session.
+        let refresh_ticket = if !do_tree && do_shot && !observation_only {
+            match self.state.snapshots.screenshot_refresh_ticket(
+                pid as i32,
+                hwnd,
+                session_id.as_deref(),
+            ) {
+                Ok(ticket) => Some(ticket),
+                Err(error) => return snapshot_publication_error(error),
+            }
+        } else {
+            None
+        };
 
         let state = self.state.clone();
         let q = query.clone();
@@ -1615,6 +1640,7 @@ impl Tool for GetWindowStateTool {
                     .as_ref()
                     .map(|(_, _, w, _, native_w, _, _)| *native_w as f64 / *w as f64);
                 let mut published_snapshot = None;
+                let mut refreshed_context = None;
                 let mut invalidated = Vec::new();
 
                 if let Some((tr, payload, walk)) = tree_opt {
@@ -1753,13 +1779,40 @@ impl Tool for GetWindowStateTool {
                         &[],
                         crate::uia::snapshot::SnapshotKind::Uia,
                     );
-                    match state.snapshots.try_publish_capture_for_session(
-                        pid as i32,
-                        hwnd,
-                        payload,
-                        session_id.as_deref(),
-                        screenshot_scale,
-                    ) {
+                    let publication = if let (Some(ticket), Some(scale)) =
+                        (refresh_ticket.clone(), screenshot_scale)
+                    {
+                        match state.snapshots.refresh_screenshot_for_session(
+                            ticket.clone(),
+                            scale,
+                            None,
+                        ) {
+                            Ok(Some(context)) => {
+                                refreshed_context = Some(context);
+                                structured["snapshot_id"] =
+                                    json!(cua_driver_core::element_token::format_snapshot_id(
+                                        context.snapshot_id
+                                    ));
+                                structured["screenshot_refreshed_snapshot"] = json!(true);
+                                Ok(Some((context.snapshot_id, vec![])))
+                            }
+                            Ok(None) => state
+                                .snapshots
+                                .try_publish_capture_for_refresh(ticket, payload, scale),
+                            Err(error) => Err(error),
+                        }
+                    } else if refresh_ticket.is_some() {
+                        Err(cua_driver_core::element_token::RegistryError::NotCurrent)
+                    } else {
+                        state.snapshots.try_publish_capture_for_session(
+                            pid as i32,
+                            hwnd,
+                            payload,
+                            session_id.as_deref(),
+                            screenshot_scale,
+                        )
+                    };
+                    match publication {
                         Ok(Some((snapshot_id, replaced))) => {
                             invalidated.extend(replaced);
                             published_snapshot = Some(snapshot_id);
@@ -1803,9 +1856,45 @@ impl Tool for GetWindowStateTool {
                                     cua_driver_core::element_token::RegistryError::NotCurrent,
                                 );
                             };
-                            match bridge.publish_window(&args, png, pid, hwnd, geometry, identity) {
-                                Ok(capture_id) => capture_id,
-                                Err(error) => {
+                            let context = refreshed_context.unwrap_or(
+                                cua_driver_core::snapshot_store::ScreenshotContext {
+                                    snapshot_id: published_snapshot.expect("published snapshot"),
+                                    window_id: hwnd,
+                                    scale: screenshot_scale.unwrap_or(1.0),
+                                    frame_revision: 1,
+                                },
+                            );
+                            let frame = match state.snapshots.frame_binding(
+                                pid as i32,
+                                session_id.as_deref(),
+                                context,
+                            ) {
+                                Ok(frame) => frame,
+                                Err(error) => return error,
+                            };
+                            match state.snapshots.with_valid_screenshot_context(
+                                pid as i32,
+                                session_id.as_deref(),
+                                context,
+                                || {
+                                    bridge.publish_window(
+                                        &args,
+                                        png,
+                                        pid,
+                                        hwnd,
+                                        geometry,
+                                        identity,
+                                        Some(frame),
+                                    )
+                                },
+                            ) {
+                                Err(_) => {
+                                    return snapshot_publication_error(
+                                        cua_driver_core::element_token::RegistryError::NotCurrent,
+                                    )
+                                }
+                                Ok(Ok(capture_id)) => capture_id,
+                                Ok(Err(error)) => {
                                     return ToolResult::error(format!(
                                         "Window capture publication failed: {error}"
                                     ))
@@ -1876,7 +1965,7 @@ impl Tool for GetWindowStateTool {
                     ),
                 );
                 if display_only {
-                    cua_driver_core::display_only::mark_display_only(&mut structured);
+                    cua_driver_core::window_state_view::mark_display_only(&mut structured);
                 }
 
                 // The capture-only path (include_accessibility_tree:false) leaves
@@ -1892,6 +1981,9 @@ impl Tool for GetWindowStateTool {
                     .with_structured(structured);
                 }
 
+                if display_only {
+                    cua_driver_core::window_state_view::mark_display_only(&mut structured);
+                }
                 if !observation_only {
                     cua_driver_core::window_state_view::apply(
                         &view,

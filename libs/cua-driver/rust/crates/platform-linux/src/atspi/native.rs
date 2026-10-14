@@ -3917,6 +3917,7 @@ impl ObservedClickTarget {
     /// Async half is also called after action-name lookups, without nesting the
     /// private runtime. Always keep the original proxy and snapshot identity.
     async fn verify_live_at_mutation(&self) -> Result<()> {
+        cua_driver_core::blocking::check_cancelled()?;
         let target = &self.visited[self.target_position];
         let identity = target
             .identity
@@ -3942,6 +3943,7 @@ impl ObservedClickTarget {
         } else if !crate::x11::window_belongs_to_pid(self.xid, self.pid) {
             anyhow::bail!("stale_element_token: window ownership changed");
         }
+        cua_driver_core::blocking::check_cancelled()?;
         Ok(())
     }
 

@@ -61,9 +61,12 @@ passes on Shell 50, but the extension still requires a real-session smoke after
 the first logout/login because Shell-only resources cannot be loaded by a
 standalone `gjs` process.
 
-On Shell 50, `Capture` uses the cursor-free `screenshot_area()` API. The older
-stage-content path can fail on remote/headless pointer seats when Mutter exposes
-a 0x0 real-cursor sprite; cua-driver renders its own agent cursor instead.
+`CaptureTarget` and `CaptureTargetPreview` capture the exact target actor through
+`paint_to_content` and cursor-free `composite_to_stream`. GPU previews retain
+atomic full-size and encoded-size metadata. Both routes require the same
+painted/current, unoccluded target and revalidate identity and geometry after
+capture; covered or off-stage targets remain refused. Legacy `Capture` and
+`Activate` fail closed.
 
 ```
 ./install.sh          # stage only; does not enable or alter the live session
@@ -83,22 +86,13 @@ still work when it is absent. With an incompatible installed helper, exact
 enumeration/capture fail closed rather than silently dropping to PID/title or
 active-stage guessing. Background mode never authorizes foreground input.
 
-## Deferred upstream 0.34.1 changes
+## Transport and rollout policy
 
-This merge retains the fork's v14/protocol-4 implementation. Upstream v9/v10
-`CaptureWindow(id,pid)` and `CaptureWindowPreview(id,pid,max_dimension)` use
-raw Shell ordinals rather than epoch-qualified targets. Actor capture of covered
-windows, its expiring transparent clones, GPU preview downscaling, and PNG
-`Creation Time` removal are deferred together. A future port must preserve
-atomic target/epoch/geometry binding and the fork's refusal gates; previews
-currently use the same exact-target capture route and resize in the driver.
-The upstream enumeration reorder is also deferred: private-compositor routing
-and refusal of a present incompatible helper retain their existing precedence.
-
-The driver retains its authenticated, connection-owned, bounded transport and
-fail-closed parser. The upstream `shell_helper/transport.rs` is not included;
-adopting that transport requires preserving connection ownership, deadlines,
-queue bounds, and epoch/native identity.
+General RPC uses the upstream persistent typed transport with exact-target
+methods and finite deadlines. Cursor actors retain their separate connection
+owner and bounded dispatcher; foreground input still uses explicit transaction
+IDs, validation, reconciliation, and restoration. Transport ownership does not
+replace either contract.
 
 Upstream libei `ei_connection.sync` acknowledgement is deferred. Its pending
 reply map and independent five-second timer do not carry this fork's shared
@@ -107,17 +101,31 @@ drain or connection discard, not compositor acknowledgement. Any ACK port must
 retain the lease through terminal completion even for cancelled callers, and
 must not reconnect or replay input; only readiness may initialize a connection.
 
-Upstream installers assume every higher helper version is an additive superset
-and keep it based on the version integer alone. That assumption is incompatible
-with this fork's exact-target protocol. The hardened, atomic, complete-runtime
-installation and stage-only default remain; upstream automatic enablement,
-version-only keep-newer behavior, and `--force` replacement are not adopted.
+The explicit rollout installer preserves a newer installed helper without
+assuming protocol compatibility. The client still requires the exact-target
+capability gate. Atomic complete-runtime installation, the stage-only default,
+and refusal of malformed version metadata remain; automatic enablement and
+`--force` replacement are not adopted.
 
 ## Other compositors
 
-wlroots compositors such as Sway and labwc do not need it: cua-driver uses
-foreign-toplevel activation, virtual-pointer input, and layer-shell there.
-
+wlroots compositors such as Sway and labwc do not need this helper: cua-driver
+uses foreign-toplevel activation, virtual-pointer input, and layer-shell there.
 KDE Plasma Wayland needs an equivalent target-addressable KWin activation
 adapter; it is not yet provided. Portal reachability alone is insufficient
 because RemoteDesktop/libei input is global to the compositor focus.
+
+## Versions and other apps that bundle the helper
+
+The UUID `winrects@cua` and session-bus name `org.cua.WinRects` are shared with
+other apps, including T3 Code. This bundle reports helper API 14 in both
+`GetVersion()` and `metadata.json`. Exact-target authority is a separate
+protocol 4 capability contract: a larger API version alone never proves it.
+Legacy global capture/activation requests are refused, and clients must prove
+the helper incarnation and exact target before requesting pixels or input.
+
+The driver installers only bundle helper files for a later explicit rollout.
+`install.sh` stages the complete runtime atomically, refuses malformed installed
+version metadata, never downgrades a newer helper, and enables only with
+`--enable`. Activation of changed helper bytes requires the normal logout/login
+boundary. No installer or updater implicitly installs or reloads the helper.

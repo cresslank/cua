@@ -110,6 +110,7 @@ pub fn type_text(pid: i32, text: &str) -> anyhow::Result<()> {
 
     for ch in text.chars() {
         let (down, up) = char_key_events(&source, ch)?;
+        cua_driver_core::blocking::check_cancelled()?;
         post_keyboard_event(pid, &down);
         key_gap_sleep();
         post_keyboard_event(pid, &up);
@@ -126,6 +127,7 @@ pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> a
 
     for ch in text.chars() {
         let (down, up) = char_key_events(&source, ch)?;
+        cua_driver_core::blocking::check_cancelled()?;
         post_keyboard_event(pid, &down);
         key_gap_sleep();
         post_keyboard_event(pid, &up);
@@ -304,6 +306,9 @@ fn post_global_key(
     let event = CGEvent::new_keyboard_event(source.clone(), key_code, key_down)
         .map_err(|_| anyhow::anyhow!("CGEvent keyboard event creation failed"))?;
     event.set_flags(flags);
+    if key_down {
+        cua_driver_core::blocking::check_cancelled()?;
+    }
     event.post(tap);
     Ok(())
 }
@@ -398,6 +403,7 @@ pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     for ch in text.chars() {
         let (down, up) = char_key_events(&source, ch)?;
+        cua_driver_core::blocking::check_cancelled()?;
         down.post(CGEventTapLocation::HID);
         key_gap_sleep();
         up.post(CGEventTapLocation::HID);
@@ -428,10 +434,17 @@ pub fn type_text_physical_global(text: &str, inter_char_delay_ms: u64) -> anyhow
             .iter()
             .map(|event| create_bare_keyboard_event(event.key_code, event.key_down))
             .collect::<anyhow::Result<Vec<_>>>()?;
-        for cg_event in native_events {
-            cg_event.post(CGEventTapLocation::HID);
-            key_gap_sleep();
-        }
+        cua_driver_core::blocking::run_input_transitions(
+            events
+                .iter()
+                .zip(native_events)
+                .map(|(spec, event)| (!spec.key_down, event)),
+            |event| {
+                event.post(CGEventTapLocation::HID);
+                key_gap_sleep();
+                Ok::<_, anyhow::Error>(())
+            },
+        )?;
         let extra = std::time::Duration::from_millis(inter_char_delay_ms).saturating_sub(key_gap());
         if !extra.is_zero() {
             std::thread::sleep(extra);
@@ -470,14 +483,14 @@ pub fn press_key_bare_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()
         .map(|(code, down, flags)| {
             let event = create_bare_keyboard_event(code, down)?;
             event.set_flags(flags);
-            Ok(event)
+            Ok((!down, event))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    for event in events {
+    cua_driver_core::blocking::run_input_transitions(events, |event| {
         event.post(CGEventTapLocation::HID);
         key_gap_sleep();
-    }
-    Ok(())
+        Ok::<_, anyhow::Error>(())
+    })
 }
 
 /// The chord's transitions with the flags each one carries. A modifier's own
@@ -656,6 +669,9 @@ fn post_key(pid: i32, key_code: u16, key_down: bool, flags: CGEventFlags) -> any
     // the event flags, including the empty case, so an unrelated Shift/Caps
     // state cannot leak into a targeted key press.
     event.set_flags(flags);
+    if key_down {
+        cua_driver_core::blocking::check_cancelled()?;
+    }
     post_keyboard_event(pid, &event);
     Ok(())
 }
@@ -671,6 +687,9 @@ fn post_key_no_auth(
     let event = CGEvent::new_keyboard_event(source, key_code, key_down)
         .map_err(|_| anyhow::anyhow!("CGEvent::new_keyboard_event failed"))?;
     event.set_flags(flags);
+    if key_down {
+        cua_driver_core::blocking::check_cancelled()?;
+    }
     let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
     // attach_auth_message = false → IOHIDPostEvent path → NSMenu fires
     if !crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false) {
@@ -696,8 +715,37 @@ fn modifier_flags(modifiers: &[&str]) -> CGEventFlags {
     flags
 }
 
+/// A multi-character key name as `key_name_to_code` matches it: lower case
+/// with spaces, `_` and `-` dropped, and common spellings folded onto one
+/// name, so "Page_Down", "page-down", "PgDn" and "ArrowLeft" all work. Single
+/// characters ("-", "_" never reaches here as a name) pass through unchanged.
+fn canonical_key_name(key: &str) -> String {
+    let lower = key.trim().to_lowercase();
+    if lower.chars().count() < 2 {
+        return lower;
+    }
+    let compact: String = lower
+        .chars()
+        .filter(|c| !matches!(c, ' ' | '_' | '-'))
+        .collect();
+    match compact.as_str() {
+        "pgdn" | "pgdown" => "pagedown",
+        "pgup" => "pageup",
+        "arrowleft" | "leftarrow" => "left",
+        "arrowright" | "rightarrow" => "right",
+        "arrowup" | "uparrow" => "up",
+        "arrowdown" | "downarrow" => "down",
+        "forwarddelete" | "fwddelete" | "deleteforward" => "forward_delete",
+        "bksp" => "backspace",
+        "escape" => "escape",
+        "kpenter" | "numpadenter" => "enter",
+        _ => return compact,
+    }
+    .to_owned()
+}
+
 pub(super) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
-    let code = match key.to_lowercase().as_str() {
+    let code = match canonical_key_name(key).as_str() {
         "return" | "enter" => 36,
         "tab" => 48,
         "space" => 49,
@@ -812,6 +860,30 @@ fn unknown_key_message(key: &str) -> String {
 mod tests {
     use super::*;
     use core_graphics::event::CGEventType;
+
+    #[test]
+    fn common_key_spellings_resolve_to_one_key() {
+        for (spelling, name) in [
+            ("Page_Down", "pagedown"),
+            ("page-down", "pagedown"),
+            ("PgDn", "pagedown"),
+            ("Page Up", "pageup"),
+            ("ArrowLeft", "left"),
+            ("left_arrow", "left"),
+            ("Forward_Delete", "del"),
+            ("ESC", "escape"),
+            ("KP_Enter", "return"),
+        ] {
+            assert_eq!(
+                super::key_name_to_code(spelling).unwrap(),
+                super::key_name_to_code(name).unwrap(),
+                "{spelling}"
+            );
+        }
+        // Single characters are keys in their own right.
+        assert_eq!(super::key_name_to_code("-").unwrap(), 27);
+        assert!(super::key_name_to_code("asterisk").is_err());
+    }
 
     #[test]
     fn unknown_key_errors_say_what_to_send_instead() {
