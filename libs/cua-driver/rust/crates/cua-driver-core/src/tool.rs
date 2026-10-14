@@ -74,7 +74,14 @@ pub fn with_runtime_scope<T>(scope: String, action: impl FnOnce() -> T) -> T {
     action()
 }
 
-const ACTION_LEASE_WAIT: Duration = Duration::from_secs(2);
+// macOS background focus cleanup retains its input grant for a three-second
+// tail. Allow that cleanup plus one second of scheduling margin before refusing
+// a successor; never release ownership early or make admission unbounded.
+const ACTION_LEASE_WAIT: Duration = Duration::from_secs(4);
+
+#[cfg(test)]
+#[path = "tool_action_admission_tests.rs"]
+mod action_admission_tests;
 
 fn lease_refusal(error: crate::action_lease::LeaseError) -> ToolResult {
     protected_refusal(error.code(), error.message())
