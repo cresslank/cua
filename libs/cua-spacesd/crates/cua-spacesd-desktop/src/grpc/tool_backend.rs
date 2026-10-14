@@ -938,7 +938,11 @@ impl DesktopBackend for ToolBackend {
                     native_role,
                     name: text("label"),
                     value: text("value"),
-                    description: text("value_description"),
+                    description: if self.platform == "Linux" {
+                        text("description")
+                    } else {
+                        text("value_description")
+                    },
                     bounds: element.get("frame").map(|frame| {
                         (
                             number(frame, "x"),
@@ -948,7 +952,21 @@ impl DesktopBackend for ToolBackend {
                         )
                     }),
                     states,
-                    actions: Vec::new(),
+                    actions: if self.platform == "Linux" {
+                        element
+                            .get("actions")
+                            .and_then(Value::as_array)
+                            .map(|actions| {
+                                actions
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_owned)
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    },
                 }
             })
             .collect();
@@ -1008,6 +1026,12 @@ impl DesktopBackend for ToolBackend {
             A11yActionKind::SetValue => self
                 .invoke("set_value", with(json!({ "value": value })))
                 .map(|_| ()),
+            // Linux's scroll tool scrolls by a positive amount; it does not
+            // promise to reveal an element. Do not substitute a wheel action
+            // for ScrollIntoView or fall back to an index-based AT-SPI walk.
+            A11yActionKind::ScrollIntoView if self.platform == "Linux" => Err(unsupported(
+                "scroll-into-view is not available through the Linux driver tools",
+            )),
             A11yActionKind::ScrollIntoView => self
                 .invoke("scroll", with(json!({ "direction": "down", "amount": 1 })))
                 .map(|_| ()),
@@ -1500,6 +1524,43 @@ mod tests {
             .a11y_act(&window, tree.snapshot + 100, "0", A11yActionKind::Press, "")
             .unwrap_err();
         assert_eq!(stale.code, ProviderErrorCode::StaleTarget);
+    }
+
+    #[test]
+    fn linux_accessibility_uses_tokens_and_refuses_unavailable_semantics() {
+        let (mut backend, tools) = backend();
+        backend.platform = "Linux";
+        let window = backend.windows().unwrap().remove(0);
+        let tree = backend.a11y_tree(&window, 0, 0).unwrap();
+        for action in [
+            A11yActionKind::Press,
+            A11yActionKind::Select,
+            A11yActionKind::Expand,
+            A11yActionKind::Collapse,
+        ] {
+            backend
+                .a11y_act(&window, tree.snapshot, "0", action, "")
+                .unwrap();
+            let (name, arguments) = last_call(&tools);
+            assert_eq!(name, "click");
+            assert_eq!(arguments, json!({ "pid": 7, "element_token": "s1:0" }));
+        }
+        let before = tools.calls.lock().unwrap().len();
+        for action in [A11yActionKind::Focus, A11yActionKind::ScrollIntoView] {
+            let error = backend
+                .a11y_act(&window, tree.snapshot, "0", action, "")
+                .unwrap_err();
+            assert_eq!(error.code, ProviderErrorCode::Unsupported);
+        }
+        assert_eq!(tools.calls.lock().unwrap().len(), before);
+        let replacement = backend.a11y_tree(&window, 0, 0).unwrap();
+        assert_ne!(replacement.snapshot, tree.snapshot);
+        let before = tools.calls.lock().unwrap().len();
+        let error = backend
+            .a11y_act(&window, tree.snapshot, "0", A11yActionKind::Press, "")
+            .unwrap_err();
+        assert_eq!(error.code, ProviderErrorCode::StaleTarget);
+        assert_eq!(tools.calls.lock().unwrap().len(), before);
     }
 
     #[test]

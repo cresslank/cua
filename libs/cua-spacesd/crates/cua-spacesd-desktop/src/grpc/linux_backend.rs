@@ -6,14 +6,13 @@
 //! Window handles come from the shared `CuaProviderBundle` catalog, so a
 //! handle returned by `WindowsService` streams through `StreamService` and
 //! drives `AccessibilityService` without translation. Accessibility uses
-//! cua-driver `platform-linux` AT-SPI; all pointer and keyboard input is
-//! delivered by cua-driver's targeted input (`platform_linux::input::targeted`),
+//! the canonical cua-driver tool registry with retained element tokens. All
+//! pointer and keyboard input is delivered by cua-driver's targeted input (`platform_linux::input::targeted`),
 //! which owns the auto/background/foreground semantics; clipboard owns the X11
 //! CLIPBOARD selection through clipboard-rs.
 
 use std::collections::HashMap;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use cua_spacesd_provider_api::{
@@ -34,15 +33,10 @@ use crate::linux_x11::{self, X11WindowKind, X11WindowState};
 use crate::CuaProviderBundle;
 
 pub struct LinuxBackend {
-    bundle: CuaProviderBundle,
+    bundle: Arc<CuaProviderBundle>,
     clipboard: Mutex<Option<clipboard_rs::ClipboardContext>>,
-    a11y_generation: Mutex<HashMap<u32, u64>>,
-    next_generation: AtomicU64,
+    accessibility: super::tool_backend::ToolBackend,
     audio: Option<Arc<dyn cua_spacesd_session::media::audio::AudioProvider>>,
-}
-
-fn unsupported(message: &str) -> ProviderError {
-    ProviderError::new(ProviderErrorCode::Unsupported, message)
 }
 
 fn failed(error: impl std::fmt::Display) -> ProviderError {
@@ -60,12 +54,27 @@ impl LinuxBackend {
     pub fn with_audio(
         audio: Option<Arc<dyn cua_spacesd_session::media::audio::AudioProvider>>,
     ) -> Result<Self, ProviderError> {
-        let bundle = CuaProviderBundle::new()?;
+        let bundle = Arc::new(CuaProviderBundle::new()?);
+        let accessibility = super::tool_backend::ToolBackend::new(
+            Arc::new(super::tool_backend::RegistryTools(bundle.registry.clone())),
+            Arc::new(super::tool_backend::BundleCatalog(bundle.clone())),
+            MediaProviders {
+                targets: bundle.targets.clone(),
+                displays: bundle.displays.clone(),
+                captures: bundle.captures.clone(),
+                actions: bundle.actions.clone(),
+                accessibility: bundle.accessibility.clone(),
+                geometry: bundle.geometry.clone(),
+                inputs: bundle.inputs.clone(),
+                audio: audio.clone(),
+            },
+            Some(bundle.registry.clone()),
+            "Linux",
+        );
         Ok(Self {
             bundle,
             clipboard: Mutex::new(None),
-            a11y_generation: Mutex::new(HashMap::new()),
-            next_generation: AtomicU64::new(1),
+            accessibility,
             audio,
         })
     }
@@ -597,84 +606,13 @@ impl DesktopBackend for LinuxBackend {
         max_depth: u32,
         max_nodes: u32,
     ) -> Result<A11yTree, ProviderError> {
-        let (pid, xid) = self.native(window)?;
-        if pid == 0 {
-            return Err(unsupported(
-                "the window does not report its process (_NET_WM_PID)",
-            ));
+        // Observation and mutation must share the driver's snapshot registry.
+        // Never turn a captured index into a fresh AT-SPI tree walk.
+        let mut tree = self.accessibility.a11y_tree(window, max_depth, max_nodes)?;
+        for node in &mut tree.nodes {
+            node.role = normalized_role(&node.native_role);
         }
-        let walked = platform_linux::atspi::walk_tree_bounded(
-            pid,
-            u64::from(xid),
-            None,
-            Some(if max_nodes == 0 {
-                5_000
-            } else {
-                max_nodes as usize
-            }),
-            (max_depth > 0).then_some(max_depth as usize),
-        );
-        if !walked.trusted {
-            return Err(ProviderError::new(
-                ProviderErrorCode::Unsupported,
-                walked.degraded_reason.unwrap_or_else(|| {
-                    "AT-SPI is unavailable for this window (is the accessibility bus running?)"
-                        .into()
-                }),
-            ));
-        }
-        let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
-        self.a11y_generation.lock().unwrap().insert(pid, generation);
-        let bounds: HashMap<usize, (i32, i32, u32, u32)> = walked
-            .bounds
-            .iter()
-            .map(|(index, x, y, w, h)| (*index, (*x, *y, *w, *h)))
-            .collect();
-        let nodes = walked
-            .nodes
-            .iter()
-            .enumerate()
-            .map(|(position, node)| {
-                let element_id = node
-                    .element_index
-                    .map(|index| index.to_string())
-                    .unwrap_or_else(|| format!("n{position}"));
-                let mut states = Vec::new();
-                if node.enabled == Some(true) {
-                    states.push("enabled".to_owned());
-                }
-                if node.checked == Some(true) {
-                    states.push("checked".to_owned());
-                }
-                if node.selected == Some(true) {
-                    states.push("selected".to_owned());
-                }
-                A11yNode {
-                    element_id,
-                    parent_id: node
-                        .parent_element_index
-                        .map(|index| index.to_string())
-                        .unwrap_or_default(),
-                    depth: node.depth as u32,
-                    role: normalized_role(&node.role),
-                    native_role: node.role.clone(),
-                    name: node.name.clone().unwrap_or_default(),
-                    value: node.value.clone().unwrap_or_default(),
-                    description: node.description.clone().unwrap_or_default(),
-                    bounds: node.element_index.and_then(|index| bounds.get(&index)).map(
-                        |(x, y, w, h)| (f64::from(*x), f64::from(*y), f64::from(*w), f64::from(*h)),
-                    ),
-                    states,
-                    actions: node.actions.clone(),
-                }
-            })
-            .collect::<Vec<_>>();
-        let truncated = max_nodes > 0 && nodes.len() >= max_nodes as usize;
-        Ok(A11yTree {
-            snapshot: generation,
-            nodes,
-            truncated,
-        })
+        Ok(tree)
     }
 
     fn a11y_act(
@@ -685,42 +623,8 @@ impl DesktopBackend for LinuxBackend {
         action: A11yActionKind,
         value: &str,
     ) -> Result<(), ProviderError> {
-        let (pid, _) = self.native(window)?;
-        if self.a11y_generation.lock().unwrap().get(&pid) != Some(&snapshot) {
-            return Err(ProviderError::new(
-                ProviderErrorCode::StaleTarget,
-                "accessibility snapshot is no longer current",
-            ));
-        }
-        let index: usize = element_id
-            .parse()
-            .map_err(|_| unsupported("this element has no actionable index"))?;
-        match action {
-            A11yActionKind::Press
-            | A11yActionKind::Select
-            | A11yActionKind::Expand
-            | A11yActionKind::Collapse => platform_linux::atspi::perform_action(pid, index)
-                .map(|_| ())
-                .map_err(failed),
-            A11yActionKind::Focus => platform_linux::atspi::focus_element(pid, index)
-                .map(|_| ())
-                .map_err(failed),
-            A11yActionKind::SetValue => {
-                platform_linux::atspi::set_value(pid, index, value).map_err(failed)
-            }
-            A11yActionKind::ScrollIntoView => platform_linux::atspi::scroll_element(
-                pid,
-                index,
-                "down",
-                0,
-                cua_driver_contract::ScrollBy::Line,
-            )
-            .map(|_| ())
-            .map_err(failed),
-            _ => Err(unsupported(
-                "this accessibility action is not available through AT-SPI here",
-            )),
-        }
+        self.accessibility
+            .a11y_act(window, snapshot, element_id, action, value)
     }
 
     fn media_providers(&self) -> MediaProviders {

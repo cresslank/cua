@@ -281,3 +281,24 @@ fn the_scanner_catches_what_it_should() {
     assert!(violations_in("let r: SendInputResponse = send_input_request();").is_empty());
     assert!(violations_in("fn adapter_newtypes_are_send_and_sync() {}").is_empty());
 }
+
+/// Accessibility mutations must use the same retained-token registry as reads.
+#[test]
+fn linux_accessibility_delegates_to_the_canonical_token_adapter() {
+    let source = include_str!("../src/grpc/linux_backend.rs");
+    let accessibility = source
+        .split("    fn a11y_tree(")
+        .nth(1)
+        .unwrap()
+        .split("    fn media_providers(")
+        .next()
+        .unwrap();
+    assert!(accessibility.contains("self.accessibility.a11y_tree(window, max_depth, max_nodes)"));
+    assert!(accessibility.contains(".a11y_act(window, snapshot, element_id, action, value)"));
+    assert!(
+        !accessibility.contains("platform_linux::atspi::"),
+        "Linux accessibility must not bypass retained driver tokens"
+    );
+    assert!(source.contains("RegistryTools(bundle.registry.clone())"));
+    assert!(source.contains("BundleCatalog(bundle.clone())"));
+}
