@@ -1525,6 +1525,16 @@ impl ToolRegistry {
             );
         }
 
+        // Current token routing was enriched before policy above. Refuse an
+        // unresolved token before adapters, leases or native work, but retain
+        // authorization and malformed/desktop-target refusal precedence.
+        if tool.def().input_schema["properties"].get("element_token").is_some()
+            && args.get("pid").is_none_or(Value::is_null)
+            && args.get("element_token").is_some_and(|token| !token.is_null())
+        {
+            return crate::element_token::stale_token_without_pid();
+        }
+
         // Resource adapters run at the same canonical boundary as policy and
         // manifest admission, after session capture-scope validation but
         // before recording or the platform tool can observe user state. This
@@ -3298,6 +3308,14 @@ mod runtime_isolation_tests {
             },
             worker: Mutex::new(Some((started, worker_release))),
         }));
+        // A stale token must stop at canonical dispatch, before an untargeted
+        // action can reach this native worker or a platform PID fallback.
+        let stale = tokio::time::timeout(Duration::from_secs(1), registry.invoke_with_context(
+            "set_value",
+            serde_json::json!({"element_token": "not-a-token", "value": "fixture"}),
+            context.clone(),
+        )).await.expect("stale token must not start native work");
+        assert_eq!(stale.structured_content.unwrap()["refusal"]["code"], "stale_element_token");
         let args = serde_json::json!({"element_token": token, "value": "fixture"});
         let mut invocation = Box::pin(registry.invoke_with_context("set_value", args, context));
         tokio::select! {

@@ -343,6 +343,10 @@ pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
     native::set_value(pid, idx, value)
 }
 
+// Retain exact-window routing. The upstream cache-index set_value_in and
+// popup-option helpers are intentionally not installed: they can rewalk/replay
+// ordinals after a retained target has gone stale. Combo selection remains
+// fail-closed until it carries retained option identity and mutation authority.
 pub fn set_value_in_exact_window(
     target_proof: &crate::wayland::ExactTargetProof,
     element_key: u64,

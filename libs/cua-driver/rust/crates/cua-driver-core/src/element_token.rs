@@ -1339,6 +1339,23 @@ impl<T> ResolvedElement<T> {
     }
 }
 
+/// Message for a call that names its target only by an `element_token` the
+/// runtime no longer knows (or never minted), so no pid can be derived.
+pub const STALE_TOKEN_WITHOUT_PID: &str =
+    "element_token is stale or unknown; call get_window_state again to refresh";
+
+/// The refusal for [`STALE_TOKEN_WITHOUT_PID`]: `stale_element_token`, with
+/// the hint that a current token names its own pid.
+pub fn stale_token_without_pid() -> ToolResult {
+    ToolResult::error(format!(
+        "{STALE_TOKEN_WITHOUT_PID} (a current token names its own pid)."
+    ))
+    .with_structured(serde_json::json!({
+        "status": "refused",
+        "refusal": { "code": "stale_element_token", "message": STALE_TOKEN_WITHOUT_PID },
+    }))
+}
+
 /// Fork compatibility shim for clients that send both snapshot fields.
 /// Call after token resolution: the index is only a cross-check, never a target.
 pub fn cross_check_legacy_index(

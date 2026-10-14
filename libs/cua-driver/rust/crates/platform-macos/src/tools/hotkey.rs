@@ -385,7 +385,7 @@ impl Tool for HotkeyTool {
         // window centre, so a keyboard-first session stays visible.
         if !coordinate_focus {
             let element_center = match element_guard.clone() {
-                Some(guard) => tokio::task::spawn_blocking(move || unsafe {
+                Some(guard) => cua_driver_core::blocking::spawn(move || unsafe {
                     crate::ax::bindings::element_screen_center(
                         guard.as_ptr() as crate::ax::bindings::AXUIElementRef
                     )

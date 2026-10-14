@@ -4068,6 +4068,13 @@ impl ObservedClickTarget {
         bounded(
             async {
                 let target = &self.visited[self.target_position];
+                // Upstream Selection.SelectChild and popup activation replay a
+                // newly enumerated child ordinal/object. A permit for this
+                // retained combo does not qualify those child targets. Refuse
+                // before any write until an exact retained-option route exists.
+                if target.role.eq_ignore_ascii_case("combo box") {
+                    anyhow::bail!("element_route_unqualified: GTK combo selection is not qualified for retained element targets; no value was written");
+                }
                 let proxies = target.acc.proxies().await?;
                 if target.has_editable {
                     let editable = proxies.editable_text().await?;

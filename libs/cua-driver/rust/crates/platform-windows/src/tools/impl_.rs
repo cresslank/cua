@@ -3327,7 +3327,7 @@ impl Tool for ClickTool {
             input_schema: json!({
                 "type":"object","properties":{
                     "session": cua_driver_core::tool_schema::session_schema(),
-                    "pid":{"type":"integer","description":"Target process ID for window scope. Omit with scope=desktop for screen-absolute coordinates from get_desktop_state."},
+                    "pid":{"type":"integer","description":"Target process ID for window scope. Optional with element_token (the token carries the pid). Omit with scope=desktop for screen-absolute coordinates from get_desktop_state."},
                     "window_id":{"type":"integer","description":"HWND of the target window. Omit when element_token is supplied (the token carries it)."},
                     "element_token": cua_driver_core::tool_schema::element_token_schema(),
                     "action":{"type":"string","description":"Accessibility action for an element_token target. \"expand\" opens the element through UIA ExpandCollapsePattern, or clicks the dropdown half of an MSAA split button. Omit for the default invoke."},
@@ -6225,15 +6225,17 @@ impl Tool for SetValueTool {
             name: "set_value".into(),
             // Description ported from Swift `SetValueTool.swift` with the
             // Windows transport (UIA ValuePattern instead of AXValue).
-            // Swift's AXPopUpButton special-case has a UIA analogue
-            // (SelectionPattern) that's not yet wired up here; documented.
+            // Native combo messaging is retained in win32::combo, but requires
+            // exact-object qualification before this token route can use it.
             description: "Set a value on a UIA element via the ValuePattern interface.\n\n\
                 Two semantic modes (matching Swift's split):\n\
                 - **Standard input** (text fields, sliders, combo box edit): writes the value \
                   directly through UIA `IUIAutomationValuePattern::SetValue`. This is the \
                   canonical Windows write path, equivalent to Swift's `AXValue` write.\n\
-                - **ComboBox / select dropdown**: ValuePattern.SetValue picks the option \
-                  whose text matches `value` on most native ComboBox controls.\n\n\
+                - **ComboBox**: native Win32 combo selection is currently refused as \
+                  element_route_unqualified because its HWND message route is not qualified \
+                  for retained element targets. Other combo boxes get a UIA value write, \
+                  which the app may not treat as a selection.\n\n\
                 For free-form text entry that the target accepts via keystrokes only, prefer \
                 `type_text` — UIA ValuePattern writes are ignored by some web inputs (same \
                 caveat as Swift's `AXValue`-vs-WebKit).".into(),
@@ -6304,7 +6306,8 @@ impl Tool for SetValueTool {
 
         let result = cua_driver_core::blocking::spawn({
             let admitted = admitted.clone();
-            move || -> anyhow::Result<String> {
+            let value = value.clone();
+            move || -> anyhow::Result<SetValueRoute> {
                 let _admission = &admitted;
                 // Retain the element under the cache lock so a concurrent
                 // get_window_state snapshot-replace on the same (pid, hwnd) can't
@@ -6317,11 +6320,27 @@ impl Tool for SetValueTool {
                 let ptr = element_guard.as_ptr();
                 use windows::core::{Interface, BSTR};
                 use windows::Win32::UI::Accessibility::{
-                    IUIAutomationElement, IUIAutomationValuePattern, UIA_ValuePatternId,
+                    IUIAutomationElement, IUIAutomationValuePattern, UIA_ComboBoxControlTypeId,
+                    UIA_ValuePatternId,
                 };
                 let elem = std::mem::ManuallyDrop::new(unsafe {
                     IUIAutomationElement::from_raw(ptr as *mut _)
                 });
+                // Detect native Win32 combos (including their edit fields)
+                // before writing: UIA changes only the displayed text, while
+                // native notifications need a separately qualified route.
+                let native = unsafe { elem.CurrentNativeWindowHandle() }
+                    .ok()
+                    .and_then(|h| crate::win32::combo::combo_for_window(h.0 as isize));
+                if native.is_some() {
+                    // The retained UIA object and MutationPermit do not pin the
+                    // child HWND's lifetime through the combo helper's sequence
+                    // of messages. Do not promote it to independent HWND input
+                    // authority until that route has exact-object qualification.
+                    anyhow::bail!("element_route_unqualified: native Win32 combo selection is not qualified for retained element targets; no value was written");
+                }
+                let is_combo = unsafe { elem.CurrentControlType() }
+                    .is_ok_and(|control_type| control_type == UIA_ComboBoxControlTypeId);
                 // Try ValuePattern first (text inputs, editable combos, etc).
                 // The SetValue is shielded by the EnableWindow bypass: a
                 // Chromium/Electron (or XAML) SetValue handler self-foregrounds via
@@ -6340,7 +6359,11 @@ impl Tool for SetValueTool {
                             },
                         );
                         if set.is_ok() {
-                            return Ok("ValuePattern".to_string());
+                            return Ok(if is_combo {
+                                SetValueRoute::ComboValuePattern
+                            } else {
+                                SetValueRoute::Pattern("ValuePattern")
+                            });
                         }
                     }
                 }
@@ -6367,7 +6390,7 @@ impl Tool for SetValueTool {
                                 unsafe { rv.SetValue(parsed) }.map_err(anyhow::Error::from)
                             },
                         )?;
-                        return Ok("RangeValuePattern".to_string());
+                        return Ok(SetValueRoute::Pattern("RangeValuePattern"));
                     }
                 }
                 anyhow::bail!(
@@ -6380,13 +6403,37 @@ impl Tool for SetValueTool {
         })
         .await;
         match result {
-            Ok(Ok(pattern_name)) => {
+            Ok(Ok(SetValueRoute::Pattern(pattern_name))) => {
                 ToolResult::text(format!("✅ Set AXValue on [{idx}] (UIA {pattern_name})."))
+            }
+            Ok(Ok(SetValueRoute::ComboValuePattern)) => ToolResult::text(format!(
+                "Set the UIA value of combo box [{idx}] to '{value}'. This combo box is not a \
+                 native Win32 one, and a UIA value write may change the shown text without \
+                 the app treating it as a selection. Check with get_window_state; if the app \
+                 did not react, click the combo box and then the option."
+            ))
+            .with_structured(json!({ "path": "ax", "verified": false, "effect": "unverifiable" })),
+            Ok(Err(e)) if e.to_string().starts_with("element_route_unqualified:") => {
+                let message = e.to_string();
+                ToolResult::error(message.clone()).with_structured(json!({
+                    "status": "refused",
+                    "code": "element_route_unqualified",
+                    "refusal": { "code": "element_route_unqualified", "message": message },
+                    "effect": "none",
+                }))
             }
             Ok(Err(e)) => ToolResult::error(e.to_string()),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
+}
+
+/// How `set_value` wrote the value.
+enum SetValueRoute {
+    /// A UIA pattern on a non-combo element (`ValuePattern`, `RangeValuePattern`).
+    Pattern(&'static str),
+    /// UIA `ValuePattern` on a combo box that has no native Win32 window.
+    ComboValuePattern,
 }
 
 // ── scroll ────────────────────────────────────────────────────────────────────
@@ -6416,7 +6463,7 @@ impl Tool for ScrollTool {
             input_schema: json!({
                 "type":"object","required":["direction"],"properties":{
                     "session": cua_driver_core::tool_schema::session_schema(),
-                    "pid":{"type":"integer","description":"Target process ID for window scope. Omit with scope=desktop for screen-absolute coordinates from get_desktop_state."},
+                    "pid":{"type":"integer","description":"Target process ID for window scope. Optional with element_token (the token carries the pid). Omit with scope=desktop for screen-absolute coordinates from get_desktop_state."},
                     "direction":{"type":"string","enum":["up","down","left","right"],"description":"Scroll direction."},
                     "by":{"type":"string","enum":["line","page"],"description":"Scroll granularity. Default: line."},
                     "amount":{"type":"integer","minimum":1,"maximum":50,

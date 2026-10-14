@@ -369,7 +369,7 @@ impl Tool for PressKeyTool {
         // or the window centre, so a keyboard-first session stays visible.
         if !px_focus {
             let element_center = match pre_focus_guard.clone() {
-                Some(guard) => tokio::task::spawn_blocking(move || unsafe {
+                Some(guard) => cua_driver_core::blocking::spawn(move || unsafe {
                     crate::ax::bindings::element_screen_center(
                         guard.as_ptr() as crate::ax::bindings::AXUIElementRef
                     )
