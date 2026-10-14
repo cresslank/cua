@@ -120,9 +120,6 @@ pkgs.rustPlatform.buildRustPackage {
   CUA_TEST_PYTHON = "${pkgs.python3}/bin/python3";
   CUA_TEST_PYTHON_DYNAMIC_LINKER = pkgs.stdenv.cc.bintools.dynamicLinker;
   CUA_TEST_GLIBC_STATIC_LIB = "${pkgs.glibc.static}/lib";
-  preCheck = ''
-    export CUA_TEST_PYTHON_READ_ROOTS="$(paste -sd: ${pythonClosure}/store-paths)"
-  '';
   buildInputs = with pkgs; [
     libx11
     libxi
@@ -136,6 +133,7 @@ pkgs.rustPlatform.buildRustPackage {
   # matrix is run by the manual Linux e2e workflow and is not hidden in Nix.
   doCheck = true;
   preCheck = ''
+    export CUA_TEST_PYTHON_READ_ROOTS="$(paste -sd: ${pythonClosure}/store-paths)"
     export CUA_DRIVER_TEST_DBUS_SESSION_CONFIG=${pkgs.dbus}/share/dbus-1/session.conf
   '';
 
