@@ -708,15 +708,11 @@ impl DesktopBackend for LinuxBackend {
             A11yActionKind::SetValue => {
                 platform_linux::atspi::set_value(pid, index, value).map_err(failed)
             }
-            A11yActionKind::ScrollIntoView => platform_linux::atspi::scroll_element(
-                pid,
-                index,
-                "down",
-                0,
-                cua_driver_contract::ScrollBy::Line,
-            )
-            .map(|_| ())
-            .map_err(failed),
+            // Attribution probe only: the base removed this primitive. Refuse
+            // the unavailable action instead of inventing an index mutation.
+            A11yActionKind::ScrollIntoView => Err(unsupported(
+                "baseline scroll-into-view primitive is unavailable",
+            )),
             _ => Err(unsupported(
                 "this accessibility action is not available through AT-SPI here",
             )),
