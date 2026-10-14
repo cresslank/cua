@@ -879,11 +879,30 @@ impl DesktopBackend for ToolBackend {
         });
         if max_nodes > 0 {
             arguments["max_elements"] = max_nodes.into();
+        } else if self.platform == "Linux" {
+            // Match the Linux gRPC adapter's pre-registry default, not the
+            // driver's compact interactive-read default of 250 nodes.
+            arguments["max_elements"] = 5_000.into();
         }
         if max_depth > 0 {
             arguments["max_depth"] = max_depth.into();
         }
         let state = self.invoke("get_window_state", arguments)?;
+        if self.platform == "Linux" && state.get("degraded").and_then(Value::as_bool) == Some(true)
+        {
+            // Discovery-only fallback data is not an authoritative accessibility
+            // tree. Do not publish its tokens or retain the prior adapter handle.
+            self.a11y_generation
+                .lock()
+                .unwrap()
+                .remove(&(native.pid, native.window_id));
+            return Err(unsupported(
+                state
+                    .get("degraded_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Linux accessibility observation is degraded"),
+            ));
+        }
         let elements = state
             .get("elements")
             .and_then(Value::as_array)
@@ -970,7 +989,10 @@ impl DesktopBackend for ToolBackend {
                 }
             })
             .collect();
-        let truncated = max_nodes > 0 && nodes.len() >= max_nodes as usize;
+        let truncated = state
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(max_nodes > 0 && nodes.len() >= max_nodes as usize);
         Ok(A11yTree {
             snapshot: generation,
             nodes,
@@ -1263,6 +1285,7 @@ mod tests {
     #[derive(Default)]
     pub(crate) struct FakeTools {
         pub calls: Mutex<Vec<(String, Value)>>,
+        pub state: Mutex<Option<Value>>,
     }
 
     impl DriverTools for FakeTools {
@@ -1271,6 +1294,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((name.to_owned(), arguments.clone()));
+            if name == "get_window_state" {
+                if let Some(state) = self.state.lock().unwrap().clone() {
+                    return Ok(state);
+                }
+            }
             Ok(match name {
                 "list_windows" => json!({ "windows": [
                     { "window_id": 11, "pid": 7, "app_name": "Fixture", "title": "Main", "bounds": { "x": 100, "y": 50, "width": 400, "height": 300 }, "layer": 0, "z_index": 0, "is_on_screen": true },
@@ -1561,6 +1589,62 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, ProviderErrorCode::StaleTarget);
         assert_eq!(tools.calls.lock().unwrap().len(), before);
+    }
+
+    #[test]
+    fn linux_accessibility_preserves_budgets_and_truncation() {
+        let (mut backend, tools) = backend();
+        backend.platform = "Linux";
+        let window = backend.windows().unwrap().remove(0);
+        for (max_nodes, max_depth, expected_budget) in [(0, 0, 5_000), (12, 3, 12)] {
+            *tools.state.lock().unwrap() = Some(json!({
+                "snapshot_id": "s1", "truncated": true,
+                "elements": [{"element_index": 7, "element_token": "s1:7", "role": "button"}]
+            }));
+            let tree = backend.a11y_tree(&window, max_depth, max_nodes).unwrap();
+            assert!(
+                tree.truncated,
+                "canonical truncation is not a returned-node count"
+            );
+            assert_eq!(tree.nodes.len(), 1);
+            assert_eq!(tree.nodes[0].element_id, "7");
+            let (_, arguments) = last_call(&tools);
+            assert_eq!(arguments["max_elements"], expected_budget);
+            if max_depth > 0 {
+                assert_eq!(arguments["max_depth"], max_depth);
+            }
+        }
+        *tools.state.lock().unwrap() = Some(json!({"elements": [], "truncated": false}));
+        assert!(!backend.a11y_tree(&window, 0, 0).unwrap().truncated);
+    }
+
+    #[test]
+    fn linux_accessibility_refuses_degraded_observations_without_publishing_tokens() {
+        let (mut backend, tools) = backend();
+        backend.platform = "Linux";
+        let window = backend.windows().unwrap().remove(0);
+        let previous = backend.a11y_tree(&window, 0, 0).unwrap();
+        for reason in [
+            "x11_property_fallback_partial",
+            "accessibility_window_identity_unproven",
+            "atspi_tree_empty",
+        ] {
+            *tools.state.lock().unwrap() = Some(json!({
+                "degraded": true, "degraded_reason": reason,
+                "snapshot_id": "s2",
+                "elements": [{"element_index": 7, "element_token": "s2:7", "role": "button"}]
+            }));
+            let error = backend.a11y_tree(&window, 0, 0).unwrap_err();
+            assert_eq!(error.code, ProviderErrorCode::Unsupported);
+            assert!(error.message.contains(reason));
+            assert!(backend.a11y_generation.lock().unwrap().is_empty());
+            let before = tools.calls.lock().unwrap().len();
+            let stale = backend
+                .a11y_act(&window, previous.snapshot, "0", A11yActionKind::Press, "")
+                .unwrap_err();
+            assert_eq!(stale.code, ProviderErrorCode::StaleTarget);
+            assert_eq!(tools.calls.lock().unwrap().len(), before);
+        }
     }
 
     #[test]
