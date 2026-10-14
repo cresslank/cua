@@ -107,7 +107,7 @@ pkgs.rustPlatform.buildRustPackage {
     "--skip"
     "legacy_page_mutation_requires_unrestricted_launch_and_operator_opt_in"
     "--skip"
-    "linux_cursor_motion_knobs_are_applied"
+    "cursor_motion_knobs_are_applied"
     "--skip"
     "policies_are_isolated_immutable_and_enforced_over_mcp"
     "--skip"

@@ -1,7 +1,8 @@
-"""Regression tests for the expensive Nix workflow's ordered path filters."""
+"""Regression tests for Nix workflow paths and Rust test selections."""
 
 import json
 from pathlib import Path
+import re
 import unittest
 
 
@@ -63,6 +64,29 @@ class TestCiNixLinuxPaths(unittest.TestCase):
 
     def workflow_selected(self, changed_paths: tuple[str, ...]) -> bool:
         return any(path_selected(self.pull_request_paths, path) for path in changed_paths)
+
+    def test_rust_exclusions_reference_current_function_names(self) -> None:
+        derivation = (REPO_ROOT / "nix/cua-driver/tests/rust-unit.nix").read_text()
+        flags = derivation.split("cargoTestFlags = [", 1)[1].split("];", 1)[0]
+        arguments = re.findall(r'^\s*"([^\"]+)"', flags, re.MULTILINE)
+        packages = [arguments[i + 1] for i, value in enumerate(arguments) if value == "-p"]
+        exclusions = [arguments[i + 1] for i, value in enumerate(arguments) if value == "--skip"]
+        self.assertTrue(packages)
+        self.assertTrue(exclusions)
+        # Cargo accepts stale --skip filters silently. Check the selected source
+        # packages without compiling or starting a native desktop in this gate.
+        functions = set()
+        for package in packages:
+            source = REPO_ROOT / "libs/cua-driver/rust/crates" / package
+            self.assertTrue(source.is_dir(), package)
+            for path in source.rglob("*.rs"):
+                functions.update(re.findall(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", path.read_text()))
+        for exclusion in exclusions:
+            with self.subTest(exclusion=exclusion):
+                self.assertTrue(
+                    any(exclusion in name for name in functions),
+                    f"Nix exclusion no longer names a current function: {exclusion}",
+                )
 
     def test_pull_request_and_main_push_filters_stay_aligned(self) -> None:
         self.assertEqual(self.pull_request_paths, self.push_paths)
