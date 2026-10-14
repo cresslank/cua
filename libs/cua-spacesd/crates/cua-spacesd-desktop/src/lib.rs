@@ -2412,9 +2412,7 @@ fn platform_registry() -> Result<ToolRegistry, ProviderError> {
     Ok(registry)
 }
 
-// Linux runs the X11 capture backend directly and does not route through a CUA
-// tool registry, so an empty registry keeps the shared catalog/epoch machinery
-// working while exposing no automation actions (ViewOnly is sufficient for v1).
+// Native Linux admission shares the SDK's trusted desktop preparation boundary.
 #[cfg(target_os = "linux")]
 fn platform_registry() -> Result<ToolRegistry, ProviderError> {
     // The full cua-driver Linux registry: AT-SPI accessibility, launch_app,
@@ -2422,10 +2420,15 @@ fn platform_registry() -> Result<ToolRegistry, ProviderError> {
     // the origin desktop. Without a display (headless CI) the overlay stays
     // off and the registry still serves non-graphical tools.
     let mut config = host_cursor_config();
-    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
+    let headless =
+        std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none();
+    let registry = if headless {
         config.enabled = false;
-    }
-    let registry = platform_linux::register_tools_with_cursor(config, false);
+        platform_linux::register_tools_with_cursor(config, false)
+    } else {
+        cua_driver_sdk::build_linux_host_registry(config)
+            .map_err(|error| ProviderError::new(ProviderErrorCode::DeliveryFailed, error))?
+    };
     mark_overlay_ready();
     Ok(registry)
 }

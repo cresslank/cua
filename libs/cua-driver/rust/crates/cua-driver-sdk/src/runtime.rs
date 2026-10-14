@@ -567,6 +567,32 @@ pub(crate) fn tool_inventory(mut options: RuntimeOptions) -> Value {
         .tools_list()
 }
 
+/// Construct a native Linux host's registry after strict trusted desktop admission.
+///
+/// Rust-only seam for hosts that already own authorization and runtime scope.
+/// This uses the same preparation lock, bus discovery, listener admission and
+/// native hooks as the embedded runtime. Errors must abort native admission.
+/// Metadata-only and headless hosts should not call this constructor.
+#[cfg(target_os = "linux")]
+pub fn build_linux_host_registry(cursor: CursorConfig) -> Result<ToolRegistry, String> {
+    let mut options = RuntimeOptions::embedded(false);
+    options.cursor = cursor;
+    build_linux_registry(&options).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn build_linux_registry(options: &RuntimeOptions) -> Result<ToolRegistry, RuntimeCreateError> {
+    configure_linux_runtime(
+        options.prepare_desktop_environment,
+        options.require_atspi_listener,
+    )?;
+    Ok(platform_linux::register_tools_with_cursor_and_provider(
+        options.authorization_host.clone(),
+        options.cursor.clone(),
+        options.compatibility_mode,
+    ))
+}
+
 fn build_registry(options: &RuntimeOptions) -> Result<ToolRegistry, RuntimeCreateError> {
     #[cfg(target_os = "macos")]
     let mut registry = {
@@ -591,17 +617,7 @@ fn build_registry(options: &RuntimeOptions) -> Result<ToolRegistry, RuntimeCreat
     };
 
     #[cfg(target_os = "linux")]
-    let mut registry = {
-        configure_linux_runtime(
-            options.prepare_desktop_environment,
-            options.require_atspi_listener,
-        )?;
-        platform_linux::register_tools_with_cursor_and_provider(
-            options.authorization_host.clone(),
-            options.cursor.clone(),
-            options.compatibility_mode,
-        )
-    };
+    let mut registry = build_linux_registry(options)?;
 
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
     let mut registry = {

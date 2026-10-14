@@ -64,6 +64,7 @@ platform-macos = { path = "../../../cua-driver/rust/crates/platform-macos" }
 screencapturekit = { version = "8.0.1", features = ["macos_15_0"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+cua-driver-sdk = { path = "../../../cua-driver/rust/crates/cua-driver-sdk" }
 # Pure-Rust XCB bindings for X11 window enumeration, per-window capture and
 # window management. `composite` backs occluded windows so they still stream a
 # full frame. No input extensions: every input injection is delegated to

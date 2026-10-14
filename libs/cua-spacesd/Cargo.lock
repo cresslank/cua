@@ -1647,6 +1647,7 @@ dependencies = [
  "core-graphics",
  "cua-driver-contract",
  "cua-driver-core",
+ "cua-driver-sdk",
  "cua-media-codec",
  "cua-media-protocol",
  "cua-media-transport",

@@ -51,6 +51,8 @@ pub use remote_mcp::{
     open_mcp_driver_channel, DriverServiceHeader, DriverServiceRequest, DriverServiceResponse,
     DriverServiceTransport, DriverServiceTransportError, McpDriverChannel,
 };
+#[cfg(target_os = "linux")]
+pub use runtime::build_linux_host_registry;
 use runtime::RuntimeOptions;
 use service_session::ServiceSessionClient;
 use worker::{ActionCompletion, PrivateWorkerClient};
