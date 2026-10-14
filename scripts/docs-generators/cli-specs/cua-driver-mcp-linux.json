@@ -1,7 +1,7 @@
 {
  "tools": [
   {
-   "description": "List Linux apps — both currently running and installed-but-not-running — with per-app state flags:\n\n- running: is a process for this app live? (pid is 0 when false)\n- active: reserved (Linux X11/Wayland focus model differs from frontmost-app); always false.\n- kind: `\"desktop\"` for XDG `.desktop` launcher entries.\n- launch_path: the launcher command from `Exec=` (field codes stripped). Pass to `launch_app(launch_path=...)`.\n- bundle_id: the XDG \"desktop file id\" — the `.desktop` file's path relative to its XDG `applications/` root with the `.desktop` suffix stripped and path separators replaced with `-` (e.g. `kde4/konqbrowser.desktop` → `kde4-konqbrowser`).\n- last_used: RFC3339 mtime of the `.desktop` file, when readable.\n- windows: the app's current top-level windows (same records as list_windows); empty for a process without one.\n\nRunning apps come from `/proc`. Installed apps come from XDG Desktop Entry files in $XDG_DATA_HOME/applications and each $XDG_DATA_DIRS entry's applications/ subdir. Entries with `NoDisplay=true` or `Hidden=true` are filtered. A `.desktop` file whose launcher matches a running process (by basename), or whose WM_CLASS a top-level window carries, is merged into a single entry with `running: true`.\n\nUse this for \"is X installed?\" as well as \"is X running?\". For per-window state — visibility, geometry, titles — call list_windows instead.",
+   "description": "List Linux apps — both currently running and installed-but-not-running — with per-app state flags:\n\n- running: is a process for this app live? (pid is 0 when false)\n- active: reserved (Linux X11/Wayland focus model differs from frontmost-app); always false.\n- kind: `\"desktop\"` for XDG `.desktop` launcher entries.\n- launch_path: the launcher command from `Exec=` (field codes stripped). Pass to `launch_app(launch_path=...)`.\n- bundle_id: the XDG \"desktop file id\" — the `.desktop` file's path relative to its XDG `applications/` root with the `.desktop` suffix stripped and path separators replaced with `-` (e.g. `kde4/konqbrowser.desktop` → `kde4-konqbrowser`).\n- last_used: RFC3339 mtime of the `.desktop` file, when readable.\n- windows: the app's current top-level windows (same records as list_windows); empty for a process without one.\n\nRunning apps come from `/proc`. Installed apps come from XDG Desktop Entry files in $XDG_DATA_HOME/applications and each $XDG_DATA_DIRS entry's applications/ subdir. Entries with `NoDisplay=true` or `Hidden=true` are filtered. A `.desktop` file is merged with a running process only from an exact, unambiguous executable path or a constrained `--name` desktop-ID claim corroborated by StartupWMClass when present; ambiguous aliases fail closed.\n\nUse this for \"is X installed?\" as well as \"is X running?\". For per-window state — visibility, geometry, titles — call list_windows instead.",
    "destructive": false,
    "idempotent": true,
    "input_schema": {
@@ -43,7 +43,7 @@
    "read_only": true
   },
   {
-   "description": "Walk a running app's AT-SPI tree and return BOTH a structured `elements` array (preferred) AND a Markdown rendering of the same tree (back-compat). Every actionable element is tagged with [element_index N] in the markdown and as `element_index` in the structured array; pass each element's `element_token` to `click`, `type_text`, `set_value`, etc.\n\nPREFERRED CONSUMERS read `structuredContent.elements` (one entry per indexed row with `element_index`, `role`, `label`, `value`, `enabled`, `selected`, `actions` (names of AT-SPI actions exposed by the element, omitted when empty), `frame: {x,y,w,h}` when AT-SPI reports usable bounds, `parent_index`, `depth`). The markdown `tree_markdown` stays available and unchanged in shape for existing text-parsing callers — but new fields will only be added to the structured side. Set `query` to project BOTH representations to matching rows plus their ancestor chain while preserving original indices. `total_element_count` reports the complete snapshot and `returned_element_count` reports the projection.\n\nAlways returns BOTH the element tree AND a screenshot — ground on both and cross-check (the tree lies on some surfaces). Choose the modality at ACTION time: an element ax action (element_token → accessibility rung) or an element px action (x,y → pixel rung off this screenshot). capture_mode is deprecated and ignored. On Wayland, where output capture cannot prove the requested surface's identity, the truthful tree is returned without a screenshot and `screenshot_error.code` is `surface_identity_unproven`.\n\nThe mirror image: pass `include_accessibility_tree:false` to SKIP the AT-SPI walk entirely and return just the screenshot plus window metadata (window_bounds, app_name, window_title) — the capture-only path for a live window preview / picture-in-picture. Setting BOTH `include_accessibility_tree:false` and `include_screenshot:false` is an error. Optional `max_dimension` caps the returned screenshot's long edge in pixels for a cheap thumbnail.\n\nOptional `max_elements` / `max_depth` bound the AT-SPI walk to mitigate context-window blow-up on Electron / large web apps that produce 10k+ element trees. When applied, BOTH the markdown and the structured elements are truncated identically. Omit both for current default behaviour.\n\nTIME BUDGET: `timeout_ms` (default 1000) bounds the whole AT-SPI walk. When omitted, a window's first snapshot gets a 2000 ms cold-start budget so Chromium/Electron can finish publishing its initial tree. Explicit values are always honored. Large apps (LibreOffice, GIMP, file managers) can exceed the budget; the call then returns the PARTIAL tree with `truncated: true`, `truncation_reason`, `nodes_visited`/`nodes_pending` and `elements_complete: false`. Every element listed is real and clickable; elements after the cut are simply missing. Retry with a larger `timeout_ms` (e.g. 5000) or narrow with `query`/`max_depth` when the element you need is absent.\n\nSCREENSHOT SCALE: the screenshot is delivered at or below 1.15 megapixels (long edge <= max_image_dimension, 1568 by default), because larger images are downsized before a model reads them and its pixel coordinates would then be uniformly short. Element `screenshot_frame`s and x/y for the pointer tools are pixels of the delivered screenshot (`frame` stays in screen coordinates, as on every platform); `frame_scale` < 1 reports the downsizing. An explicit per-call `max_image_dimension` (0 = native) replaces this cap.\n\nPOPUP MENUS: a context menu / popover / combo list is an override-redirect window that list_windows never shows. A click or right_click that opened one names it in its result (`popup: {window_id, bounds, title}`); pass that window_id here to walk the popup's own AT-SPI toplevel so its menu items get element indices (then click them by element_token). Omitting window_id while a popup of this pid is open walks that popup.",
+   "description": "Walk a running app's AT-SPI tree and return it ONCE, as compact Markdown by default (`tree_format:\"markdown\"`). Every actionable element is tagged `[N]` (an element_index); its element_token is `<snapshot_id>:N`, where `snapshot_id` is printed in the response header and returned in structuredContent. Pass `tree_format:\"elements\"` for the structured `elements` array instead (explicit `element_token`, `role`, `label`, `value`, `enabled`, `selected`, `actions`, `frame: {x,y,w,h}` when AT-SPI reports usable bounds, `parent_index`, `depth`), or `\"both\"` for both (about twice the size). Set `query` to project the tree to matching rows plus their ancestor chain while preserving original indices; `total_element_count` reports the complete snapshot.\n\nSize: a read is bounded by default (`max_elements` 250 actionable nodes). When the walk stops at that budget the response says `Tree truncated at max_elements=…` and `truncated: true`; pass a larger `max_elements`, or `query` / `max_depth`, to reach the rest. `_note` is omitted unless `verbose:true`. `full_output:true` restores the previous full response: both representations, all metadata, and the walker's own limits (≤5 000 nodes).\n\nDIFF READS: pass `since: <snapshot_id>` from an earlier read of the same window to get only what changed: `+` added rows, `~` changed rows, `-` removed rows (their ids are the old snapshot's), or `no change since …`. Rows not listed keep their previous `[N]` unless a `reindexed:` line says otherwise. The response carries a NEW snapshot_id: use it in element_tokens. An unknown, expired, other-window or differently-scoped (query/max_elements/max_depth) `since` falls back to a full read and `since_status` says why. The focused element is not reported on Linux yet.\n\nAlways returns BOTH the element tree AND a screenshot — ground on both and cross-check (the tree lies on some surfaces). Choose the modality at ACTION time: an element ax action (element_token → accessibility rung) or an element px action (x,y → pixel rung off this screenshot). capture_mode is deprecated and ignored. On Wayland, where output capture cannot prove the requested surface's identity, the truthful tree is returned without a screenshot and `screenshot_error.code` is `surface_identity_unproven`.\n\nThe mirror image: pass `include_accessibility_tree:false` to SKIP the AT-SPI walk entirely and return just the screenshot plus window metadata (window_bounds, app_name, window_title) — the capture-only path for a live window preview / picture-in-picture. Setting BOTH `include_accessibility_tree:false` and `include_screenshot:false` is an error. Optional `max_dimension` caps the returned screenshot's long edge in pixels for a cheap thumbnail.\n\nOptional `max_elements` / `max_depth` bound the AT-SPI walk (Electron / large web apps produce 10k+ element trees). Markdown and structured elements are truncated identically. Default: `max_elements` 250.\n\nTIME BUDGET: `timeout_ms` (default 1000) bounds the whole AT-SPI walk. When omitted, a window's first snapshot gets a 2000 ms cold-start budget so Chromium/Electron can finish publishing its initial tree. Explicit values are always honored. Large apps (LibreOffice, GIMP, file managers) can exceed the budget; the call then returns the PARTIAL tree with `truncated: true`, `truncation_reason`, `nodes_visited`/`nodes_pending` and `elements_complete: false`. Every element listed is real and clickable; elements after the cut are simply missing. Retry with a larger `timeout_ms` (e.g. 5000) or narrow with `query`/`max_depth` when the element you need is absent.\n\nSCREENSHOT SCALE: the screenshot is delivered at or below 1.15 megapixels (long edge <= max_image_dimension, 1568 by default), because larger images are downsized before a model reads them and its pixel coordinates would then be uniformly short. Element `screenshot_frame`s and x/y for the pointer tools are pixels of the delivered screenshot (`frame` stays in screen coordinates, as on every platform); `frame_scale` < 1 reports the downsizing. An explicit per-call `max_image_dimension` (0 = native) replaces this cap.\n\nPOPUP MENUS: a context menu / popover / combo list is an override-redirect window that list_windows never shows. A click or right_click that opened one names it in its result (`popup: {window_id, bounds, title}`); pass that window_id here to walk the popup's own AT-SPI toplevel so its menu items get element indices (then click them by element_token). Omitting window_id while a popup of this pid is open walks that popup.",
    "destructive": false,
    "idempotent": false,
    "input_schema": {
@@ -61,8 +61,12 @@
       "description": "Default false. With include_accessibility_tree:false, returns pixels for display without registering an action capture or replacing the agent snapshot. The image cannot ground input actions.",
       "type": "boolean"
      },
+     "full_output": {
+      "description": "Default false. Set true to restore the previous full response: both `elements` and `tree_markdown`, all metadata, and the platform's own walk limits unless max_elements / max_depth are passed. Does not combine with `since`.",
+      "type": "boolean"
+     },
      "include_accessibility_tree": {
-      "description": "Default true — walk the AT-SPI tree and return `elements` + `tree_markdown` alongside the screenshot. Set false to SKIP the AT-SPI walk entirely and return just the screenshot plus window metadata (window_bounds, app_name, window_title) — the capture-only path for a live window preview / picture-in-picture. Mirrors include_screenshot. Setting BOTH include_accessibility_tree:false AND include_screenshot:false is an error (nothing to return).",
+      "description": "Default true — walk the AT-SPI tree and return it (per `tree_format`) alongside the screenshot. Set false to SKIP the AT-SPI walk entirely and return just the screenshot plus window metadata (window_bounds, app_name, window_title) — the capture-only path for a live window preview / picture-in-picture. Mirrors include_screenshot. Setting BOTH include_accessibility_tree:false AND include_screenshot:false is an error (nothing to return).",
       "type": "boolean"
      },
      "include_screenshot": {
@@ -80,7 +84,7 @@
       "type": "integer"
      },
      "max_elements": {
-      "description": "Cap on total AT-SPI nodes walked. Omit for the default (5 000). Lower for huge web/Electron trees.",
+      "description": "Cap on total AT-SPI nodes walked. Default 250 (5 000 with full_output:true); the response states when the tree was cut. Raise it to read further into a large window.",
       "minimum": 1,
       "type": "integer"
      },
@@ -105,12 +109,29 @@
       "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
       "type": "string"
      },
+     "since": {
+      "description": "A `snapshot_id` from an earlier get_window_state of the same window. Returns only what changed against that snapshot: `+` added rows, `~` changed rows, `-` removed rows (removed ids are the old snapshot's), or `no change`. Falls back to a full read when the snapshot is unknown, expired, belongs to another window, or was read with a different query/max_elements/max_depth; `since_status` says which. The response still carries a NEW snapshot_id and its element_tokens; rows not listed keep their previous [N] unless a `reindexed:` line says otherwise.",
+      "type": "string"
+     },
      "timeout_ms": {
       "default": 1000,
       "description": "Wall-clock budget in milliseconds for the accessibility-tree walk (default 1000, min 100, max 120000). Bounds the WHOLE walk. When the budget runs out the tool returns the PARTIAL tree it has, flagged with `truncated: true`, `truncation_reason`, `nodes_visited`, `nodes_pending` and `elements_complete: false`; retry with a larger value (e.g. 5000) or narrow with `query` / `max_depth`.",
       "maximum": 120000,
       "minimum": 100,
       "type": "integer"
+     },
+     "tree_format": {
+      "description": "Which tree representation to return. Default \"markdown\": the compact `tree_markdown` only, where a row `[N]` is addressed with element_token `<snapshot_id>:N`. \"elements\": the structured `elements` array only (per-element element_token, frame, parent_index, value). \"both\": the two together, as before; roughly doubles the size.",
+      "enum": [
+       "markdown",
+       "elements",
+       "both"
+      ],
+      "type": "string"
+     },
+     "verbose": {
+      "description": "Default false. Set true to include the `_note` string and the full `background_input` capability report (macOS), which are omitted by default to save context.",
+      "type": "boolean"
      },
      "window_id": {
       "description": "Native window identifier from list_windows, or the `popup.window_id` a click / right_click result named (an open context menu / popover; its menu items then get element indices). Omitted: the pid's open popup menu when one is mapped, else its focused / active / largest window.",
@@ -317,7 +338,7 @@
       "type": "string"
      },
      "urls": {
-      "description": "URLs to open via xdg-open.",
+      "description": "URLs to open through the resolved XDG desktop handler, with xdg-open as a compatibility fallback.",
       "items": {
        "type": "string"
       },
@@ -354,7 +375,7 @@
    "read_only": false
   },
   {
-   "description": "Persistently activate a window so subsequent input lands on it. This deliberately breaks the no-foreground contract and is not part of the normal input ladder. For an ordinary `background_unavailable` response, retry only the refused action with `delivery_mode:\"foreground\"`; the input tool performs its own activate, act, and restore sequence. Use `bring_to_front` only for a focus-proxy surface that must remain foreground across multiple calls, such as a remote desktop session, or when repeated action-scoped activation prevents the remote surface from accepting input. X11: EWMH _NET_ACTIVE_WINDOW activation (the `wmctrl -a` equivalent, with proper timestamp handling to beat focus-stealing prevention). Wayland: activates through a target-addressable compositor adapter (wlroots foreign-toplevel or the GNOME Shell helper) and refuses when the compositor offers no safe adapter. Matches the macOS / Windows bring_to_front rung.",
+   "description": "Persistently activate a window so subsequent input lands on it. X11: EWMH _NET_ACTIVE_WINDOW activation (the `wmctrl -a` equivalent, proper timestamp handling to beat focus-stealing prevention) — call it before `delivery_mode:\"foreground\"` input to avoid a per-call flash, or to escalate when background injection didn't land. Wayland: activates through a target-addressable compositor adapter (wlroots foreign-toplevel or the GNOME Shell helper) and refuses when the compositor offers no safe adapter. Matches the macOS / Windows bring_to_front rung.",
    "destructive": false,
    "idempotent": true,
    "input_schema": {
@@ -369,7 +390,7 @@
       "type": "string"
      },
      "window_id": {
-      "description": "X11 window id (xid) to activate. If omitted, the first window of `pid` is used.",
+      "description": "Exact window id to activate. Required when a Wayland process owns more than one toplevel.",
       "type": "integer"
      }
     },
@@ -479,7 +500,7 @@
    "read_only": false
   },
   {
-   "description": "Click against a target pid. **Prefer `element_token` over pixel coordinates** — element_token works on backgrounded / hidden windows, surfaces a stable handle, and tells you what you're clicking via the cached AT-SPI element's role + label. Reach for `x, y` only when the target is a canvas / custom-drawn surface that doesn't appear in the AT-SPI tree.\n\nProvide either (window_id + x/y) or (pid + element_token). x/y are WINDOW-LOCAL pixels of window_id (the get_window_state screenshot frame); a point outside the window is refused (point_outside_window) and every pixel result reports the resolved window_point / screen_point. Background delivery first resolves the accessible under the point and fires its action (the result says `hit: <role> \"<name>\" action=...`; a file / list item is selected through its container: `selected: ...`), else presses the real virtual pointer there. A click that opens a popup menu names it (`popup: {window_id, bounds}`): pass that window_id to get_window_state to index its items. The token is stale once the next get_window_state of the same window replaces its snapshot — re-snapshot every turn before clicking.\n\nAfter a zoom call, pass from_zoom=true to auto-translate zoom-image coords back to full-window space.\n\n`count`: 1 (default), 2 for a double-click, 3 for a triple-click (selects a line / paragraph in editors) — one press train with real double-click cadence, in background and foreground alike; there is no separate triple_click tool.\n\nbutton: \"left\" (default), \"right\", or \"middle\". Defaults to left so the field is fully back-compat. X11: routes through XSendEvent ButtonPress/Release with the matching button code. Native Wayland: only left-button is supported via the virtual-pointer protocol — right/middle return an error rather than silently degrading to left. `modifier` holds ctrl/shift/alt/super for the click on X11. Native Wayland refuses modified pointer clicks until its input protocol can carry keyboard modifier state.",
+   "description": "Click against a target pid. **Prefer `element_token` over pixel coordinates** — element_token works on backgrounded / hidden windows, surfaces a stable handle, and tells you what you're clicking via the cached AT-SPI element's role + label. Reach for `x, y` only when the target is a canvas / custom-drawn surface that doesn't appear in the AT-SPI tree.\n\nProvide either (window_id + x/y) or (pid + element_token). Routes via XSendEvent (no focus steal). element_token cache is scoped per (pid, window_id) and is replaced by the next get_window_state of the same window — re-snapshot every turn before clicking.\n\nAfter a zoom call, pass from_zoom=true to auto-translate zoom-image coords back to full-window space.\n\nbutton: \"left\" (default), \"right\", or \"middle\". Defaults to left so the field is fully back-compat. X11: routes through XSendEvent ButtonPress/Release with the matching button code. Native Wayland: only left-button is supported via the virtual-pointer protocol — right/middle return an error rather than silently degrading to left. `modifier` holds ctrl/shift/alt/super for the click on X11. Native Wayland refuses modified pointer clicks until its input protocol can carry keyboard modifier state.",
    "destructive": true,
    "idempotent": false,
    "input_schema": {
@@ -499,7 +520,8 @@
       "type": "string"
      },
      "coordinate_frame": {
-      "description": "Frame of x/y (and from_x/from_y/to_x/to_y). Default \"window\": window-local screenshot pixels as returned by get_window_state. \"desktop\": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:\"desktop\" together with pid/window_id means the same thing.",
+      "default": "window",
+      "description": "Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter.",
       "enum": [
        "window",
        "desktop"
@@ -507,7 +529,8 @@
       "type": "string"
      },
      "count": {
-      "description": "Number of clicks in one press train: 1 (default), 2 = double-click, 3 = triple-click (line/paragraph selection). There is no separate triple_click tool — pass count: 3 here.",
+      "description": "Click count — 1 (single), 2 (double), or 3 (triple). Default 1.",
+      "maximum": 3,
       "minimum": 1,
       "type": "integer"
      },
@@ -622,14 +645,15 @@
    "read_only": false
   },
   {
-   "description": "Double-click at (x,y) or an element_token (AT-SPI bounds). Background delivery on X11 sends real button events from the session's virtual master pointer (path mpx_pointer); a point covered by another application's window is refused (target_occluded), one covered by this app's own dialog is retargeted to it (retargeted_to). No focus steal. Provide either (window_id + x/y) or (pid + element_token). After a zoom call, pass from_zoom=true to auto-translate zoom-image coords.",
+   "description": "Double-click at (x,y) or an element_token (AT-SPI bounds) via XSendEvent. No focus steal. Provide either (window_id + x/y) or (pid + element_token). After a zoom call, pass from_zoom=true to auto-translate zoom-image coords.",
    "destructive": true,
    "idempotent": false,
    "input_schema": {
     "additionalProperties": false,
     "properties": {
      "coordinate_frame": {
-      "description": "Frame of x/y (and from_x/from_y/to_x/to_y). Default \"window\": window-local screenshot pixels as returned by get_window_state. \"desktop\": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:\"desktop\" together with pid/window_id means the same thing.",
+      "default": "window",
+      "description": "Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter.",
       "enum": [
        "window",
        "desktop"
@@ -688,14 +712,15 @@
    "read_only": false
   },
   {
-   "description": "Right-click at (x,y) or an element_token (AT-SPI bounds). Background delivery on X11 sends real button events from the session's virtual master pointer (path mpx_pointer); a point covered by another application's window is refused (target_occluded), one covered by this app's own dialog is retargeted to it (retargeted_to), one outside the window is refused (point_outside_window; x/y are window-local pixels, the result reports window_point / screen_point). No focus steal. When a context menu opens, the result names it (`popup: {window_id, bounds, title}`): call get_window_state(pid, window_id=<that id>) to index its menu items and click them by element_token. Provide either (window_id + x/y) or (pid + element_token). After a zoom call, pass from_zoom=true to auto-translate zoom-image coords.",
+   "description": "Right-click at (x,y) or an element_token (AT-SPI bounds) via XSendEvent. No focus steal. Provide either (window_id + x/y) or (pid + element_token). After a zoom call, pass from_zoom=true to auto-translate zoom-image coords.",
    "destructive": true,
    "idempotent": false,
    "input_schema": {
     "additionalProperties": false,
     "properties": {
      "coordinate_frame": {
-      "description": "Frame of x/y (and from_x/from_y/to_x/to_y). Default \"window\": window-local screenshot pixels as returned by get_window_state. \"desktop\": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:\"desktop\" together with pid/window_id means the same thing.",
+      "default": "window",
+      "description": "Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter.",
       "enum": [
        "window",
        "desktop"
@@ -761,7 +786,7 @@
    "read_only": false
   },
   {
-   "description": "Press-drag-release gesture from (from_x, from_y) to (to_x, to_y) in window-local screenshot pixels. Background delivery on X11 is one real held gesture on the session's virtual master pointer (path mpx_pointer: press, interpolated motion, release) — it lands on GTK/VCL/Qt/Chromium; a point covered by another application's window is refused (target_occluded), one covered by this app's own dialog is retargeted to it. Headless servers fall back to XSendEvent. duration_ms (default 500), steps (default 20). No focus steal.",
+   "description": "Press-drag-release gesture from (from_x, from_y) to (to_x, to_y) in window-local screenshot pixels via XSendEvent (ButtonPress + MotionNotify × steps + ButtonRelease). duration_ms (default 500), steps (default 20). No focus steal.",
    "destructive": true,
    "idempotent": false,
    "input_schema": {
@@ -777,7 +802,8 @@
       "type": "string"
      },
      "coordinate_frame": {
-      "description": "Frame of x/y (and from_x/from_y/to_x/to_y). Default \"window\": window-local screenshot pixels as returned by get_window_state. \"desktop\": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:\"desktop\" together with pid/window_id means the same thing.",
+      "default": "window",
+      "description": "Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter.",
       "enum": [
        "window",
        "desktop"
@@ -939,7 +965,8 @@
       "type": "string"
      },
      "coordinate_frame": {
-      "description": "Frame of x/y (and from_x/from_y/to_x/to_y). Default \"window\": window-local screenshot pixels as returned by get_window_state. \"desktop\": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:\"desktop\" together with pid/window_id means the same thing.",
+      "default": "window",
+      "description": "Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter.",
       "enum": [
        "window",
        "desktop"
@@ -1051,7 +1078,8 @@
     "additionalProperties": false,
     "properties": {
      "coordinate_frame": {
-      "description": "Frame of x/y (and from_x/from_y/to_x/to_y). Default \"window\": window-local screenshot pixels as returned by get_window_state. \"desktop\": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:\"desktop\" together with pid/window_id means the same thing.",
+      "default": "window",
+      "description": "Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter.",
       "enum": [
        "window",
        "desktop"
@@ -1208,7 +1236,8 @@
     "additionalProperties": false,
     "properties": {
      "coordinate_frame": {
-      "description": "Frame of x/y (and from_x/from_y/to_x/to_y). Default \"window\": window-local screenshot pixels as returned by get_window_state. \"desktop\": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:\"desktop\" together with pid/window_id means the same thing.",
+      "default": "window",
+      "description": "Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter.",
       "enum": [
        "window",
        "desktop"
@@ -1332,7 +1361,8 @@
     "additionalProperties": false,
     "properties": {
      "coordinate_frame": {
-      "description": "Frame of x/y (and from_x/from_y/to_x/to_y). Default \"window\": window-local screenshot pixels as returned by get_window_state. \"desktop\": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:\"desktop\" together with pid/window_id means the same thing.",
+      "default": "window",
+      "description": "Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter.",
       "enum": [
        "window",
        "desktop"
@@ -1456,7 +1486,7 @@
    "read_only": false
   },
   {
-   "description": "Press a combination of keys simultaneously, e.g. [\"ctrl\",\"c\"] for Copy. Delivered to the target window without focus steal (real key events from a virtual master keyboard on X11); target does NOT need to be frontmost. Window-manager chords cannot reach the WM that way: alt+F4 on a window target closes that window through the WM (_NET_CLOSE_WINDOW, effect confirmed when it unmaps); super+*, alt+tab, ctrl+alt+* and other WM bindings are refused with code wm_chord_unavailable — use bring_to_front / list_windows / kill_app or delivery_mode:\"foreground\" instead.",
+   "description": "Press a combination of keys simultaneously, e.g. [\"ctrl\",\"c\"] for Copy. Sent via XSendEvent directly to the target pid; target does NOT need to be frontmost.",
    "destructive": true,
    "idempotent": false,
    "input_schema": {
@@ -1582,15 +1612,6 @@
    "input_schema": {
     "additionalProperties": false,
     "properties": {
-     "delivery_mode": {
-      "default": "background",
-      "description": "Input delivery mode. 'background' (default) never activates or raises the target window. On X11 it injects via XTEST / the XInput2 master pointer (no focus steal). On Wayland it goes through libei + xdg-desktop-portal, which injects to the compositor's input focus — Wayland's security model has no per-window background targeting, so a specific non-focused window cannot be aimed at; when no libei backend is available the tool returns a structured background_unavailable error. 'foreground' is the explicit escalation: activate the target (X11 _NET_ACTIVE_WINDOW; Wayland compositor activate), inject, then restore the prior active window — a brief focus swap unless the target was already active. Matches the macOS / Windows delivery_mode surface.",
-      "enum": [
-       "background",
-       "foreground"
-      ],
-      "type": "string"
-     },
      "element_token": {
       "description": "Opaque per-snapshot element handle from `structuredContent.elements[].element_token`. Returns an explicit stale error naming the current snapshots once a newer read supersedes it.",
       "pattern": "^s[0-9a-f]{8}:[0-9]+$",
@@ -1605,11 +1626,8 @@
       "type": "string"
      },
      "value": {
-      "description": "New value. Written through AT-SPI EditableText/Value when the element exposes them; otherwise (GTK2 spin scales, VCL spin buttons) the field is clicked with the session's real pointer, its text selected and replaced through the virtual keyboard and committed with Tab, then read back.",
-      "type": [
-       "string",
-       "number"
-      ]
+      "description": "New value for the element.",
+      "type": "string"
      },
      "window_id": {
       "description": "Omit when element_token is supplied (the token carries it).",
@@ -1647,7 +1665,8 @@
       "type": "string"
      },
      "coordinate_frame": {
-      "description": "Frame of x/y (and from_x/from_y/to_x/to_y). Default \"window\": window-local screenshot pixels as returned by get_window_state. \"desktop\": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:\"desktop\" together with pid/window_id means the same thing.",
+      "default": "window",
+      "description": "Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter.",
       "enum": [
        "window",
        "desktop"
@@ -1897,6 +1916,11 @@
       "description": "Cursor instance to move. Default: 'default'.",
       "type": "string"
      },
+     "pid": {
+      "description": "Window scope: process ID of the target window. Supply with window_id; required on GNOME Wayland and in Wayland inject mode.",
+      "minimum": 1,
+      "type": "integer"
+     },
      "scope": {
       "default": "window",
       "description": "\"window\" (default) moves only the agent cursor overlay; \"desktop\" moves the real OS pointer.",
@@ -1963,8 +1987,13 @@
       ],
       "description": "Preferred per-call target: an exact window (`kind=\"window\"`, `pid`, `window_id`) or the\nprimary desktop (`kind=\"desktop\"`, `display_id=\"primary\"`)."
      },
+     "window_id": {
+      "description": "Window scope: target window id, supplied with pid. Makes x and y window-local.",
+      "minimum": 1,
+      "type": "integer"
+     },
      "x": {
-      "description": "Destination X. Window scope: screen coordinates of the agent cursor overlay. Desktop scope: get_desktop_state screenshot pixels.",
+      "description": "Destination X. Window scope: window-local pixels of window_id when pid and window_id are given, otherwise screen coordinates of the agent cursor overlay. Desktop scope: get_desktop_state screenshot pixels.",
       "type": "number"
      },
      "y": {
@@ -2261,7 +2290,7 @@
    "read_only": true
   },
   {
-   "description": "Return current cua-driver-rs configuration.",
+   "description": "Return current cua-driver-rs configuration, including the agent_cursor.glide_duration_ms default. Explicit motion overrides are reported by get_agent_cursor_state.",
    "destructive": false,
    "idempotent": true,
    "input_schema": {
@@ -2278,12 +2307,18 @@
    "read_only": true
   },
   {
-   "description": "Update cua-driver-rs configuration. capture_mode / max_image_dimension take effect immediately.\n\nTwo input shapes (both accepted, matching Windows/Swift):\n- **{key, value}** (preferred): `{\"key\": \"max_image_dimension\", \"value\": 800}` — single leaf write.\n- **Legacy per-field**: `{\"capture_mode\": \"som\", \"max_image_dimension\": 0}`.\n\nThe experimental_pip keys persist to ~/.cua-driver/config.json and apply on next daemon restart (the PiP backend is initialised once at startup; Linux ships only the trait stub today — see issue #1729).\n\n`cursor.motion.style`, `cursor.motion.timing` and `cursor.motion.effects.<name>` save the default cursor motion for sessions started afterwards.",
+   "description": "Update cua-driver-rs configuration. capture_mode / max_image_dimension and agent_cursor_glide_duration_ms take effect immediately.\n\nTwo input shapes (both accepted, matching Windows/Swift):\n- **{key, value}** (preferred): `{\"key\": \"max_image_dimension\", \"value\": 800}` — single leaf write.\n- **Legacy per-field**: `{\"capture_mode\": \"som\", \"max_image_dimension\": 0}`.\n\nThe experimental_pip keys persist to ~/.cua-driver/config.json and apply on next daemon restart (the PiP backend is initialised once at startup; Linux ships only the trait stub today — see issue #1729).\n\n`cursor.motion.style`, `cursor.motion.timing` and `cursor.motion.effects.<name>` save the default cursor motion for sessions started afterwards.",
    "destructive": false,
    "idempotent": true,
    "input_schema": {
     "additionalProperties": false,
     "properties": {
+     "agent_cursor_glide_duration_ms": {
+      "description": "Default agent cursor glide duration in milliseconds (clamped to 0..5000). 0 preserves speed-based motion. Applies immediately; explicit set_agent_cursor_motion glide duration wins.",
+      "maximum": 5000,
+      "minimum": 0,
+      "type": "number"
+     },
      "capture_mode": {
       "description": "Legacy per-field shape. Default capture mode for get_window_state. (\"som\"/\"screenshot\" still decode as deprecated aliases.)",
       "enum": [

@@ -44,13 +44,13 @@ Pixel path (x, y provided): two down/up pairs ~80 ms apart at the given coordina
 </Tab>
 <Tab value="Linux">
 
-Double-click at (x,y) or an element_token (AT-SPI bounds). Background delivery on X11 sends real button events from the session's virtual master pointer (path mpx_pointer); a point covered by another application's window is refused (target_occluded), one covered by this app's own dialog is retargeted to it (retargeted_to). No focus steal. Provide either (window_id + x/y) or (pid + element_token). After a zoom call, pass from_zoom=true to auto-translate zoom-image coords.
+Double-click at (x,y) or an element_token (AT-SPI bounds) via XSendEvent. No focus steal. Provide either (window_id + x/y) or (pid + element_token). After a zoom call, pass from_zoom=true to auto-translate zoom-image coords.
 
 **Linux parameters**
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| <span id="double_click--linux--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` |  | Frame of x/y (and from_x/from_y/to_x/to_y). Default "window": window-local screenshot pixels as returned by get_window_state. "desktop": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:"desktop" together with pid/window_id means the same thing. |
+| <span id="double_click--linux--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` | `"window"` | Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter. |
 | <span id="double_click--linux--cursor_id"></span>`cursor_id` | `string` |  | Optional multi-cursor instance id. Default: 'default'. |
 | <span id="double_click--linux--delivery_mode"></span>`delivery_mode` | `"background" \| "foreground"` | `"background"` | Input delivery mode. 'background' (default) never activates or raises the target window. On X11 it injects via XTEST / the XInput2 master pointer (no focus steal). On Wayland it goes through libei + xdg-desktop-portal, which injects to the compositor's input focus: Wayland's security model has no per-window background targeting, so a specific non-focused window cannot be aimed at; when no libei backend is available the tool returns a structured background_unavailable error. 'foreground' is the explicit escalation: activate the target (X11 _NET_ACTIVE_WINDOW; Wayland compositor activate), inject, then restore the prior active window; a brief focus swap unless the target was already active. Matches the macOS / Windows delivery_mode surface. |
 | <span id="double_click--linux--from_zoom"></span>`from_zoom` | `boolean` |  | Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space. |
@@ -125,13 +125,13 @@ Exactly one of `element_token` or (`x` AND `y`) must be provided. `pid` always r
 </Tab>
 <Tab value="Linux">
 
-Right-click at (x,y) or an element_token (AT-SPI bounds). Background delivery on X11 sends real button events from the session's virtual master pointer (path mpx_pointer); a point covered by another application's window is refused (target_occluded), one covered by this app's own dialog is retargeted to it (retargeted_to), one outside the window is refused (point_outside_window; x/y are window-local pixels, the result reports window_point / screen_point). No focus steal. When a context menu opens, the result names it (`popup: {window_id, bounds, title}`): call get_window_state(pid, window_id=&lt;that id&gt;) to index its menu items and click them by element_token. Provide either (window_id + x/y) or (pid + element_token). After a zoom call, pass from_zoom=true to auto-translate zoom-image coords.
+Right-click at (x,y) or an element_token (AT-SPI bounds) via XSendEvent. No focus steal. Provide either (window_id + x/y) or (pid + element_token). After a zoom call, pass from_zoom=true to auto-translate zoom-image coords.
 
 **Linux parameters**
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| <span id="right_click--linux--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` |  | Frame of x/y (and from_x/from_y/to_x/to_y). Default "window": window-local screenshot pixels as returned by get_window_state. "desktop": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:"desktop" together with pid/window_id means the same thing. |
+| <span id="right_click--linux--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` | `"window"` | Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter. |
 | <span id="right_click--linux--cursor_id"></span>`cursor_id` | `string` |  | Optional multi-cursor instance id. Default: 'default'. |
 | <span id="right_click--linux--delivery_mode"></span>`delivery_mode` | `"background" \| "foreground"` | `"background"` | Input delivery mode. 'background' (default) never activates or raises the target window. On X11 it injects via XTEST / the XInput2 master pointer (no focus steal). On Wayland it goes through libei + xdg-desktop-portal, which injects to the compositor's input focus: Wayland's security model has no per-window background targeting, so a specific non-focused window cannot be aimed at; when no libei backend is available the tool returns a structured background_unavailable error. 'foreground' is the explicit escalation: activate the target (X11 _NET_ACTIVE_WINDOW; Wayland compositor activate), inject, then restore the prior active window; a brief focus swap unless the target was already active. Matches the macOS / Windows delivery_mode surface. |
 | <span id="right_click--linux--from_zoom"></span>`from_zoom` | `boolean` |  | Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space. |

@@ -64,14 +64,14 @@ macOS has no background drag: a window-scoped drag needs delivery_mode:"foregrou
 </Tab>
 <Tab value="Linux">
 
-Press-drag-release gesture from (from_x, from_y) to (to_x, to_y) in window-local screenshot pixels. Background delivery on X11 is one real held gesture on the session's virtual master pointer (path mpx_pointer: press, interpolated motion, release); it lands on GTK/VCL/Qt/Chromium; a point covered by another application's window is refused (target_occluded), one covered by this app's own dialog is retargeted to it. Headless servers fall back to XSendEvent. duration_ms (default 500), steps (default 20). No focus steal.
+Press-drag-release gesture from (from_x, from_y) to (to_x, to_y) in window-local screenshot pixels via XSendEvent (ButtonPress + MotionNotify × steps + ButtonRelease). duration_ms (default 500), steps (default 20). No focus steal.
 
 **Linux parameters**
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | <span id="drag--linux--button"></span>`button` | `"left" \| "right" \| "middle"` |  | Mouse button. Default "left". |
-| <span id="drag--linux--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` |  | Frame of x/y (and from_x/from_y/to_x/to_y). Default "window": window-local screenshot pixels as returned by get_window_state. "desktop": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:"desktop" together with pid/window_id means the same thing. |
+| <span id="drag--linux--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` | `"window"` | Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter. |
 | <span id="drag--linux--cursor_id"></span>`cursor_id` | `string` |  | Optional multi-cursor instance id. Default: 'default'. |
 | <span id="drag--linux--delivery_mode"></span>`delivery_mode` | `"background" \| "foreground"` | `"background"` | Input delivery mode. 'background' (default) never activates or raises the target window. On X11 it injects via XTEST / the XInput2 master pointer (no focus steal). On Wayland it goes through libei + xdg-desktop-portal, which injects to the compositor's input focus: Wayland's security model has no per-window background targeting, so a specific non-focused window cannot be aimed at; when no libei backend is available the tool returns a structured background_unavailable error. 'foreground' is the explicit escalation: activate the target (X11 _NET_ACTIVE_WINDOW; Wayland compositor activate), inject, then restore the prior active window; a brief focus swap unless the target was already active. Matches the macOS / Windows delivery_mode surface. |
 | <span id="drag--linux--duration_ms"></span>`duration_ms` | `integer` |  | Total drag duration. Default: 500. Range: 0 to 10000. |
@@ -162,7 +162,7 @@ Scroll the target pid's focused region via XSendEvent Button4/5. direction requi
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | <span id="scroll--linux--amount"></span>`amount` | `integer` |  | Number of scroll steps. Default: 3. Range: 1 to 50. |
-| <span id="scroll--linux--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` |  | Frame of x/y (and from_x/from_y/to_x/to_y). Default "window": window-local screenshot pixels as returned by get_window_state. "desktop": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:"desktop" together with pid/window_id means the same thing. |
+| <span id="scroll--linux--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` | `"window"` | Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter. |
 | <span id="scroll--linux--cursor_id"></span>`cursor_id` | `string` |  | Optional multi-cursor instance id. Default: 'default'. |
 | <span id="scroll--linux--delivery_mode"></span>`delivery_mode` | `"background" \| "foreground"` | `"background"` | Input delivery mode. 'background' (default) never activates or raises the target window. On X11 it injects via XTEST / the XInput2 master pointer (no focus steal). On Wayland it goes through libei + xdg-desktop-portal, which injects to the compositor's input focus: Wayland's security model has no per-window background targeting, so a specific non-focused window cannot be aimed at; when no libei backend is available the tool returns a structured background_unavailable error. 'foreground' is the explicit escalation: activate the target (X11 _NET_ACTIVE_WINDOW; Wayland compositor activate), inject, then restore the prior active window; a brief focus swap unless the target was already active. Matches the macOS / Windows delivery_mode surface. |
 | <span id="scroll--linux--pid"></span>`pid` | `integer` |  | Target process ID. Required unless scope is "desktop". |
@@ -239,8 +239,10 @@ Move the synthetic agent cursor without changing the user's pointer. Only an exp
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
+| <span id="move_cursor--linux--pid"></span>`pid` | `integer` |  | Window scope: process ID of the target window. Supply with window_id; required on GNOME Wayland and in Wayland inject mode. Minimum: 1. |
 | <span id="move_cursor--linux--scope"></span>`scope` | `"window" \| "desktop"` | `"window"` | "window" (default) moves only the agent cursor overlay; "desktop" moves the real OS pointer. |
-| <span id="move_cursor--linux--x"></span>`x` | `number` | required | Destination X. Window scope: screen coordinates of the agent cursor overlay. Desktop scope: get_desktop_state screenshot pixels. |
+| <span id="move_cursor--linux--window_id"></span>`window_id` | `integer` |  | Window scope: target window id, supplied with pid. Makes x and y window-local. Minimum: 1. |
+| <span id="move_cursor--linux--x"></span>`x` | `number` | required | Destination X. Window scope: window-local pixels of window_id when pid and window_id are given, otherwise screen coordinates of the agent cursor overlay. Desktop scope: get_desktop_state screenshot pixels. |
 
 </Tab>
 <Tab value="Windows">
@@ -281,7 +283,7 @@ Effect: destructive. Platforms: Linux.
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | <span id="mouse_button_down--button"></span>`button` | `"left" \| "right" \| "middle"` |  | Mouse button. Default "left". |
-| <span id="mouse_button_down--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` |  | Frame of x/y (and from_x/from_y/to_x/to_y). Default "window": window-local screenshot pixels as returned by get_window_state. "desktop": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:"desktop" together with pid/window_id means the same thing. |
+| <span id="mouse_button_down--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` | `"window"` | Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter. |
 | <span id="mouse_button_down--cursor_id"></span>`cursor_id` | `string` |  | Optional multi-cursor instance id. Default: 'default'. |
 | <span id="mouse_button_down--from_zoom"></span>`from_zoom` | `boolean` |  | Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space. |
 | <span id="mouse_button_down--pid"></span>`pid` | `integer` | required | Target process ID. |
@@ -304,7 +306,7 @@ Effect: destructive. Platforms: Linux.
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| <span id="mouse_button_up--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` |  | Frame of x/y (and from_x/from_y/to_x/to_y). Default "window": window-local screenshot pixels as returned by get_window_state. "desktop": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:"desktop" together with pid/window_id means the same thing. |
+| <span id="mouse_button_up--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` | `"window"` | Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter. |
 | <span id="mouse_button_up--cursor_id"></span>`cursor_id` | `string` |  | Optional multi-cursor instance id. Default: 'default'. |
 | <span id="mouse_button_up--from_zoom"></span>`from_zoom` | `boolean` |  | Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space. |
 | <span id="mouse_button_up--pid"></span>`pid` | `integer` |  | Optional process ID; must match the held button's target. |

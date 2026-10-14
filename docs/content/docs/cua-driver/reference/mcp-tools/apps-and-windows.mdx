@@ -57,7 +57,7 @@ List Linux apps, both currently running and installed-but-not-running, with per-
 - last_used: RFC3339 mtime of the `.desktop` file, when readable.
 - windows: the app's current top-level windows (same records as list_windows); empty for a process without one.
 
-Running apps come from `/proc`. Installed apps come from XDG Desktop Entry files in $XDG_DATA_HOME/applications and each $XDG_DATA_DIRS entry's applications/ subdir. Entries with `NoDisplay=true` or `Hidden=true` are filtered. A `.desktop` file whose launcher matches a running process (by basename), or whose WM_CLASS a top-level window carries, is merged into a single entry with `running: true`.
+Running apps come from `/proc`. Installed apps come from XDG Desktop Entry files in $XDG_DATA_HOME/applications and each $XDG_DATA_DIRS entry's applications/ subdir. Entries with `NoDisplay=true` or `Hidden=true` are filtered. A `.desktop` file is merged with a running process only from an exact, unambiguous executable path or a constrained `--name` desktop-ID claim corroborated by StartupWMClass when present; ambiguous aliases fail closed.
 
 Use this for "is X installed?" as well as "is X running?". For per-window state, visibility, geometry, titles, call list_windows instead.
 
@@ -191,7 +191,7 @@ Launch a Linux app in the background. Provide launch_path (preferred: round-trip
 | <span id="launch_app--linux--bundle_id"></span>`bundle_id` | `string` |  | Ignored on Linux (macOS/Windows concept). |
 | <span id="launch_app--linux--launch_path"></span>`launch_path` | `string` |  | Round-trip the `launch_path` returned by `list_apps`: the Exec= command from the .desktop file with XDG field codes already stripped. Highest precedence on Linux; spawned directly via the system shell. |
 | <span id="launch_app--linux--name"></span>`name` | `string` |  | App name or command to launch. Tried as a direct command first, then matched against installed .desktop applications (exact display name, desktop-file id, or Exec basename; else an unambiguous display-name substring). |
-| <span id="launch_app--linux--urls"></span>`urls` | `string[]` |  | URLs to open via xdg-open. |
+| <span id="launch_app--linux--urls"></span>`urls` | `string[]` |  | URLs to open through the resolved XDG desktop handler, with xdg-open as a compatibility fallback. |
 
 </Tab>
 <Tab value="Windows">
@@ -284,14 +284,14 @@ Persistently activate an app and leave it in the foreground. Most input does not
 </Tab>
 <Tab value="Linux">
 
-Persistently activate a window so subsequent input lands on it. This deliberately breaks the no-foreground contract and is not part of the normal input ladder. For an ordinary `background_unavailable` response, retry only the refused action with `delivery_mode:"foreground"`; the input tool performs its own activate, act, and restore sequence. Use `bring_to_front` only for a focus-proxy surface that must remain foreground across multiple calls, such as a remote desktop session, or when repeated action-scoped activation prevents the remote surface from accepting input. X11: EWMH _NET_ACTIVE_WINDOW activation (the `wmctrl -a` equivalent, with proper timestamp handling to beat focus-stealing prevention). Wayland: activates through a target-addressable compositor adapter (wlroots foreign-toplevel or the GNOME Shell helper) and refuses when the compositor offers no safe adapter. Matches the macOS / Windows bring_to_front rung.
+Persistently activate a window so subsequent input lands on it. X11: EWMH _NET_ACTIVE_WINDOW activation (the `wmctrl -a` equivalent, proper timestamp handling to beat focus-stealing prevention); call it before `delivery_mode:"foreground"` input to avoid a per-call flash, or to escalate when background injection didn't land. Wayland: activates through a target-addressable compositor adapter (wlroots foreign-toplevel or the GNOME Shell helper) and refuses when the compositor offers no safe adapter. Matches the macOS / Windows bring_to_front rung.
 
 **Linux parameters**
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | <span id="bring_to_front--linux--pid"></span>`pid` | `integer` | required | Process ID of the app to activate. |
-| <span id="bring_to_front--linux--window_id"></span>`window_id` | `integer` |  | X11 window id (xid) to activate. If omitted, the first window of `pid` is used. |
+| <span id="bring_to_front--linux--window_id"></span>`window_id` | `integer` |  | Exact window id to activate. Required when a Wayland process owns more than one toplevel. |
 
 </Tab>
 <Tab value="Windows">
