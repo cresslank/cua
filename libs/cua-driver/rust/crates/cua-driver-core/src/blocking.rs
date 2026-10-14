@@ -68,6 +68,7 @@ pub fn run_input_transitions<T, E: From<NativeDeadlineError>>(
 pub struct NativeTask<R> {
     handle: tokio::task::JoinHandle<R>,
     cancelled: Arc<AtomicBool>,
+    completed: bool,
 }
 
 impl<R> NativeTask<R> {
@@ -83,13 +84,19 @@ impl<R> std::future::Future for NativeTask<R> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        std::pin::Pin::new(&mut self.handle).poll(cx)
+        let result = std::pin::Pin::new(&mut self.handle).poll(cx);
+        if matches!(&result, std::task::Poll::Ready(Ok(_))) {
+            self.completed = true;
+        }
+        result
     }
 }
 
 impl<R> Drop for NativeTask<R> {
     fn drop(&mut self) {
-        self.cancelled.store(true, Ordering::Release);
+        if !self.completed {
+            self.cancelled.store(true, Ordering::Release);
+        }
         // Do not abort: queued closures own native payloads and must destroy
         // them under ActionLeaseScope even when their mutation is skipped.
     }
@@ -114,6 +121,26 @@ impl ActionLeaseScope {
                 .flatten(),
             NATIVE_CANCELLATION.try_with(Clone::clone).ok(),
         )
+    }
+
+    /// Run already-owned release/restoration on a bounded scheduler. Cancellation
+    /// stops new action units, never necessary cleanup. Retain the originating
+    /// action lease while clearing cancellation only for this cleanup body.
+    pub fn try_run_cleanup<R>(
+        &self,
+        function: impl FnOnce() -> R,
+    ) -> Result<R, NativeDeadlineError> {
+        let _admission = native_call_limit()
+            .try_acquire_owned()
+            .map_err(|_| NativeDeadlineError::Busy)?;
+        Ok(self.run_cleanup(function))
+    }
+
+    /// Release-only cleanup within an already admitted native worker.
+    pub fn run_cleanup<R>(&self, function: impl FnOnce() -> R) -> R {
+        crate::tool::DISPATCH_ACTION_LEASE.sync_scope(self.0.clone(), || {
+            NATIVE_CANCELLATION.sync_scope(Vec::new(), function)
+        })
     }
 
     /// Propagate ownership to any further native continuations started here.
@@ -158,11 +185,13 @@ impl NativeDeadline {
     }
 }
 
-struct CancelNativeWaiter(Arc<AtomicBool>);
+struct CancelNativeWaiter(Arc<AtomicBool>, bool);
 
 impl Drop for CancelNativeWaiter {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
+        if !self.1 {
+            self.0.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -198,7 +227,7 @@ where
         expires: std::time::Instant::now() + timeout,
         cancelled: Arc::new(AtomicBool::new(false)),
     };
-    let waiter = CancelNativeWaiter(deadline.cancelled.clone());
+    let mut waiter = CancelNativeWaiter(deadline.cancelled.clone(), false);
     let remaining = deadline.expires;
     let admission = limit
         .try_acquire_owned()
@@ -225,6 +254,7 @@ where
         .map_err(NativeDeadlineError::Spawn)?;
     let outcome =
         receiver.recv_timeout(remaining.saturating_duration_since(std::time::Instant::now()));
+    waiter.1 = matches!(&outcome, Ok(Ok(Ok(_)))) && std::time::Instant::now() < remaining;
     drop(waiter);
     // A ready result can be delivered after the deadline if this waiter was
     // descheduled. Do not start a caller's mutation body on that late result.
@@ -305,7 +335,11 @@ where
             Err(error) => panic!("native worker cancelled during shutdown: {error}"),
         }
     });
-    NativeTask { handle, cancelled }
+    NativeTask {
+        handle,
+        cancelled,
+        completed: false,
+    }
 }
 
 #[derive(Debug)]
@@ -399,6 +433,33 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Condvar, Mutex,
     };
+
+    #[tokio::test]
+    async fn successful_native_completion_keeps_deferred_authority_usable() {
+        let scope = spawn(ActionLeaseScope::capture).await.unwrap();
+        assert!(scope.run(check_cancelled).is_ok());
+        assert!(scope.try_run_cleanup(check_cancelled).unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_native_scope_refuses_mutation_but_runs_cleanup() {
+        let (send, recv) = std::sync::mpsc::sync_channel(1);
+        let (release, wait) = std::sync::mpsc::sync_channel(1);
+        let task = spawn(move || {
+            send.send(ActionLeaseScope::capture()).unwrap();
+            wait.recv().unwrap();
+        });
+        let scope = tokio::task::spawn_blocking(move || recv.recv().unwrap())
+            .await
+            .unwrap();
+        drop(task);
+        assert!(matches!(
+            scope.run(check_cancelled),
+            Err(NativeDeadlineError::TimedOut)
+        ));
+        assert!(scope.try_run_cleanup(check_cancelled).unwrap().is_ok());
+        release.send(()).unwrap();
+    }
 
     #[tokio::test]
     async fn timed_out_native_continuations_retain_the_dispatch_lease() {

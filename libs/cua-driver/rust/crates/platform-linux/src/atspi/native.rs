@@ -390,6 +390,14 @@ async fn shared_connection() -> Result<&'static AccessibilityConnection> {
             conn.add_registry_event::<atspi::ObjectEvents>()
                 .await
                 .map_err(|error| anyhow!("AT-SPI object-event registration failed: {error}"))?;
+            // Registry interest alone does not install D-Bus match rules.
+            // Keep upstream's typed subscriptions on this trusted connection.
+            conn.register_event::<atspi::events::object::StateChangedEvent>()
+                .await
+                .map_err(|error| anyhow!("AT-SPI state-changed subscription failed: {error}"))?;
+            conn.register_event::<atspi::events::object::ActiveDescendantChangedEvent>()
+                .await
+                .map_err(|error| anyhow!("AT-SPI active-descendant subscription failed: {error}"))?;
             Ok(conn)
         })
         .await

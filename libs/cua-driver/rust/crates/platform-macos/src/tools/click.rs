@@ -223,6 +223,20 @@ fn background_pixel_restore_pid(
     }
 }
 
+/// Poll until `pid` is the frontmost application or `budget` runs out.
+async fn wait_until_frontmost(pid: i32, budget: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if apps::frontmost_pid() == Some(pid) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
+}
+
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "click".into(),
@@ -231,7 +245,7 @@ fn def() -> &'static ToolDef {
             - element_token: AX action path. Tokens are scoped to (pid, window_id) and stale once the window is snapshotted again.\n\
             - x, y: window-local pixels of the get_window_state screenshot, sent as CGEvent mouse events. Needs a visible window. `modifier` takes cmd/shift/option/ctrl.\n\
             \n\
-            `button` defaults to left; on the AX path \"right\" maps to AXShowMenu and \"middle\" falls back to a pixel click at the element center. `action`: press (default), show_menu, pick, confirm, cancel, open. `from_zoom:true` translates zoom-image pixels after a `zoom` call. Pressing a popup button opens its menu and leaves it open (holding key focus) until dismissed; to choose an option use `set_value`.".into(),
+            `button` defaults to left; on the AX path \"right\" maps to AXShowMenu and \"middle\" falls back to a pixel click at the element center. `action`: press (default), show_menu, pick, confirm, cancel, open, show_alternate_ui, show_default_ui; an element listing showalternateui reveals its hover-only controls with show_alternate_ui, in the background and without the pointer. `from_zoom:true` translates zoom-image pixels after a `zoom` call. Pressing a popup button opens its menu and leaves it open until an item is chosen or it is dismissed; in the background the user's front window keeps key focus meanwhile. To choose an option in one call use `set_value`.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             // `pid` is conditionally required — needed for window/element clicks
@@ -248,7 +262,7 @@ fn def() -> &'static ToolDef {
                 "capture_id": { "type": "string", "description": "Optional capture ID from get_window_state or get_desktop_state. With x,y it is consumed atomically; stale or mismatched captures are refused." },
                 "x":             { "type": "number",  "description": "X in screenshot pixels (get_window_state PNG, or get_desktop_state PNG for a desktop target)." },
                 "y":             { "type": "number",  "description": "Y in screenshot pixels from the image selected by target." },
-                "action":        { "type": "string",  "description": "AX action." },
+                "action":        { "type": "string",  "description": "AX action: press (default), show_menu, pick, confirm, cancel, open, show_alternate_ui, show_default_ui. show_alternate_ui reveals hover-only controls on an element that lists it, without the pointer." },
                 "button":        {
                     "type": "string",
                     "enum": ["left", "right", "middle"],
@@ -467,6 +481,9 @@ impl Tool for ClickTool {
             .opt_f64("y")
             .or_else(|| args.opt_i64("y").map(|i| i as f64));
         let action = args.str_or("action", "press");
+        if let Err(error) = crate::input::ax_actions::map_action(&action) {
+            return ToolResult::error(format!("click: {error}"));
+        }
         // Surface 5: optional `button` arg, default "left" preserves legacy behaviour.
         // Pixel path: routes to left/right/middle CGEvent primitives.
         // AX path: "right" delegates to AXShowMenu (same surface as right_click);
@@ -1153,38 +1170,16 @@ impl Tool for ClickTool {
                 }
             };
 
-            // Restore the Swift background-click prologue that was left
-            // disconnected in the original Rust port. It makes an opaque
-            // target AppKit-active without raising/restacking its window, which
-            // is required by Chromium gates and remote-HID proxies such as
-            // iPhone Mirroring. Re-pin after the focus record because changing
-            // AppKit active state can disturb overlay ordering.
-            let focus_without_raise =
-                if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise {
-                    let wid = window_id.expect("activation policy requires window_id");
-                    let activation_permit = capture_permit.clone();
-                    match cua_driver_core::blocking::spawn(move || {
-                        let _permit = activation_permit;
-                        crate::input::mouse::prepare_background_pixel_click(pid, wid)
-                    })
+            // A raw click can open a menu (a popup drawn without AX, a canvas
+            // context menu); keep the user's key focus if it does.
+            let _key_focus = if fg {
+                None
+            } else {
+                cua_driver_core::blocking::spawn(move || crate::key_focus_guard::protect(pid))
                     .await
-                    {
-                        Ok(activated) => {
-                            crate::cursor::overlay::send_command(
-                                cursor_key.clone(),
-                                cursor_overlay::OverlayCommand::PinAbove(wid as u64),
-                            );
-                            activated
-                        }
-                        Err(error) => {
-                            return ToolResult::error(format!(
-                                "Background click activation task failed: {error}"
-                            ));
-                        }
-                    }
-                } else {
-                    false
-                };
+                    .ok()
+                    .flatten()
+            };
 
             // Pulse only after the activation settle so it visually coincides
             // with the real target click rather than the private focus prelude.
@@ -1274,6 +1269,9 @@ impl Tool for ClickTool {
                                     do_click,
                                 )
                             }
+                            (_, Some(wid)) if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise => {
+                                crate::input::skylight::with_background_pixel_activation(pid, wid, do_click)
+                            }
                             _ => do_click(),
                         }
                     })
@@ -1282,48 +1280,12 @@ impl Tool for ClickTool {
             )
             .await;
 
-            // The no-raise record can make NSWorkspace report the target as
-            // active even though its window never moved in z-order. Once the
-            // click has been queued, restore the prior app if the target is
-            // still reported frontmost. Base this on observed state, not
-            // `focus_without_raise`: the private recipe can report failure
-            // after partially activating the target, and the raw click can
-            // self-activate even when that recipe is unavailable. Do not
-            // overwrite a different app here; the wildcard suppression lease
-            // handles genuine side effects.
-            if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise
-                && prior_front != Some(pid)
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if let Some(previous_pid) = background_pixel_restore_pid(
-                    activation_policy,
-                    prior_front,
-                    pid,
-                    apps::frontmost_pid(),
-                ) {
-                    let _ = apps::activate_pid(previous_pid);
-                } else if let (Some(previous_pid), Some(wid)) = (prior_front, window_id) {
-                    // The prior app is still frontmost, but the no-raise
-                    // recipe posted it a defocus record: hand its key window
-                    // focus back so the user's typing keeps landing there.
-                    if focus_without_raise && apps::frontmost_pid() == Some(previous_pid) {
-                        let _ = cua_driver_core::blocking::spawn(move || {
-                            crate::input::skylight::restore_focus_after_without_raise(
-                                previous_pid,
-                                pid,
-                                wid,
-                            )
-                        })
-                        .await;
-                    }
-                }
-            }
-
             let changes = super::finish_window_observation(snapshot).await;
 
-            let button_label = match button_str.as_str() {
-                "right" => "right-click",
-                "middle" => "middle-click",
+            let button_label = match (button_str.as_str(), count) {
+                ("right", _) => "right-click",
+                ("middle", _) => "middle-click",
+                (_, 2) => "double-click",
                 _ => "click",
             };
             match result {
@@ -1385,7 +1347,7 @@ fn perform_ax_click(
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
     let (element_ptr, idx) = element;
     let (pid, window_id) = window;
-    let ax_action = map_action(action_str);
+    let ax_action = crate::input::ax_actions::map_action(action_str)?;
     let element = element_ptr as AXUIElementRef;
 
     // Check the live value immediately before dispatch. Foreground assist can
@@ -1607,9 +1569,9 @@ fn perform_ax_click(
             if !options.is_empty() {
                 let opt_list = options.join(", ");
                 summary.push_str(
-                    "\n\n⚠️ This is a popup/select button. The native macOS menu closes \
-                     immediately when the window is in the background. Do NOT use click \
-                     again — instead, use:\n  set_value(pid, element_token, value)\n\
+                    "\n\nThis is a popup/select button; its menu is open. Choose an item \
+                     by clicking its AXMenuItem from a fresh get_window_state, or select \
+                     in one call with:\n  set_value(pid, element_token, value)\n\
                      Available options: [",
                 );
                 summary.push_str(&opt_list);
@@ -1683,18 +1645,6 @@ mod selection_fallback_tests {
         assert!(selection_readback_confirms(true, false, true, true));
         assert!(!selection_readback_confirms(true, true, true, true));
         assert!(!selection_readback_confirms(false, true, true, false));
-    }
-}
-
-fn map_action(action: &str) -> &'static str {
-    match action.to_lowercase().as_str() {
-        "press" | "click" => "AXPress",
-        "show_menu" | "right_click" => "AXShowMenu",
-        "pick" => "AXPick",
-        "confirm" => "AXConfirm",
-        "cancel" => "AXCancel",
-        "open" => "AXOpen",
-        _ => "AXPress",
     }
 }
 

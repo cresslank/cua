@@ -78,6 +78,27 @@ pub(crate) fn hold(
     }
 }
 
+/// Poll deferred observation on the same bounded reaper that owns the lease.
+/// A saturated holder returns the original lease for synchronous protection.
+pub(crate) fn hold_observation(
+    lease: SuppressionLease,
+    deadline: Instant,
+    generation: u64,
+    poll: impl FnMut() -> bool + Send + 'static,
+) -> Result<(), SuppressionLease> {
+    let Some(holder) = HOLDER.get().filter(|_| background()) else {
+        return Err(lease);
+    };
+    let mut state = holder.state.0.lock().unwrap();
+    let previous = state.last_id;
+    state.hold(lease, deadline, generation, Instant::now())?;
+    if state.last_id != previous {
+        state.leases.last_mut().unwrap().poll = Some(Box::new(poll));
+    }
+    holder.state.1.notify_all();
+    Ok(())
+}
+
 struct State<T> {
     generation: u64,
     last_id: u64,
@@ -89,6 +110,7 @@ struct Held<T> {
     id: u64,
     deadline: Instant,
     _lease: T,
+    poll: Option<Box<dyn FnMut() -> bool + Send>>,
 }
 
 impl<T> State<T> {
@@ -114,12 +136,15 @@ impl<T> State<T> {
             id: self.last_id,
             deadline,
             _lease: lease,
+            poll: None,
         });
         Ok(())
     }
 
     fn reap(&mut self, now: Instant) {
-        self.leases.retain(|held| held.deadline > now);
+        self.leases.retain_mut(|held| {
+            held.deadline > now && !held.poll.as_mut().is_some_and(|poll| poll())
+        });
     }
 
     fn pending_through(&self, last_id: u64) -> bool {
@@ -176,6 +201,11 @@ impl<T: Send + 'static> Holder<T> {
                     }
                     state = match state.leases.iter().map(|held| held.deadline).min() {
                         Some(at) => {
+                            let at = if state.leases.iter().any(|held| held.poll.is_some()) {
+                                at.min(now + Duration::from_millis(25))
+                            } else {
+                                at
+                            };
                             wake.wait_timeout(state, at.saturating_duration_since(now))
                                 .unwrap()
                                 .0
@@ -313,6 +343,41 @@ mod tests {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn deferred_poll_keeps_lease_until_completion_and_cancel_discards_work() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let polls = Arc::new(AtomicUsize::new(0));
+        let now = Instant::now();
+        let mut state = State {
+            generation: 0,
+            last_id: 0,
+            leases: vec![],
+            stopped: false,
+        };
+        assert!(state
+            .hold(Lease(drops.clone()), now + Duration::from_secs(1), 0, now)
+            .is_ok());
+        let calls = polls.clone();
+        let active = drops.clone();
+        state.leases[0].poll = Some(Box::new(move || {
+            assert_eq!(active.load(Ordering::SeqCst), 0);
+            calls.fetch_add(1, Ordering::SeqCst) == 1
+        }));
+        state.reap(now);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        state.reap(now);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert!(state
+            .hold(Lease(drops.clone()), now + Duration::from_secs(1), 0, now)
+            .is_ok());
+        state.leases[0].poll = Some(Box::new(|| panic!("cancelled observation ran")));
+        state.generation += 1;
+        state.leases.clear();
+        state.reap(now);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     #[test]

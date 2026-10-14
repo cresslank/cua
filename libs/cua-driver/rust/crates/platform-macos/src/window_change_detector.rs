@@ -32,16 +32,14 @@
 //! // changes.result_suffix() — append to ToolResult text.
 //! ```
 //!
-//! Long-lived hosts (`serve`, direct MCP, SDK runtime) use `detect_async()`:
-//! one immediate observation is returned, while a background holder retains the
-//! lease for `CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS` after the action. Windows
-//! appearing after return are not reported in that result; inspect the next
-//! screenshot or `list_windows`. `0` skips observation and releases the wildcard
-//! lease immediately. `CUA_DRIVER_WINDOW_CHANGE_POLL_MS` only affects synchronous
-//! polling. Bare registries and finite hosts retain `detect()`'s synchronous
-//! behavior. Dropping an unconsumed snapshot always releases its lease (RAII).
+//! Long-lived hosts report changes for up to 300 ms, then use the bounded
+//! post-action reaper for the remaining observation tail. Late changes are
+//! reported on a subsequent result. Zero skips observation and publication.
+//! Finite hosts retain synchronous polling. Cancellation of deferred guards
+//! never replaces the ownership of an active native action.
 
 use std::collections::HashSet;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use cua_driver_core::window_observation::WindowObservationBounds;
@@ -167,8 +165,64 @@ fn is_daemon_window(window: &WindowInfo) -> bool {
 /// the wildcard suppressor time to fire and settle.
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
 
-/// Default inter-poll interval. Matches Swift's 50ms.
-const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Default inter-poll interval.
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// How long the action result itself waits for a window change. Menus,
+/// popovers and sheets map well inside this. When nothing has changed by
+/// then the result returns, and the rest of the observation deadline runs
+/// detached (owned by the bounded post-action reaper): the focus-steal lease stays armed and a late
+/// window is reported on the next action's result. Before this, every
+/// action that opened nothing paid the whole deadline.
+const REPORT_WINDOW: Duration = Duration::from_millis(300);
+
+/// A late change older than this is not reported on a later result.
+const LATE_REPORT_MAX_AGE: Duration = Duration::from_secs(10);
+
+/// A change a detached tail saw after its action had returned.
+#[derive(Debug, Clone)]
+struct Late {
+    at: Instant,
+    new_windows: Vec<WindowEvent>,
+    foreground_changed: bool,
+}
+
+static LATE: Mutex<Option<Late>> = Mutex::new(None);
+
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// End the detached observation of the previous action, releasing its
+/// focus-steal lease now. Called before the driver's next action and before
+/// any intentional activation, so a lingering wildcard lease never reverts
+/// an activation the driver itself asked for.
+pub fn end_tail() {
+    crate::post_action::cancel();
+}
+
+/// Advanced whenever the driver itself makes an app frontmost (bring_to_front,
+/// launch_app, any foreground delivery). The key-focus guard reverts a
+/// background target's self-activation only while this has not moved since
+/// the guard was armed, so it never undoes an activation the driver asked for.
+static INTENTIONAL_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record an activation the driver asked for.
+pub fn note_intentional_activation() {
+    INTENTIONAL_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// The current intentional-activation epoch.
+pub fn intentional_epoch() -> u64 {
+    INTENTIONAL_EPOCH.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Take a late change recorded by a detached tail, if it is recent.
+fn take_late() -> Option<Late> {
+    lock(&LATE)
+        .take()
+        .filter(|late| late.at.elapsed() <= LATE_REPORT_MAX_AGE)
+}
 
 /// Resolve the post-action observation bounds from raw host values against
 /// the macOS defaults. Pure; `cua_driver_core::window_observation` owns the
@@ -336,13 +390,66 @@ impl Snapshot {
     /// observation, then retain focus protection for the host timeout after
     /// observation. Finite hosts keep the synchronous polling behavior.
     pub async fn detect_async(self) -> Changes {
-        self.finish_with(
-            host_observation_bounds(),
-            crate::post_action::background(),
-            observe_host,
-            crate::post_action::hold,
-        )
-        .await
+        let bounds = host_observation_bounds();
+        let background = crate::post_action::background();
+        let ids = self.window_ids.clone();
+        let front = self.front_pid;
+        let earlier = take_late();
+        let authority = cua_driver_core::blocking::ActionLeaseScope::capture();
+        let report_ids = ids.clone();
+        let started = Instant::now();
+        let mut changes = self
+            .finish_with(
+                bounds,
+                background,
+                move || loop {
+                    let current = observe_host();
+                    let changed = Self::diff(&report_ids, &current.0).0;
+                    if !background
+                        || !changed.is_empty()
+                        || current.1 != front
+                        || started.elapsed() >= REPORT_WINDOW.min(bounds.timeout)
+                    {
+                        return current;
+                    }
+                    std::thread::sleep(bounds.poll);
+                },
+                move |lease, deadline, generation| {
+                    crate::post_action::hold_observation(lease, deadline, generation, move || {
+                        authority
+                            .try_run_cleanup(|| {
+                                let (current, current_front) = observe_host();
+                                let new_windows = Self::diff(&ids, &current).0;
+                                let foreground_changed =
+                                    matches!((front, current_front), (Some(a), Some(b)) if a != b);
+                                if new_windows.is_empty() && !foreground_changed {
+                                    return false;
+                                }
+                                *lock(&LATE) = Some(Late {
+                                    at: Instant::now(),
+                                    new_windows,
+                                    foreground_changed,
+                                });
+                                true
+                            })
+                            .unwrap_or(false)
+                    })
+                },
+            )
+            .await;
+        if let Some(earlier) = earlier {
+            for window in earlier.new_windows {
+                if !changes
+                    .new_windows
+                    .iter()
+                    .any(|w| w.window_id == window.window_id)
+                {
+                    changes.new_windows.push(window);
+                }
+            }
+            changes.foreground_changed |= earlier.foreground_changed;
+        }
+        changes
     }
 
     async fn finish_with(

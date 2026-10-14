@@ -103,4 +103,14 @@ export { useThisMachine, type HostFailure, type HostFormView as HostSetupFormVie
 export type { HostFormAction, HostSetupRequest } from "./ops/host-setup";
 export type { TelemetrySignal } from "./ops/telemetry";
 export { useStartup, type StartupHook } from "./startup";
+export { expiresInText, PAIRING_POLL_MS, pairingUnsupported, usePairingCode, type PairingHook, type PairingPhase } from "./pairing";
 export { READY_STARTUP, type StartupAction, type StartupPhase, type StartupState } from "./ops/startup";
+export {
+  CHECKLIST_STEPS,
+  checklistComplete,
+  useChecklist,
+  type ChecklistHook,
+  type ChecklistState,
+  type ChecklistStep,
+} from "./checklist";
+export { formatHours, relayUsageLine, useRelayUsage, RELAY_USAGE_FOCUS_MS, RELAY_USAGE_POLL_MS, type RelayUsage } from "./relay-usage";

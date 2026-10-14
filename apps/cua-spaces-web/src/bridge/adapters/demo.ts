@@ -9,7 +9,7 @@
 
 import { Emitter, HostError, UnsupportedOperationError, type DataAdapter } from "../adapter";
 import type { AgentSetupRow, PersistentAgent } from "../contracts/agents";
-import type { OnboardingState } from "../contracts/host";
+import type { MachineRow, OnboardingState } from "../contracts/host";
 import type { KvItem } from "../contracts/keyvault";
 import type { SpaceOs, SpaceRow } from "../contracts/spaces";
 import {
@@ -44,6 +44,7 @@ import { demoVolumeHandlers, demoVolumeState, type DemoVolumeState } from "./dem
 import { demoHostSetupHandlers, demoHostSetupState, type DemoHostSetupState } from "./demo/host-setup";
 import { demoSpaceDetailHandlers, demoSpaceDetailState, type DemoSpaceDetailState } from "./demo/space-detail";
 import { demoTelemetryHandlers, demoTelemetryState, type DemoTelemetryState } from "./demo/telemetry";
+import { demoRelayUsageHandlers, demoRelayUsageState, type DemoRelayUsageState } from "./demo/relay-usage";
 import { demoStartupHandlers, demoStartupState, type DemoStartupState } from "./demo/startup";
 import { demoMachine, MAC_DEMO_PLATFORM, type DemoPlatform } from "./demo/platform";
 
@@ -112,8 +113,10 @@ export function createDemoAdapter(options: DemoOptions = {}): DataAdapter & { re
     runs: demoRunRecords(now()),
     agentSetup: demoAgentSetup(),
     platform: options.platform ?? MAC_DEMO_PLATFORM,
+    paired: [],
     volume: demoVolumeState(now(), options.onboarded !== false, options.platform),
     ...demoTelemetryState(),
+    ...demoRelayUsageState(),
     ...demoSpaceDetailState(),
     ...demoHostSetupState(now(), options.onboarded === false),
     ...demoStartupState(Boolean(options.keychain)),
@@ -269,7 +272,7 @@ export function createDemoAdapter(options: DemoOptions = {}): DataAdapter & { re
       return null;
     },
 
-    "machines.list": () => demoMachineRows(now(), state.host, state.platform),
+    "machines.list": () => [...demoMachineRows(now(), state.host, state.platform), ...state.paired.map((m) => ({ ...m, limits: [...m.limits] }))],
     "host.status": () => ({ ...state.host }),
 
     "settings.get": () => settingsSnapshot(),
@@ -431,8 +434,9 @@ export function createDemoAdapter(options: DemoOptions = {}): DataAdapter & { re
     ...demoShareHandlers({ wait, stepMs: step }),
     ...demoAgentKeysHandlers({ wait, stepMs: step, now }),
     ...demoVolumeHandlers({ state: state.volume, now, wait, step, emit, platform: state.platform }),
-    ...createDemoSettings({ now, wait, emit, stepMs: step, platform: state.platform, experiments: state.volume.experiments, signedIn: () => Boolean(state.identity), settings: () => state.settings, setSettings: (p) => ((state.settings = { ...state.settings, ...p }), emit({ type: "settings.changed" })) }),
+    ...createDemoSettings({ now, wait, emit, stepMs: step, platform: state.platform, experiments: state.volume.experiments, signedIn: () => Boolean(state.identity), settings: () => state.settings, setSettings: (p) => ((state.settings = { ...state.settings, ...p }), emit({ type: "settings.changed" })), addMachine: (m) => ((state.paired = [...state.paired, m]), emit({ type: "machines.changed" })) }),
     ...demoTelemetryHandlers(ctx),
+    ...demoRelayUsageHandlers(ctx),
     ...demoSpaceDetailHandlers(ctx),
     ...demoHostSetupHandlers(ctx),
     ...demoKeyvaultSetupHandlers(ctx),
@@ -459,7 +463,7 @@ export function createDemoAdapter(options: DemoOptions = {}): DataAdapter & { re
   };
 }
 
-export interface DemoState extends DemoTelemetryState, DemoSpaceDetailState, DemoHostSetupState, DemoStartupState, DemoNewSpaceState, DemoKeyvaultSetupState, DemoKeyvaultManageState {
+export interface DemoState extends DemoTelemetryState, DemoRelayUsageState, DemoSpaceDetailState, DemoHostSetupState, DemoStartupState, DemoNewSpaceState, DemoKeyvaultSetupState, DemoKeyvaultManageState {
   rows: SpaceRow[];
   items: KvItem[];
   keyvaultLocked: boolean;
@@ -475,4 +479,6 @@ export interface DemoState extends DemoTelemetryState, DemoSpaceDetailState, Dem
   agentSetup: AgentSetupRow[];
   volume: DemoVolumeState;
   platform: DemoPlatform;
+  /** Machines added with a pairing code ("Add a machine"). */
+  paired: MachineRow[];
 }

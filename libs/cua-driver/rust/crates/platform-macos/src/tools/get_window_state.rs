@@ -113,6 +113,22 @@ fn invalidate_capture_only_authority(
         .ok_or(cua_driver_core::element_token::RegistryError::NotCurrent)
 }
 
+/// Chromium stops painting and stops updating its accessibility tree while its
+/// window is not visible, which includes sitting on another Space (CUA-1351,
+/// cdb-v2-40: a click delivered off-Space only showed once the Space was shown).
+/// AppKit windows keep drawing, so they get no note.
+fn off_space_staleness_note(
+    on_current_space: Option<bool>,
+    chromium: bool,
+) -> Option<&'static str> {
+    (on_current_space == Some(false) && chromium).then_some(
+        "This browser window is on another Space. Chromium pauses painting and \
+         accessibility updates while its window is not visible, so this screenshot \
+         and tree can show an older state. This read is observation-only: obtain \
+         fresh state after the window is shown before using its pixels for an action.",
+    )
+}
+
 fn chromium_browser_window(pid: i32) -> bool {
     let identity = format!(
         "{} {}",
@@ -257,7 +273,13 @@ impl Tool for GetWindowStateTool {
         // a trusted direct in-process invocation can enable this mode.
         // `display_only` is the public form of the same mode: pixels for a
         // preview, with no snapshot or capture change.
-        let observation_only = display_only
+        let other_space_observation = cua_driver_core::blocking::spawn(move || {
+            crate::windows::window_on_current_space_by_id(window_id) == Some(false)
+        })
+        .await
+        .unwrap_or(true);
+        let mut observation_only = other_space_observation
+            || display_only
             || args
                 .get("_observation_only")
                 .and_then(|value| value.as_bool())
@@ -343,16 +365,6 @@ impl Tool for GetWindowStateTool {
         // this tool never does — so treat that as resolved.
         let scope_matched = window_scope.as_ref().is_none_or(|s| s.is_matched());
 
-        let removed = if !scope_matched && !observation_only {
-            match invalidate_capture_only_authority(&self.state.snapshots, pid, window_id) {
-                Ok(invalidated) => Some(invalidated),
-                Err(error) => return ToolResult::error(format!("snapshot invalidation failed: {error}"))
-                    .with_structured(serde_json::json!({"status":"refused","refusal":{"code":"snapshot_invalidation_failed","message":error.to_string()}})),
-            }
-        } else {
-            None
-        };
-
         let refresh_ticket = if !want_tree && should_capture && scope_matched && !observation_only {
             match self.state.snapshots.screenshot_refresh_ticket(
                 pid,
@@ -391,7 +403,7 @@ impl Tool for GetWindowStateTool {
         let screenshot = if should_capture {
             let out_file = screenshot_out_file.clone();
             let res = cua_driver_core::blocking::spawn(move || -> Result<
-                (
+                (bool, Result<(
                     Vec<u8>,
                     Option<String>,
                     u32,
@@ -400,18 +412,22 @@ impl Tool for GetWindowStateTool {
                     u32,
                     crate::windows::WindowBounds,
                     f64,
-                ),
+                ), super::px_frame::PxFrameError>),
                 super::px_frame::PxFrameError,
             > {
                 let bounds = crate::windows::window_bounds_by_id(window_id)
                     .filter(|b| b.width > 0.0 && b.height > 0.0)
                     .ok_or(super::px_frame::PxFrameError::WindowNotFound { window_id })?;
-                let raw = crate::capture::screenshot_window_bytes(window_id).map_err(|e| {
+                let capture = crate::capture::screenshot_window_capture(window_id).map_err(|e| {
                     super::px_frame::PxFrameError::CaptureUnavailable {
                         window_id,
                         reason: e.to_string(),
                     }
                 })?;
+                let capture_actionable = capture.actionable;
+                let raw = capture.bytes;
+                // Carry qualification even if validation, resizing or file output fails.
+                let frame = (|| {
                 let (orig_w, orig_h) = crate::capture::png_dimensions(&raw).map_err(|e| {
                     super::px_frame::PxFrameError::CaptureUnavailable {
                         window_id,
@@ -461,7 +477,16 @@ impl Tool for GetWindowStateTool {
                         scale,
                     ))
                 }
+                })();
+                Ok((capture_actionable, frame))
             }).await;
+            let res = match res {
+                Ok(Ok((capture_actionable, frame))) => {
+                    observation_only |= !capture_actionable;
+                    Ok(frame)
+                }
+                other => other.map(|result| result.map(|(_, frame)| frame).and_then(|frame| frame)),
+            };
             match res {
                 Ok(Ok((png, file_path, w, h, orig_w, orig_h, bounds, scale))) => {
                     if !observation_only {
@@ -480,6 +505,16 @@ impl Tool for GetWindowStateTool {
                     tracing::warn!("Screenshot task error for window {window_id}: {e}");
                     None
                 }
+            }
+        } else {
+            None
+        };
+
+        let removed = if !scope_matched && !observation_only {
+            match invalidate_capture_only_authority(&self.state.snapshots, pid, window_id) {
+                Ok(invalidated) => Some(invalidated),
+                Err(error) => return ToolResult::error(format!("snapshot invalidation failed: {error}"))
+                    .with_structured(serde_json::json!({"status":"refused","refusal":{"code":"snapshot_invalidation_failed","message":error.to_string()}})),
             }
         } else {
             None
@@ -862,7 +897,7 @@ impl Tool for GetWindowStateTool {
                 "height": bounds.height
             });
             structured["screenshot_scale"] = serde_json::json!(scale);
-            structured["screenshot_frame_valid"] = serde_json::json!(true);
+            structured["screenshot_frame_valid"] = serde_json::json!(!observation_only);
         }
         if let Some(error) = screenshot_frame_error {
             structured["screenshot_frame_valid"] = serde_json::json!(false);
@@ -883,6 +918,20 @@ impl Tool for GetWindowStateTool {
             if !info.title.is_empty() {
                 structured["window_title"] = serde_json::json!(info.title);
             }
+        }
+        let on_current_space = crate::windows::window_on_current_space_by_id(window_id);
+        if observation_only {
+            structured["observation_only"] = serde_json::json!(true);
+            structured["capture_authority"] =
+                serde_json::json!("unqualified_space_or_backing_store");
+        }
+        if on_current_space == Some(false) {
+            structured["on_current_space"] = serde_json::json!(false);
+        }
+        if let Some(note) = off_space_staleness_note(on_current_space, chromium_browser_window(pid))
+        {
+            structured["off_space_staleness"] = serde_json::json!(note);
+            content.push(Content::text(note));
         }
         cua_driver_core::window_inspection::mark_browser_chrome_capture_coverage(
             &mut structured,
@@ -1471,6 +1520,14 @@ mod capture_only_regression {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_off_space_chromium_windows_get_the_staleness_note() {
+        assert!(off_space_staleness_note(Some(false), true).is_some());
+        assert!(off_space_staleness_note(Some(false), false).is_none());
+        assert!(off_space_staleness_note(Some(true), true).is_none());
+        assert!(off_space_staleness_note(None, true).is_none());
+    }
     use crate::ax::tree::AXNode;
     use serde_json::json;
 

@@ -270,6 +270,13 @@ describe("electron adapter", () => {
     expect(invoke).toHaveBeenCalledWith(ELECTRON_BRIDGE_CHANNEL, expect.objectContaining({ method: "spaces.openStream", args: { spaceId: "local:a", tier: "tile" } }));
   });
 
+  it("asks the shell for the relay allowance (the SwiftUI app does not read it yet)", async () => {
+    const usage = { metered: true, period: "2026-10", plan: "free", team: null, liveSessions: 1, liveSessionsLimit: 2, hoursUsed: 6.5, hoursLimit: 20, myHoursUsed: 6.5, softLimitReached: false, reasons: [], upgradeUrl: null };
+    const { win, invoke } = electronHost(bridged(() => ({ ok: true, result: usage })));
+    expect(await createElectronAdapter(win).call("relay.usage", {})).toEqual(usage);
+    expect(invoke).toHaveBeenCalledWith(ELECTRON_BRIDGE_CHANNEL, expect.objectContaining({ method: "relay.usage" }));
+  });
+
   it("reads the first run from the shell and finishes it there (the SwiftUI app's is native)", async () => {
     const sent: [string, unknown][] = [];
     let completed = false;
@@ -749,6 +756,31 @@ describe("webkit adapter", () => {
       expect(hostFailure(e)).toEqual({ title: "Sign in to Cua", message: presented.message, details: presented.details, actionLabel: "Sign In" });
       // A plain error stays plain.
       expect(hostFailure(new HostError("nope", "failed"))).toEqual({ message: "nope" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("waits as long as a teleport run takes, past the call timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const report = { appId: "vscode", installed: ["code"], sent: [], imported: [], skipped: [], launched: true, warnings: [] };
+      let answer!: (a: Answer) => void;
+      const { win } = webkitHost((req) => (req.method === "teleport.run" ? new Promise<Answer>((r) => (answer = r)) : ok(null)));
+      const call = createWebkitAdapter(win, { timeoutMs: 1_000 }).call("teleport.run", {
+        spaceId: "local:dev",
+        plan: { json: "{}" } as never,
+        consent: {} as never,
+        runId: "run-1",
+      });
+      const settled = call.then(
+        (r) => ({ ok: true as const, r }),
+        (e: unknown) => ({ ok: false as const, e }),
+      );
+      // An install that downloads the app: minutes, not the call timeout.
+      await vi.advanceTimersByTimeAsync(120_000);
+      answer(ok(report));
+      expect(await settled).toEqual({ ok: true, r: report });
     } finally {
       vi.useRealTimers();
     }

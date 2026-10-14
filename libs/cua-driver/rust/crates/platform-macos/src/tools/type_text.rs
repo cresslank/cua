@@ -1520,41 +1520,59 @@ fn type_text_blocking(
                     // part of what activation resets: keep it too.
                     let selection = remembered
                         .and_then(|element| unsafe { copy_raw_attr(element, SELECTED_RANGE) });
-                    let mut typed_delivery = (false, None);
-                    let fronted = crate::input::skylight::with_foreground_assist(
-                        pid as libc::pid_t,
-                        wid,
-                        || {
-                            if !super::bring_to_front::activate_exact_window_blocking(pid, wid)
-                                || !await_front_settled(pid, wid)
-                            {
-                                anyhow::bail!(
-                                    "foreground browser target did not settle on the exact window"
-                                );
-                            }
-                            if let Some(element) = remembered {
-                                let _ = crate::input::ax_actions::focus_element(element as usize);
-                                if let Some(selection) = selection {
-                                    unsafe { set_raw_attr(element, SELECTED_RANGE, selection) };
+                    struct BrowserRestore {
+                        previous: Option<i32>,
+                        target: i32,
+                        remembered: Option<AXUIElementRef>,
+                        selection: Option<core_foundation::base::CFTypeRef>,
+                    }
+                    impl Drop for BrowserRestore {
+                        fn drop(&mut self) {
+                            unsafe {
+                                if let Some(selection) = self.selection {
+                                    CFRelease(selection);
+                                }
+                                if let Some(element) = self.remembered {
+                                    CFRelease(element as _);
                                 }
                             }
-                            // The remembered field is focused again; the read-back
-                            // follows the focused element.
-                            typed_delivery = do_type(element_ptr_and_idx)?;
-                            Ok(())
-                        },
-                    );
-                    unsafe {
-                        if let Some(selection) = selection {
-                            CFRelease(selection);
+                            if crate::input::skylight::front_process_pid() == Some(self.target)
+                                && !crate::key_focus_guard::user_switched_recently()
+                            {
+                                if let Some(previous) = self.previous {
+                                    super::bring_to_front::reactivate_application(previous);
+                                }
+                            }
                         }
+                    }
+                    let _restore = BrowserRestore {
+                        previous: previous_pid,
+                        target: pid,
+                        remembered,
+                        selection,
+                    };
+                    let mut typed_delivery = (false, None);
+                    let fronted: anyhow::Result<bool> = (|| {
+                        cua_driver_core::blocking::check_cancelled()?;
+                        if !super::bring_to_front::activate_exact_window_blocking(pid, wid)
+                            || !await_front_settled(pid, wid)
+                        {
+                            anyhow::bail!(
+                                "foreground browser target did not settle on the exact window"
+                            );
+                        }
+                        cua_driver_core::blocking::check_cancelled()?;
                         if let Some(element) = remembered {
-                            CFRelease(element as core_foundation::base::CFTypeRef);
+                            let _ = crate::input::ax_actions::focus_element(element as usize);
+                            cua_driver_core::blocking::check_cancelled()?;
+                            if let Some(selection) = selection {
+                                unsafe { set_raw_attr(element, SELECTED_RANGE, selection) };
+                            }
                         }
-                    }
-                    if let Some(previous_pid) = previous_pid {
-                        super::bring_to_front::reactivate_application(previous_pid);
-                    }
+                        cua_driver_core::blocking::check_cancelled()?;
+                        typed_delivery = do_type(element_ptr_and_idx)?;
+                        Ok(true)
+                    })();
                     fronted.map(|fronted| (typed_delivery, fronted))
                 })?
             }
@@ -1650,6 +1668,7 @@ fn type_text_blocking(
         };
         let readback_element =
             unsafe { crate::ax::readback_observer::ReadbackElement::new(element) };
+        cua_driver_core::blocking::check_cancelled()?;
         let err = unsafe { set_string_attr(element, "AXSelectedText", text) };
         let returned_at = std::time::Instant::now();
         // Gecko updates AXValue asynchronously after an AXSelectedText write.
@@ -1680,12 +1699,17 @@ fn type_text_blocking(
         ax_readback = measurement;
         // Remove the worker's run-loop source before any return or fallback.
         drop(observer);
+        let document = if ax_progress == AxReadbackResult::Observed(TypedProgress::Complete) {
+            unsafe { crate::document_edit::ensure_marked_after_ax_write(pid, element, false) }
+        } else {
+            crate::document_edit::DocumentEdited::NotADocument
+        };
         let idx_str = idx_opt.map(|i| format!(" [{i}]")).unwrap_or_default();
         if let Some(delivery) = ax_readback_delivery(
             ax_progress,
             ax_readback,
             text.chars().count(),
-            &format!("{idx_str} {role} \"{title}\""),
+            &format!("{idx_str} {role} \"{title}\"{}", document.note()),
         ) {
             return Ok(delivery);
         }

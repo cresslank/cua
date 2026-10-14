@@ -52,10 +52,12 @@ mod shell;
 mod skills;
 #[doc(hidden)]
 pub mod stream_probe;
+mod team_cmd;
 mod telemetry_cmd;
 pub mod teleport;
 pub mod teleport_session;
 mod trajectory;
+mod usage_cmd;
 pub mod util;
 
 use clap::{ArgAction, CommandFactory, FromArgMatches, Parser, Subcommand};
@@ -230,6 +232,29 @@ enum Command {
   cua devices audit"
     )]
     Devices(devices_cmd::DevicesCmd),
+    /// Teams: share machines with every member and their agents. Owners
+    /// and admins invite (email or link), approve member devices, add
+    /// machines and read the audit log.
+    #[command(
+        subcommand,
+        after_help = "Examples:
+  cua team create AIGIS
+  cua team invite AIGIS dillon@example.com
+  cua team add-machine AIGIS local:build-box
+  cua team approve AIGIS dev_0123456789abcdef01234567
+  cua team audit AIGIS"
+    )]
+    Team(team_cmd::TeamCmd),
+    /// Your relay allowance this month: live sessions, relay hours, and
+    /// your plan. Spaces on your own network use none of it.
+    #[command(after_help = "Examples:
+  cua usage
+  cua usage --json")]
+    Usage {
+        /// Relay URL (default $CUA_RELAY_URL, else the CUA_ENV relay, https://relay.cua.ai in production).
+        #[arg(long)]
+        relay: Option<String>,
+    },
     /// Move a desktop app session (tabs, profile, sign-in) into a sandbox.
     #[command(subcommand)]
     Teleport(teleport::TeleportCmd),
@@ -1665,6 +1690,28 @@ async fn run(cli: Cli, out: &mut dyn Write) -> Result<i32, CuaError> {
         Command::Devices(cmd) => {
             return devices_cmd::run(cmd, &util::cua_home(), json, out).await;
         }
+        // Adding a machine is sharing the Space with the team: the same
+        // path as `cua spaces share <space> team:<id>` (attach, confirm).
+        Command::Team(team_cmd::TeamCmd::AddMachine { team, space, yes }) => {
+            let auth = devices_cmd::device_auth(&host::relay_url(None, &util::cua_home()))?;
+            let id = team_cmd::resolve_team(&auth, &team).await?;
+            let share = Cli {
+                command: Command::Spaces(host::SpacesCmd::Share {
+                    space,
+                    who: format!("team:{id}"),
+                    role: "editor".into(),
+                    yes,
+                }),
+                ..cli
+            };
+            return Box::pin(run(share, out)).await;
+        }
+        Command::Team(cmd) => {
+            return team_cmd::run(cmd, &util::cua_home(), json, out).await;
+        }
+        Command::Usage { relay } => {
+            return usage_cmd::run(relay, &util::cua_home(), json, out).await;
+        }
         // A machine that provides Spaces over its direct address: kept in
         // this cua home's registry, which the daemon reads too.
         Command::Spaces(cmd @ host::SpacesCmd::Add { host: true, .. }) => {
@@ -1711,12 +1758,17 @@ async fn run(cli: Cli, out: &mut dyn Write) -> Result<i32, CuaError> {
                 // already has it; an embedded runtime gets it here), and
                 // an embedded runtime confirms on the terminal.
                 host::attach_relay_account(&cua, || host::daemon_relay_account(&util::cua_home()));
-                if let Some(rt) = cua.embedded_runtime()
-                    && !rt.spaces().has_share_consent()
-                {
-                    let yes = matches!(cmd, host::SpacesCmd::Share { yes: true, .. });
-                    rt.spaces()
-                        .set_share_consent(Some(Arc::new(host::TerminalConsent { yes })));
+                let yes = matches!(cmd, host::SpacesCmd::Share { yes: true, .. });
+                if let Some(rt) = cua.embedded_runtime() {
+                    if !rt.spaces().has_share_consent() {
+                        rt.spaces()
+                            .set_share_consent(Some(Arc::new(host::TerminalConsent { yes })));
+                    }
+                } else if matches!(cmd, host::SpacesCmd::Share { .. }) {
+                    // The daemon asks for user presence on this computer.
+                    use std::io::IsTerminal as _;
+                    host::daemon_share_gate(yes, std::io::stdin().is_terminal())?;
+                    eprintln!("Confirm the share on this computer (Touch ID or your password).");
                 }
             }
             return host::run_spaces_sdk(&cua, cmd, json, out).await;
@@ -2052,6 +2104,8 @@ async fn run_sdk(cli: Cli, out: &mut dyn Write) -> Result<i32, CuaError> {
         | Command::Spaces(_)
         | Command::Cloud(_)
         | Command::Devices(_)
+        | Command::Team(_)
+        | Command::Usage { .. }
         | Command::Fleet(_)
         | Command::Teleport(_)
         | Command::Cache(_)
@@ -2449,6 +2503,16 @@ pub fn main() {
     #[cfg(windows)]
     keep_stdio_out_of_children();
     promote_spacesd_env_vars();
+    // `CUA_ENV` picks every endpoint and the cua home: a typo must not fall
+    // back to production silently.
+    if let Err(e) = cua_home::env::CuaEnv::try_current() {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
+    // SAFETY: still first in `main`, before any other thread exists. Pins
+    // `CUA_HOME` for a non-production `CUA_ENV` so every component and
+    // child process (the daemon) uses that environment's home.
+    unsafe { cua_home::env::pin_home() };
     let matches = Cli::command().get_matches();
     let command = command_path(&matches);
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());

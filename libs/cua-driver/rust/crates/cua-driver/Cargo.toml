@@ -105,6 +105,9 @@ base64 = { workspace = true }
 tempfile = "3"
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
+# Private session and accessibility buses for the AT-SPI listener tests: the
+# test owns `org.a11y.Bus` and `org.a11y.atspi.Registry` itself and reads
+# the bus daemon's per-connection statistics.
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]

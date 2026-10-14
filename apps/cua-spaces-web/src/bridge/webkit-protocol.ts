@@ -110,6 +110,9 @@ export const WEBKIT_METHODS = [
   "devices.rename",
   "devices.revoke",
   "devices.confirmMachine",
+  "devices.createPairingCode",
+  "devices.pairingCodes",
+  "devices.revokePairingCode",
   "storage.get",
   "storage.run",
   "notifications.list",
@@ -147,8 +150,9 @@ export type WebkitMethod = (typeof WEBKIT_METHODS)[number];
  * page (WebCodecs), so the page asks it for a media ticket
  * (`ops/stream.ts`), and its first run is this page's (`onboarding.get`,
  * `onboarding.complete`); the Mac app draws video and its first run
- * natively. */
-export const ELECTRON_HOST_METHODS = ["onboarding.get", "onboarding.complete", "spaces.openStream"] as const;
+ * natively. It also reads the account's relay allowance
+ * (`relay.usage`, `ops/relay-usage.ts`). */
+export const ELECTRON_HOST_METHODS = ["onboarding.get", "onboarding.complete", "spaces.openStream", "relay.usage"] as const;
 
 /** `onboarding.get` and `onboarding.complete`'s answer: whether the first run finished, and as what. */
 export interface WkOnboarding {
@@ -160,6 +164,8 @@ export type HostMethod = WebkitMethod | (typeof ELECTRON_HOST_METHODS)[number];
 
 /** The app menu's Settings command (⌘,) while the SwiftUI app's New UI window is in front: go to Settings. */
 export const WEBKIT_OPEN_SETTINGS_EVENT = "settings.openRequested";
+/** The app menu's Help > Getting Started: show the getting-started checklist again. */
+export const WEBKIT_OPEN_CHECKLIST_EVENT = "checklist.openRequested";
 
 export const WEBKIT_EVENTS = [
   "spaces.changed",

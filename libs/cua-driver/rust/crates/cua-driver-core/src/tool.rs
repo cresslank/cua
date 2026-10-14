@@ -218,7 +218,13 @@ fn unknown_argument(def: &ToolDef, args: &Value) -> Option<String> {
             let paired_index = name.as_str() == "element_index"
                 && properties.is_some_and(|p| p.contains_key("element_token"))
                 && args.get("element_token").and_then(Value::as_str).is_some();
-            !paired_index && !properties.is_some_and(|p| p.contains_key(*name))
+            // Legacy set_config is a wire-only compatibility form. Never
+            // rewrite it: policy, recording and native handlers need the exact pair.
+            let config_pair = def.name == "set_config"
+                && args.get("key").and_then(Value::as_str).is_some()
+                && args.get("value").is_some()
+                && matches!(name.as_str(), "key" | "value");
+            !paired_index && !config_pair && !properties.is_some_and(|p| p.contains_key(*name))
         })
         .map(String::as_str)
         .collect();
@@ -268,10 +274,34 @@ fn unknown_argument(def: &ToolDef, args: &Value) -> Option<String> {
 /// validation, so a batch step accepts what a direct call accepts. `Err` is a
 /// refusal detail for an alias that cannot be translated.
 pub(crate) fn normalize_argument_aliases(tool_name: &str, args: &mut Value) -> Result<(), String> {
+    if cfg!(target_os = "linux") && tool_name == "set_value" {
+        if let Some(value @ Value::Number(_)) = args.get_mut("value") {
+            *value = Value::String(value.to_string());
+        }
+    }
     normalize_zoom_args(tool_name, args);
     normalize_key_args(tool_name, args);
     normalize_menu_args(tool_name, args);
-    normalize_scroll_args(tool_name, args)
+    normalize_scroll_args(tool_name, args)?;
+    validate_set_config_compatibility_args(tool_name, args)
+}
+
+/// Validate the unadvertised compatibility pair without changing its wire shape.
+fn validate_set_config_compatibility_args(tool_name: &str, args: &Value) -> Result<(), String> {
+    let Some(object) = args.as_object().filter(|_| tool_name == "set_config") else {
+        return Ok(());
+    };
+    match (object.get("key"), object.get("value")) {
+        (None, None) => Ok(()),
+        (Some(Value::String(key)), Some(_))
+            if !key.starts_with('_') && !matches!(key.as_str(), "key" | "value" | "session") =>
+        {
+            Ok(())
+        }
+        (Some(Value::String(key)), Some(_)) => Err(format!("key '{key}' is reserved")),
+        (Some(_), _) => Err("key requires an exact value".into()),
+        (None, Some(_)) => Err("value requires an exact key".into()),
+    }
 }
 
 /// `invoke_menu` takes `path` as a list of labels. Models also send
@@ -606,8 +636,6 @@ pub(crate) fn advertised_runtime_input_schema(tool_name: &str, schema: &Value) -
     if !crate::action_target::supports_typed_target(tool_name) {
         return schema;
     }
-    // Reuse the portable contract's exact tagged-union schema while retaining
-    // the live runtime's broader legacy `scope=window|desktop` decoder.
     if let Some(portable) = cua_driver_contract::tool_contract(tool_name) {
         if let Some(portable_properties) = portable
             .input_schema
@@ -627,6 +655,12 @@ pub(crate) fn advertised_runtime_input_schema(tool_name: &str, schema: &Value) -
 /// only the new name, and its result ends with a one-line deprecation note.
 /// To be removed in a future release.
 pub const RENAMED_TOOLS: &[(&str, &str)] = &[("run_actions", crate::batch_tools::RUN_STEPS_TOOL)];
+
+/// `~/.cua-driver/config.json` key that turns `run_script` off when `true`.
+pub const DISABLE_CONFIG_KEY: &str = "disable_run_script";
+/// Legacy `~/.cua-driver/config.json` key. `false` turns `run_script` off;
+/// `true` changes nothing.
+pub const LEGACY_CONFIG_KEY: &str = "experimental_script";
 
 /// The current name of a renamed tool, or `None` when `name` is not an old name.
 pub fn renamed_tool(name: &str) -> Option<&'static str> {
@@ -1900,6 +1934,37 @@ impl ToolRegistry {
             );
         }
 
+        if resolved_name == "set_config"
+            && (args.get("capture_scope").is_some()
+                || args.get("key").and_then(Value::as_str) == Some("capture_scope"))
+        {
+            return ToolResult::error(
+                "config key 'capture_scope' is retired; select a window or desktop target on each action",
+            )
+            .with_structured(serde_json::json!({
+                "code": "config_key_retired",
+                "key": "capture_scope",
+                "replacement": "action.target",
+            }));
+        }
+        if let Some(key) = [DISABLE_CONFIG_KEY, LEGACY_CONFIG_KEY]
+            .into_iter()
+            .find(|key| {
+                resolved_name == "set_config"
+                    && (args.get(key).is_some()
+                        || args.get("key").and_then(Value::as_str) == Some(*key))
+            })
+        {
+            return ToolResult::error(format!(
+                "config key '{key}' is set by whoever runs cua-driver, in \
+                 ~/.cua-driver/config.json or the environment, not through set_config"
+            ))
+            .with_structured(serde_json::json!({
+                "code": "config_key_operator_only",
+                "key": key,
+            }));
+        }
+
         if let Some(detail) = unknown_argument {
             return protected_refusal(
                 "invalid_arguments",
@@ -3062,20 +3127,6 @@ impl ToolRegistry {
         context: &crate::session_authorization::EffectiveAuthorizationContext,
         lifecycle_session: Option<&str>,
     ) -> Result<(), ToolResult> {
-        if args.get("capture_scope").is_some()
-            || args.get("key").and_then(Value::as_str) == Some("capture_scope")
-        {
-            return Err(
-                ToolResult::error(
-                    "config key 'capture_scope' is retired; select a window or desktop target on each action",
-                )
-                .with_structured(serde_json::json!({
-                    "code": "config_key_retired",
-                    "key": "capture_scope",
-                    "replacement": "action.target",
-                })),
-            );
-        }
         if context.mode() == crate::authorization::PermissionMode::Unrestricted
             && context.capability_manifest().is_none()
         {
@@ -3094,33 +3145,23 @@ impl ToolRegistry {
             if key == "session" || key.starts_with('_') {
                 continue;
             }
-            if !properties.contains_key(key) {
+            // Review the referenced field, but retain the original pair in
+            // exact_changes and in the arguments passed to the native handler.
+            let reviewed_key = if matches!(key.as_str(), "key" | "value") {
+                object.get("key").and_then(Value::as_str).unwrap_or(key)
+            } else {
+                key
+            };
+            if !properties.contains_key(reviewed_key) {
                 return Err(protected_scope_refusal(&format!(
-                    "set_config field '{key}' is not present in the concrete tool schema"
+                    "set_config field '{reviewed_key}' is not present in the concrete tool schema"
                 )));
             }
         }
 
         let mut exact = serde_json::Map::new();
-        if let Some(key) = args.get("key").and_then(Value::as_str) {
-            if matches!(key, "key" | "value" | "session" | "_session_id")
-                || !properties.contains_key(key)
-            {
-                return Err(protected_scope_refusal(&format!(
-                    "set_config key '{key}' is not present in the concrete tool schema"
-                )));
-            }
-            let value = args
-                .get("value")
-                .ok_or_else(|| protected_scope_refusal("set_config key requires an exact value"))?;
-            exact.insert(key.to_owned(), value.clone());
-        } else if args.get("value").is_some() {
-            return Err(protected_scope_refusal(
-                "set_config value requires an exact key",
-            ));
-        }
         for (key, value) in object {
-            if matches!(key.as_str(), "session" | "key" | "value") || key.starts_with('_') {
+            if key == "session" || key.starts_with('_') {
                 continue;
             }
             exact.insert(key.clone(), value.clone());
@@ -4430,8 +4471,6 @@ mod runtime_isolation_tests {
             serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "key": {"type": "string"},
-                    "value": {},
                     "max_image_dimension": {"type": "integer"},
                     "experimental_pip": {"type": "boolean"}
                 },
@@ -6163,10 +6202,23 @@ resources:
                     "value": true,
                     "session": "config"
                 }),
-                context,
+                context.clone(),
             )
             .await;
         assert_eq!(unknown.is_error, Some(true));
+        for key in ["disable_run_script", "experimental_script"] {
+            for args in [
+                serde_json::json!({"key": key, "value": true}),
+                serde_json::json!({key: true}),
+            ] {
+                let refused = registry
+                    .invoke_with_context("set_config", args.clone(), context.clone())
+                    .await;
+                let structured = refused.structured_content.unwrap();
+                assert_eq!(structured["code"], "config_key_operator_only", "{args}");
+                assert_eq!(structured["key"], key, "{args}");
+            }
+        }
         assert_eq!(hits.load(Ordering::SeqCst), 3);
         assert_eq!(provider.requests.load(Ordering::SeqCst), 0);
     }

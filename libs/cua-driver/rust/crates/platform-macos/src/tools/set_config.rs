@@ -30,7 +30,7 @@ fn with_cursor_motion_properties(mut schema: Value) -> Value {
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "set_config".into(),
-        description: "Update cua-driver-rs configuration. Changes to \
+        description: "Update cua-driver-rs configuration. Prefer typed per-field arguments; legacy {key, value} remains accepted as a compatibility wire form. Changes to \
             max_image_dimension and agent_cursor_glide_duration_ms take effect immediately. Named sessions override these in memory; anonymous CLI calls persist them. The \
             experimental_pip keys are persisted to ~/.cua-driver/config.json and \
             take effect on the next daemon restart (the PiP backend is \
@@ -46,15 +46,6 @@ fn def() -> &'static ToolDef {
         input_schema: with_cursor_motion_properties(serde_json::json!({
             "type": "object",
             "properties": {
-                "key": {
-                    "type": "string",
-                    "description": "Name of a single config field to write ({key, value} shape, \
-                        matching the CLI `config set` and the Windows/Linux tools). Pair with `value`. \
-                        Equivalent to passing the field directly."
-                },
-                "value": {
-                    "description": "New value for `key`. JSON type depends on the key."
-                },
                 "agent_cursor_glide_duration_ms": cua_driver_core::agent_cursor::glide_duration_config_schema(),
                 "max_image_dimension": {
                     "type": "integer",

@@ -8961,16 +8961,8 @@ impl Tool for SetConfigTool {
     fn def(&self) -> &ToolDef {
         SCFG_DEF.get_or_init(|| ToolDef {
             name: "set_config".into(),
-            // Description ported from Swift `SetConfigTool.swift`.  Windows
-            // accepts BOTH Swift's `{key, value}` dotted-path shape AND a
-            // legacy per-field shape; documented as intentional.
             description: "Write a setting into the persistent driver config. Values take \
-                effect immediately.\n\n\
-                Two input shapes:\n\
-                - **Swift-compatible** (preferred): `{\"key\": \"max_image_dimension\", \"value\": 1568}` \
-                  — single dotted-path leaf write.\n\
-                - **Legacy per-field** (Rust-only): `{\"max_image_dimension\": 0}` \
-                  — bulk write of named fields.\n\n\
+                effect immediately. Prefer typed per-field arguments. Legacy {key, value} remains accepted as a compatibility wire form.\n\n\
                 Known keys:\n\
                 - `capture_mode` (string: `vision` | `ax` | `som`) — DEPRECATED and ignored; \
                   `get_window_state` always returns both the UIA tree and a screenshot. Still \
@@ -8979,16 +8971,14 @@ impl Tool for SetConfigTool {
                 - `max_image_dimension` (integer)\n\
                 - `experimental_pip` (boolean; persisted to config.json, applies on next daemon restart — Windows backend stubbed today, see issue #1729)\n\
                 - `experimental_pip_geometry` (string `WxH` or `WxH+X+Y`; persisted; applies on next daemon restart)\n\n\
-                - `cursor.motion.style`, `cursor.motion.timing`, `cursor.motion.effects.<name>` — saved default cursor motion for sessions started afterwards (see the cursor docs).\n\n\
+                - `cursor.motion.style`, `cursor.motion.timing`, `cursor.motion.effects.<name>` (`on`, `off`, or `default`) — saved default cursor motion for sessions started afterwards. `cursor.motion: \"default\"` clears every saved cursor motion default.\n\n\
                 Returns the full updated config in the same shape as `get_config`.".into(),
             input_schema: with_cursor_motion_config_properties(json!({"type":"object","properties":{
-                "key":{"type":"string","description":"Dotted snake_case path to a leaf config field (Swift-compatible shape). Pair with `value`."},
-                "value":{"description":"New value for `key`. JSON type depends on the key."},
                 "capture_mode":{"type":"string","enum":["ax","vision"],"description":"DEPRECATED and ignored — get_window_state always returns both the UIA tree and a screenshot. Still accepted/persisted for back-compat but has no effect. (\"som\"/\"screenshot\" still decode as deprecated aliases.)"},
                 "agent_cursor_glide_duration_ms": cua_driver_core::agent_cursor::glide_duration_config_schema(),
-                "max_image_dimension":{"type":"integer","description":"Legacy per-field shape."},
-                "experimental_pip":{"type":"boolean","description":"Legacy per-field shape. Enables PiP preview (applies next restart)."},
-                "experimental_pip_geometry":{"type":"string","description":"Legacy per-field shape. PiP window size + optional position."}
+                "max_image_dimension":{"type":"integer","description":"Max dimension for screenshot resizing (0 = no limit)."},
+                "experimental_pip":{"type":"boolean","description":"Enables PiP preview (applies next restart)."},
+                "experimental_pip_geometry":{"type":"string","description":"PiP window size + optional position."}
             },"additionalProperties":false})),
             read_only: false, destructive: false, idempotent: true, open_world: false,
         })
@@ -9160,9 +9150,7 @@ impl Tool for SetConfigTool {
             applied = true;
         }
         if !applied {
-            return ToolResult::error(
-                "Missing required string field `key` (or a known legacy per-field).",
-            );
+            return ToolResult::error("set_config did not contain a known field.");
         }
         // Emit the same pretty-JSON payload as `get_config` (matches Swift's
         // `set_config` return shape — both tools echo the full config after).

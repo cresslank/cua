@@ -26,7 +26,8 @@ export const METHODS = [
   "agents.setupDriver",
   "about.get", "about.set", "about.checkNow", "loginItem.get", "loginItem.set", "loginItem.openSettings",
   "devices.get", "devices.enroll", "devices.checkEnrolled", "devices.approve", "devices.rename",
-  "devices.revoke", "devices.confirmMachine", "storage.get", "storage.run",
+  "devices.revoke", "devices.confirmMachine", "devices.createPairingCode", "devices.pairingCodes",
+  "devices.revokePairingCode", "storage.get", "storage.run",
   "notifications.list", "notifications.markAllRead",
   "telemetry.track", "spaces.usage", "spaces.windows", "stream.pip",
   "spaces.thumbnail",
@@ -41,8 +42,9 @@ export const METHODS = [
   "startup.get", "startup.act",
 ] as const;
 
-/** A live desktop's media ticket for the page's WebCodecs player, and the
- * first run's state (the SwiftUI app draws its first run natively). */
-export const ELECTRON_METHODS = ["onboarding.get", "onboarding.complete", "spaces.openStream"] as const;
+/** A live desktop's media ticket for the page's WebCodecs player, the
+ * first run's state (the SwiftUI app draws its first run natively), and the
+ * account's relay allowance. */
+export const ELECTRON_METHODS = ["onboarding.get", "onboarding.complete", "spaces.openStream", "relay.usage"] as const;
 
 export type Method = (typeof METHODS)[number] | (typeof ELECTRON_METHODS)[number];

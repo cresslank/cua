@@ -54,10 +54,12 @@ import { webkitKeyvaultSetupOps } from "../ops/keyvault-setup";
 import { webkitSettingsOps } from "../ops/settings";
 import { startupFromHost, webkitStartupOps } from "../ops/startup";
 import { unsupportedStreamOps, type StreamTicket } from "../ops/stream";
+import { unsupportedRelayUsageOps, type RelayUsage } from "../ops/relay-usage";
 import type { SpaceRow } from "../contracts/spaces";
 import {
   isWebkitResponse,
   WEBKIT_EVENT,
+  WEBKIT_OPEN_CHECKLIST_EVENT,
   WEBKIT_OPEN_SETTINGS_EVENT,
   type HostMethod,
   type WebkitEventDetail,
@@ -573,6 +575,8 @@ export function createWebkitAdapter(
     ...(electron
       ? { "spaces.openStream": (target: OpArgs<"spaces.openStream">) => request<StreamTicket>("spaces.openStream", { ...target }) }
       : unsupportedStreamOps("webkit")),
+    // The relay allowance: Electron reads it; the Mac app not yet.
+    ...(electron ? { "relay.usage": () => request<RelayUsage | null>("relay.usage") } : unsupportedRelayUsageOps("webkit")),
   };
 
   const onEvent = (detail: WebkitEventDetail) => {
@@ -586,10 +590,10 @@ export function createWebkitAdapter(
       requestNewSpace(typeof on === "string" && on ? on : null);
       return;
     }
-    // The Electron menu's Settings… (⌘,): the same window event the SwiftUI
+    // The Electron menu's Settings… (⌘,) and Help > Getting Started: the same window event the SwiftUI
     // host sends, which the page's key bindings answer (the SwiftUI host's
     // already arrives as one).
-    if (detail?.event === WEBKIT_OPEN_SETTINGS_EVENT) {
+    if (detail?.event === WEBKIT_OPEN_SETTINGS_EVENT || detail?.event === WEBKIT_OPEN_CHECKLIST_EVENT) {
       if (electron) (win as unknown as Partial<Window>).dispatchEvent?.(new CustomEvent(WEBKIT_EVENT, { detail }));
       return;
     }

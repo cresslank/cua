@@ -108,6 +108,18 @@ where
         None
     };
 
+    // Hand key focus back to the user's app if the target opens a menu
+    // (popup, select, context menu) while it is in the background.
+    let _key_focus = match target_pid {
+        Some(tp) if prior_frontmost != Some(tp) => {
+            cua_driver_core::blocking::spawn(move || crate::key_focus_guard::protect(tp))
+                .await
+                .ok()
+                .flatten()
+        }
+        _ => None,
+    };
+
     let result = f().await;
     let generation = crate::post_action::generation();
 

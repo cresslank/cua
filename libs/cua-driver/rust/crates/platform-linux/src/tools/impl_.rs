@@ -12805,20 +12805,19 @@ impl Tool for SetConfigTool {
             description: "Update cua-driver-rs configuration. capture_mode / \
                 max_image_dimension and agent_cursor_glide_duration_ms take effect immediately.\n\n\
                 Two input shapes (both accepted, matching Windows/Swift):\n\
-                - **{key, value}** (preferred): `{\"key\": \"max_image_dimension\", \"value\": 800}` \
+                - **Legacy {key, value} compatibility wire form**: `{\"key\": \"max_image_dimension\", \"value\": 800}` \
                   — single leaf write.\n\
-                - **Legacy per-field**: `{\"capture_mode\": \"som\", \"max_image_dimension\": 0}`.\n\n\
+                - **Typed per-field (preferred)**: `{\"capture_mode\": \"ax\", \"max_image_dimension\": 0}`.\n\n\
                 The experimental_pip keys persist to ~/.cua-driver/config.json and apply on next \
                 daemon restart (the PiP backend is initialised once at startup; \
                 Linux ships only the trait stub today — see issue #1729).\n\n\
                 `cursor.motion.style`, `cursor.motion.timing` and `cursor.motion.effects.<name>` \
-                save the default cursor motion for sessions started afterwards.".into(),
+                (`on`, `off`, or `default`) save the default cursor motion for sessions started afterwards. \
+                `cursor.motion: \"default\"` clears every saved cursor motion default.".into(),
             input_schema: with_cursor_motion_config_properties(json!({"type":"object","properties":{
-                "key":{"type":"string","description":"Name of a single config field to write ({key, value} shape). Pair with `value`."},
-                "value":{"description":"New value for `key`. JSON type depends on the key."},
-                "capture_mode":{"type":"string","enum":["ax","vision"],"description":"Legacy per-field shape. Default capture mode for get_window_state. (\"som\"/\"screenshot\" still decode as deprecated aliases.)"},
+                "capture_mode":{"type":"string","enum":["ax","vision"],"description":"Default capture mode for get_window_state. (\"som\"/\"screenshot\" still decode as deprecated aliases.)"},
                 "agent_cursor_glide_duration_ms": cua_driver_core::agent_cursor::glide_duration_config_schema(),
-                "max_image_dimension":{"type":"integer","description":"Legacy per-field shape. Max dimension for screenshot resizing (0 = no limit)."},
+                "max_image_dimension":{"type":"integer","description":"Max dimension for screenshot resizing (0 = no limit)."},
                 "experimental_pip":{"type":"boolean","description":"Enable the experimental PiP preview window (applies next restart; Linux backend stubbed)."},
                 "experimental_pip_geometry":{"type":"string","description":"PiP window size + optional position in `WxH` or `WxH+X+Y` form."}
             },"additionalProperties":false})),

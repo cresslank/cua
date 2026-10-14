@@ -247,11 +247,23 @@ pub(crate) fn activate_exact_window_blocking(pid: i32, window_id: u32) -> bool {
     else {
         return false;
     };
+    if cua_driver_core::blocking::check_cancelled().is_err() {
+        return false;
+    }
     crate::input::skylight::set_front_process_persistently(pid, window_id);
+    if cua_driver_core::blocking::check_cancelled().is_err() {
+        return false;
+    }
     crate::input::skylight::make_exact_window_key(pid, window_id);
+    if cua_driver_core::blocking::check_cancelled().is_err() {
+        return false;
+    }
     unsafe {
         app.activateWithOptions(NSApplicationActivationOptions::NSApplicationActivateAllWindows)
     };
+    if cua_driver_core::blocking::check_cancelled().is_err() {
+        return false;
+    }
     raise_exact_ax_window(pid, window_id);
     wait_for_exact_window(pid, window_id).exact_postcondition(pid, window_id)
 }
@@ -366,7 +378,8 @@ impl Tool for BringToFrontTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        crate::post_action::cancel();
+        crate::window_change_detector::end_tail();
+        crate::window_change_detector::note_intentional_activation();
         let pid = match args.get("pid").and_then(Value::as_i64) {
             Some(p) => match libc::pid_t::try_from(p) {
                 Ok(pid) => pid,

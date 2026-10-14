@@ -6,9 +6,11 @@ import { lazy, Suspense, useEffect, useRef } from "react";
 
 import { useBridge, useSavedOnboarding, useSession, useStartup } from "@/bridge";
 
+import { ChecklistTracker } from "@/components/getting-started";
 import { NewSpace } from "@/components/new-space";
 import { CommandPalette } from "@/components/shell/command-palette";
 import { Sidebar } from "@/components/shell/sidebar";
+import { RelayAllowanceNotice } from "@/components/shell/relay-allowance-notice";
 import { SpacesNotice } from "@/components/shell/spaces-notice";
 import { SpaceSheets } from "@/components/space-sheets";
 import { TopBar } from "@/components/shell/top-bar";
@@ -63,11 +65,13 @@ function RootLayout() {
       <div className="flex min-w-0 flex-1 flex-col bg-background">
         <TopBar />
         <SpacesNotice />
+        <RelayAllowanceNotice />
         <main className="min-h-0 flex-1">
           <Outlet />
         </main>
       </div>
       <CommandPalette />
+      <ChecklistTracker />
       <NewSpace />
       <SpaceSheets />
     </div>

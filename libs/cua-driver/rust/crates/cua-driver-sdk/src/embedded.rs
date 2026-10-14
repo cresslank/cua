@@ -919,6 +919,7 @@ pub(crate) fn inherited_runtime_environment_name(name: &str) -> bool {
             | "CUA_DRIVER_RS_HOME"
             | "CUA_DRIVER_RS_RECORDING_IDLE_TTL_SECS"
             | "CUA_DRIVER_RS_SESSION_IDLE_TTL_SECS"
+            | "CUA_DRIVER_RS_UPDATE_CHECK"
             | "CUA_DRIVER_RS_TELEMETRY_ENABLED"
             | "CUA_INJECT_SOCKET"
             | "CUA_PRIVATE_INSTANCE"
@@ -1493,6 +1494,29 @@ mod tests {
         }));
         assert!(!values.iter().any(|variable| variable.value == "0"));
         assert!(!values.iter().any(|variable| variable.value == "false"));
+    }
+
+    #[test]
+    fn update_check_preference_is_inherited_only() {
+        assert!(!allowed_environment_name("CUA_DRIVER_RS_UPDATE_CHECK"));
+        assert!(!allowed_environment_name("cua_driver_rs_update_check"));
+
+        let inherited = [("CUA_DRIVER_RS_UPDATE_CHECK".into(), "1".into())];
+        let values = merge_safe_environment(inherited.clone(), &[]);
+        assert!(values.iter().any(|variable| {
+            variable.name == "CUA_DRIVER_RS_UPDATE_CHECK" && variable.value == "1"
+        }));
+
+        let values = merge_safe_environment(
+            inherited,
+            &[EmbeddedEnvironmentVariable {
+                name: "CUA_DRIVER_RS_UPDATE_CHECK".into(),
+                value: "false".into(),
+            }],
+        );
+        assert!(values.iter().any(|variable| {
+            variable.name == "CUA_DRIVER_RS_UPDATE_CHECK" && variable.value == "1"
+        }));
     }
 
     #[test]

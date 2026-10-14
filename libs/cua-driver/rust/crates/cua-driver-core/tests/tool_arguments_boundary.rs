@@ -453,3 +453,157 @@ async fn anonymous_config_scope_survives_lifecycle_stamping_but_cannot_be_forged
         }
     }
 }
+
+#[tokio::test]
+async fn set_config_compatibility_pair_preserves_wire_arguments_under_typed_schema() {
+    let seen = Arc::new(std::sync::Mutex::new(Value::Null));
+    let mut registry = ToolRegistry::new();
+    // Same honest per-field types as native tools/list; no typeless value node.
+    for name in ["set_config", "get_config"] {
+        registry.register(Box::new(ConfigCall {
+            def: ToolDef {
+                name: name.into(),
+                description: "typed configuration".into(),
+                input_schema: json!({"type":"object", "properties": {
+                    "max_image_dimension": {"type":"integer"},
+                    "experimental_pip": {"type":"boolean"},
+                    "experimental_pip_geometry": {"type":"string"}
+                }, "additionalProperties":false}),
+                read_only: false,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+            seen: seen.clone(),
+        }));
+    }
+    let registry = Arc::new(registry);
+    registry.init_self_weak();
+    let standard = SessionAuthorizationRegistry::with_ceiling(
+        SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Standard],
+            false,
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        )
+        .unwrap(),
+    )
+    .compatibility_context(PermissionMode::Standard, None)
+    .unwrap();
+    for context in [standard, unrestricted_context()] {
+        for (key, value) in [
+            ("max_image_dimension", json!(800)),
+            ("experimental_pip", json!(true)),
+            ("experimental_pip_geometry", json!("320x200+24+24")),
+        ] {
+            for args in [json!({"key":key,"value":value}), json!({key:value})] {
+                let result = registry
+                    .invoke_with_context("set_config", args.clone(), context.clone())
+                    .await;
+                assert_ne!(result.is_error, Some(true), "{args}: {result:?}");
+                let public: serde_json::Map<String, Value> = seen
+                    .lock()
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .filter(|(key, _)| !key.starts_with('_'))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                assert_eq!(
+                    Value::Object(public),
+                    args,
+                    "native handler must see original wire shape"
+                );
+            }
+        }
+        for (name, args, code) in [
+            (
+                "set_config",
+                json!({"key":"max_image_dimension","value":800,"extra":true}),
+                "invalid_arguments",
+            ),
+            (
+                "set_config",
+                json!({"max_image_dimension":800,"extra":true}),
+                "invalid_arguments",
+            ),
+            (
+                "get_config",
+                json!({"key":"max_image_dimension","value":800}),
+                "invalid_arguments",
+            ),
+            (
+                "set_config",
+                json!({"key":"max_image_dimension"}),
+                "invalid_arguments",
+            ),
+            ("set_config", json!({"value":800}), "invalid_arguments"),
+            (
+                "set_config",
+                json!({"key":"_global_config","value":true}),
+                "invalid_arguments",
+            ),
+            (
+                "set_config",
+                json!({"key":"session","value":"forged"}),
+                "invalid_arguments",
+            ),
+            (
+                "set_config",
+                json!({"key":"capture_scope","value":"desktop"}),
+                "config_key_retired",
+            ),
+            (
+                "set_config",
+                json!({"capture_scope":"desktop"}),
+                "config_key_retired",
+            ),
+            (
+                "set_config",
+                json!({"key":"experimental_script","value":true}),
+                "config_key_operator_only",
+            ),
+            (
+                "set_config",
+                json!({"experimental_script":true}),
+                "config_key_operator_only",
+            ),
+            (
+                "set_config",
+                json!({"key":"disable_run_script","value":false}),
+                "config_key_operator_only",
+            ),
+            (
+                "set_config",
+                json!({"disable_run_script":false}),
+                "config_key_operator_only",
+            ),
+        ] {
+            *seen.lock().unwrap() = Value::Null;
+            let result = registry
+                .invoke_with_context(name, args.clone(), context.clone())
+                .await;
+            assert_eq!(
+                result
+                    .structured_content
+                    .as_ref()
+                    .unwrap()
+                    .get("code")
+                    .or_else(|| result
+                        .structured_content
+                        .as_ref()
+                        .unwrap()
+                        .pointer("/refusal/code"))
+                    .unwrap(),
+                code,
+                "{args}: {result:?}"
+            );
+            assert_eq!(
+                *seen.lock().unwrap(),
+                Value::Null,
+                "refused call reached handler: {args}"
+            );
+        }
+    }
+}
