@@ -12,7 +12,8 @@
 //! `perform_action`, `set_value`, and `get_element_bounds` index into that same
 //! ordered set.
 
-use std::sync::OnceLock;
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -397,7 +398,9 @@ async fn shared_connection() -> Result<&'static AccessibilityConnection> {
                 .map_err(|error| anyhow!("AT-SPI state-changed subscription failed: {error}"))?;
             conn.register_event::<atspi::events::object::ActiveDescendantChangedEvent>()
                 .await
-                .map_err(|error| anyhow!("AT-SPI active-descendant subscription failed: {error}"))?;
+                .map_err(|error| {
+                    anyhow!("AT-SPI active-descendant subscription failed: {error}")
+                })?;
             Ok(conn)
         })
         .await
@@ -1470,6 +1473,25 @@ async fn collect_visited_bounded_opts<'a>(
             return Ok(None);
         }
     };
+    // Chromium lazily enables accessibility on GetAttributes. Cache only a
+    // successful wake of this exact process and application on this bus;
+    // PID reuse, bus restart and failed reads must remain retryable.
+    let wake_key = crate::proc_fs::process_instance_id(pid).map(|incarnation| ApplicationWakeKey {
+        pid,
+        incarnation,
+        bus: conn.connection().server_guid().to_string(),
+        destination: app.inner().destination().to_string(),
+        path: app.inner().path().to_string(),
+    });
+    if wake_key
+        .as_ref()
+        .is_none_or(|key| !application_wakes().lock().unwrap().contains(key))
+        && matches!(call(app.get_attributes()).await, Some(Ok(_)))
+    {
+        if let Some(key) = wake_key {
+            application_wakes().lock().unwrap().remember(key);
+        }
+    }
     let zconn = conn.connection();
     // Mapped popups of this pid, read once and only when a menubar menu's
     // open state cannot be told from AT-SPI states alone (gail, focus elsewhere).
@@ -2443,6 +2465,41 @@ fn is_indexable_capabilities(
 }
 
 // ── Public (sync) entry points ───────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ApplicationWakeKey {
+    pid: u32,
+    incarnation: u64,
+    bus: String,
+    destination: String,
+    path: String,
+}
+
+#[derive(Default)]
+struct ApplicationWakes(VecDeque<ApplicationWakeKey>);
+
+impl ApplicationWakes {
+    const CAPACITY: usize = 256;
+
+    fn contains(&self, key: &ApplicationWakeKey) -> bool {
+        self.0.contains(key)
+    }
+
+    fn remember(&mut self, key: ApplicationWakeKey) {
+        if self.contains(&key) {
+            return;
+        }
+        if self.0.len() == Self::CAPACITY {
+            self.0.pop_front();
+        }
+        self.0.push_back(key);
+    }
+}
+
+fn application_wakes() -> &'static Mutex<ApplicationWakes> {
+    static WAKES: OnceLock<Mutex<ApplicationWakes>> = OnceLock::new();
+    WAKES.get_or_init(|| Mutex::new(ApplicationWakes::default()))
+}
 
 pub fn walk_tree(pid: u32) -> Result<Option<(String, Vec<AtspiNode>)>> {
     walk_tree_bounded(pid, 0, None, None)
@@ -7411,6 +7468,49 @@ mod coord_tests {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+
+    #[test]
+    fn application_attributes_wake_tracks_exact_incarnation_and_bus_with_bounded_memory() {
+        let key = ApplicationWakeKey {
+            pid: 42,
+            incarnation: 1,
+            bus: "bus-one".into(),
+            destination: ":1.2".into(),
+            path: "/app".into(),
+        };
+        let mut wakes = ApplicationWakes::default();
+        assert!(!wakes.contains(&key));
+        wakes.remember(key.clone());
+        assert!(wakes.contains(&key));
+        for changed in [
+            ApplicationWakeKey {
+                incarnation: 2,
+                ..key.clone()
+            },
+            ApplicationWakeKey {
+                bus: "bus-two".into(),
+                ..key.clone()
+            },
+            ApplicationWakeKey {
+                destination: ":1.3".into(),
+                ..key.clone()
+            },
+            ApplicationWakeKey {
+                path: "/other".into(),
+                ..key.clone()
+            },
+        ] {
+            assert!(!wakes.contains(&changed));
+        }
+        for incarnation in 2..=ApplicationWakes::CAPACITY as u64 + 1 {
+            wakes.remember(ApplicationWakeKey {
+                incarnation,
+                ..key.clone()
+            });
+        }
+        assert_eq!(wakes.0.len(), ApplicationWakes::CAPACITY);
+        assert!(!wakes.contains(&key));
+    }
 
     #[test]
     fn focus_log_tracks_latest_focused_object_per_bus_and_clears_on_blur() {
