@@ -338,7 +338,7 @@ async fn real_proxies_recover_from_control_loss_without_waiting_for_stdin() {
     #[cfg(unix)]
     let directory = tempfile::Builder::new()
         .prefix("cua-recovery-")
-        .tempdir_in("/tmp")
+        .tempdir()
         .unwrap();
     #[cfg(unix)]
     let (daemon_endpoint, proxy_endpoint) = (
@@ -440,7 +440,7 @@ async fn idle_reclaimed_unnamed_session_is_recreated_through_the_daemon() {
     #[cfg(unix)]
     let directory = tempfile::Builder::new()
         .prefix("cua-idle-")
-        .tempdir_in("/tmp")
+        .tempdir()
         .unwrap();
     #[cfg(unix)]
     let endpoint = directory.path().join("d.sock").display().to_string();

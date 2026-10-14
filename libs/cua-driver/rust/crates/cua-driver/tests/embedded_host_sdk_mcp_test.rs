@@ -22,14 +22,38 @@ fn read_json(reader: &mut BufReader<std::process::ChildStdout>) -> Value {
     serde_json::from_str(line.trim()).expect("parse MCP response")
 }
 
-/// Construct a host for the source-built driver with per-user state isolated
-/// from the developer's installed product (#4094). Keep the returned root alive
-/// for as long as the daemon runs.
-fn isolated_driver_host(
-    host_bundle_id: &str,
-) -> (std::sync::Arc<EmbeddedCuaDriverHost>, IsolatedStateRoot) {
-    let state = IsolatedStateRoot::new().expect("isolated driver state root");
-    let host = EmbeddedCuaDriverHost::with_options(EmbeddedDriverHostOptions {
+/// Isolate the trusted host without mutating the parallel runner environment.
+/// The parent retains the state root until the reexec host and daemon stop;
+/// real private bus routing remains inherited.
+fn run_in_isolated_host(test: &str) -> bool {
+    if std::env::var("CUA_TEST_EMBEDDED_ISOLATED_HOST").as_deref() == Ok(test) {
+        return false;
+    }
+    let state = IsolatedStateRoot::new().unwrap();
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", test, "--test-threads=1", "--nocapture"])
+        .envs(state.env())
+        .env("CUA_TEST_EMBEDDED_ISOLATED_HOST", test);
+    let mut child = spawn_in_job(&mut command).expect("spawn isolated embedded host");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "isolated embedded host failed: {status}");
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("isolated embedded host exceeded its deadline");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Construct a source-built host inside the isolated reexec process.
+fn inherited_host_options(host_bundle_id: &str) -> EmbeddedDriverHostOptions {
+    EmbeddedDriverHostOptions {
         binary_path: env!("CARGO_BIN_EXE_cua-driver").into(),
         host_bundle_id: host_bundle_id.into(),
         socket_path: None,
@@ -41,23 +65,34 @@ fn isolated_driver_host(
         session_policy_path: None,
         approve_session_policy: false,
         dangerously_bypass_approvals: false,
-        environment: state
-            .env()
-            .into_iter()
-            // The SDK forwards only its safe allowlist; without XDG overrides
-            // the driver derives its XDG state from the isolated HOME.
-            .filter(|(name, _)| matches!(*name, "HOME" | "APPDATA" | "LOCALAPPDATA"))
-            .map(|(name, value)| EmbeddedEnvironmentVariable {
-                name: name.into(),
-                value: value.to_string_lossy().into_owned(),
-            })
-            .collect(),
+        environment: Vec::new(),
         inherit_stderr: true,
         // No overlay window on the developer's display.
         no_overlay: true,
-    })
-    .expect("construct host");
-    (host, state)
+    }
+}
+
+fn assert_home_overrides_rejected(host_bundle_id: &str) {
+    for name in ["HOME", "hOmE"] {
+        let mut hostile = inherited_host_options(host_bundle_id);
+        hostile.environment = vec![EmbeddedEnvironmentVariable {
+            name: name.into(),
+            value: std::env::temp_dir()
+                .join("forged-embedded-home")
+                .to_string_lossy()
+                .into_owned(),
+        }];
+        assert!(matches!(
+            EmbeddedCuaDriverHost::with_options(hostile),
+            Err(cua_driver_sdk::EmbeddedDriverError::Configuration { reason })
+                if reason == format!("environment variable {name} is not in the embedded safe allowlist")
+        ));
+    }
+}
+
+fn isolated_driver_host(host_bundle_id: &str) -> std::sync::Arc<EmbeddedCuaDriverHost> {
+    EmbeddedCuaDriverHost::with_options(inherited_host_options(host_bundle_id))
+        .expect("construct inherited-state host")
 }
 
 fn tool_names(value: &Value, field: &str) -> BTreeSet<String> {
@@ -118,7 +153,12 @@ fn write_test_shell_script(path: &std::path::Path, body: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn embedded_host_serves_sdk_and_mcp_with_one_contract() {
-    let (host, _state) = isolated_driver_host("com.trycua.embedded-contract-test");
+    if run_in_isolated_host("embedded_host_serves_sdk_and_mcp_with_one_contract") {
+        return;
+    }
+    assert_home_overrides_rejected("com.trycua.embedded-contract-test");
+    // Readiness below proves attested inherited state still works after refusal.
+    let host = isolated_driver_host("com.trycua.embedded-contract-test");
     let connection = host.clone().start().await.expect("start embedded host");
     assert_eq!(host.state(), EmbeddedDriverHostState::Ready);
 
@@ -273,7 +313,10 @@ async fn embedded_host_serves_sdk_and_mcp_with_one_contract() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropping_the_host_cannot_orphan_its_daemon() {
-    let (host, _state) = isolated_driver_host("com.trycua.embedded-drop-test");
+    if run_in_isolated_host("dropping_the_host_cannot_orphan_its_daemon") {
+        return;
+    }
+    let host = isolated_driver_host("com.trycua.embedded-drop-test");
     let connection = host.clone().start().await.expect("start embedded host");
     drop(host);
 
@@ -296,7 +339,10 @@ async fn dropping_the_host_cannot_orphan_its_daemon() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_start_coalesces_and_restart_rotates_generation() {
-    let (host, _state) = isolated_driver_host("com.trycua.embedded-lifecycle-test");
+    if run_in_isolated_host("concurrent_start_coalesces_and_restart_rotates_generation") {
+        return;
+    }
+    let host = isolated_driver_host("com.trycua.embedded-lifecycle-test");
 
     let (left, right, third) = tokio::join!(
         host.clone().start(),
@@ -330,6 +376,9 @@ async fn concurrent_start_coalesces_and_restart_rotates_generation() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_cancels_startup_and_unblocks_every_waiter() {
+    if run_in_isolated_host("stop_cancels_startup_and_unblocks_every_waiter") {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let binary = directory.path().join("never-ready-driver");
     write_test_shell_script(&binary, "read _");
@@ -358,6 +407,9 @@ async fn stop_cancels_startup_and_unblocks_every_waiter() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn early_child_exit_resets_the_host_to_stopped() {
+    if run_in_isolated_host("early_child_exit_resets_the_host_to_stopped") {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let binary = directory.path().join("early-exit-driver");
     write_test_shell_script(&binary, "exit 7");

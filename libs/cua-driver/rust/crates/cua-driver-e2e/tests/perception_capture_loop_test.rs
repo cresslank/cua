@@ -407,7 +407,7 @@ impl MacosDaemon {
         // Unix socket paths are short on macOS.
         let socket_dir = tempfile::Builder::new()
             .prefix("cua-p-")
-            .tempdir_in("/tmp")
+            .tempdir()
             .expect("create daemon socket directory");
         let socket = socket_dir.path().join("d.sock").display().to_string();
         let pid_file = socket_dir.path().join("d.pid").display().to_string();

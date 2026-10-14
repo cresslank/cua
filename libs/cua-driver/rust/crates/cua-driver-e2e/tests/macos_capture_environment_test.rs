@@ -31,7 +31,7 @@ fn desktop_capture_does_not_require_sbin_on_path() {
     assert_eq!(app.extension().and_then(|s| s.to_str()), Some("app"));
     for path in ["/usr/bin:/bin:/usr/sbin:/sbin", "/usr/bin:/bin"] {
         eprintln!("desktop capture with daemon PATH={path}");
-        let output = tempfile::tempdir_in("/tmp").unwrap();
+        let output = tempfile::tempdir().unwrap();
         let socket = output.path().join("d.sock");
         let _stop = StopDaemon {
             binary: &binary,

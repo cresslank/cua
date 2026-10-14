@@ -10,7 +10,7 @@ fn missing_socket() -> (String, Option<tempfile::TempDir>) {
     {
         let directory = tempfile::Builder::new()
             .prefix("cua-missing-")
-            .tempdir_in("/tmp")
+            .tempdir()
             .expect("temporary socket directory");
         let socket = directory.path().join("missing.sock").display().to_string();
         (socket, Some(directory))

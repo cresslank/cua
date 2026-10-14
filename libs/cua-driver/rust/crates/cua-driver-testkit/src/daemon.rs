@@ -428,10 +428,7 @@ mod readiness_probe_tests {
     ) {
         use std::io::{BufRead, BufReader, Write};
 
-        let dir = tempfile::Builder::new()
-            .prefix("cua-")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let dir = tempfile::Builder::new().prefix("cua-").tempdir().unwrap();
         let socket = dir.path().join("p.sock").display().to_string();
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
@@ -460,10 +457,7 @@ mod readiness_probe_tests {
     #[cfg(unix)]
     #[test]
     fn unix_probe_reports_each_protocol_outcome() {
-        let missing = tempfile::Builder::new()
-            .prefix("cua-")
-            .tempdir_in("/tmp")
-            .unwrap();
+        let missing = tempfile::Builder::new().prefix("cua-").tempdir().unwrap();
         let missing = missing.path().join("none.sock").display().to_string();
         assert_eq!(
             probe_socket_with_timeout(&missing, Duration::from_secs(2)),
