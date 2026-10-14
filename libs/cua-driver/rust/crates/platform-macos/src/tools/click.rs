@@ -1267,12 +1267,12 @@ impl Tool for ClickTool {
                                     pid as libc::pid_t,
                                     wid,
                                     do_click,
-                                )
+                                ).map(|()| false)
                             }
                             (_, Some(wid)) if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise => {
                                 crate::input::skylight::with_background_pixel_activation(pid, wid, do_click)
                             }
-                            _ => do_click(),
+                            _ => do_click().map(|()| false),
                         }
                     })
                     .await
@@ -1289,7 +1289,7 @@ impl Tool for ClickTool {
                 _ => "click",
             };
             match result {
-                Ok(Ok(())) => {
+                Ok(Ok(focus_without_raise)) => {
                     let target = if route == PixelClickRoute::ForegroundHid {
                         format!("at screen-point ({screen_x:.0},{screen_y:.0}) for pid {pid}")
                     } else {

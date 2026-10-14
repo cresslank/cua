@@ -991,7 +991,7 @@ pub(crate) fn with_background_pixel_activation(
     pid: i32,
     wid: u32,
     body: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     let _turn = focus_turn(false);
     cua_driver_core::blocking::check_cancelled()?;
     let prior = front_process_pid();
@@ -1029,9 +1029,10 @@ pub(crate) fn with_background_pixel_activation(
         epoch: crate::window_change_detector::intentional_epoch(),
     };
     cua_driver_core::blocking::check_cancelled()?;
-    crate::input::mouse::prepare_background_pixel_click(pid, wid);
+    let focus_without_raise = crate::input::mouse::prepare_background_pixel_click(pid, wid);
     cua_driver_core::blocking::check_cancelled()?;
-    body()
+    body()?;
+    Ok(focus_without_raise)
 }
 
 /// Keep Cocoa activation, exact-window input, and restoration in the same
