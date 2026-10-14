@@ -686,6 +686,26 @@ impl TokenRegistry {
         self.publish(candidate, Duration::ZERO)
     }
 
+    /// Routing-only lookup for token-only calls, before authorization and
+    /// action-lease admission. Native mutation still requires a MutationPermit.
+    pub(crate) fn target_for_token(&self, token: &str) -> Option<(i32, u64)> {
+        let (public, _) = parse_token(token)?;
+        let runtime = current_runtime_scope();
+        let pid = {
+            let state = self.inner.state.lock().unwrap();
+            let mut matches = state.bindings.keys().filter_map(|(scope, pid, handle)| {
+                (scope == &runtime && *handle == public).then_some(*pid)
+            });
+            let pid = matches.next()?;
+            if matches.next().is_some() {
+                return None;
+            }
+            pid
+        };
+        let (window_id, _) = self.resolve(pid, token).ok()?;
+        Some((pid, window_id))
+    }
+
     pub fn resolve_generation(
         &self,
         pid: i32,

@@ -666,6 +666,23 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 })
             })
     }
+
+    /// Infer a token's process only from this store's live runtime generation.
+    /// This is routing metadata, not mutation authority: `resolve` must still
+    /// acquire and retain the generation's MutationPermit before any action.
+    pub fn pid_for_token(&self, args: &serde_json::Value) -> Option<i32> {
+        let token = args.get("element_token")?.as_str()?;
+        let (snapshot_id, _) = element_token::parse_token(token)?;
+        let inner = self.inner.lock().unwrap();
+        inner.snapshots.iter().find_map(|(pid, lane)| {
+            lane.iter().any(|snapshot| {
+                snapshot.id == snapshot_id
+                    && self.metadata_live(*pid, snapshot)
+                    && !Self::session_retired(&inner, snapshot.screenshot_owner.as_deref())
+            }).then_some(*pid)
+        })
+    }
+
     pub fn resolve(
         &self,
         pid: i32,
@@ -2322,6 +2339,44 @@ mod tests {
     use crate::element_token::{format_snapshot_id, token_for, LRU_CAP_PER_PID};
     use crate::snapshot_test_support::Payload;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn pid_for_token_finds_the_owning_process() {
+        crate::tool::with_runtime_scope(format!("snapshot-test-{}", uuid::Uuid::new_v4()), || {
+            let cache = SnapshotStore::new();
+            let pid = std::process::id() as i32;
+            let id = cache.publish(pid, 7, Payload(vec![10, 20]));
+            cache.publish(unsafe { libc::getppid() }, 8, Payload(vec![1]));
+            let args = serde_json::json!({ "element_token": token_for(id, 1) });
+            assert_eq!(cache.pid_for_token(&args), Some(pid));
+            assert_eq!(cache.pid_for_token(&serde_json::json!({})), None);
+            let unknown = serde_json::json!({ "element_token": token_for(id + 1000, 0) });
+            assert_eq!(cache.pid_for_token(&unknown), None);
+            crate::tool::with_runtime_scope(format!("snapshot-other-{}", uuid::Uuid::new_v4()), || {
+                assert_eq!(cache.pid_for_token(&args), None);
+            });
+            // A different store can replace the registry generation while this
+            // store still contains its old metadata. Never route on that row.
+            let other = SnapshotStore::new();
+            other.publish(pid, 7, Payload(vec![30]));
+            assert_eq!(cache.pid_for_token(&args), None);
+        });
+    }
+
+    #[test]
+    fn pid_for_token_refuses_retired_session() {
+        crate::tool::with_runtime_scope(format!("snapshot-test-{}", uuid::Uuid::new_v4()), || {
+            let cache = SnapshotStore::new();
+            let pid = std::process::id() as i32;
+            let (id, _) = cache.try_publish_for_session(pid, 7, Payload(vec![10]), Some("owner"), None)
+                .unwrap().unwrap();
+            let args = serde_json::json!({ "element_token": token_for(id, 0) });
+            assert_eq!(cache.pid_for_token(&args), Some(pid));
+            cache.retire_session_screenshots("owner");
+            assert_eq!(cache.pid_for_token(&args), None);
+            assert!(cache.resolve(pid, &args).is_err());
+        });
+    }
 
     #[test]
     fn publish_then_resolve_returns_projection() {

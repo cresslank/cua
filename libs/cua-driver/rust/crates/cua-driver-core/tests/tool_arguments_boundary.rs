@@ -125,6 +125,7 @@ impl cua_driver_core::snapshot_store::SnapshotPayload for ElementPayload {
 
 struct ElementAction {
     def: ToolDef,
+    pid: i32,
     snapshots: cua_driver_core::snapshot_store::SnapshotStore<ElementPayload>,
     calls: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -135,7 +136,7 @@ impl Tool for ElementAction {
         &self.def
     }
     async fn invoke(&self, args: Value) -> ToolResult {
-        match self.snapshots.resolve(std::process::id() as i32, &args) {
+        match self.snapshots.resolve(self.pid, &args) {
             Ok(cua_driver_core::element_token::ResolvedElement::Element {
                 element_index, ..
             }) => {
@@ -148,13 +149,36 @@ impl Tool for ElementAction {
     }
 }
 
+#[test]
+fn owned_target_process() {
+    if std::env::var_os("CUA_TOKEN_BOUNDARY_TEST_CHILD").is_some() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+struct OwnedTarget(std::process::Child);
+impl Drop for OwnedTarget {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[tokio::test]
 async fn legacy_element_index_only_cross_checks_a_current_token() {
+    // Token-only routing now exposes the true target to protected-process
+    // policy. Use an owned child, not the authorization process itself.
+    let target = OwnedTarget(std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "owned_target_process"])
+        .env("CUA_TOKEN_BOUNDARY_TEST_CHILD", "1")
+        .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null()).spawn().unwrap());
+    let pid = target.0.id() as i32;
     let context = unrestricted_context();
     let (snapshots, token) =
         cua_driver_core::tool::with_runtime_scope(context.runtime_scope_key(), || {
             let snapshots = cua_driver_core::snapshot_store::SnapshotStore::new();
-            let id = snapshots.publish(std::process::id() as i32, 41, ElementPayload);
+            let id = snapshots.publish(pid, 41, ElementPayload);
             (snapshots, cua_driver_core::element_token::token_for(id, 1))
         });
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -171,6 +195,7 @@ async fn legacy_element_index_only_cross_checks_a_current_token() {
             idempotent: true,
             open_world: false,
         },
+        pid,
         snapshots,
         calls: calls.clone(),
     }));
@@ -179,6 +204,7 @@ async fn legacy_element_index_only_cross_checks_a_current_token() {
     for args in [
         json!({"element_token":token}),
         json!({"element_token":token,"element_index":1}),
+        json!({"target":{"kind":"window","pid":pid,"window_id":41},"element_token":token}),
     ] {
         let result = registry
             .invoke_with_context("click", args, context.clone())
@@ -219,11 +245,44 @@ async fn legacy_element_index_only_cross_checks_a_current_token() {
                 .contains("element_token from get_window_state"));
         }
     }
+    // An explicit typed target wins over inference, but cannot redirect the
+    // retained element to a different window.
+    let result = registry.invoke_with_context("click", json!({
+        "target":{"kind":"window","pid":pid,"window_id":99},
+        "element_token":token
+    }), context.clone()).await;
+    assert_eq!(result.structured_content.unwrap()["refusal"]["code"], "conflicting_element_target");
     assert_eq!(
         calls.load(std::sync::atomic::Ordering::SeqCst),
-        2,
+        3,
         "refusals must not act"
     );
+}
+
+#[tokio::test]
+async fn token_only_target_cannot_hide_the_authorization_process() {
+    let context = unrestricted_context();
+    let pid = std::process::id() as i32;
+    let (snapshots, token) = cua_driver_core::tool::with_runtime_scope(context.runtime_scope_key(), || {
+        let snapshots = cua_driver_core::snapshot_store::SnapshotStore::new();
+        let id = snapshots.publish(pid, 42, ElementPayload);
+        (snapshots, cua_driver_core::element_token::token_for(id, 1))
+    });
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(ElementAction {
+        def: ToolDef {
+            name: "set_value".into(), description: "protected token target".into(),
+            input_schema: json!({"type":"object", "properties": {
+                "element_token": {"type":"string"}
+            }}),
+            read_only: false, destructive: false, idempotent: true, open_world: false,
+        },
+        pid, snapshots, calls: calls.clone(),
+    }));
+    let result = registry.invoke_with_context("set_value", json!({"element_token": token}), context).await;
+    assert_eq!(result.structured_content.unwrap()["refusal"]["code"], "permission_denied");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
 }
 
 struct ConfigCall {

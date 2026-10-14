@@ -1290,9 +1290,28 @@ impl ToolRegistry {
         // consent, recording, or implementation layer interprets the call.
         normalize_delivery_mode_args(tool.def(), &mut args);
         let unknown_argument = unknown_argument(tool.def(), &args);
+        // Explicit typed targets must be flattened first; inferred legacy
+        // fields must not turn a valid typed target into a mixed-shape error.
         if let Err(result) = crate::action_target::normalize_action_target(resolved_name, &mut args)
         {
             return result;
+        }
+        // Token-only platform routing must not happen after policy or leasing:
+        // set_value would otherwise be admitted as an untargeted observation.
+        // Enrich only missing fields; explicit conflicting targets are never
+        // repaired and still fail the platform's retained-generation resolver.
+        if tool.def().input_schema["properties"].get("element_token").is_some()
+            && args.get("pid").is_none_or(Value::is_null)
+        {
+            if let Some((pid, window_id)) = args.get("element_token")
+                .and_then(Value::as_str)
+                .and_then(|token| crate::element_token::global().target_for_token(token))
+            {
+                args["pid"] = pid.into();
+                if args.get("window_id").is_none_or(Value::is_null) {
+                    args["window_id"] = window_id.into();
+                }
+            }
         }
         if let Err(result) = crate::action_target::enforce_delivery_target(resolved_name, &args) {
             return result;
@@ -3219,6 +3238,66 @@ mod runtime_isolation_tests {
             .acquire(LeaseRequest::desktop_raw(None, Duration::from_secs(2)))
             .await
             .expect("worker exit releases input");
+    }
+
+    #[test]
+    fn token_action_process_fixture() {
+        if std::env::var_os("CUA_TOKEN_ACTION_TEST_CHILD").is_some() {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[tokio::test]
+    async fn token_only_semantic_action_retains_target_lease_after_cancel() {
+        use crate::action_lease::{global, ExactWindow, LeaseRequest};
+        struct OwnedChild(std::process::Child);
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let target = OwnedChild(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tool::runtime_isolation_tests::token_action_process_fixture"])
+            .env("CUA_TOKEN_ACTION_TEST_CHILD", "1")
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()).spawn().unwrap());
+        let context = standard_context();
+        let pid = target.0.id() as i32;
+        let window = ExactWindow { pid: pid.into(), window_id: 837201 };
+        let (cache, token) = DISPATCH_RUNTIME_SCOPE.scope(context.runtime_scope_key(), async {
+            let cache = crate::snapshot_store::SnapshotStore::new();
+            let id = cache.publish(pid, window.window_id, crate::snapshot_test_support::Payload(vec![1]));
+            (cache, crate::element_token::token_for(id, 0))
+        }).await;
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, worker_release) = std::sync::mpsc::channel();
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(DetachedInputProbe {
+            def: super::ToolDef {
+                name: "set_value".into(),
+                description: "hermetic token-only semantic dispatch".into(),
+                input_schema: serde_json::json!({"type": "object", "properties": {
+                    "pid": {"type": "integer"}, "window_id": {"type": "integer"},
+                    "element_token": {"type": "string"}, "value": {"type": "string"}
+                }}),
+                read_only: false, destructive: false, idempotent: false, open_world: false,
+            },
+            worker: Mutex::new(Some((started, worker_release))),
+        }));
+        let args = serde_json::json!({"element_token": token, "value": "fixture"});
+        let mut invocation = Box::pin(registry.invoke_with_context("set_value", args, context));
+        tokio::select! {
+            result = &mut invocation => panic!("action returned before worker release: {result:?}"),
+            started = tokio::time::timeout(Duration::from_secs(5), running) => started.unwrap().unwrap(),
+        }
+        drop(invocation);
+        let blocked = global().acquire(LeaseRequest::window_semantic(window, Duration::from_millis(25))).await;
+        release.send(()).unwrap();
+        assert_eq!(blocked.expect_err("token-only native work must retain its target lease").code(), "target_busy");
+        global().acquire(LeaseRequest::window_semantic(window, Duration::from_secs(2))).await
+            .expect("native exit releases target lease");
+        drop(cache);
     }
 
     struct ReplayProbe {
