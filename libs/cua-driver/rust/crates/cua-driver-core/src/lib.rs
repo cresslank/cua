@@ -56,6 +56,7 @@ pub mod agent_cursor;
 pub mod authorization;
 pub mod ax_readback;
 pub mod background_input;
+pub mod batch_tools;
 pub mod blocking;
 pub mod browser;
 pub mod build_info;
