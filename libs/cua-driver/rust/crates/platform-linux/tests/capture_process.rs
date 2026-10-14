@@ -8,13 +8,19 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-fn fixture(script: &str) -> Child {
-    Command::new("/bin/sh")
+fn fixture_command(script: &str) -> Command {
+    let mut command = Command::new("/bin/sh");
+    command
         .args(["-c", script])
         .env_clear()
-        .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn fixture(script: &str) -> Child {
+    fixture_command(script)
+        .stdin(Stdio::null())
         .spawn()
         .unwrap()
 }
@@ -31,7 +37,14 @@ fn drains_both_pipes_beyond_pipe_capacity_and_preserves_exit_status() {
 
 #[test]
 fn timeout_terminates_and_reaps_the_owned_child() {
-    let mut child = fixture("exec /bin/sleep 30");
+    // Nix guarantees /bin/sh, not /bin/sleep or a default command search path.
+    // A shell builtin blocked on our still-open pipe needs neither. Keep the
+    // writer outside Child so waiting cannot close stdin and release the child.
+    let mut child = fixture_command("read -r value")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = child.stdin.take().unwrap();
     let started = Instant::now();
     let error =
         capture_process::wait_with_output(&mut child, Duration::from_millis(50)).unwrap_err();
@@ -41,6 +54,7 @@ fn timeout_terminates_and_reaps_the_owned_child() {
         Some(libc::SIGKILL)
     );
     assert!(started.elapsed() < Duration::from_secs(5));
+    drop(input);
 }
 
 #[test]
