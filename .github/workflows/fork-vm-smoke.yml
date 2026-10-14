@@ -1,0 +1,21 @@
+name: Fork VM smoke
+on:
+  push:
+    branches: [ci/fork-runner-smoke]
+permissions:
+  contents: read
+concurrency:
+  group: fork-vm-smoke
+  cancel-in-progress: false
+jobs:
+  smoke:
+    if: github.actor == github.repository_owner && github.triggering_actor == github.repository_owner
+    runs-on: [self-hosted, macOS, ARM64, fork-vm]
+    timeout-minutes: 10
+    steps:
+      - name: Generic toolchain facts
+        shell: bash
+        run: |
+          sw_vers
+          xcodebuild -version
+          cargo --version
