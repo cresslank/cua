@@ -335,16 +335,31 @@ def test_unix_installer_recomputes_the_tarball_after_a_fallback() -> None:
     adopt = source.index('VERSION="$API_VERSION"')
     retag = source.index('TAG="${TAG_PREFIX}${VERSION}"', adopt)
     archive = source.index('TARBALL="$(release_tarball_name "$VERSION")"', retag)
-    checksum_url = source.index(
-        'CHECKSUMS_URL="https://github.com/$REPO/releases/download/$TAG/checksums.txt"',
-        archive,
-    )
-    verify = source.index(
-        'verify_release_checksum "$TMP_DIR/$TARBALL" "$TARBALL" "$CHECKSUMS_URL"',
-        checksum_url,
-    )
+    verify = source.index('verify_release_tarball "$VERSION" "$TARBALL"', archive)
     stage = source.index('STAGE="cua-driver-rs-${VERSION}-darwin-universal"', verify)
-    assert adopt < retag < archive < checksum_url < verify < stage
+    assert adopt < retag < archive < verify < stage
+
+
+@requires_posix_bash
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("linux-x86_64", "cua-driver-rs-1.2.3-linux-x86_64-binary.tar.gz"),
+        ("linux-arm64", "cua-driver-rs-1.2.3-linux-arm64-binary.tar.gz"),
+        ("darwin-x86_64", "cua-driver-rs-1.2.3-darwin-universal.tar.gz"),
+        ("darwin-arm64", "cua-driver-rs-1.2.3-darwin-universal.tar.gz"),
+    ],
+)
+def test_unix_release_archive_selects_binary_or_app_bundle(
+    label: str, expected: str
+) -> None:
+    result = subprocess.run(
+        ["bash", "-c", f'LABEL="{label}"\n'
+         + _extract_shell_function(_unix_source(), "release_tarball_name")
+         + '\nrelease_tarball_name "1.2.3"'],
+        capture_output=True, text=True, check=True,
+    )
+    assert result.stdout == expected
 
 
 def test_unix_api_resolver_queries_bounded_full_pages() -> None:
@@ -666,6 +681,11 @@ def _run_download(tmp_path: Path, scenario: str, token_env: str = "") -> tuple[i
     )
     result = subprocess.run(["bash", script.as_posix()], capture_output=True, text=True)
     call_lines = calls.read_text(encoding="utf-8").splitlines()
+    for call in call_lines:
+        assert call.split()[-1] == (
+            "https://github.com/trycua/cua/releases/download/cua-driver-rs-v1.2.3/"
+            "cua-driver-rs-1.2.3-linux-x86_64-binary.tar.gz"
+        )
     return result.returncode, call_lines, result.stderr
 
 
@@ -796,21 +816,35 @@ def _run_fallback_flow(
             REPO="trycua/cua"
             TMP_DIR="{tmp_path.as_posix()}"
             DOWNLOAD_RESULTS=({statuses})
-            DOWNLOAD_INDEX=0
+            printf '0' > "{tmp_path.as_posix()}/download-index"
+            log() {{ :; }}
             err() {{ printf 'error: %s\\n' "$*" >&2; }}
-            download_release_tarball() {{
-                printf 'download:%s\\n' "$1" >> "{calls.as_posix()}"
-                local result="${{DOWNLOAD_RESULTS[$DOWNLOAD_INDEX]}}"
-                DOWNLOAD_INDEX=$((DOWNLOAD_INDEX + 1))
-                return "$result"
+            curl() {{
+                local output="" previous="" arg url="" index result
+                for arg in "$@"; do
+                    if [[ "$previous" == "-o" ]]; then output="$arg"; fi
+                    previous="$arg"
+                    url="$arg"
+                done
+                printf 'download:%s:%s\\n' "$VERSION" "$url" >> "{calls.as_posix()}"
+                index="$(cat "{tmp_path.as_posix()}/download-index")"
+                result="${{DOWNLOAD_RESULTS[$index]}}"
+                printf '%s' "$((index + 1))" > "{tmp_path.as_posix()}/download-index"
+                case "$result" in
+                    0) printf 'archive' > "$output"; printf '200' ;;
+                    44) printf '404' ;;
+                    1) printf '401' ;;
+                    *) return 92 ;;
+                esac
             }}
+            {_extract_shell_function(source, "download_release_tarball")}
             resolve_latest_version_from_api() {{
                 printf 'api\\n' >> "{calls.as_posix()}"
                 printf '1.2.2'
             }}
             {_extract_shell_function(source, "release_tarball_name")}
-            verify_release_checksum() {{
-                printf 'verify:%s:%s:%s\\n' "$1" "$2" "$3" >> "{calls.as_posix()}"
+            verify_release_tarball() {{
+                printf 'verify:%s:%s\\n' "$1" "$2" >> "{calls.as_posix()}"
             }}
             {flow}
             printf 'resolved:%s:%s:%s\\n' "$VERSION" "$TAG" "$TARBALL"
@@ -830,16 +864,15 @@ def test_unix_baked_404_falls_back_and_adopts_downloaded_version(tmp_path: Path)
     )
     assert result.returncode == 0
     assert calls == [
-        "download:1.2.3",
+        "download:1.2.3:https://github.com/trycua/cua/releases/download/"
+        "cua-driver-rs-v1.2.3/cua-driver-rs-1.2.3-linux-x86_64-binary.tar.gz",
         "api",
-        "download:1.2.2",
-        (
-            f"verify:{tmp_path}/cua-driver-rs-1.2.2-linux-x86_64-binary.tar.gz:"
-            "cua-driver-rs-1.2.2-linux-x86_64-binary.tar.gz:"
-            "https://github.com/trycua/cua/releases/download/"
-            "cua-driver-rs-v1.2.2/checksums.txt"
-        ),
+        "download:1.2.2:https://github.com/trycua/cua/releases/download/"
+        "cua-driver-rs-v1.2.2/cua-driver-rs-1.2.2-linux-x86_64-binary.tar.gz",
+        "verify:1.2.2:cua-driver-rs-1.2.2-linux-x86_64-binary.tar.gz",
     ]
+    assert (tmp_path / "cua-driver-rs-1.2.2-linux-x86_64-binary.tar.gz").read_text() == "archive"
+    assert not (tmp_path / "cua-driver-rs-1.2.3-linux-x86_64-binary.tar.gz").exists()
     # Every release-derived name, including the archive, follows the adopted version.
     assert result.stdout == (
         "resolved:1.2.2:cua-driver-rs-v1.2.2:cua-driver-rs-1.2.2-linux-x86_64-binary.tar.gz\n"
@@ -859,7 +892,10 @@ def test_unix_non_fallback_download_failure_makes_zero_api_calls(
         tmp_path, version_source=version_source, download_statuses=[download_status]
     )
     assert result.returncode == 1
-    assert calls == ["download:1.2.3"]
+    assert calls == [
+        "download:1.2.3:https://github.com/trycua/cua/releases/download/"
+        "cua-driver-rs-v1.2.3/cua-driver-rs-1.2.3-linux-x86_64-binary.tar.gz"
+    ]
 
 
 # ---------- Withdrawn releases ----------------------------------------------

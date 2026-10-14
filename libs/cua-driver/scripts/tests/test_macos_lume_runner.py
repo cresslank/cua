@@ -15,6 +15,7 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -268,7 +269,7 @@ def test_seed_guide_keeps_the_login_keychain_searchable() -> None:
 
 def _fake_python_with_tk(tmp_path: Path, patchlevel: str | None) -> Path:
     fake_bin = tmp_path / "bin"
-    real = shutil.which("python3")
+    real = sys.executable
     if patchlevel is None:
         body = 'case "$*" in *tkinter*) exit 1 ;; esac\nexec "$TEST_REAL_PYTHON" "$@"\n'
     else:
@@ -292,7 +293,7 @@ def test_lume_runner_refuses_missing_or_legacy_tk(
     completed = _run(
         RUN_ALL,
         'PATH="$TEST_FAKE_BIN:$PATH"\nrequire_modern_tk\n',
-        env={"TEST_FAKE_BIN": str(fake_bin), "TEST_REAL_PYTHON": shutil.which("python3") or ""},
+        env={"TEST_FAKE_BIN": str(fake_bin), "TEST_REAL_PYTHON": sys.executable},
     )
     assert completed.returncode == 2
     assert message in completed.stderr
@@ -304,7 +305,7 @@ def test_lume_runner_accepts_modern_tk(tmp_path: Path, patchlevel: str) -> None:
     completed = _run(
         RUN_ALL,
         'PATH="$TEST_FAKE_BIN:$PATH"\nrequire_modern_tk\n',
-        env={"TEST_FAKE_BIN": str(fake_bin), "TEST_REAL_PYTHON": shutil.which("python3") or ""},
+        env={"TEST_FAKE_BIN": str(fake_bin), "TEST_REAL_PYTHON": sys.executable},
     )
     assert completed.returncode == 0, completed.stderr
 
