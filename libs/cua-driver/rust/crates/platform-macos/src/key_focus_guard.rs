@@ -194,7 +194,10 @@ const MAX_RESTORES_PER_WATCH: u32 = 3;
 
 /// One process-wide scheduler coalesces notices and tails. The event-tap
 /// infrastructure never occupies a native mutation slot; each finite cleanup
-/// turn must obtain admission and retains the originating dispatch authority.
+/// turn must obtain native-call admission. While the arming action is live a
+/// turn runs under its dispatch authority; in the idle tail after it ended the
+/// guard holds no action lease, as upstream's guard never does, so a following
+/// action is not made to wait out the tail.
 fn ensure_cleanup_worker() {
     static WORKER: OnceLock<()> = OnceLock::new();
     WORKER.get_or_init(|| {
@@ -208,7 +211,7 @@ fn ensure_cleanup_worker() {
                     let current = guard.epoch == crate::window_change_detector::intentional_epoch();
                     let due = guard.pending_release || guard.leases == 0;
                     if due {
-                        let authority = guard.authority.clone();
+                        let authority = guard.authority.clone().unwrap_or_default();
                         // On saturation retain pending cleanup and its authority.
                         if authority
                             .try_run_cleanup(|| {
@@ -358,7 +361,10 @@ struct Guard {
     pending_release: bool,
     restores: u32,
     reverts: u32,
-    authority: cua_driver_core::blocking::ActionLeaseScope,
+    /// The arming action's dispatch authority, held only while that action
+    /// is live. Taken when its last [`Lease`] drops: the tail keeps guarding
+    /// (releases, order restores, self-activation reverts) without the seat.
+    authority: Option<cua_driver_core::blocking::ActionLeaseScope>,
 }
 impl Guard {
     fn queue_release(&mut self, epoch: u64) -> bool {
@@ -368,10 +374,22 @@ impl Guard {
         self.pending_release = true;
         true
     }
-    fn release_lease(&mut self, id: u64, now: Instant) {
-        if self.id == id {
-            self.leases = self.leases.saturating_sub(1);
-            self.until = now + TAIL;
+    /// Returns the dispatch authority once the last lease is gone, so the
+    /// caller can drop it outside the state lock.
+    fn release_lease(
+        &mut self,
+        id: u64,
+        now: Instant,
+    ) -> Option<cua_driver_core::blocking::ActionLeaseScope> {
+        if self.id != id {
+            return None;
+        }
+        self.leases = self.leases.saturating_sub(1);
+        self.until = now + TAIL;
+        if self.leases == 0 {
+            self.authority.take()
+        } else {
+            None
         }
     }
     fn can_restore(&self, epoch: u64, now: Instant, user_switched: bool) -> bool {
@@ -422,10 +440,16 @@ pub struct Lease {
 }
 impl Drop for Lease {
     fn drop(&mut self) {
-        let mut st = lock();
-        if let Some(guard) = st.guarded.get_mut(&self.pid).filter(|g| g.id == self.id) {
-            guard.release_lease(self.id, Instant::now());
-        }
+        let authority = {
+            let mut st = lock();
+            st.guarded
+                .get_mut(&self.pid)
+                .filter(|g| g.id == self.id)
+                .and_then(|guard| guard.release_lease(self.id, Instant::now()))
+        };
+        // Releasing the action lease can wake a waiting action; never do it
+        // under the guard state lock.
+        drop(authority);
     }
 }
 
@@ -454,7 +478,7 @@ pub fn protect(target_pid: i32) -> Option<Lease> {
     ensure_cleanup_worker();
     let id = NEXT_GUARD.fetch_add(1, Ordering::Relaxed);
     let order = !target_above_front(target_pid, front);
-    {
+    let replaced = {
         let mut st = lock();
         if st.guarded.len() >= MAX_GUARDS && !st.guarded.contains_key(&target_pid) {
             return None;
@@ -473,10 +497,12 @@ pub fn protect(target_pid: i32) -> Option<Lease> {
                 pending_release: false,
                 restores: 0,
                 reverts: 0,
-                authority: cua_driver_core::blocking::ActionLeaseScope::capture(),
+                authority: Some(cua_driver_core::blocking::ActionLeaseScope::capture()),
             },
-        );
-    }
+        )
+    };
+    // A superseded guard's authority, if any, is released outside the lock.
+    drop(replaced);
     let lease = Lease {
         pid: target_pid,
         id,
@@ -817,6 +843,47 @@ mod tests {
     }
 
     const OWN: i32 = 100;
+
+    #[test]
+    fn the_idle_tail_keeps_guarding_without_the_action_lease() {
+        let now = Instant::now();
+        let mut guard = Guard {
+            id: 7,
+            leases: 2,
+            until: now,
+            front: 10,
+            epoch: 4,
+            order: true,
+            pending_release: false,
+            restores: 0,
+            reverts: 0,
+            authority: Some(Default::default()),
+        };
+        // Another guard's lease, then one of two live leases: the seat stays.
+        assert!(guard.release_lease(8, now).is_none());
+        assert!(guard.release_lease(7, now).is_none() && guard.authority.is_some());
+        // The last lease hands the authority back; the tail still guards.
+        assert!(guard.release_lease(7, now).is_some());
+        assert!(guard.authority.is_none());
+        assert!(guard_applies(
+            guard.leases,
+            guard.until,
+            guard.epoch,
+            now,
+            4
+        ));
+        assert!(guard.can_restore(4, now, false));
+    }
+
+    #[test]
+    fn lease_drop_releases_the_authority_outside_the_state_lock() {
+        let source = include_str!("key_focus_guard.rs");
+        let start = source.find(concat!("impl Drop ", "for Lease {")).unwrap();
+        let body = &source[start..start + source[start..].find("\n}\n").unwrap()];
+        let unlock = body.find("};").expect("state lock scope ends");
+        let release = body.find("drop(authority);").expect("authority dropped");
+        assert!(unlock < release);
+    }
 
     #[test]
     fn a_guarded_target_theft_is_released_and_swallowed() {

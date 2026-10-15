@@ -74,9 +74,11 @@ pub fn with_runtime_scope<T>(scope: String, action: impl FnOnce() -> T) -> T {
     action()
 }
 
-// macOS background focus cleanup retains its input grant for a three-second
-// tail. Allow that cleanup plus one second of scheduling margin before refusing
-// a successor; never release ownership early or make admission unbounded.
+// A macOS cleanup owner can retain the input grant after its action returns:
+// a hover reveal's three-second reaper, or a deferred window-change read up to
+// its timeout. (The key-focus guard's idle tail no longer holds it.) Allow the
+// longest plus one second of scheduling margin before refusing a successor;
+// never release ownership early or make admission unbounded.
 const ACTION_LEASE_WAIT: Duration = Duration::from_secs(4);
 
 #[cfg(test)]
