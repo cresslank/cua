@@ -8,8 +8,11 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn admission_budget_covers_macos_cleanup_tail_with_scheduling_margin() {
-    // key_focus_guard::TAIL is three seconds. The native background-counter
-    // probe exhausted the former two-second admission wait before cleanup ended.
+    // The focus guard's idle tail no longer holds the seat, but a cleanup
+    // owner still can after its action returns: a hover reveal's three-second
+    // reaper (move_cursor) and a deferred window-change read (up to its
+    // CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS bound). Wait out the longest plus
+    // scheduling margin rather than refuse.
     let cleanup_tail = Duration::from_secs(3);
     let scheduling_margin = Duration::from_secs(1);
     assert!(ACTION_LEASE_WAIT >= cleanup_tail + scheduling_margin);
