@@ -22,7 +22,7 @@
 //! that blocking zbus connection and serializes those calls.
 
 use std::collections::{HashMap, HashSet};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 mod transport;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -686,18 +686,10 @@ fn is_trusted_gnome_shell(pid: u32) -> bool {
     if comm.as_deref().map(str::trim) != Some("gnome-shell") {
         return false;
     }
-    let executable = std::fs::read_link(format!("/proc/{pid}/exe")).ok();
-    let metadata = executable
-        .as_ref()
-        .and_then(|path| std::fs::metadata(path).ok());
-    executable
-        .as_ref()
-        .and_then(|path| path.file_name())
-        .and_then(|name| name.to_str())
-        == Some("gnome-shell")
-        && metadata
-            .as_ref()
-            .is_some_and(|meta| meta.uid() == 0 && meta.permissions().mode() & 0o022 == 0)
+    // Judge the image the Shell is running, not the file now at its path: a
+    // package update replaces /usr/bin/gnome-shell, and the Shell keeps running
+    // the old, unlinked image until the next login.
+    crate::proc_fs::running_executable(pid).is_some_and(|exe| exe.is_system_program("gnome-shell"))
 }
 
 fn gdbus_call_target(
@@ -1412,6 +1404,21 @@ pub fn remove_cursor(owner: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Shell left running after a package update replaced its binary is
+    /// judged by the image it runs. Run as root, or in `unshare -r` where our
+    /// files show as root-owned, the replaced copy is trusted; otherwise not.
+    #[test]
+    fn a_shell_whose_binary_was_replaced_is_judged_by_its_running_image() {
+        use std::os::unix::fs::MetadataExt;
+        let (program, _before, after) =
+            crate::proc_fs::tests::replaced_program("gnome-shell", false).expect("spawn");
+        let pid = program.child.id();
+        let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).expect("comm");
+        assert_eq!(comm.trim(), "gnome-shell");
+        let root_owned = after.metadata.as_ref().expect("image").uid() == 0;
+        assert_eq!(is_trusted_gnome_shell(pid), root_owned);
+    }
 
     const EXTENSION_SOURCE: &str =
         include_str!("../../../../../wayland-helper/winrects@cua/extension.js");
