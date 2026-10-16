@@ -175,47 +175,19 @@ pub fn walk_tree_bounded_within(
     // while the tree is suspiciously root-only, so the first get_window_state
     // after launch returns the real tree instead of an empty one. See #1927.
     // Every retry runs against what is LEFT of the caller's budget.
-    const MAX_ATTEMPTS: usize = 4;
-    const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
     let started = std::time::Instant::now();
-    let mut native_failure = None;
-    let mut last_partial: Option<native::WalkedTree> = None;
-    for attempt in 0..MAX_ATTEMPTS {
-        let remaining = timeout.saturating_sub(started.elapsed());
-        if remaining.is_zero() {
-            break;
-        }
-        match native::walk_tree_bounded_with_timeout(pid, xid, max_elements, max_depth, remaining) {
-            Ok(Some(walked)) => {
-                // `nodes.len() <= 1` == only the root window resolved: the
-                // cold-registry symptom. Accept any real tree immediately; only
-                // keep waiting on the degenerate case, and accept it anyway on the
-                // final attempt rather than discarding a (minimal) valid result.
-                // A truncated walk is never the cold-registry symptom — retrying
-                // it would only burn the budget again.
-                let is_last = attempt == MAX_ATTEMPTS - 1
-                    || timeout.saturating_sub(started.elapsed()) <= RETRY_BACKOFF;
-                if !walked.markdown.is_empty()
-                    && (walked.nodes.len() > 1 || walked.truncation.is_some() || is_last)
-                {
-                    return AtspiTreeResult::from_walked(walked, query);
-                }
-                if walked.truncation.is_some() {
-                    // Out of time before the application even answered.
-                    last_partial = Some(walked);
-                    break;
-                }
-                if !walked.markdown.is_empty() {
-                    last_partial = Some(walked);
-                }
+    let (last_partial, native_failure) =
+        match walk_native_with_retries(timeout, registration_may_be_pending(pid), |remaining| {
+            native::walk_tree_bounded_with_timeout(pid, xid, max_elements, max_depth, remaining)
+        }) {
+            NativeWalkOutcome::Complete(walked) => {
+                return AtspiTreeResult::from_walked(walked, query)
             }
-            Ok(None) => {}
-            Err(error) => native_failure = Some(error.to_string()),
-        }
-        if attempt < MAX_ATTEMPTS - 1 {
-            std::thread::sleep(RETRY_BACKOFF);
-        }
-    }
+            NativeWalkOutcome::Exhausted {
+                last_partial,
+                native_failure,
+            } => (last_partial, native_failure),
+        };
     if let Some(walked) = last_partial {
         if !walked.markdown.is_empty() || walked.truncation.is_some() {
             let mut result = AtspiTreeResult::from_walked(walked, query);
@@ -247,6 +219,93 @@ pub fn walk_tree_bounded_within(
     fallback.elapsed_ms = started.elapsed().as_millis();
     fallback.degraded_reason = native_failure.map(|error| format!("atspi_walk_failed: {error}"));
     fallback
+}
+
+/// What [`walk_native_with_retries`] produced.
+enum NativeWalkOutcome {
+    /// A tree to return as it is.
+    Complete(native::WalkedTree),
+    /// No acceptable tree: the last partial walk and the last native error.
+    Exhausted {
+        last_partial: Option<native::WalkedTree>,
+        native_failure: Option<String>,
+    },
+}
+
+/// Run `walk` (given what is left of `timeout`) until it returns a real tree,
+/// retrying a few times with a short backoff on the cold-registry symptoms: a
+/// root-only tree, or no application yet for a process that may still be
+/// registering (`registration_pending`).
+fn walk_native_with_retries(
+    timeout: std::time::Duration,
+    registration_pending: bool,
+    mut walk: impl FnMut(std::time::Duration) -> Result<Option<native::WalkedTree>>,
+) -> NativeWalkOutcome {
+    const MAX_ATTEMPTS: usize = 4;
+    const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
+    let started = std::time::Instant::now();
+    let mut native_failure = None;
+    let mut last_partial: Option<native::WalkedTree> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            break;
+        }
+        match walk(remaining) {
+            Ok(Some(walked)) => {
+                // `nodes.len() <= 1` == only the root window resolved: the
+                // cold-registry symptom. Accept any real tree immediately; only
+                // keep waiting on the degenerate case, and accept it anyway on the
+                // final attempt rather than discarding a (minimal) valid result.
+                // A truncated walk is never the cold-registry symptom — retrying
+                // it would only burn the budget again.
+                let is_last = attempt == MAX_ATTEMPTS - 1
+                    || timeout.saturating_sub(started.elapsed()) <= RETRY_BACKOFF;
+                if !walked.markdown.is_empty()
+                    && (walked.nodes.len() > 1 || walked.truncation.is_some() || is_last)
+                {
+                    return NativeWalkOutcome::Complete(walked);
+                }
+                if walked.truncation.is_some() {
+                    // Out of time before the application even answered.
+                    last_partial = Some(walked);
+                    break;
+                }
+                if !walked.markdown.is_empty() {
+                    last_partial = Some(walked);
+                }
+            }
+            // No application on the registry belongs to this process. Only one
+            // that has just started can still be registering; for any other,
+            // waiting cannot change the answer and costs every read ~450 ms.
+            Ok(None) if !registration_pending => break,
+            Ok(None) => {}
+            Err(error) => native_failure = Some(error.to_string()),
+        }
+        if attempt < MAX_ATTEMPTS - 1 {
+            std::thread::sleep(RETRY_BACKOFF);
+        }
+    }
+    NativeWalkOutcome::Exhausted {
+        last_partial,
+        native_failure,
+    }
+}
+
+/// How long after a process starts its toolkit may still be registering with
+/// the AT-SPI registry (#1927: Qt6 and some GTK bridges register lazily on a
+/// cold launch). An application that has not registered by then will not do so
+/// by itself: a toolkit decides once, at startup, whether to join the bus.
+const COLD_REGISTRATION_WINDOW: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether `pid` is young enough that a missing registry entry may still
+/// appear. An unknown age keeps the old behaviour and retries.
+fn registration_may_be_pending(pid: u32) -> bool {
+    registration_pending_for_age(crate::proc_fs::process_age(pid))
+}
+
+fn registration_pending_for_age(age: Option<std::time::Duration>) -> bool {
+    age.is_none_or(|age| age < COLD_REGISTRATION_WINDOW)
 }
 
 /// Perform the first advertised action on element `idx` within pid's app tree.
@@ -624,6 +683,65 @@ mod budget_tests {
             bounds_complete: false,
             elapsed: std::time::Duration::from_millis(1234),
         }
+    }
+
+    #[test]
+    fn an_unregistered_long_running_process_is_walked_once() {
+        let mut calls = 0;
+        let outcome = walk_native_with_retries(std::time::Duration::from_secs(5), false, |_| {
+            calls += 1;
+            Ok(None)
+        });
+        assert!(matches!(
+            outcome,
+            NativeWalkOutcome::Exhausted {
+                last_partial: None,
+                native_failure: None
+            }
+        ));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_just_started_process_is_retried_until_it_registers() {
+        let mut calls = 0;
+        let outcome = walk_native_with_retries(std::time::Duration::from_secs(5), true, |_| {
+            calls += 1;
+            Ok((calls == 3).then(|| walked(None)))
+        });
+        assert!(matches!(outcome, NativeWalkOutcome::Complete(_)));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn walk_errors_are_retried_whatever_the_process_age() {
+        let mut calls = 0;
+        let outcome = walk_native_with_retries(std::time::Duration::from_secs(5), false, |_| {
+            calls += 1;
+            Err(anyhow::anyhow!("registry unavailable"))
+        });
+        assert!(matches!(
+            outcome,
+            NativeWalkOutcome::Exhausted {
+                last_partial: None,
+                native_failure: Some(_)
+            }
+        ));
+        assert_eq!(calls, 4);
+    }
+
+    #[test]
+    fn registration_may_be_pending_only_for_a_young_or_unknown_process() {
+        assert!(registration_pending_for_age(None));
+        assert!(registration_pending_for_age(Some(
+            std::time::Duration::from_secs(1)
+        )));
+        assert!(!registration_pending_for_age(Some(
+            COLD_REGISTRATION_WINDOW
+        )));
+        assert!(!registration_pending_for_age(Some(
+            std::time::Duration::from_secs(3600)
+        )));
     }
 
     #[test]

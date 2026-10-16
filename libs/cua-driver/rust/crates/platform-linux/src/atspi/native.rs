@@ -31,6 +31,9 @@ use super::{AtspiIdentity, AtspiNode};
 // Presence hit-testing is read-only and does not redirect mutation authority.
 pub mod hit;
 
+// Flatpak apps register on the accessibility bus through their sandbox's proxy.
+mod sandbox_peer;
+
 // Point-owner redirection is deferred: it can substitute another native object.
 
 /// Per-call D-Bus timeout: a single unresponsive accessible (common in large,
@@ -52,6 +55,63 @@ tokio::task_local! {
     /// otherwise be allowed the full [`CALL_TIMEOUT`]. Set via [`bounded_for`]
     /// / [`walk_tree_bounded_with_timeout`]; absent for legacy callers.
     static OP_DEADLINE: tokio::time::Instant;
+    /// Set by the snapshot walk ([`walk_tree_bounded_with_timeout`]) only:
+    /// receives the reason when the application lookup could not prove
+    /// absence (a registry or peer call failed or timed out), so the walk can
+    /// retry instead of treating it as "no application". Other callers keep
+    /// their `Ok(None)` (type_text falls back to XTEST on it).
+    static REGISTRY_INCOMPLETE: std::cell::Cell<Option<&'static str>>;
+    /// Set for a snapshot walk ([`collect_visited_bounded_opts`]) of an
+    /// application admitted through its Flatpak sandbox's proxy: every object
+    /// the walk addresses must then be on that proxy's own connection (see
+    /// [`sandbox_gate_allows`]). Unset (`None`) for every other walk.
+    static SANDBOX_GATE: std::cell::RefCell<Option<SandboxGate>>;
+}
+
+/// The proxy a sandboxed walk is confined to, and the verdicts already
+/// reached for the unique bus names it has seen.
+struct SandboxGate {
+    proxy: u32,
+    verdicts: std::collections::HashMap<String, bool>,
+}
+
+/// Whether the current walk may address an object on bus `name`. Always true
+/// outside a sandboxed walk. Inside one, only a unique name whose connection
+/// belongs to the sandbox proxy passes: a well-known name can move to another
+/// connection between a check and its use, and a unique name cannot.
+async fn sandbox_gate_allows(conn: &atspi::zbus::Connection, name: &str) -> bool {
+    let gate = SANDBOX_GATE.try_with(|gate| {
+        gate.borrow()
+            .as_ref()
+            .map(|gate| (gate.proxy, gate.verdicts.get(name).copied()))
+    });
+    let (proxy, cached) = match gate {
+        Ok(Some(gate)) => gate,
+        // Outside a sandboxed walk (or outside any walk scope).
+        Ok(None) | Err(_) => return true,
+    };
+    if let Some(verdict) = cached {
+        return verdict;
+    }
+    let owner = if name.starts_with(':') {
+        match atspi::zbus::fdo::DBusProxy::new(conn).await {
+            Ok(dbus) => bus_owner_pid(&dbus, name).await,
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    let verdict = sandbox_peer::addressable(name, owner, proxy);
+    let _ = SANDBOX_GATE.try_with(|gate| {
+        if let Some(gate) = gate.borrow_mut().as_mut() {
+            gate.verdicts.insert(name.to_owned(), verdict);
+        }
+    });
+    verdict
+}
+
+fn sandbox_refusal(name: &str) -> anyhow::Error {
+    anyhow!("sandbox_foreign_object: {name} is not on the Flatpak sandbox proxy's connection")
 }
 
 /// Time left on the current operation's deadline, or [`CALL_TIMEOUT`] when no
@@ -759,6 +819,9 @@ async fn accessible_via_bus<'a>(
     conn: &'a AccessibilityConnection,
     oref: &RawObjectRef,
 ) -> Result<AccessibleProxy<'a>> {
+    if !sandbox_gate_allows(conn.connection(), &oref.name).await {
+        return Err(sandbox_refusal(&oref.name));
+    }
     // Do not eagerly open every application's optional P2P accessibility
     // socket: one stale peer can block initialization for the whole driver.
     // Object references already carry an exact bus destination, so build the
@@ -835,6 +898,9 @@ pub(crate) const CHILD_ENUMERATION_CAP: usize = 2048;
 /// Accessible.ChildCount: one cheap property read that tells a leaf (skip the
 /// GetChildren round-trip entirely) from a container that must not be expanded.
 async fn raw_child_count(conn: &atspi::zbus::Connection, oref: &RawObjectRef) -> Result<i32> {
+    if !sandbox_gate_allows(conn, &oref.name).await {
+        return Err(sandbox_refusal(&oref.name));
+    }
     // `cache_properties(No)` is load-bearing (see `accessible_via_bus`): a
     // zbus proxy with the default lazy cache answers this one `ChildCount`
     // read with `Properties.GetAll`, which segfaults Qt5's AT-SPI bridge
@@ -896,6 +962,9 @@ async fn raw_children(
     conn: &atspi::zbus::Connection,
     oref: &RawObjectRef,
 ) -> Result<Vec<RawObjectRef>> {
+    if !sandbox_gate_allows(conn, &oref.name).await {
+        return Err(sandbox_refusal(&oref.name));
+    }
     let proxy = atspi::zbus::Proxy::new(
         conn,
         oref.name.as_str(),
@@ -926,12 +995,28 @@ async fn pid_of(
     dbus.get_connection_unix_process_id(bus).await.ok()
 }
 
+/// How a registry peer stands for the target process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admission {
+    /// The peer is the target process itself.
+    Exact,
+    /// The peer is the proxy proven to serve the target's own Flatpak
+    /// sandbox (its pid). Every client in that sandbox shares it, so it proves
+    /// sandbox membership, not which process registered.
+    SandboxProxy(u32),
+}
+
 /// Keep the first matching application as a compatibility fallback, but allow
 /// a later registration with a real child tree to win. Some Qt processes
 /// publish an empty application object before their populated one (#2678,
 /// #2706).
 struct ApplicationSelection<T> {
     target_pid: u32,
+    /// For a Flatpak target: the proof a registry peer must pass to stand in
+    /// for it, since its applications register through the sandbox's proxy.
+    sandbox: Option<sandbox_peer::SandboxPeerProof>,
+    exact_registrations: usize,
+    proxy_registrations: usize,
     fallback: Option<T>,
     populated: Vec<T>,
 }
@@ -940,13 +1025,49 @@ impl<T> ApplicationSelection<T> {
     fn new(target_pid: u32) -> Self {
         Self {
             target_pid,
+            sandbox: None,
+            exact_registrations: 0,
+            proxy_registrations: 0,
             fallback: None,
             populated: Vec::new(),
         }
     }
 
+    fn with_sandbox(mut self, sandbox: Option<sandbox_peer::SandboxPeerProof>) -> Self {
+        self.sandbox = sandbox;
+        self
+    }
+
+    /// The exact pid, or the proxy proven to serve the target's own Flatpak
+    /// sandbox. Every other peer is someone else's application.
+    fn classify(&self, candidate_pid: Option<u32>) -> Option<Admission> {
+        match candidate_pid {
+            Some(pid) if pid == self.target_pid => Some(Admission::Exact),
+            Some(pid) => self
+                .sandbox
+                .as_ref()
+                .is_some_and(|proof| proof.admits(pid))
+                .then_some(Admission::SandboxProxy(pid)),
+            None => None,
+        }
+    }
+
+    #[cfg(test)]
     fn matches_pid(&self, candidate_pid: Option<u32>) -> bool {
-        candidate_pid == Some(self.target_pid)
+        self.classify(candidate_pid).is_some()
+    }
+
+    /// Classify a registry peer and count its registration, whether or not
+    /// the application then answers. A proxy proves only that the
+    /// registration came from inside the target's sandbox, so selection
+    /// through it requires it to be the only registration there is.
+    fn admit(&mut self, candidate_pid: Option<u32>) -> Option<Admission> {
+        let admission = self.classify(candidate_pid)?;
+        match admission {
+            Admission::Exact => self.exact_registrations += 1,
+            Admission::SandboxProxy(_) => self.proxy_registrations += 1,
+        }
+        Some(admission)
     }
 
     /// Retain every populated exact-PID candidate so resolution can reject an
@@ -962,12 +1083,25 @@ impl<T> ApplicationSelection<T> {
     }
 
     fn into_selected(mut self) -> std::result::Result<Option<T>, usize> {
+        let registrations = self.exact_registrations + self.proxy_registrations;
+        if self.proxy_registrations > 0 && registrations > 1 {
+            return Err(registrations);
+        }
         match self.populated.len() {
             0 => Ok(self.fallback),
             1 => Ok(self.populated.pop()),
             count => Err(count),
         }
     }
+}
+
+/// What a registry scan found for one target process.
+enum AppLookup<'a> {
+    Found(ResolvedApp<'a>),
+    /// The registry answered in full and no application belongs to the process.
+    Absent,
+    /// The registry or a peer did not answer, so absence is not proven.
+    Incomplete(&'static str),
 }
 
 /// An application accessible plus the top-level children its selection probe
@@ -977,14 +1111,22 @@ impl<T> ApplicationSelection<T> {
 struct ResolvedApp<'a> {
     app: AccessibleProxy<'a>,
     children: Option<Vec<atspi::ObjectRefOwned>>,
+    /// The sandbox proxy's pid when the application was admitted through it;
+    /// every object walked from it must then live on that proxy's connection.
+    sandbox_proxy: Option<u32>,
 }
 
-/// Locate the application accessible whose backing process is `pid`.
+/// Locate the application accessible whose backing process is `pid` (exact
+/// pid only: focus and hit-testing callers walk objects without the sandbox
+/// ownership checks the snapshot walk applies).
 async fn app_for_pid<'a>(
     conn: &'a AccessibilityConnection,
     pid: u32,
 ) -> Result<Option<AccessibleProxy<'a>>> {
-    Ok(resolve_app_for_pid(conn, pid).await?.map(|r| r.app))
+    Ok(match resolve_app_for_pid(conn, pid, false).await? {
+        AppLookup::Found(resolved) => Some(resolved.app),
+        AppLookup::Absent | AppLookup::Incomplete(_) => None,
+    })
 }
 
 /// Best-effort executable/process name for `pid`, read from `/proc/<pid>/comm`
@@ -997,10 +1139,14 @@ fn process_name(pid: u32) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// `admit_sandbox`: also accept the proxy proven to serve `pid`'s Flatpak
+/// sandbox (see [`sandbox_peer`]), for callers that enforce its ownership
+/// rules on every object they walk.
 async fn resolve_app_for_pid<'a>(
     conn: &'a AccessibilityConnection,
     pid: u32,
-) -> Result<Option<ResolvedApp<'a>>> {
+    admit_sandbox: bool,
+) -> Result<AppLookup<'a>> {
     let zconn = conn.connection();
     // Every AT-SPI round-trip below can block on an app whose main loop isn't
     // servicing D-Bus — most commonly one holding a modal grab (an "Add/Edit/
@@ -1014,7 +1160,7 @@ async fn resolve_app_for_pid<'a>(
         Some(Err(e)) => return Err(anyhow!("registry root unavailable: {e}")),
         None => {
             dlog!("registry root lookup timed out");
-            return Ok(None);
+            return Ok(AppLookup::Incomplete("registry_root_timeout"));
         }
     };
     let dbus = atspi::zbus::fdo::DBusProxy::new(zconn)
@@ -1022,36 +1168,55 @@ async fn resolve_app_for_pid<'a>(
         .map_err(|e| anyhow!("DBus proxy unavailable: {e}"))?;
 
     let apps = match call(root.get_children()).await {
-        Some(r) => r.unwrap_or_default(),
+        Some(Ok(apps)) => apps,
+        Some(Err(error)) => {
+            dlog!("registry get_children failed: {error:#}");
+            return Ok(AppLookup::Incomplete("registry_children_failed"));
+        }
         None => {
             dlog!("registry get_children timed out");
-            return Ok(None);
+            return Ok(AppLookup::Incomplete("registry_children_timeout"));
         }
     };
     dlog!(
         "registry root has {} application(s); seeking pid {pid}",
         apps.len()
     );
-    let mut selection = ApplicationSelection::new(pid);
-    // Only the exact PID on the accessibility bus can supply this tree.
+    // Only the exact PID on the accessibility bus, or the proxy proven to serve
+    // its own Flatpak sandbox, can supply this tree.
+    let sandbox = admit_sandbox
+        .then(|| sandbox_peer::SandboxPeerProof::for_target(pid))
+        .flatten();
+    let mut selection = ApplicationSelection::new(pid).with_sandbox(sandbox.clone());
+    let mut incomplete = None;
 
     for child in apps {
         // A modal-grabbed app can't answer the pid query; skip it after
         // CALL_TIMEOUT rather than blocking the whole walk on it.
         let cpid = match call(pid_of(&dbus, &child)).await {
-            Some(p) => p,
-            None => {
+            Some(Some(pid)) => pid,
+            // A failed or timed-out lookup leaves this peer's owner unknown: it
+            // may be the target, so absence is no longer proven.
+            Some(None) | None => {
                 dlog!(
-                    "  pid_of timed out for bus={:?}, skipping",
+                    "  pid_of failed or timed out for bus={:?}, skipping",
                     child.name_as_str()
                 );
+                incomplete = Some("peer_pid_unknown");
                 continue;
             }
         };
-        dlog!("  app bus={:?} pid={:?}", child.name_as_str(), cpid);
-        if !selection.matches_pid(cpid) {
+        dlog!("  app bus={:?} pid={cpid}", child.name_as_str());
+        let Some(admission) = selection.admit(Some(cpid)) else {
             continue;
+        };
+        if let Admission::SandboxProxy(proxy) = admission {
+            dlog!("  peer pid {proxy} is pid {pid}'s Flatpak accessibility proxy");
         }
+        let sandbox_proxy = match admission {
+            Admission::Exact => None,
+            Admission::SandboxProxy(proxy) => Some(proxy),
+        };
         let child = match RawObjectRef::from_atspi(&child) {
             Some(child) => child,
             None => continue,
@@ -1060,10 +1225,12 @@ async fn resolve_app_for_pid<'a>(
             Some(Ok(app)) => app,
             Some(Err(error)) => {
                 dlog!("  accessible_for failed for pid {pid}: {error:#}");
+                incomplete = Some("application_unanswered");
                 continue;
             }
             None => {
                 dlog!("  accessible_for timed out for pid {pid}");
+                incomplete = Some("application_unanswered");
                 continue;
             }
         };
@@ -1080,16 +1247,71 @@ async fn resolve_app_for_pid<'a>(
         };
         let has_children = children.as_ref().is_some_and(|c| !c.is_empty());
         dlog!("  matching app has_children={has_children}");
-        selection.consider_matching(ResolvedApp { app, children }, has_children);
+        selection.consider_matching(
+            ResolvedApp {
+                app,
+                children,
+                sandbox_proxy,
+            },
+            has_children,
+        );
     }
-    match selection.into_selected() {
-        Ok(Some(app)) => Ok(Some(app)),
-        Ok(None) => Ok(None),
-        Err(count) => Err(anyhow!(
-            "ambiguous AT-SPI application selection for pid {pid}: \
-             {count} populated application accessibles matched"
-        )),
+    let selected = match selection.into_selected() {
+        Ok(Some(app)) => app,
+        Ok(None) => {
+            return Ok(match incomplete {
+                Some(reason) => AppLookup::Incomplete(reason),
+                None => AppLookup::Absent,
+            })
+        }
+        Err(count) => {
+            return Err(anyhow!(
+                "ambiguous AT-SPI application selection for pid {pid}: \
+                 {count} application accessibles matched"
+            ))
+        }
+    };
+    if selected.sandbox_proxy.is_some() {
+        // A proxy proves only that the registration came from inside the
+        // sandbox. It stands for the target only when it was provably the one
+        // registration there (no peer left unanswered) and no other process in
+        // that sandbox owns a window it could belong to.
+        if let Some(reason) = incomplete {
+            return Ok(AppLookup::Incomplete(reason));
+        }
+        // Only the GNOME Shell helper's own window list is complete enough to
+        // prove this: it lists every window actor, titled or not, with its
+        // pid, and parses all or nothing. It runs off this task under the
+        // walk's deadline. Elsewhere (X11, Sway, KWin, Hyprland), or when the
+        // helper is missing, slow or fails, a sandbox registration is refused.
+        let windows = if crate::wayland::is_wayland() {
+            bounded_blocking(|| crate::wayland::shell_helper::list_windows(None))
+                .await
+                .flatten()
+        } else {
+            None
+        };
+        let shared = match (sandbox.as_ref(), windows) {
+            (Some(proof), Some(windows)) => {
+                !proof.owns_its_sandbox_windows(windows.iter().map(|window| window.pid))
+            }
+            _ => true,
+        };
+        if shared {
+            return Err(anyhow!(
+                "flatpak_sandbox_shared: pid {pid}'s sandbox has another window owner, or its \
+                 windows could not be listed; its accessibility registration cannot be \
+                 attributed to pid {pid}"
+            ));
+        }
     }
+    Ok(AppLookup::Found(selected))
+}
+
+/// The pid behind a unique bus name on the accessibility bus.
+async fn bus_owner_pid(dbus: &atspi::zbus::fdo::DBusProxy<'_>, unique_name: &str) -> Option<u32> {
+    let bus = atspi::zbus::names::BusName::try_from(unique_name.to_owned()).ok()?;
+    call(dbus.get_connection_unix_process_id(bus)).await?.ok()
 }
 
 /// Depth-first, pre-order walk of an application's windows. Mirrors the old
@@ -1458,12 +1680,34 @@ async fn collect_visited_bounded_opts<'a>(
     max_depth: Option<usize>,
     walk_closed_menus: bool,
 ) -> Result<Option<Collected<'a>>> {
+    // Each walk gets its own gate scope, closed until a sandbox admission
+    // opens it, so no other walk inherits it.
+    SANDBOX_GATE
+        .scope(
+            std::cell::RefCell::new(None),
+            collect_visited_in_gate(conn, pid, xid, max_elements, max_depth, walk_closed_menus),
+        )
+        .await
+}
+
+async fn collect_visited_in_gate<'a>(
+    conn: &'a AccessibilityConnection,
+    pid: u32,
+    xid: u64,
+    max_elements: Option<usize>,
+    max_depth: Option<usize>,
+    walk_closed_menus: bool,
+) -> Result<Option<Collected<'a>>> {
     let ResolvedApp {
         app,
         children: probed,
-    } = match resolve_app_for_pid(conn, pid).await? {
-        Some(a) => a,
-        None => {
+        sandbox_proxy,
+    } = match resolve_app_for_pid(conn, pid, true).await? {
+        AppLookup::Found(a) => a,
+        lookup => {
+            if let AppLookup::Incomplete(reason) = lookup {
+                let _ = REGISTRY_INCOMPLETE.try_with(|cell| cell.set(Some(reason)));
+            }
             if deadline_passed() {
                 // The registry / application did not answer inside the caller's
                 // budget. Distinguish that from "no such application" so the
@@ -1500,11 +1744,40 @@ async fn collect_visited_bounded_opts<'a>(
     // Keep a single immutable seed list: window correlation and traversal must
     // refer to the same top-level ordering.
     let app_answered = probed.is_some();
-    let seeds: Vec<RawObjectRef> = probed
+    let mut seeds: Vec<RawObjectRef> = probed
         .unwrap_or_default()
         .into_iter()
         .filter_map(|child| RawObjectRef::from_atspi(&child))
         .collect();
+    // An application admitted through its sandbox's proxy may only contribute
+    // objects on that proxy's own connection: from here on every object this
+    // walk addresses (seeds, descendants, relation targets, menu peeks, child
+    // counts) passes `sandbox_gate_allows`, and a reference to another
+    // application's objects is never followed.
+    if let Some(proxy) = sandbox_proxy {
+        let opened = SANDBOX_GATE.try_with(|gate| {
+            *gate.borrow_mut() = Some(SandboxGate {
+                proxy,
+                verdicts: std::collections::HashMap::new(),
+            });
+        });
+        if opened.is_err() {
+            return Err(anyhow!("sandbox gate unavailable for pid {pid}"));
+        }
+        let zconn = conn.connection();
+        let mut kept = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            if sandbox_gate_allows(zconn, &seed.name).await {
+                kept.push(seed);
+            } else {
+                dlog!(
+                    "  sandboxed seed {:?} is not on its proxy's connection; skipped",
+                    seed.name
+                );
+            }
+        }
+        seeds = kept;
+    }
     if !app_answered {
         // The application registered with AT-SPI but never answered
         // `GetChildren`: LibreOffice with its bridge half-initialised, or a
@@ -1602,6 +1875,13 @@ async fn collect_visited_bounded_opts<'a>(
         // otherwise the loop never returns to the deadline check at the top and
         // the walk stalls past OP_TIMEOUT for callers without an outer guard
         // (snapshot bounds, insert_text). That was the residual #1936 hang.
+        if !sandbox_gate_allows(zconn, &oref.name).await {
+            dlog!(
+                "  sandboxed object on {:?} is not on its proxy's connection; skipped",
+                oref.name
+            );
+            continue;
+        }
         let object_identity = identity_ref(conn, &oref, &mut identity_owners).await;
         let frame_identity = identity_ref(conn, &seeds[frame_ordinal], &mut identity_owners).await;
         let acc = match call(accessible_for(
@@ -2556,10 +2836,22 @@ pub(super) fn walk_tree_bounded_with_timeout(
         // Backstop only: the walk observes `deadline` itself and returns its
         // partial result; this guards the few un-wrapped awaits.
         let backstop = deadline + Duration::from_millis(500);
-        let walk = OP_DEADLINE.scope(deadline, async {
-            let conn = shared_connection().await?;
-            collect_visited_bounded(conn, pid, xid, max_elements, max_depth).await
-        });
+        let walk = REGISTRY_INCOMPLETE.scope(
+            std::cell::Cell::new(None),
+            OP_DEADLINE.scope(deadline, async {
+                let conn = shared_connection().await?;
+                let walked =
+                    collect_visited_bounded(conn, pid, xid, max_elements, max_depth).await?;
+                // Unproven absence is a failed lookup, which the caller retries,
+                // not an application that is not there.
+                match REGISTRY_INCOMPLETE.with(|cell| cell.get()) {
+                    Some(reason) if walked.is_none() && !deadline_passed() => {
+                        Err(anyhow!("atspi_registry_incomplete: {reason}"))
+                    }
+                    _ => Ok(walked),
+                }
+            }),
+        );
         let walked = match before_snapshot_deadline(backstop, walk).await {
             Ok(Ok(result)) => result,
             Ok(Err(error)) if error.to_string() == "app_lookup_timeout" => {

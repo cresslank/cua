@@ -61,6 +61,31 @@ pub fn process_instance_id(pid: u32) -> Option<u64> {
     process_start_time_from_stat(&stat)
 }
 
+/// How long `pid` has been running: system uptime minus its kernel start
+/// time. `None` when either cannot be read.
+pub(crate) fn process_age(pid: u32) -> Option<std::time::Duration> {
+    let start_ticks = process_instance_id(pid)?;
+    let uptime = fs::read_to_string("/proc/uptime").ok()?;
+    // SAFETY: sysconf has no preconditions.
+    let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    age_from_start_ticks(start_ticks, &uptime, ticks_per_second)
+}
+
+/// [`process_age`] from its inputs: start time in clock ticks since boot, the
+/// contents of `/proc/uptime` (seconds since boot first) and the tick rate.
+pub(crate) fn age_from_start_ticks(
+    start_ticks: u64,
+    uptime: &str,
+    ticks_per_second: libc::c_long,
+) -> Option<std::time::Duration> {
+    if ticks_per_second <= 0 {
+        return None;
+    }
+    let uptime: f64 = uptime.split_whitespace().next()?.parse().ok()?;
+    let started = start_ticks as f64 / ticks_per_second as f64;
+    std::time::Duration::try_from_secs_f64((uptime - started).max(0.0)).ok()
+}
+
 /// One process instance as `/proc/<pid>/stat` describes it: its scheduler
 /// state and its kernel start time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -317,6 +342,21 @@ pub fn list_processes() -> Vec<ProcessInfo> {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::path::PathBuf;
+
+    #[test]
+    fn process_age_is_uptime_minus_start_time() {
+        let age = |start, uptime, rate| super::age_from_start_ticks(start, uptime, rate);
+        assert_eq!(
+            age(10_000, "12345.50 99999.00\n", 100),
+            Some(std::time::Duration::from_millis(12_245_500))
+        );
+        // A start reported after the uptime reading is a process that just began.
+        assert_eq!(age(200, "1.00 2.00", 100), Some(std::time::Duration::ZERO));
+        assert_eq!(age(1, "garbage", 100), None);
+        assert_eq!(age(1, "", 100), None);
+        assert_eq!(age(1, "5.0 1.0", 0), None);
+        assert!(super::process_age(std::process::id()).is_some());
+    }
 
     #[test]
     fn a_replaced_programs_path_loses_the_kernels_deleted_suffix_only_when_unlinked() {
