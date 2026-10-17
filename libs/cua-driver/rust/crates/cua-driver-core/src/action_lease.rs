@@ -254,6 +254,72 @@ pub fn global() -> &'static Arc<ActionLeaseTable> {
     TABLE.get_or_init(ActionLeaseTable::new)
 }
 
+/// Transport permission selected once before admission and carried through
+/// dispatch, native workers and cleanup. This does not change the lease class.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InputRoute {
+    #[default]
+    Unrestricted,
+    AccessibilityOnly,
+}
+
+tokio::task_local! {
+    static DISPATCH_INPUT_ROUTE: InputRoute;
+}
+
+impl InputRoute {
+    pub async fn scope<F: std::future::Future>(self, future: F) -> F::Output {
+        // Nested dispatch cannot regain input permission its parent lacks.
+        let route = if current_input_route() == Self::AccessibilityOnly {
+            Self::AccessibilityOnly
+        } else {
+            self
+        };
+        DISPATCH_INPUT_ROUTE.scope(route, future).await
+    }
+
+    pub(crate) fn sync_scope<R>(self, action: impl FnOnce() -> R) -> R {
+        let route = if current_input_route() == Self::AccessibilityOnly {
+            Self::AccessibilityOnly
+        } else {
+            self
+        };
+        DISPATCH_INPUT_ROUTE.sync_scope(route, action)
+    }
+}
+
+pub fn current_input_route() -> InputRoute {
+    DISPATCH_INPUT_ROUTE
+        .try_with(|route| *route)
+        .unwrap_or_default()
+}
+
+/// Check before starting, waiting on or submitting to a raw input transport.
+pub fn require_raw_input_allowed() -> Result<(), &'static str> {
+    if current_input_route() == InputRoute::AccessibilityOnly {
+        Err("input_unavailable: accessibility-only dispatch cannot use compositor input; refresh the element or explicitly request a raw-input action")
+    } else {
+        Ok(())
+    }
+}
+
+type InputRouteHook = fn(&str, &Value) -> InputRoute;
+static INPUT_ROUTE: OnceLock<InputRouteHook> = OnceLock::new();
+
+pub fn install_input_route_hook(hook: InputRouteHook) {
+    let _ = INPUT_ROUTE.set(hook);
+}
+
+pub fn input_route_for_tool(tool: &str, args: &Value) -> InputRoute {
+    if current_input_route() == InputRoute::AccessibilityOnly {
+        InputRoute::AccessibilityOnly
+    } else {
+        INPUT_ROUTE
+            .get()
+            .map_or(InputRoute::Unrestricted, |hook| hook(tool, args))
+    }
+}
+
 /// Receives the tool name and its call arguments: the platform route (and so
 /// the transport to prepare) can depend on arguments such as modifiers.
 type RawInputReadyHook = fn(&str, &Value) -> Result<(), String>;

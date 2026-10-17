@@ -19,6 +19,7 @@ pub fn build_registry(compat: bool) -> ToolRegistry {
 
 #[cfg(target_os = "linux")]
 fn install_action_lease_hooks() {
+    cua_driver_core::action_lease::install_input_route_hook(crate::wayland::input_route_for_tool);
     cua_driver_core::action_lease::install_raw_input_ready_hook(
         crate::wayland::ensure_raw_input_ready_for_tool,
     );

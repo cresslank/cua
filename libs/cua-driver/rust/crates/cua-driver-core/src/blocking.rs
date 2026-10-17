@@ -110,6 +110,7 @@ impl<R> Drop for NativeTask<R> {
 pub struct ActionLeaseScope(
     Option<Arc<crate::action_lease::ActionLease>>,
     Option<Vec<Arc<AtomicBool>>>,
+    crate::action_lease::InputRoute,
 );
 
 impl ActionLeaseScope {
@@ -120,6 +121,7 @@ impl ActionLeaseScope {
                 .ok()
                 .flatten(),
             NATIVE_CANCELLATION.try_with(Clone::clone).ok(),
+            crate::action_lease::current_input_route(),
         )
     }
 
@@ -138,16 +140,20 @@ impl ActionLeaseScope {
 
     /// Release-only cleanup within an already admitted native worker.
     pub fn run_cleanup<R>(&self, function: impl FnOnce() -> R) -> R {
-        crate::tool::DISPATCH_ACTION_LEASE.sync_scope(self.0.clone(), || {
-            NATIVE_CANCELLATION.sync_scope(Vec::new(), function)
+        self.2.sync_scope(|| {
+            crate::tool::DISPATCH_ACTION_LEASE.sync_scope(self.0.clone(), || {
+                NATIVE_CANCELLATION.sync_scope(Vec::new(), function)
+            })
         })
     }
 
     /// Propagate ownership to any further native continuations started here.
     pub fn run<R>(&self, function: impl FnOnce() -> R) -> R {
-        crate::tool::DISPATCH_ACTION_LEASE.sync_scope(self.0.clone(), || match &self.1 {
-            Some(cancelled) => NATIVE_CANCELLATION.sync_scope(cancelled.clone(), function),
-            None => function(),
+        self.2.sync_scope(|| {
+            crate::tool::DISPATCH_ACTION_LEASE.sync_scope(self.0.clone(), || match &self.1 {
+                Some(cancelled) => NATIVE_CANCELLATION.sync_scope(cancelled.clone(), function),
+                None => function(),
+            })
         })
     }
 }
