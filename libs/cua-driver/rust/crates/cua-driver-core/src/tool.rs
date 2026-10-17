@@ -95,6 +95,24 @@ fn lease_refusal(error: crate::action_lease::LeaseError) -> ToolResult {
 async fn admit_action_lease(
     tool_name: &str,
     args: &Value,
+    route: crate::action_lease::InputRoute,
+) -> Result<Option<Arc<crate::action_lease::ActionLease>>, ToolResult> {
+    admit_action_lease_with(
+        tool_name,
+        args,
+        route,
+        crate::action_lease::global(),
+        crate::action_lease::ensure_raw_input_ready,
+    )
+    .await
+}
+
+async fn admit_action_lease_with(
+    tool_name: &str,
+    args: &Value,
+    route: crate::action_lease::InputRoute,
+    table: &Arc<crate::action_lease::ActionLeaseTable>,
+    readiness: impl FnOnce(&str, &Value) -> Result<(), String> + Send + 'static,
 ) -> Result<Option<Arc<crate::action_lease::ActionLease>>, ToolResult> {
     let class = crate::action_lease::classify_tool(tool_name);
     if class == crate::action_lease::ActionClass::Observation {
@@ -103,16 +121,13 @@ async fn admit_action_lease(
     // Existing-profile setup uses native keyboard/pointer navigation even though
     // its dispatch grant is BrowserProfile, not DesktopRaw. Prepare transport
     // before either that grant or the platform foreground transaction is held.
-    if class == crate::action_lease::ActionClass::DesktopRaw
-        || is_existing_profile_prepare(tool_name, args)
+    if route != crate::action_lease::InputRoute::AccessibilityOnly
+        && (class == crate::action_lease::ActionClass::DesktopRaw
+            || is_existing_profile_prepare(tool_name, args))
     {
         let tool = tool_name.to_owned();
         let readiness_args = args.clone();
-        match crate::blocking::spawn(move || {
-            crate::action_lease::ensure_raw_input_ready(&tool, &readiness_args)
-        })
-        .await
-        {
+        match crate::blocking::spawn(move || readiness(&tool, &readiness_args)).await {
             Ok(Ok(())) => {}
             Ok(Err(message)) => {
                 return Err(protected_refusal("input_unavailable", &message));
@@ -129,7 +144,7 @@ async fn admit_action_lease(
     if crate::action_lease::ActionLeaseTable::resources_for(&request).is_empty() {
         return Ok(None);
     }
-    crate::action_lease::global()
+    table
         .acquire_for_dispatch(request)
         .await
         .map(Some)
@@ -2335,7 +2350,9 @@ impl ToolRegistry {
         // Resource-scoped writes are admitted after authorization so a
         // consent dialog cannot hold desktop-raw. Portal/libei readiness
         // runs first; the lease is taken only when the injector can start.
-        let _action_lease = match admit_action_lease(resolved_name, &args).await {
+        // One route decision governs both readiness and dispatch permissions.
+        let input_route = crate::action_lease::input_route_for_tool(resolved_name, &args);
+        let _action_lease = match admit_action_lease(resolved_name, &args, input_route).await {
             Ok(lease) => lease,
             Err(mut refusal) => {
                 restore_public_runtime_result(&mut refusal, &runtime_prefix);
@@ -2384,7 +2401,9 @@ impl ToolRegistry {
         }
         let mut result = crate::recording::scope_dispatch_click_capture(
             pending_turn.as_ref(),
-            DISPATCH_ACTION_LEASE.scope(_action_lease.clone(), tool.invoke(args.clone())),
+            input_route.scope(
+                DISPATCH_ACTION_LEASE.scope(_action_lease.clone(), tool.invoke(args.clone())),
+            ),
         )
         .await;
         match resolved_name {

@@ -1,4 +1,92 @@
 //! Hermetic admission regressions: no platform hooks or process-global table.
+
+#[tokio::test]
+async fn semantic_input_gnome_click_skips_readiness_but_keeps_lease_and_raw_ordering() {
+    use crate::action_lease::InputRoute;
+    let table = ActionLeaseTable::new();
+    let args = json!({"pid":500,"window_id":5,"element_token":"s:1","delivery_mode":"background"});
+    // The Linux selector supplies AccessibilityOnly for this GNOME shape;
+    // exercise the real core admission body without global hook mutation.
+    let semantic = super::admit_action_lease_with(
+        "click",
+        &args,
+        InputRoute::AccessibilityOnly,
+        &table,
+        |_, _| panic!("semantic admission must not call readiness"),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        table
+            .acquire(LeaseRequest::desktop_raw(None, Duration::ZERO))
+            .await
+            .unwrap_err()
+            .code(),
+        "input_busy"
+    );
+    drop(semantic);
+    let probe_table = table.clone();
+    let coordinate = super::admit_action_lease_with(
+        "click",
+        &json!({"pid":500,"window_id":5,"x":1,"y":2}),
+        InputRoute::Unrestricted,
+        &table,
+        move |tool, args| {
+            assert_eq!(tool, "click");
+            assert_eq!(args["x"], 1);
+            // This would fail if the raw lease preceded readiness.
+            let lease = probe_table
+                .acquire_blocking(LeaseRequest::desktop_raw(None, Duration::ZERO))
+                .unwrap();
+            drop(lease);
+            Err("fixture: EIS unavailable".into())
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        coordinate.structured_content.unwrap()["refusal"]["code"],
+        "input_unavailable"
+    );
+    table
+        .acquire(LeaseRequest::desktop_raw(None, Duration::ZERO))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn semantic_input_scope_survives_native_continuations_cleanup_and_nested_dispatch() {
+    use crate::action_lease::{
+        current_input_route, input_route_for_tool, require_raw_input_allowed, InputRoute,
+    };
+    let scope = InputRoute::AccessibilityOnly
+        .scope(async {
+            assert_eq!(
+                input_route_for_tool("press_key", &json!({})),
+                InputRoute::AccessibilityOnly
+            );
+            InputRoute::Unrestricted
+                .scope(async {
+                    assert!(require_raw_input_allowed().is_err());
+                })
+                .await;
+            crate::blocking::spawn(|| {
+                assert!(require_raw_input_allowed().is_err());
+                ActionLeaseScope::capture()
+            })
+            .await
+            .unwrap()
+        })
+        .await;
+    assert_eq!(current_input_route(), InputRoute::Unrestricted);
+    std::thread::spawn(move || {
+        scope.run(|| assert!(require_raw_input_allowed().is_err()));
+        scope.run_cleanup(|| assert!(require_raw_input_allowed().is_err()));
+    })
+    .join()
+    .unwrap();
+}
 use super::{lease_refusal, ACTION_LEASE_WAIT, DISPATCH_ACTION_LEASE};
 use crate::action_lease::{lease_request_for, ActionLeaseTable, ExactWindow, LeaseRequest};
 use crate::blocking::ActionLeaseScope;

@@ -302,6 +302,10 @@ impl CommandSender {
     }
 
     fn send(&self, command: Cmd) -> anyhow::Result<Arc<CommandCompletion>> {
+        if !matches!(command, Cmd::Shutdown) {
+            cua_driver_core::action_lease::require_raw_input_allowed()
+                .map_err(anyhow::Error::msg)?;
+        }
         let completion = Arc::new(CommandCompletion {
             deadline: super::foreground_deadline::cap(Instant::now() + COMMAND_TIMEOUT),
             execution: Mutex::new(CommandExecution {
@@ -420,6 +424,7 @@ fn unparented_wayland_identifier() -> ashpd::WindowIdentifier {
 /// Spawn the libei worker thread (idempotent — safe to call from every
 /// MCP tool invocation; subsequent calls are no-ops).
 pub fn ensure_started() -> anyhow::Result<()> {
+    cua_driver_core::action_lease::require_raw_input_allowed().map_err(anyhow::Error::msg)?;
     TX.get_or_init(|| {
         let (tx, rx) = bounded(64);
         let sender = CommandSender::new(tx);
@@ -1667,6 +1672,72 @@ mod drain_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn semantic_input_accidental_libei_calls_refuse_before_start_wait_or_inject() {
+        use cua_driver_core::action_lease::InputRoute;
+        InputRoute::AccessibilityOnly
+            .scope(async {
+                cua_driver_core::blocking::spawn(|| {
+                    for result in [
+                        ensure_started(),
+                        wait_pointer_ready(),
+                        wait_scroll_ready(),
+                        wait_keyboard_ready(),
+                        reconnect_for_readiness("ei_pointer_absolute"),
+                        click(1.0, 2.0, Button::Left),
+                        move_absolute(1.0, 2.0),
+                        scroll(0.0, 1.0),
+                        type_text("test"),
+                        press_key(28),
+                        key_sequence(&[KeyTransition::Press(28), KeyTransition::Release(28)]),
+                        drag(1.0, 2.0, 3.0, 4.0, 1, 1, Button::Left),
+                    ] {
+                        assert!(result
+                            .unwrap_err()
+                            .to_string()
+                            .starts_with("input_unavailable: accessibility-only"));
+                    }
+                })
+                .await
+                .unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn semantic_input_warm_sender_enqueues_nothing_even_in_detached_cleanup() {
+        use cua_driver_core::action_lease::InputRoute;
+        let (tx, rx) = bounded(1);
+        let sender = CommandSender::new(tx);
+        sender.live.store(true, Ordering::Release);
+        let scope = InputRoute::AccessibilityOnly
+            .scope(async { cua_driver_core::blocking::ActionLeaseScope::capture() })
+            .await;
+        std::thread::spawn(move || {
+            scope.run_cleanup(|| {
+                let (reply, _) = bounded(1);
+                let error = match sender.send(Cmd::Click {
+                    x: 1.0,
+                    y: 2.0,
+                    button: Button::Left,
+                    reply,
+                }) {
+                    Err(error) => error,
+                    Ok(_) => panic!("semantic dispatch enqueued raw input"),
+                };
+                assert!(error
+                    .to_string()
+                    .starts_with("input_unavailable: accessibility-only"));
+                assert!(
+                    rx.try_recv().is_err(),
+                    "no command may reach even a live EIS worker"
+                );
+            })
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn unparented_portal_dialog_uses_nonempty_wayland_identifier() {

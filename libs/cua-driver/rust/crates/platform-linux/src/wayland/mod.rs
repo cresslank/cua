@@ -22,6 +22,8 @@ pub mod persistent_vptr;
 pub(crate) mod portal;
 pub mod portal_screenshot;
 mod primary_seat;
+pub(crate) mod semantic_input;
+pub use semantic_input::input_route_for_tool;
 pub mod shell_helper;
 pub mod sway_ipc;
 mod virtual_keyboard;
@@ -142,7 +144,18 @@ pub fn ensure_raw_input_ready_for_tool(tool: &str, args: &serde_json::Value) -> 
             }
         },
     )
-    .map_err(|error| error.to_string())
+    .map_err(|error| readiness_failure_message(session, &error.to_string()))
+}
+
+fn readiness_failure_message(session: InputReadinessSession, error: &str) -> String {
+    if matches!(session, InputReadinessSession::Gnome) {
+        // DRM connector state cannot establish Mutter's virtual-monitor state.
+        // Do not add a potentially stalled DisplayConfig roundtrip to failure
+        // handling or claim the cause is known; give the monitor-off recovery.
+        format!("{error}; possible cause: no active monitors: GNOME offers no absolute pointer; turn a display on, or use element-addressed background actions")
+    } else {
+        error.to_owned()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -5409,6 +5422,23 @@ mod identity_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn semantic_input_readiness_diagnostic_names_monitor_off_without_claiming_detection() {
+        let message = super::readiness_failure_message(
+            super::InputReadinessSession::Gnome,
+            "EIS unavailable",
+        );
+        assert!(message.contains("possible cause: no active monitors: GNOME offers no absolute pointer; turn a display on, or use element-addressed background actions"));
+        assert!(message.starts_with("EIS unavailable"));
+        assert_eq!(
+            super::readiness_failure_message(
+                super::InputReadinessSession::NativeWayland,
+                "EIS unavailable"
+            ),
+            "EIS unavailable"
+        );
+    }
+
     /// The pointer always moves before a desktop click or scroll, even when
     /// it already sits on the target pixel (corners and 1-pixel outputs too).
     #[test]

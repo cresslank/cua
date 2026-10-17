@@ -6642,6 +6642,9 @@ impl Tool for ClickTool {
                 .with_structured(json!({"code":"capture_route_unqualified","effect":"refused"}));
         }
 
+        if let Err(refusal) = crate::wayland::semantic_input::validate_dispatch("click", &args) {
+            return refusal;
+        }
         let cursor_id = resolve_cursor_key(&args);
         let modifiers: Vec<String> = args.str_array("modifier");
 
@@ -7620,6 +7623,10 @@ impl Tool for TypeTextTool {
                 .with_structured(json!({"code":"capture_route_unqualified","effect":"refused"}));
         }
 
+        if let Err(refusal) = crate::wayland::semantic_input::validate_dispatch("type_text", &args)
+        {
+            return refusal;
+        }
         use cua_driver_core::tool_args::ArgsExt;
         if args.opt_str("scope").as_deref() == Some("desktop") && args.get("pid").is_none() {
             let input = match parse_typed_projection::<TypeTextInput>("type_text", &args) {
@@ -9029,6 +9036,10 @@ impl Tool for SetValueTool {
                 .with_structured(json!({"code":"capture_route_unqualified","effect":"refused"}));
         }
 
+        if let Err(refusal) = crate::wayland::semantic_input::validate_dispatch("set_value", &args)
+        {
+            return refusal;
+        }
         use cua_driver_core::tool_args::ArgsExt;
         let pid = match args.require_u32("pid") {
             Ok(v) => v,
@@ -9498,6 +9509,9 @@ impl Tool for ScrollTool {
                 .with_structured(json!({"code":"capture_route_unqualified","effect":"refused"}));
         }
 
+        if let Err(refusal) = crate::wayland::semantic_input::validate_dispatch("scroll", &args) {
+            return refusal;
+        }
         let cursor_id = resolve_cursor_key(&args);
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()
