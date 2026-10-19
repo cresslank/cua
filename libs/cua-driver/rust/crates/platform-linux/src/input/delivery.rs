@@ -112,8 +112,29 @@ impl BackgroundUnavailable {
 pub fn background_unavailable_error(
     reason: BackgroundUnavailable,
 ) -> cua_driver_core::protocol::ToolResult {
+    background_unavailable(reason, false)
+}
+
+/// Admission-only refusal. The entire request must precede every input event,
+/// accessibility action, scroll-into-view and focus change. In particular, do
+/// not use this after a failed semantic action or a keyboard pixel-focus click.
+pub fn background_unavailable_before_input_error(
+    reason: BackgroundUnavailable,
+) -> cua_driver_core::protocol::ToolResult {
+    background_unavailable(reason, true)
+}
+
+fn background_unavailable(
+    reason: BackgroundUnavailable,
+    before_input: bool,
+) -> cua_driver_core::protocol::ToolResult {
     let detail = reason.detail();
-    cua_driver_core::delivery::background_unavailable_result(
+    let build = if before_input {
+        cua_driver_core::delivery::background_unavailable_before_input_result
+    } else {
+        cua_driver_core::delivery::background_unavailable_result
+    };
+    build(
         format!(
             "Background delivery is not available: {detail}. Retry this action with \
              delivery_mode:\"foreground\"; Cua Driver will activate the target window, \

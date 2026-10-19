@@ -4128,6 +4128,10 @@ fn is_gtk_process(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+// Admission-only guards below: callers must not have attempted input, an AX
+// action, scroll-into-view or focus changes. Returning sibling routes do not
+// reach these guards. Post-AX click and keyboard fallback sites intentionally
+// retain background_unavailable_error (no zero-delivery proof).
 fn unavailable_webkit_background(
     pid: u32,
     delivery: crate::input::delivery::DeliveryMode,
@@ -4137,7 +4141,7 @@ fn unavailable_webkit_background(
         && !crate::wayland::is_inject_mode()
         && !crate::input::real_pointer_input_available())
     .then(|| {
-        crate::input::delivery::background_unavailable_error(
+        crate::input::delivery::background_unavailable_before_input_error(
             crate::input::delivery::BackgroundUnavailable::WebKitSyntheticInput,
         )
     })
@@ -4149,7 +4153,7 @@ fn unavailable_webkit_keyboard_background(
 ) -> Option<ToolResult> {
     (!delivery.is_foreground() && is_webkitgtk_embedder(pid) && !crate::wayland::is_inject_mode())
         .then(|| {
-            crate::input::delivery::background_unavailable_error(
+            crate::input::delivery::background_unavailable_before_input_error(
                 crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
             )
         })
@@ -4157,9 +4161,20 @@ fn unavailable_webkit_keyboard_background(
 
 /// Add accessibility setup details without admitting a disabled keyboard route.
 fn background_keyboard_refusal(atspi_ok: bool) -> ToolResult {
-    let mut refusal = crate::input::delivery::background_unavailable_error(
-        crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
-    );
+    // Called after pixel focus, PTY/AX/Tk attempts or the Qt FocusIn workaround:
+    // never attach pre-input proof to this fallback.
+    background_keyboard_refusal_with_bus_hint(
+        crate::input::delivery::background_unavailable_error(
+            crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
+        ),
+        atspi_ok,
+    )
+}
+
+fn background_keyboard_refusal_with_bus_hint(
+    mut refusal: ToolResult,
+    atspi_ok: bool,
+) -> ToolResult {
     if !atspi_ok {
         let bus = crate::health_report::START_ATSPI_BUS_HINT;
         refusal
@@ -4183,8 +4198,17 @@ fn unavailable_gtk_keyboard_background(
     pid: u32,
     delivery: crate::input::delivery::DeliveryMode,
 ) -> Option<ToolResult> {
-    (!delivery.is_foreground() && is_gtk_process(pid) && !crate::wayland::is_inject_mode())
-        .then(|| background_keyboard_refusal(atspi_up()))
+    (!delivery.is_foreground() && is_gtk_process(pid) && !crate::wayland::is_inject_mode()).then(
+        || {
+            // No keyboard/pixel-focus/AX attempt yet; add only a read-only bus hint.
+            background_keyboard_refusal_with_bus_hint(
+                crate::input::delivery::background_unavailable_before_input_error(
+                    crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
+                ),
+                atspi_up(),
+            )
+        },
+    )
 }
 
 /// Refusal for a background element click that falls back to an X11
@@ -4225,7 +4249,7 @@ fn unavailable_gtk_pointer_background(
         && !crate::wayland::is_inject_mode()
         && !crate::input::real_pointer_input_available())
     .then(|| {
-        crate::input::delivery::background_unavailable_error(
+        crate::input::delivery::background_unavailable_before_input_error(
             crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
         )
     })
@@ -4239,7 +4263,7 @@ fn unavailable_wayland_focused_input_background(
         && !(focus_free_inject_supported && crate::wayland::is_inject_mode())
         && !delivery.is_foreground())
     .then(|| {
-        crate::input::delivery::background_unavailable_error(
+        crate::input::delivery::background_unavailable_before_input_error(
             crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
         )
     })
@@ -4258,9 +4282,11 @@ fn unavailable_chromium_background(
         crate::wayland::is_inject_mode(),
         is_chromium_embedder(pid),
     ) {
-        Some(crate::input::delivery::background_unavailable_error(
-            crate::input::delivery::BackgroundUnavailable::ChromiumInput,
-        ))
+        Some(
+            crate::input::delivery::background_unavailable_before_input_error(
+                crate::input::delivery::BackgroundUnavailable::ChromiumInput,
+            ),
+        )
     } else {
         None
     }
@@ -6501,8 +6527,16 @@ impl ClickTool {
             let (path, suspected_noop) = match action {
                 Ok((_, suspected_noop)) => ("ax", suspected_noop),
                 Err(error) if crate::atspi::click_error_allows_pointer_fallback(&error) => {
-                    if let Some(refusal) = unavailable_chromium_background(pid, delivery) {
-                        return Ok(refusal);
+                    // perform_action ran above. Even a fallback-eligible AX error
+                    // is not the request-wide proof required by the admission helper.
+                    if chromium_background_must_refuse(
+                        delivery.is_foreground(),
+                        crate::wayland::is_inject_mode(),
+                        is_chromium_embedder(pid),
+                    ) {
+                        return Ok(crate::input::delivery::background_unavailable_error(
+                            crate::input::delivery::BackgroundUnavailable::ChromiumInput,
+                        ));
                     }
                     // The background branch below sends XSendEvent, never the
                     // real pointer, so refuse toolkits that drop synthetic
@@ -9380,6 +9414,28 @@ async fn invoke_observed_scroll(
 #[cfg(test)]
 #[test]
 fn retained_scroll_chromium_background_refuses_before_native_resolution() {
+    fn assert_pre_input_evidence(tool: &str, result: ToolResult) {
+        let wire = serde_json::to_value(result).unwrap();
+        assert_eq!(wire["isError"], true, "{tool}: {wire}");
+        let data = &wire["structuredContent"];
+        assert_eq!(data["code"], "background_unavailable", "{tool}: {wire}");
+        assert_eq!(data["effect"], "refused", "{tool}: {wire}");
+        assert_eq!(
+            data["delivery"],
+            json!({"mode": "not_applicable", "delivered_count": 0}),
+            "{tool}: {wire}"
+        );
+        assert_eq!(data["delivery"]["delivered_count"].as_u64(), Some(0));
+        for key in ["delivered_count", "acknowledged", "acknowledged_count"] {
+            assert!(
+                data.get(key).is_none(),
+                "conflicting evidence: {tool}: {wire}"
+            );
+        }
+        assert!(data.get("ok").is_none() && data.get("success").is_none());
+        assert!(data.get("refusal").is_none());
+        println!("pre-input {tool}: {data}");
+    }
     cua_driver_core::tool::with_runtime_scope(
         format!("retained-scroll-background-{}", uuid::Uuid::new_v4()),
         || {
@@ -9435,15 +9491,99 @@ fn retained_scroll_chromium_background_refuses_before_native_resolution() {
                         .publish(state.snapshots.prepare(pid, 0x7f30_0105, &[node]).unwrap())
                         .unwrap();
                     let token = cua_driver_core::element_token::token_for(id, 7);
-                    let result = ScrollTool { state }
-        .invoke(json!({
-            "pid":pid, "element_token":token, "direction":"down", "delivery_mode":"background"
-        }))
-        .await;
-                    assert_eq!(
-                        result.structured_content.unwrap()["code"],
-                        "background_unavailable"
+                    let args = json!({
+                        "pid": pid, "window_id": 0x7f30_0105u64,
+                        "delivery_mode": "background"
+                    });
+                    // The real tool trait boundary is sufficient for every
+                    // family except press_key: that tool first checks native
+                    // window ownership, which needs a desktop. Its shared
+                    // admission seam is exercised here and its wiring/order
+                    // is owned by background_refusal_evidence_wiring.rs.
+                    let mut calls: Vec<(Box<dyn Tool>, Value)> = vec![
+                        (
+                            Box::new(ClickTool {
+                                state: state.clone(),
+                            }),
+                            args.clone(),
+                        ),
+                        (
+                            Box::new(RightClickTool {
+                                state: state.clone(),
+                            }),
+                            args.clone(),
+                        ),
+                        (
+                            Box::new(DoubleClickTool {
+                                state: state.clone(),
+                            }),
+                            args.clone(),
+                        ),
+                        (
+                            Box::new(TypeTextTool {
+                                state: state.clone(),
+                            }),
+                            {
+                                let mut args = args.clone();
+                                args["text"] = json!("hello");
+                                args
+                            },
+                        ),
+                        (
+                            Box::new(HotkeyTool {
+                                state: state.clone(),
+                            }),
+                            {
+                                let mut args = args.clone();
+                                args["keys"] = json!(["ctrl", "a"]);
+                                args
+                            },
+                        ),
+                        (
+                            Box::new(DragTool {
+                                state: state.clone(),
+                            }),
+                            args.clone(),
+                        ),
+                        (
+                            Box::new(ScrollTool {
+                                state: state.clone(),
+                            }),
+                            {
+                                let mut args = args.clone();
+                                args["direction"] = json!("down");
+                                args["element_token"] = json!(token);
+                                args
+                            },
+                        ),
+                    ];
+                    for (tool, args) in calls.drain(..) {
+                        assert_pre_input_evidence(
+                            tool.def().name.as_str(),
+                            tool.invoke(args).await,
+                        );
+                    }
+                    assert_pre_input_evidence(
+                        "press_key admission seam",
+                        unavailable_chromium_background(
+                            pid,
+                            crate::input::delivery::DeliveryMode::Background,
+                        )
+                        .unwrap(),
                     );
+                    // Non-plain element admission needs no native resolution
+                    // (even this deliberately invalid token must not be read).
+                    for (button, count) in [("right", 1), ("left", 2), ("middle", 1)] {
+                        assert_pre_input_evidence(
+                            "element click qualification",
+                            ClickTool {
+                                state: state.clone(),
+                            }
+                            .invoke(json!({"pid": pid, "element_token": "not-a-token",
+                                "button": button, "count": count, "delivery_mode": "background"}))
+                            .await,
+                        );
+                    }
                 });
         },
     );
@@ -9772,7 +9912,9 @@ impl Tool for ScrollTool {
 
         if crate::wayland::is_inject_mode() {
             let Some((x, y)) = pixel_target else {
-                return crate::input::delivery::background_unavailable_error(
+                // Every earlier mutating route returned; this branch has only
+                // resolved arguments/window geometry and cosmetic overlay state.
+                return crate::input::delivery::background_unavailable_before_input_error(
                     crate::input::delivery::BackgroundUnavailable::FocusedInputOnly,
                 );
             };

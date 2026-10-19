@@ -81,6 +81,45 @@ pub fn background_unavailable_result(
     ToolResult::error(message).with_structured(Value::Object(structured))
 }
 
+/// Build a background refusal with explicit proof that this request sent no input.
+///
+/// Callers MUST guarantee that no input event, accessibility action,
+/// scroll-into-view, or focus change has been performed for this request. A
+/// failed/ambiguous actuator attempt does not satisfy this precondition. Use
+/// [`background_unavailable_result`] when non-delivery has not been proven.
+///
+/// This remains the existing MCP error envelope, not the closed success-only
+/// `ActionResult`. Its evidence uses that contract's public effect and delivery
+/// types. `NotApplicable` describes an actuator that was never attempted; using
+/// `Background` would misleadingly describe an actual delivery modality. The
+/// internal record likewise represents an unattempted refusal with
+/// `actual_delivery: None`, so no transport or action record is invented here.
+/// The closed `ActionResult` refusal invariants are deliberately unchanged.
+/// `fields` must contain diagnostics only, not other action/delivery evidence.
+/// Supplied effect/delivery values cannot override the proof.
+pub fn background_unavailable_before_input_result(
+    message: impl Into<String>,
+    code: &str,
+    escalation_reason: impl Into<String>,
+    fields: Value,
+) -> ToolResult {
+    use cua_driver_contract::{ActionDelivery, ActionDeliveryMode, ActionEffect};
+
+    let mut result = background_unavailable_result(message, code, escalation_reason, fields);
+    let structured = result
+        .structured_content
+        .as_mut()
+        .expect("background refusal has structured content");
+    structured["effect"] = json!(ActionEffect::Refused);
+    structured["delivery"] = json!(ActionDelivery {
+        mode: ActionDeliveryMode::NotApplicable,
+        delivered_count: Some(0),
+        ax_readback_ms: None,
+        ax_readback: None,
+    });
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,6 +156,36 @@ mod tests {
             assert_eq!(mode, expected, "{args}");
             assert_eq!(mode.is_foreground(), expected == DeliveryMode::Foreground);
         }
+    }
+
+    #[test]
+    fn background_unavailable_before_input_serializes_explicit_non_delivery() {
+        let result = background_unavailable_before_input_result(
+            "No addressed backend.",
+            "background_unavailable",
+            "focus-free route unavailable",
+            json!({"detail": "no backend", "effect": "partial",
+                "delivery": {"mode": "unknown", "delivered_count": 1}}),
+        );
+        assert!(
+            result.action_record.is_none(),
+            "no attempted transport to record"
+        );
+        assert_eq!(
+            serde_json::to_value(result).unwrap(),
+            json!({
+                "content": [{"type": "text", "text": "No addressed backend."}],
+                "isError": true,
+                "structuredContent": {
+                    "code": "background_unavailable",
+                    "detail": "no backend",
+                    "effect": "refused",
+                    "delivery": {"mode": "not_applicable", "delivered_count": 0},
+                    "suggestion": FOREGROUND_RETRY_SUGGESTION,
+                    "escalation": {"recommended": "foreground", "reason": "focus-free route unavailable"}
+                }
+            })
+        );
     }
 
     #[test]

@@ -63,8 +63,43 @@ The invariants are:
 
 - `confirmed` has publishable readback or window-change evidence;
 - `partial` has `delivery.delivered_count`;
-- `refused` has neither delivery nor evidence;
+- `refused` has neither delivery nor evidence in the closed success-result schema;
 - `error` appears only on `refused`.
+
+### Pre-input background refusal errors
+
+Linux admission guards that prove no input event, accessibility action,
+scroll-into-view, or focus change occurred return the existing `isError: true`
+MCP envelope with explicit non-delivery evidence at the top level of
+`structuredContent` (not nested under an action-result field):
+
+```json
+{
+  "code": "background_unavailable",
+  "detail": "the requested target has no focus-free input backend; the remaining XTest/X11 route can only deliver to the globally focused widget",
+  "effect": "refused",
+  "delivery": {"mode": "not_applicable", "delivered_count": 0},
+  "suggestion": "Retry this action with delivery_mode:\"foreground\".",
+  "escalation": {
+    "recommended": "foreground",
+    "reason": "background input is unavailable on this surface; retry this action with delivery_mode:\"foreground\"."
+  }
+}
+```
+
+The effect and delivery fields serialize the shared public `ActionEffect` and
+`ActionDelivery` types. `not_applicable` means no actuator was attempted (the
+internal `ActualDelivery` equivalent is `None`), not that background input was
+delivered. This error envelope is not the closed successful `ActionResult`;
+its validation and generated success schema are unchanged.
+
+Only the opt-in `background_unavailable_before_input_result` helper makes this
+proof. The ordinary `background_unavailable_result` deliberately does not:
+some refusals follow accessibility, focus or other mutation attempts, including
+macOS scroll-to-visible and Linux semantic/pixel-focus fallback paths. Neither
+the code alone, nor a missing delivery count, proves non-delivery. Consumers
+must reject conflicting progress/effect evidence and observe before retrying
+when the first request may have reached an actuator.
 
 ## Window target resolution
 
