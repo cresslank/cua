@@ -527,6 +527,9 @@ mod tests {
         }
     }
 
+    // Return the queued worker out of the lease scope before awaiting it: that
+    // boundary is exactly what this test verifies; awaiting here would hang.
+    #[allow(clippy::async_yields_async)]
     #[tokio::test]
     async fn queued_native_work_retains_the_dispatch_lease_before_admission() {
         use crate::action_lease::{ActionLeaseTable, LeaseRequest};
@@ -560,6 +563,9 @@ mod tests {
             .unwrap();
     }
 
+    // Deliberately drop an unawaited queued worker outside its lease scope to
+    // exercise cancellation/cleanup, not completion inside the async block.
+    #[allow(clippy::async_yields_async)]
     #[tokio::test]
     async fn cancelled_queued_native_work_cleans_up_under_its_lease_without_mutating() {
         use crate::action_lease::{ActionLeaseTable, LeaseRequest};

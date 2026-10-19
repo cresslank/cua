@@ -1,7 +1,9 @@
 //! Secondary element clicks never rejoin a pixel/ordinal ladder. Native I/O
 //! seams leave qualification, per-click validation and accounting in production.
 use super::{ToolResult, ToolState};
-use crate::input::delivery::{background_unavailable_error, BackgroundUnavailable, DeliveryMode};
+use crate::input::delivery::{
+    background_unavailable_before_input_error, BackgroundUnavailable, DeliveryMode,
+};
 use anyhow::{Context, Result};
 use cua_driver_core::element_token::MutationPermit;
 use cua_driver_core::{action_record::*, element_token::SnapshotIdentity};
@@ -70,7 +72,8 @@ fn qualify_on_platform(
     }
     let plain = button == 1 && count == 1 && modifiers.is_empty();
     if !plain && !delivery.is_foreground() {
-        return Err(background_unavailable_error(
+        // Argument admission runs before token/native resolution, AX or focus.
+        return Err(background_unavailable_before_input_error(
             BackgroundUnavailable::FocusedInputOnly,
         ));
     }
