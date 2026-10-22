@@ -489,6 +489,17 @@ fn focus_ax_window_with_thread_affinity(pid: i32, window_id: u32) -> Result<(), 
     }
 }
 
+fn check_foreground_menu_admission(pid: i32, frontmost: Option<i32>) -> Result<(), String> {
+    if frontmost != Some(pid) {
+        return Err(
+            "invoke_menu: target is no longer frontmost; retry from fresh state".to_owned(),
+        );
+    }
+    // The serialized turn and the native identity read can both block after
+    // worker admission. A cancelled waiter must not change the key window.
+    cua_driver_core::blocking::check_cancelled().map_err(|error| error.to_string())
+}
+
 fn focus_exact_window(pid: i32, window_id: u32) -> Result<(), String> {
     crate::post_action::cancel();
     let native_key_requested = crate::input::skylight::make_exact_window_key(pid, window_id);
@@ -1030,30 +1041,23 @@ impl Tool for InvokeMenuTool {
         }
 
         let outcome = cua_driver_core::blocking::spawn(move || {
-            let prior_frontmost = live_frontmost_app().or_else(crate::apps::frontmost_pid);
-            let prior_frontmost_window =
-                prior_frontmost.and_then(crate::ax::bindings::focused_window_id_of_pid);
-            let needs_activation = prior_frontmost != Some(pid);
-
-            let result = focus_exact_window(pid, window_id)
-                .and_then(|()| unsafe { invoke_path(pid, &path) });
-
-            // Restore the exact prior key window when one was observable,
-            // including across applications. Falling back to app activation
-            // preserves the previous behavior for apps without an AX window.
-            if let Some(prior_pid) = prior_frontmost {
-                let already_restored =
-                    prior_pid == pid && prior_frontmost_window == Some(window_id);
-                if !already_restored {
-                    let restored_exact = prior_frontmost_window.is_some_and(|prior_window_id| {
-                        focus_exact_window(prior_pid, prior_window_id).is_ok()
-                    });
-                    if needs_activation && !restored_exact {
-                        let _ = crate::apps::activate_pid(prior_pid);
-                    }
-                }
-            }
-            result
+            crate::input::skylight::with_foreground_transaction(|| {
+                // Admission and this worker are separated by an await. A user
+                // switch in between is not permission to reactivate the app.
+                check_foreground_menu_admission(
+                    pid,
+                    live_frontmost_app().or_else(crate::apps::frontmost_pid),
+                )?;
+                focus_exact_window(pid, window_id)?;
+                unsafe { invoke_path(pid, &path) }
+                // Do not restore the previously key sibling here. AXPress
+                // acknowledges enqueueing, not AppKit command dispatch. A
+                // restore overtakes that dispatch: responder-chain commands
+                // then run in the sibling, or disappear when that sibling has
+                // no responder for the command. This is already the foreground
+                // route, so leave the explicitly requested window key, including when a
+                // native action reports an error after possibly enqueueing it.
+            })
         })
         .await;
 
@@ -1084,6 +1088,51 @@ impl Tool for InvokeMenuTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_menu_queued_behind_foreground_turn_cannot_admit_focus() {
+        use std::time::Duration;
+        let (held_tx, held_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let owner = std::thread::spawn(move || {
+            crate::input::skylight::with_foreground_transaction(|| {
+                held_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            });
+        });
+        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (queued_tx, queued_rx) = tokio::sync::oneshot::channel();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        let waiter = cua_driver_core::blocking::spawn(move || {
+            queued_tx.send(()).unwrap();
+            let result = crate::input::skylight::with_foreground_transaction(|| {
+                // Pure identity input: no host windows or native input in unit tests.
+                check_foreground_menu_admission(42, Some(42))?;
+                Ok::<_, String>("focus admitted")
+            });
+            result_tx.send(result).unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(5), queued_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(waiter);
+        release_tx.send(()).unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(5), result_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        owner.join().unwrap();
+        assert_eq!(
+            result.unwrap_err(),
+            "native worker deadline expired or its waiter was cancelled"
+        );
+        assert!(check_foreground_menu_admission(42, Some(42)).is_ok());
+        assert_eq!(
+            check_foreground_menu_admission(42, Some(43)).unwrap_err(),
+            "invoke_menu: target is no longer frontmost; retry from fresh state"
+        );
+    }
 
     #[test]
     fn a_background_menu_refusal_names_the_code_and_the_route() {
