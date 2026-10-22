@@ -442,24 +442,25 @@ pub(crate) fn probe_a11y_bus() -> bool {
         Ok(rt) => rt,
         Err(_) => return false,
     };
-    rt.block_on(async {
-        let bus = match zbus::Connection::session().await {
-            Ok(b) => b,
+    let result = rt.block_on(async {
+        let bus = match crate::wayland::portal::fresh_session_connection().await {
+            Ok(bus) => bus,
             Err(_) => return false,
         };
-        let proxy = match zbus::fdo::DBusProxy::new(&bus).await {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        // `name_has_owner` is the cheap direct existence check — avoids
-        // pulling the entire session-bus name registry just to look up one
-        // entry. Matches the pattern in `wayland::portal_screenshot::probe_portal`.
-        let bus_name = match "org.a11y.Bus".try_into() {
-            Ok(n) => n,
-            Err(_) => return false,
-        };
-        proxy.name_has_owner(bus_name).await.unwrap_or(false)
-    })
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let proxy = zbus::fdo::DBusProxy::new(&bus).await.ok()?;
+            let name = "org.a11y.Bus".try_into().ok()?;
+            proxy.name_has_owner(name).await.ok()
+        })
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+        crate::wayland::portal::close_connection(bus).await;
+        result
+    });
+    rt.shutdown_timeout(std::time::Duration::from_millis(250));
+    result
 }
 
 #[cfg(not(target_os = "linux"))]

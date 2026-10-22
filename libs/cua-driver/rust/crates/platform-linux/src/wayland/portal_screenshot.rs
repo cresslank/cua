@@ -40,8 +40,7 @@ fn screenshot_via_portal_blocking() -> anyhow::Result<Vec<u8>> {
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build tokio runtime for ashpd: {e}"))?;
-    let uri = rt.block_on(async {
-        let connection = super::portal::fresh_session_connection().await?;
+    let result = rt.block_on(super::portal::with_connection(|connection| async move {
         Screenshot::request()
             .interactive(false)
             .modal(false)
@@ -52,7 +51,9 @@ fn screenshot_via_portal_blocking() -> anyhow::Result<Vec<u8>> {
             .response()
             .map_err(map_ashpd_err)
             .map(|resp| resp.uri().clone())
-    })?;
+    }));
+    rt.shutdown_timeout(super::portal::RUNTIME_SHUTDOWN_TIMEOUT);
+    let uri = result?;
 
     // The portal returns a file:// URI pointing at a PNG (typically in
     // /tmp or $XDG_RUNTIME_DIR/doc/...). Decode it via the `url` crate.
@@ -113,16 +114,19 @@ fn map_ashpd_err<E: std::fmt::Display>(e: E) -> anyhow::Error {
 /// is needed. We accept the false-positive risk in exchange for the
 /// no-consent, no-burn-dialog property.
 pub fn probe_portal() -> anyhow::Result<bool> {
+    super::portal::off_runtime(probe_portal_blocking)
+}
+
+fn probe_portal_blocking() -> anyhow::Result<bool> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build tokio runtime for ashpd probe: {e}"))?;
-    rt.block_on(async {
+    let result = rt.block_on(super::portal::with_connection(|conn| async move {
         tokio::time::timeout(super::portal::PROBE_TIMEOUT, async {
             // Cheapest possible probe: open a session bus and check that the
             // portal name has an owner. We avoid Screenshot::request() because
             // that would cache a (potentially undesired) consent grant.
-            let conn = super::portal::fresh_session_connection().await?;
             let proxy = zbus::fdo::DBusProxy::new(&conn)
                 .await
                 .map_err(|e| anyhow::anyhow!("dbus proxy creation failed: {e}"))?;
@@ -138,5 +142,7 @@ pub fn probe_portal() -> anyhow::Result<bool> {
         })
         .await
         .map_err(|_| anyhow::anyhow!("xdg-desktop-portal availability probe timed out"))?
-    })
+    }));
+    rt.shutdown_timeout(super::portal::RUNTIME_SHUTDOWN_TIMEOUT);
+    result
 }

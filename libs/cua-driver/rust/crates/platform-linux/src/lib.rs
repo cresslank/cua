@@ -72,6 +72,9 @@ mod snapshot_queries;
 pub mod a11y;
 
 #[cfg(target_os = "linux")]
+pub mod lifecycle;
+
+#[cfg(target_os = "linux")]
 pub mod recording_hooks;
 
 #[cfg(target_os = "linux")]

@@ -23,6 +23,9 @@ use std::sync::{
     Arc, Mutex,
 };
 
+#[cfg(target_os = "linux")]
+mod linux_shutdown;
+
 const RECORDING_IDLE_TTL_SECS_DEFAULT: u64 = 300;
 const SESSION_IDLE_TTL_SECS_DEFAULT: u64 = 300;
 #[cfg(test)]
@@ -168,6 +171,10 @@ pub(crate) struct DriverRuntime {
     /// previously admitted operation is still executing.
     lifecycle: tokio::sync::RwLock<()>,
     lifecycle_maintenance: Mutex<Option<LifecycleMaintenance>>,
+    #[cfg(target_os = "linux")]
+    platform_lease: Mutex<Option<platform_linux::lifecycle::RuntimeLease>>,
+    #[cfg(target_os = "linux")]
+    shutdown_signal: tokio::sync::watch::Sender<bool>,
     activity_observer: Option<Arc<dyn DriverActivityObserver>>,
 }
 
@@ -178,6 +185,8 @@ struct LifecycleMaintenance {
 
 impl DriverRuntime {
     pub(crate) fn create(options: RuntimeOptions) -> Result<Arc<Self>, RuntimeCreateError> {
+        #[cfg(target_os = "linux")]
+        linux_shutdown::reap_finished();
         #[cfg(target_os = "windows")]
         if let Err(reason) = platform_windows::diagnostics::interactive_desktop_check() {
             return Err(RuntimeCreateError::Unavailable(format!(
@@ -197,6 +206,9 @@ impl DriverRuntime {
                 .legacy_context()
                 .map_err(RuntimeCreateError::Authorization)?,
         };
+        #[cfg(target_os = "linux")]
+        let platform_lease = platform_linux::lifecycle::RuntimeLease::acquire()
+            .map_err(|error| RuntimeCreateError::Unavailable(error.to_string()))?;
         let registry = Arc::new(cua_driver_core::tool::with_runtime_scope(
             compatibility_context.runtime_scope_key(),
             || build_registry(&options),
@@ -212,6 +224,10 @@ impl DriverRuntime {
             last_activity: AtomicU64::new(now_unix_secs()),
             lifecycle: tokio::sync::RwLock::new(()),
             lifecycle_maintenance: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            platform_lease: Mutex::new(Some(platform_lease)),
+            #[cfg(target_os = "linux")]
+            shutdown_signal: tokio::sync::watch::channel(false).0,
             activity_observer: options.activity_observer.clone(),
         });
         *runtime.lifecycle_maintenance.lock().unwrap() =
@@ -229,6 +245,36 @@ impl DriverRuntime {
 
     pub(crate) async fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
+        #[cfg(target_os = "linux")]
+        let _drained = {
+            // Preserve normal graceful draining, but a wedged request cannot
+            // retain platform resources indefinitely. Cancellation drops the
+            // invocation future; detached native calls hold owned generations.
+            let guard = match linux_shutdown::timeout(
+                std::time::Duration::from_millis(250),
+                self.lifecycle.write(),
+            )
+            .await
+            {
+                Ok(guard) => Some(guard),
+                Err(_) => {
+                    self.shutdown_signal.send_replace(true);
+                    linux_shutdown::timeout(
+                        std::time::Duration::from_millis(250),
+                        self.lifecycle.write(),
+                    )
+                    .await
+                    .ok()
+                }
+            };
+            if guard.is_none() {
+                tracing::warn!(
+                    "Linux request drain exceeded shutdown deadline; cancelling transports"
+                );
+            }
+            guard
+        };
+        #[cfg(not(target_os = "linux"))]
         let _drained = self.lifecycle.write().await;
         // Drain captures a fixed set after our admitted calls finish. Leases
         // subsequently added by other runtimes cannot prolong this shutdown.
@@ -252,13 +298,42 @@ impl DriverRuntime {
             &self.compatibility_context.runtime_scope_key(),
         );
         let recording = self.registry.recording.clone();
-        let _ = tokio::task::spawn_blocking(move || recording.stop_owner(None)).await;
+        let stop_recording = tokio::task::spawn_blocking(move || recording.stop_owner(None));
+        #[cfg(target_os = "linux")]
+        if linux_shutdown::timeout(std::time::Duration::from_secs(1), stop_recording)
+            .await
+            .is_err()
+        {
+            tracing::warn!("recording finalization exceeded Linux shutdown deadline");
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = stop_recording.await;
+        #[cfg(target_os = "linux")]
+        {
+            let lease = self.platform_lease.lock().unwrap().take();
+            if let Some(lease) = lease {
+                linux_shutdown::run(move || drop(lease)).await;
+            }
+        }
     }
 
     fn stop_lifecycle_maintenance(&self) {
         if let Some(maintenance) = self.lifecycle_maintenance.lock().unwrap().take() {
             let _ = maintenance.shutdown.send(());
             if maintenance.thread.thread().id() != std::thread::current().id() {
+                #[cfg(target_os = "linux")]
+                {
+                    let deadline =
+                        std::time::Instant::now() + std::time::Duration::from_millis(500);
+                    while !maintenance.thread.is_finished() && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    if !maintenance.thread.is_finished() {
+                        tracing::warn!("Linux lifecycle maintenance did not stop before deadline");
+                        return;
+                    }
+                }
                 let _ = maintenance.thread.join();
             }
         }
@@ -340,10 +415,19 @@ impl DriverRuntime {
             .into_iter()
             .map(|adapter| adapter.id.to_owned())
             .collect::<Vec<_>>();
-        let result = self
+        #[cfg(target_os = "linux")]
+        let mut shutdown = self.shutdown_signal.subscribe();
+        let invoke = self
             .registry
-            .invoke_with_context_and_evidence(name, args, context, evidence)
-            .await;
+            .invoke_with_context_and_evidence(name, args, context, evidence);
+        #[cfg(target_os = "linux")]
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.wait_for(|shutdown| *shutdown) => return None,
+            result = invoke => result,
+        };
+        #[cfg(not(target_os = "linux"))]
+        let result = invoke.await;
         if let Some(observer) = self.activity_observer.as_ref() {
             let refusal_code = result
                 .structured_content
@@ -478,6 +562,8 @@ impl Drop for DriverRuntime {
             let recording = self.registry.recording.clone();
             let _ = recording.stop_owner(None);
         }
+        #[cfg(target_os = "linux")]
+        self.platform_lease.get_mut().unwrap().take();
     }
 }
 
@@ -575,9 +661,16 @@ pub(crate) fn tool_inventory(mut options: RuntimeOptions) -> Value {
 /// Metadata-only and headless hosts should not call this constructor.
 #[cfg(target_os = "linux")]
 pub fn build_linux_host_registry(cursor: CursorConfig) -> Result<ToolRegistry, String> {
+    // The Rust-only registry seam is an owner too, even without DriverRuntime.
+    // Retain it through the registry's existing drop-cleanup mechanism so an
+    // unrelated embedded SDK cannot retire this host's shared native resources.
+    let lease =
+        platform_linux::lifecycle::RuntimeLease::acquire().map_err(|error| error.to_string())?;
     let mut options = RuntimeOptions::embedded(false);
     options.cursor = cursor;
-    build_linux_registry(&options).map_err(|error| error.to_string())
+    let mut registry = build_linux_registry(&options).map_err(|error| error.to_string())?;
+    registry.retain_runtime_cleanup(move || drop(lease));
+    Ok(registry)
 }
 
 #[cfg(target_os = "linux")]
@@ -1121,7 +1214,12 @@ mod tests {
 
     #[test]
     fn every_registered_tool_schema_matches_the_dispatch_argument_check() {
-        let registry = build_registry(&RuntimeOptions::embedded(false)).expect("test registry");
+        let mut options = RuntimeOptions::embedded(false);
+        // Schema validation is metadata-only, just like tool_inventory. Do not
+        // open a desktop bus without a runtime lease or race a peer's teardown.
+        // Real accessibility admission remains covered by the strict E2E lane.
+        options.prepare_desktop_environment = false;
+        let registry = build_registry(&options).expect("test registry");
         // These schemas declare `additionalProperties: true`.
         let open = [
             "get_browser_state",
@@ -1142,6 +1240,62 @@ mod tests {
         ];
         let violations = registry.input_conformance_violations(&open);
         assert!(violations.is_empty(), "{violations:#?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn metadata_schema_validation_does_not_reopen_a_retired_native_owner() {
+        let exact = concat!(
+            module_path!(),
+            "::metadata_schema_validation_does_not_reopen_a_retired_native_owner"
+        )
+        .split_once("::")
+        .unwrap()
+        .1;
+        if std::env::var("CUA_SCHEMA_OWNER_CHILD").as_deref() == Ok(exact) {
+            let lease = platform_linux::lifecycle::RuntimeLease::acquire().unwrap();
+            drop(lease);
+            assert!(platform_linux::a11y::trusted_accessibility_bus_address().is_err());
+            every_registered_tool_schema_matches_the_dispatch_argument_check();
+            assert!(
+                platform_linux::a11y::trusted_accessibility_bus_address().is_err(),
+                "metadata construction must not initialize an accessibility bus"
+            );
+            return;
+        }
+        // No desktop/session bus is inherited, and a regression cannot hang the
+        // suite indefinitely. The child owns its process-global native state.
+        let home = tempfile::tempdir().unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", exact, "--nocapture"])
+            .env("CUA_SCHEMA_OWNER_CHILD", exact)
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path())
+            .env("XDG_RUNTIME_DIR", home.path())
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("retired-owner metadata probe timed out");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 
     #[test]

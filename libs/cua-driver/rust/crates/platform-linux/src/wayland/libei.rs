@@ -7,7 +7,7 @@
 //! `zwlr_virtual_pointer_v1` / `zwlr_virtual_keyboard_v1` protocols.
 //!
 //! Sequence:
-//! 1. `ei::Context::connect_to_env()` — fast path when a compositor or test
+//! 1. Nonblocking `$LIBEI_SOCKET` connect — fast path when a compositor or test
 //!    environment already exports `$LIBEI_SOCKET`.
 //! 2. Fallback: ashpd `RemoteDesktop::create_session` →
 //!    `select_devices(KEYBOARD|POINTER)` →
@@ -47,7 +47,7 @@ use std::collections::HashMap;
 use std::os::fd::{AsFd, AsRawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -247,8 +247,23 @@ fn command_timeout() -> anyhow::Error {
     )
 }
 
+thread_local! {
+    static WORKER_STOP: std::cell::RefCell<Option<Arc<AtomicBool>>> = const { std::cell::RefCell::new(None) };
+}
+
+fn worker_stopped() -> bool {
+    WORKER_STOP.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Acquire))
+    })
+}
+
 fn check_deadline(deadline: Instant) -> std::io::Result<()> {
-    if Instant::now() >= deadline || cua_driver_core::blocking::check_cancelled().is_err() {
+    if worker_stopped()
+        || Instant::now() >= deadline
+        || cua_driver_core::blocking::check_cancelled().is_err()
+    {
         Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "libei output drain deadline expired",
@@ -262,6 +277,7 @@ struct CommandSender {
     tx: Sender<WorkerRequest>,
     live: Arc<AtomicBool>,
     readiness: Arc<Mutex<()>>,
+    stopped: Arc<AtomicBool>,
 }
 
 impl CommandSender {
@@ -270,6 +286,7 @@ impl CommandSender {
             tx,
             live: Arc::new(AtomicBool::new(false)),
             readiness: Arc::new(Mutex::new(())),
+            stopped: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -283,11 +300,16 @@ impl CommandSender {
         open: impl FnOnce() -> anyhow::Result<(reis::ei::Context, PortalKeepAlive)>,
     ) -> anyhow::Result<()> {
         let _ready = self.readiness.lock().unwrap_or_else(|e| e.into_inner());
+        self.check_running()?;
         if !self.live.load(Ordering::Acquire) {
             let (context, keepalive) = open()
                 .map_err(|error| anyhow::anyhow!("failed to obtain EIS connection: {error}"))?;
+            self.check_running()?;
             self.tx
-                .send(WorkerRequest::Connect { context, keepalive })
+                .send_timeout(
+                    WorkerRequest::Connect { context, keepalive },
+                    super::portal::CLOSE_TIMEOUT,
+                )
                 .map_err(|_| anyhow::anyhow!("libei worker channel closed"))?;
             // A lease-free readiness request is also the handoff acknowledgement.
             // The caller waits for device negotiation below before admission.
@@ -301,7 +323,29 @@ impl CommandSender {
         wait_for_reply(waiter, completion)
     }
 
+    fn request_shutdown(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.live.store(false, Ordering::Release);
+        // Wake an idle worker without waiting for queue capacity or capturing
+        // an input lease. The atomic fence also cancels a full/active queue.
+        let _ = self.tx.try_send(WorkerRequest::Command(QueuedCommand {
+            command: Cmd::Shutdown,
+            completion: Arc::new(CommandCompletion {
+                deadline: Instant::now(),
+                execution: Mutex::new(CommandExecution::default()),
+            }),
+        }));
+    }
+
+    fn check_running(&self) -> anyhow::Result<()> {
+        if self.stopped.load(Ordering::Acquire) {
+            anyhow::bail!("libei worker is shutting down");
+        }
+        Ok(())
+    }
+
     fn send(&self, command: Cmd) -> anyhow::Result<Arc<CommandCompletion>> {
+        self.check_running()?;
         if !matches!(command, Cmd::Shutdown) {
             cua_driver_core::action_lease::require_raw_input_allowed()
                 .map_err(anyhow::Error::msg)?;
@@ -329,10 +373,18 @@ impl CommandSender {
     }
 }
 
-static TX: OnceLock<CommandSender> = OnceLock::new();
+struct WorkerOwner {
+    sender: CommandSender,
+    thread: thread::JoinHandle<()>,
+}
 
-fn tx() -> anyhow::Result<&'static CommandSender> {
-    TX.get()
+static TX: Mutex<Option<WorkerOwner>> = Mutex::new(None);
+
+fn tx() -> anyhow::Result<CommandSender> {
+    TX.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|owner| owner.sender.clone())
         .ok_or_else(|| anyhow::anyhow!("libei worker not started; call ensure_started() first"))
 }
 
@@ -423,22 +475,54 @@ fn unparented_wayland_identifier() -> ashpd::WindowIdentifier {
 
 /// Spawn the libei worker thread (idempotent — safe to call from every
 /// MCP tool invocation; subsequent calls are no-ops).
+static ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub(crate) fn restart() {
+    ENABLED.store(true, Ordering::Release);
+}
+
 pub fn ensure_started() -> anyhow::Result<()> {
     cua_driver_core::action_lease::require_raw_input_allowed().map_err(anyhow::Error::msg)?;
-    TX.get_or_init(|| {
+    anyhow::ensure!(
+        ENABLED.load(Ordering::Acquire),
+        "libei owner is shutting down"
+    );
+    let mut slot = TX.lock().unwrap_or_else(|e| e.into_inner());
+    anyhow::ensure!(
+        ENABLED.load(Ordering::Acquire),
+        "libei owner is shutting down"
+    );
+    if let Some(owner) = slot.as_ref() {
+        if !owner.thread.is_finished() {
+            return owner.sender.check_running();
+        }
+        // Do not replace a cancelled opener still closing its owned resources.
+        if owner.sender.readiness.try_lock().is_err() {
+            anyhow::bail!("libei opener is still shutting down");
+        }
+    }
+    if let Some(owner) = slot.take() {
+        let _ = owner.thread.join();
+    }
+    {
         let (tx, rx) = bounded(64);
         let sender = CommandSender::new(tx);
         let live = sender.live.clone();
-        thread::Builder::new()
+        let stopped = sender.stopped.clone();
+        let thread = thread::Builder::new()
             .name("cua-libei-worker".into())
             .spawn(move || {
-                if let Err(e) = worker(rx, live) {
+                WORKER_STOP.with(|slot| *slot.borrow_mut() = Some(stopped));
+                if let Err(e) = worker(rx, live.clone()) {
                     tracing::warn!("cua-libei-worker exited with error: {e}");
                 }
-            })
-            .expect("spawn cua-libei-worker thread");
-        sender
-    });
+                live.store(false, Ordering::Release);
+                WORKER_STOP.with(|slot| {
+                    slot.borrow_mut().take();
+                });
+            })?;
+        *slot = Some(WorkerOwner { sender, thread });
+    }
     Ok(())
 }
 
@@ -451,7 +535,8 @@ fn wait_until_ready(interface: &'static str) -> anyhow::Result<()> {
 /// Ordinary wait_*_ready calls made inside actions never open a connection.
 pub(super) fn reconnect_for_readiness(interface: &'static str) -> anyhow::Result<()> {
     ensure_started()?;
-    tx()?.connect(interface, open_eis_context)
+    let sender = tx()?;
+    sender.connect(interface, || open_eis_context(&sender.stopped))
 }
 
 /// Negotiate a resumed absolute-pointer device without emitting input.
@@ -611,10 +696,42 @@ pub fn drag(
     wait_for_reply(rx_r, completion)
 }
 
-/// Cleanly stop the worker thread.
+/// Fence old senders, cancel consent/drain, close the portal session and join.
+/// A timed-out owner stays fenced in the slot; a new generation cannot overlap it.
 pub fn shutdown() {
-    if let Some(tx) = TX.get() {
-        let _ = tx.send(Cmd::Shutdown);
+    ENABLED.store(false, Ordering::Release);
+    let deadline = Instant::now() + super::portal::OWNER_SHUTDOWN_TIMEOUT;
+    let Some(mut slot) = super::portal::lock_until(&TX, deadline) else {
+        tracing::warn!("libei owner shutdown already in progress");
+        return;
+    };
+    let Some(owner) = slot.as_ref() else { return };
+    owner.sender.request_shutdown();
+    if !super::portal::wait_for_thread(&owner.thread, deadline) {
+        tracing::warn!("libei owner shutdown timed out; owner remains fenced");
+        return;
+    }
+    // A lease-free opener may still own a partially-created portal runtime.
+    // Cancellation reaches it without taking this lock, including during consent.
+    loop {
+        match owner.sender.readiness.try_lock() {
+            Ok(guard) => {
+                drop(guard);
+                break;
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => break,
+            Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => {
+                tracing::warn!("libei opener shutdown timed out; owner remains fenced");
+                return;
+            }
+        }
+    }
+    let owner = slot.take().unwrap();
+    if owner.thread.join().is_err() {
+        tracing::warn!("libei owner panicked during shutdown");
     }
 }
 
@@ -635,18 +752,56 @@ pub fn shutdown() {
 /// Holding these for the worker's lifetime keeps the connection — and the
 /// session — open. The direct `$LIBEI_SOCKET` fast path has no portal
 /// session, so it carries `None`.
-#[allow(dead_code)] // fields are keep-alive only; never read
 enum PortalKeepAlive {
     None,
     Portal {
-        _rt: tokio::runtime::Runtime,
-        _proxy: ashpd::desktop::remote_desktop::RemoteDesktop,
-        _session: ashpd::desktop::Session<ashpd::desktop::remote_desktop::RemoteDesktop>,
+        rt: Option<tokio::runtime::Runtime>,
+        proxy: Option<ashpd::desktop::remote_desktop::RemoteDesktop>,
+        session: Option<ashpd::desktop::Session<ashpd::desktop::remote_desktop::RemoteDesktop>>,
+        connection: Option<zbus::Connection>,
     },
 }
 
+impl Drop for PortalKeepAlive {
+    fn drop(&mut self) {
+        if let Self::Portal {
+            rt,
+            proxy,
+            session,
+            connection,
+        } = self
+        {
+            let Some(rt) = rt.take() else { return };
+            let proxy = proxy.take();
+            let session = session.take();
+            let connection = connection.take();
+            super::portal::off_runtime(move || {
+                rt.block_on(async {
+                    if let Some(session) = session.as_ref() {
+                        super::portal::close_session(session).await;
+                    }
+                    drop(session);
+                    drop(proxy);
+                    if let Some(connection) = connection {
+                        super::portal::close_connection(connection).await;
+                    }
+                });
+                rt.shutdown_timeout(super::portal::RUNTIME_SHUTDOWN_TIMEOUT);
+            });
+        }
+    }
+}
+
 fn worker(rx: Receiver<WorkerRequest>, live: Arc<AtomicBool>) -> anyhow::Result<()> {
-    while let Ok(request) = rx.recv() {
+    while !worker_stopped() {
+        let request = match rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(request) => request,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+        if worker_stopped() {
+            break;
+        }
         match request {
             WorkerRequest::Command(queued) => {
                 if matches!(queued.command, Cmd::Shutdown) {
@@ -679,11 +834,33 @@ fn worker(rx: Receiver<WorkerRequest>, live: Arc<AtomicBool>) -> anyhow::Result<
     Ok(())
 }
 
+// Match reis's environment/path rules, but never enter its blocking
+// UnixStream::connect: a full Unix listener backlog must not strand a retiring
+// generation's readiness caller. Healthy local connects complete immediately.
+fn open_env_context() -> std::io::Result<Option<reis::ei::Context>> {
+    let Some(path) = std::env::var_os("LIBEI_SOCKET") else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    let path = if path.is_relative() {
+        let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") else {
+            return Ok(None);
+        };
+        PathBuf::from(runtime).join(path)
+    } else {
+        path
+    };
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    socket.set_nonblocking(true)?;
+    socket.connect(&socket2::SockAddr::unix(path)?)?;
+    reis::ei::Context::new(socket.into()).map(Some)
+}
+
 /// Open the EIS context. Fast path: `$LIBEI_SOCKET` supplied by the environment.
 /// Fallback: ashpd portal RemoteDesktop handshake.
-fn open_eis_context() -> anyhow::Result<(reis::ei::Context, PortalKeepAlive)> {
-    if let Some(ctx) = reis::ei::Context::connect_to_env()
-        .map_err(|e| anyhow::anyhow!("env ei socket open failed: {e}"))?
+fn open_eis_context(stopped: &AtomicBool) -> anyhow::Result<(reis::ei::Context, PortalKeepAlive)> {
+    if let Some(ctx) =
+        open_env_context().map_err(|e| anyhow::anyhow!("env ei socket open failed: {e}"))?
     {
         // Direct $LIBEI_SOCKET fast path: no portal session to keep alive.
         return Ok((ctx, PortalKeepAlive::None));
@@ -710,15 +887,33 @@ fn open_eis_context() -> anyhow::Result<(reis::ei::Context, PortalKeepAlive)> {
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build tokio runtime for ashpd: {e}"))?;
 
-    let (fd, proxy, session) = rt.block_on(async {
-        let connection = super::portal::fresh_session_connection().await?;
-        let proxy = RemoteDesktop::with_connection(connection)
+    let mut keepalive = PortalKeepAlive::Portal {
+        rt: Some(rt),
+        proxy: None,
+        session: None,
+        connection: None,
+    };
+    let PortalKeepAlive::Portal {
+        rt,
+        proxy,
+        session,
+        connection,
+    } = &mut keepalive
+    else {
+        unreachable!()
+    };
+    let fd = rt.as_ref().unwrap().block_on(super::portal::until_stopped(stopped, async {
+        let owned_connection = super::portal::fresh_session_connection().await?;
+        *connection = Some(owned_connection.clone());
+        *proxy = Some(RemoteDesktop::with_connection(owned_connection)
             .await
-            .map_err(|e| anyhow::anyhow!("portal RemoteDesktop proxy unreachable: {e}. Install xdg-desktop-portal-gnome / xdg-desktop-portal-kde."))?;
-        let session = proxy
+            .map_err(|e| anyhow::anyhow!("portal RemoteDesktop proxy unreachable: {e}. Install xdg-desktop-portal-gnome / xdg-desktop-portal-kde."))?);
+        let proxy = proxy.as_ref().unwrap();
+        *session = Some(proxy
             .create_session(CreateSessionOptions::default())
             .await
-            .map_err(|e| anyhow::anyhow!("portal create_session failed: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("portal create_session failed: {e}"))?);
+        let session = session.as_ref().unwrap();
 
         let mut select_opts = SelectDevicesOptions::default()
             .set_devices(BitFlags::<DeviceType>::from(DeviceType::Keyboard) | DeviceType::Pointer)
@@ -728,7 +923,7 @@ fn open_eis_context() -> anyhow::Result<(reis::ei::Context, PortalKeepAlive)> {
         }
 
         proxy
-            .select_devices(&session, select_opts)
+            .select_devices(session, select_opts)
             .await
             .map_err(|e| anyhow::anyhow!("portal select_devices failed: {e}"))?
             .response()
@@ -736,7 +931,7 @@ fn open_eis_context() -> anyhow::Result<(reis::ei::Context, PortalKeepAlive)> {
 
         let parent = unparented_wayland_identifier();
         let started = proxy
-            .start(&session, Some(&parent), StartOptions::default())
+            .start(session, Some(&parent), StartOptions::default())
             .await
             .map_err(|e| anyhow::anyhow!("portal start failed: {e}"))?
             .response()
@@ -752,23 +947,16 @@ fn open_eis_context() -> anyhow::Result<(reis::ei::Context, PortalKeepAlive)> {
         }
 
         let fd = proxy
-            .connect_to_eis(&session, ConnectToEISOptions::default())
+            .connect_to_eis(session, ConnectToEISOptions::default())
             .await
             .map_err(|e| anyhow::anyhow!("portal connect_to_eis failed: {e}"))?;
-        anyhow::Ok((fd, proxy, session))
-    })?;
+        anyhow::Ok(fd)
+    }))?;
 
     let stream = UnixStream::from(fd);
     let ctx = reis::ei::Context::new(stream)
         .map_err(|e| anyhow::anyhow!("reis ei::Context::new failed: {e}"))?;
-    Ok((
-        ctx,
-        PortalKeepAlive::Portal {
-            _rt: rt,
-            _proxy: proxy,
-            _session: session,
-        },
-    ))
+    Ok((ctx, keepalive))
 }
 
 // ── calloop dispatch ────────────────────────────────────────────────────
@@ -804,10 +992,7 @@ fn wait_writable(context: &reis::ei::Context, deadline: Instant) -> std::io::Res
     loop {
         check_deadline(deadline)?;
         let remaining = deadline.saturating_duration_since(Instant::now());
-        let timeout_ms = remaining
-            .as_millis()
-            .saturating_add(1)
-            .min(i32::MAX as u128) as i32;
+        let timeout_ms = remaining.as_millis().saturating_add(1).min(20) as i32;
         let mut fd = libc::pollfd {
             fd: context.as_raw_fd(),
             events: libc::POLLOUT,
@@ -857,6 +1042,9 @@ fn run_calloop(context: reis::ei::Context, rx: &Receiver<WorkerRequest>) -> anyh
     let mut pending = Vec::new();
 
     loop {
+        if worker_stopped() {
+            break;
+        }
         match rx.try_recv() {
             Ok(WorkerRequest::Command(queued)) if matches!(queued.command, Cmd::Shutdown) => break,
             Ok(WorkerRequest::Command(queued)) => pending.push(queued),
@@ -990,6 +1178,12 @@ impl EisState {
         };
         context.read()?;
         while let Some(result) = context.pending_event() {
+            if worker_stopped() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "libei owner shutting down",
+                ));
+            }
             let request = match result {
                 PendingRequestResult::Request(r) => r,
                 _ => continue,
@@ -1347,9 +1541,12 @@ impl EisState {
                     ptr_abs.motion_absolute(ix, iy);
                     device.frame(serial, event_time_us());
                     self.drain(deadline)?;
-                    if !delay.is_zero() {
-                        std::thread::sleep(
-                            delay.min(deadline.saturating_duration_since(Instant::now())),
+                    let wake = (Instant::now() + delay).min(deadline);
+                    while Instant::now() < wake {
+                        check_deadline(deadline)?;
+                        thread::sleep(
+                            wake.saturating_duration_since(Instant::now())
+                                .min(Duration::from_millis(20)),
                         );
                     }
                     check_deadline(deadline)?;
@@ -1672,6 +1869,190 @@ mod drain_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_socket_full_backlog_never_blocks_retirement() {
+        super::super::portal::tests::private_bus_test(
+            concat!(
+                module_path!(),
+                "::env_socket_full_backlog_never_blocks_retirement"
+            ),
+            || {
+                let home = tempfile::tempdir().unwrap();
+                let path = home.path().join("eis.sock");
+                let listener =
+                    socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
+                        .unwrap();
+                listener
+                    .bind(&socket2::SockAddr::unix(&path).unwrap())
+                    .unwrap();
+                listener.listen(0).unwrap();
+                std::env::set_var("LIBEI_SOCKET", &path);
+                let first = open_env_context().unwrap().unwrap();
+                let started = Instant::now();
+                let error = match open_env_context() {
+                    Err(error) => error,
+                    Ok(_) => panic!("full listener backlog accepted another connection"),
+                };
+                assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                assert!(started.elapsed() < Duration::from_secs(1));
+                std::env::remove_var("LIBEI_SOCKET");
+                drop(first);
+            },
+        );
+    }
+
+    #[test]
+    fn shutdown_cancels_partial_portal_and_restarts_generation() {
+        use super::super::portal::tests::{private_bus_test, FakePortal};
+        use std::sync::mpsc;
+        private_bus_test(
+            concat!(
+                module_path!(),
+                "::shutdown_cancels_partial_portal_and_restarts_generation"
+            ),
+            || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let (entered, entering) = mpsc::channel();
+                let (closed, closing) = mpsc::channel();
+                let fake = FakePortal {
+                    entered,
+                    closed,
+                    stall_close: true,
+                };
+                let service = rt.block_on(fake.serve());
+                for _ in 0..2 {
+                    restart();
+                    let opener = thread::spawn(|| reconnect_for_readiness("ei_keyboard"));
+                    let name = entering.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let old = tx().unwrap();
+                    let started = Instant::now();
+                    shutdown();
+                    assert!(started.elapsed() < Duration::from_secs(3));
+                    let error = opener.join().unwrap().unwrap_err();
+                    assert!(
+                        error.to_string().contains("portal owner is shutting down"),
+                        "{error}"
+                    );
+                    closing.recv_timeout(Duration::from_secs(1)).unwrap();
+                    rt.block_on(async {
+                        super::super::portal::tests::assert_name_gone(&service, &name).await;
+                    });
+                    assert_eq!(
+                        old.wait_ready("ei_keyboard").unwrap_err().to_string(),
+                        "libei worker is shutting down"
+                    );
+                    shutdown();
+                    assert!(TX.lock().unwrap().is_none());
+                }
+                rt.block_on(super::super::portal::close_connection(service));
+                rt.shutdown_timeout(super::super::portal::RUNTIME_SHUTDOWN_TIMEOUT);
+            },
+        );
+    }
+
+    #[test]
+    fn shutdown_joins_live_eis_owner_despite_retained_sender_and_context() {
+        use std::io::Read;
+        use std::os::unix::net::UnixStream;
+        super::super::portal::tests::private_bus_test(
+            concat!(
+                module_path!(),
+                "::shutdown_joins_live_eis_owner_despite_retained_sender_and_context"
+            ),
+            || {
+                use super::super::portal::tests::FakePortal;
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let (entered, _) = std::sync::mpsc::channel();
+                let (closed, closing) = std::sync::mpsc::channel();
+                let service = rt.block_on(
+                    FakePortal {
+                        entered,
+                        closed,
+                        stall_close: false,
+                    }
+                    .serve(),
+                );
+                let owned_rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let connection = owned_rt
+                    .block_on(super::super::portal::fresh_session_connection())
+                    .unwrap();
+                let name = connection.unique_name().unwrap().to_string();
+                let proxy = owned_rt
+                    .block_on(
+                        ashpd::desktop::remote_desktop::RemoteDesktop::with_connection(
+                            connection.clone(),
+                        ),
+                    )
+                    .unwrap();
+                let session = owned_rt
+                    .block_on(proxy.create_session(ashpd::desktop::CreateSessionOptions::default()))
+                    .unwrap();
+                let keepalive = PortalKeepAlive::Portal {
+                    rt: Some(owned_rt),
+                    connection: Some(connection),
+                    proxy: Some(proxy),
+                    session: Some(session),
+                };
+                ensure_started().unwrap();
+                let old = tx().unwrap();
+                let (socket, mut peer) = UnixStream::pair().unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let context = reis::ei::Context::new(socket).unwrap();
+                let stale = context.clone();
+                old.tx
+                    .send(WorkerRequest::Connect { context, keepalive })
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while !old.live.load(Ordering::Acquire) {
+                    assert!(Instant::now() < deadline);
+                    thread::sleep(Duration::from_millis(5));
+                }
+                shutdown();
+                let mut bytes = Vec::new();
+                peer.read_to_end(&mut bytes).unwrap();
+                closing.recv_timeout(Duration::from_secs(1)).unwrap();
+                rt.block_on(async {
+                    super::super::portal::tests::assert_name_gone(&service, &name).await;
+                });
+                assert_eq!(
+                    unsafe {
+                        libc::send(
+                            stale.as_raw_fd(),
+                            b"x".as_ptr().cast(),
+                            1,
+                            libc::MSG_NOSIGNAL,
+                        )
+                    },
+                    -1
+                );
+                assert_eq!(
+                    old.wait_ready("ei_keyboard").unwrap_err().to_string(),
+                    "libei worker is shutting down"
+                );
+                assert!(TX.lock().unwrap().is_none());
+                shutdown();
+                restart();
+                ensure_started().unwrap();
+                assert!(!tx().unwrap().stopped.load(Ordering::Acquire));
+                shutdown();
+                rt.block_on(super::super::portal::close_connection(service));
+                rt.shutdown_timeout(super::super::portal::RUNTIME_SHUTDOWN_TIMEOUT);
+            },
+        );
+    }
 
     #[tokio::test]
     async fn semantic_input_accidental_libei_calls_refuse_before_start_wait_or_inject() {

@@ -151,7 +151,8 @@ pub fn chain_at_point(
         HitCoords::Window => CoordType::Window,
     };
     runtime().block_on(async move {
-        let conn = shared_connection().await?;
+        let connection = shared_connection().await?;
+        let conn = &connection;
         // Cache the app's top-level frame references (their bus names are
         // real peer names; the application proxy's own destination may be a
         // peer-to-peer placeholder that cannot be re-addressed).

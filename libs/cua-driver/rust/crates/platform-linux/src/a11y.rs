@@ -129,35 +129,13 @@ pub fn ensure_accessibility_enabled_with_session_bus(
             .ok()
             .as_deref(),
     );
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("cua-a11y-prepare".into())
-        .spawn(move || {
-            // Moving the lock into this worker keeps a timed-out D-Bus mutation
-            // serialized until the worker really exits.
-            let _preparation_lock = preparation_lock;
-            let result = std::panic::catch_unwind(|| {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                runtime.block_on(prepare_accessibility(mode, session_bus_address.as_deref()))
-            })
-            .map_err(|_| anyhow!("accessibility preparation panicked"))
-            .and_then(|result| result);
-            let _ = sender.send(result);
-        })
-        .map_err(|error| format!("could not spawn accessibility preparation: {error}"))?;
-    let address = receiver
-        .recv_timeout(timeout)
-        .map_err(|error| match error {
-            std::sync::mpsc::RecvTimeoutError::Timeout => {
-                format!("accessibility preparation exceeded its {timeout:?} deadline")
-            }
-            std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                "accessibility preparation exited without a result".to_owned()
-            }
-        })?
-        .map_err(|error| format!("could not prepare session accessibility: {error:#}"))?;
+    let address = run_preparation(timeout, move || async move {
+        // The worker owns this lock until cancellation/close and Tokio shutdown
+        // finish; a timeout cannot allow overlapping desktop advertisement.
+        let _preparation_lock = preparation_lock;
+        prepare_accessibility(mode, session_bus_address.as_deref(), timeout).await
+    })
+    .map_err(|error| format!("could not prepare session accessibility: {error:#}"))?;
     let expected = TrustedAccessibilityBus {
         address,
         private_worker: false,
@@ -174,14 +152,70 @@ pub fn ensure_accessibility_enabled_with_session_bus(
     Ok(())
 }
 
+const CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A joined one-shot owner, not a detached thread or a main-thread mpmc
+/// receiver (whose cached TLS context survives until after process exit).
+fn run_preparation<T, F, Fut>(timeout: std::time::Duration, work: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    let worker = std::thread::Builder::new()
+        .name("cua-a11y-prepare".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let result = runtime.block_on(async {
+                tokio::time::timeout(timeout + CLEANUP_TIMEOUT, work())
+                    .await
+                    .map_err(|_| {
+                        anyhow!("accessibility preparation exceeded its {timeout:?} deadline")
+                    })?
+            });
+            runtime.shutdown_timeout(CLEANUP_TIMEOUT);
+            result
+        })
+        .context("spawning the accessibility preparation owner")?;
+    worker
+        .join()
+        .map_err(|_| anyhow!("accessibility preparation panicked"))?
+}
+
 async fn prepare_accessibility(
     mode: AdvertiseMode,
     session_bus_address: Option<&str>,
+    timeout: std::time::Duration,
 ) -> anyhow::Result<String> {
-    let session_bus = match session_bus_address {
-        Some(address) => zbus::connection::Builder::address(address)?.build().await?,
-        None => zbus::Connection::session().await?,
-    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    let session_bus = tokio::time::timeout_at(deadline, async {
+        match session_bus_address {
+            Some(address) => zbus::connection::Builder::address(address)?.build().await,
+            None => zbus::Connection::session().await,
+        }
+    })
+    .await
+    .context("accessibility session connection timed out")??;
+    let result = tokio::time::timeout_at(deadline, prepare_accessibility_on(&session_bus, mode))
+        .await
+        .context("accessibility preparation timed out")
+        .and_then(|result| result);
+    // Close on both success and error, while the owning executor still runs.
+    if tokio::time::timeout(CLEANUP_TIMEOUT, session_bus.close())
+        .await
+        .is_err()
+    {
+        tracing::warn!("accessibility preparation connection close timed out");
+    }
+    result
+}
+
+async fn prepare_accessibility_on(
+    session_bus: &zbus::Connection,
+    mode: AdvertiseMode,
+) -> anyhow::Result<String> {
     let bus = zbus::Proxy::new(
         &session_bus,
         ACCESSIBILITY_BUS_SERVICE,
@@ -251,47 +285,11 @@ pub fn ensure_chromium_accessibility_enabled() {
 }
 
 fn advertise_accessibility_to_session(mode: AdvertiseMode) -> anyhow::Result<()> {
-    // The daemon's tokio runtime is already driving this thread when the tool
-    // registry is built, and `block_on` panics if called from within a runtime.
-    // Run the one-shot bus work on a dedicated OS thread that owns a small
-    // runtime of its own, then join it — no nesting, torn down once it returns.
-    std::thread::Builder::new()
-        .name("cua-a11y-advertise".into())
-        .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            runtime.block_on(advertise_accessibility(mode))
-        })
-        .context("spawning the accessibility-advertise thread")?
-        .join()
-        .map_err(|_| anyhow!("accessibility-advertise thread panicked"))?
-}
-
-async fn advertise_accessibility(mode: AdvertiseMode) -> anyhow::Result<()> {
-    let session_bus = zbus::Connection::session().await?;
-    let status = zbus::Proxy::new(
-        &session_bus,
-        ACCESSIBILITY_BUS_SERVICE,
-        ACCESSIBILITY_BUS_OBJECT,
-        ACCESSIBILITY_STATUS_INTERFACE,
-    )
-    .await?;
-
-    // Don't clobber a screen reader the user is already running: only write when
-    // a flag is currently false, so an active Orca session stays authoritative
-    // and we avoid emitting a redundant PropertiesChanged.
-    if mode == AdvertiseMode::All && !is_flag_set(&status, SCREEN_READER_ENABLED_PROPERTY).await {
-        status
-            .set_property(SCREEN_READER_ENABLED_PROPERTY, true)
-            .await?;
-    }
-    if !is_flag_set(&status, ACCESSIBILITY_IS_ENABLED_PROPERTY).await {
-        status
-            .set_property(ACCESSIBILITY_IS_ENABLED_PROPERTY, true)
-            .await?;
-    }
-    Ok(())
+    run_preparation(ACCESSIBILITY_ADVERTISE_TIMEOUT, move || async move {
+        prepare_accessibility(mode, None, ACCESSIBILITY_ADVERTISE_TIMEOUT)
+            .await
+            .map(|_| ())
+    })
 }
 
 fn advertise_mode_from(
@@ -360,6 +358,21 @@ async fn is_flag_set(status: &zbus::Proxy<'_>, property: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preparation_owner_joins_success_and_bounds_a_stalled_future() {
+        let value =
+            super::run_preparation(std::time::Duration::from_millis(20), || async { Ok(17) })
+                .unwrap();
+        assert_eq!(value, 17);
+        let start = std::time::Instant::now();
+        let result =
+            super::run_preparation::<(), _, _>(std::time::Duration::from_millis(20), || async {
+                std::future::pending().await
+            });
+        assert!(result.unwrap_err().to_string().contains("exceeded"));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
     use super::{advertise_mode_from, AdvertiseMode};
 
     #[test]

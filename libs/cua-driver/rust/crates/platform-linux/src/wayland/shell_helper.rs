@@ -19,13 +19,31 @@
 //! screen coords, no Wayland cursor). General RPC uses a bounded persistent
 //! typed transport. Foreground transaction IDs remain independently reconciled. Cursor calls need one persistent D-Bus connection so Shell can
 //! bind actor lifetime to its unique name; a dedicated non-Tokio thread owns
-//! that blocking zbus connection and serializes those calls.
+//! that independently owned transport and serializes those calls.
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 mod transport;
+
+/// Fence both transports, cancel pending RPCs and join the cursor dispatcher.
+pub fn shutdown() {
+    ENABLED.store(false, Ordering::Release);
+    let dispatcher = OVERLAY_DISPATCH_TX.lock().unwrap().take();
+    if let Some(dispatcher) = dispatcher.as_ref() {
+        dispatcher.stop.store(true, Ordering::Release);
+    }
+    transport::shutdown();
+    if let Some(dispatcher) = dispatcher {
+        dispatcher.shutdown();
+    }
+}
+
+pub(crate) fn restart() {
+    ENABLED.store(true, Ordering::Release);
+    transport::restart();
+}
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::x11::WindowInfo;
@@ -44,8 +62,8 @@ const INTROSPECT_IFACE: &str = "org.gnome.Shell.Introspect";
 /// target capability protocol advertised by `GetCapabilities`.
 const REQUIRED_HELPER_API_VERSION: u32 = 14;
 const REQUIRED_EXACT_TARGET_PROTOCOL: u64 = 4;
-static OVERLAY_DISPATCH_TX: OnceLock<Option<std::sync::mpsc::SyncSender<OverlayDispatchRequest>>> =
-    OnceLock::new();
+static OVERLAY_DISPATCH_TX: Mutex<Option<OverlayDispatcher>> = Mutex::new(None);
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static FOREGROUND_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static PENDING_FOREGROUND: Mutex<Option<String>> = Mutex::new(None);
 
@@ -106,29 +124,55 @@ impl OverlayDispatchRequest {
     }
 }
 
-fn spawn_overlay_dispatcher<F>(
-    mut dispatch: F,
-) -> Option<std::sync::mpsc::SyncSender<OverlayDispatchRequest>>
+struct OverlayDispatcher {
+    sender: std::sync::mpsc::SyncSender<OverlayDispatchRequest>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+impl OverlayDispatcher {
+    fn shutdown(self) {
+        self.stop.store(true, Ordering::Release);
+        drop(self.sender);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !self.thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if self.thread.is_finished() {
+            let _ = self.thread.join();
+        } else {
+            tracing::warn!("GNOME cursor dispatcher shutdown timed out");
+        }
+    }
+}
+
+fn spawn_overlay_dispatcher<F>(mut dispatch: F) -> Option<OverlayDispatcher>
 where
     F: FnMut(OverlayDispatchRequest) + Send + 'static,
 {
     let (tx, rx) = std::sync::mpsc::sync_channel(OVERLAY_DISPATCH_CAPACITY);
-    std::thread::Builder::new()
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping = stop.clone();
+    let thread = std::thread::Builder::new()
         .name("cua-gnome-cursor-dbus".to_owned())
         .spawn(move || {
-            while let Ok(request) = rx.recv() {
-                dispatch(request);
+            while !stopping.load(Ordering::Acquire) {
+                match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(request) => dispatch(request),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
             }
         })
         .ok()?;
-    Some(tx)
+    Some(OverlayDispatcher {
+        sender: tx,
+        stop,
+        thread,
+    })
 }
 
-fn dispatch_overlay_request(
-    connection: &zbus::blocking::Connection,
-    targets: &HashMap<String, u64>,
-    request: OverlayDispatchRequest,
-) {
+fn dispatch_overlay_request(targets: &HashMap<String, u64>, request: OverlayDispatchRequest) {
     let Some(destination) = shell_owner(false) else {
         return;
     };
@@ -154,12 +198,15 @@ fn dispatch_overlay_request(
             let Some(target) = resolve_target(window_id) else {
                 return;
             };
-            let _ = connection.call_method(
-                Some(destination.as_str()),
-                PATH,
-                Some(IFACE),
-                "MoveCursorFor",
-                &(owner.as_str(), target.target_id.as_str(), x, y),
+            let _ = transport::cursor_call(
+                &destination,
+                &format!("{IFACE}.MoveCursorFor"),
+                &[
+                    owner.as_str().to_string(),
+                    target.target_id.as_str().to_string(),
+                    x.to_string(),
+                    y.to_string(),
+                ],
             );
         }
         OverlayDispatchRequest::ClickPulse { owner, x, y } => {
@@ -169,21 +216,22 @@ fn dispatch_overlay_request(
             let Some(target) = resolve_target(window_id) else {
                 return;
             };
-            let _ = connection.call_method(
-                Some(destination.as_str()),
-                PATH,
-                Some(IFACE),
-                "ClickPulseFor",
-                &(owner.as_str(), target.target_id.as_str(), x, y),
+            let _ = transport::cursor_call(
+                &destination,
+                &format!("{IFACE}.ClickPulseFor"),
+                &[
+                    owner.as_str().to_string(),
+                    target.target_id.as_str().to_string(),
+                    x.to_string(),
+                    y.to_string(),
+                ],
             );
         }
         OverlayDispatchRequest::SetColor { owner, fill_color } => {
-            let _ = connection.call_method(
-                Some(destination.as_str()),
-                PATH,
-                Some(IFACE),
-                "SetCursorColorFor",
-                &(owner.as_str(), fill_color.as_str()),
+            let _ = transport::cursor_call(
+                &destination,
+                &format!("{IFACE}.SetCursorColorFor"),
+                &[owner.as_str().to_string(), fill_color.as_str().to_string()],
             );
         }
         OverlayDispatchRequest::SetState {
@@ -193,45 +241,37 @@ fn dispatch_overlay_request(
             target,
             active,
         } => {
-            let _ = connection.call_method(
-                Some(destination.as_str()),
-                PATH,
-                Some(IFACE),
-                "SetCursorStateFor",
-                &(
-                    owner.as_str(),
-                    action.as_str(),
-                    delivery.as_str(),
-                    target.as_str(),
-                    active,
-                ),
+            let _ = transport::cursor_call(
+                &destination,
+                &format!("{IFACE}.SetCursorStateFor"),
+                &[
+                    owner.as_str().to_string(),
+                    action.as_str().to_string(),
+                    delivery.as_str().to_string(),
+                    target.as_str().to_string(),
+                    active.to_string(),
+                ],
             );
         }
         OverlayDispatchRequest::SetSessionLabel { owner, label } => {
-            let _ = connection.call_method(
-                Some(destination.as_str()),
-                PATH,
-                Some(IFACE),
-                "SetSessionLabelFor",
-                &(owner.as_str(), label.as_str()),
+            let _ = transport::cursor_call(
+                &destination,
+                &format!("{IFACE}.SetSessionLabelFor"),
+                &[owner.as_str().to_string(), label.as_str().to_string()],
             );
         }
         OverlayDispatchRequest::Hide { owner } => {
-            let _ = connection.call_method(
-                Some(destination.as_str()),
-                PATH,
-                Some(IFACE),
-                "HideCursorFor",
-                &(owner.as_str(),),
+            let _ = transport::cursor_call(
+                &destination,
+                &format!("{IFACE}.HideCursorFor"),
+                &[owner.to_string()],
             );
         }
         OverlayDispatchRequest::Remove { owner } => {
-            let _ = connection.call_method(
-                Some(destination.as_str()),
-                PATH,
-                Some(IFACE),
-                "RemoveCursor",
-                &(owner.as_str(),),
+            let _ = transport::cursor_call(
+                &destination,
+                &format!("{IFACE}.RemoveCursor"),
+                &[owner.to_string()],
             );
         }
     }
@@ -260,8 +300,14 @@ fn prepare_overlay_dispatch(
 }
 
 pub fn start_overlay_dispatcher() {
-    let _ = OVERLAY_DISPATCH_TX.get_or_init(|| {
-        let mut connection: Option<zbus::blocking::Connection> = None;
+    let mut dispatcher = OVERLAY_DISPATCH_TX.lock().unwrap();
+    if !ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    if dispatcher.is_some() {
+        return;
+    }
+    *dispatcher = (|| {
         let mut helper_compatible: Option<(Instant, bool)> = None;
         let mut targets = HashMap::new();
         spawn_overlay_dispatcher(move |request| {
@@ -291,14 +337,9 @@ pub fn start_overlay_dispatcher() {
             if !compatible {
                 return;
             }
-            if connection.is_none() {
-                connection = zbus::blocking::Connection::session().ok();
-            }
-            if let Some(connection) = connection.as_ref() {
-                dispatch_overlay_request(connection, &targets, request);
-            }
+            dispatch_overlay_request(&targets, request);
         })
-    });
+    })();
 }
 
 fn try_enqueue_overlay_request(
@@ -327,14 +368,15 @@ fn try_enqueue_overlay_request(
 
 fn enqueue_overlay_request(request: OverlayDispatchRequest) -> bool {
     start_overlay_dispatcher();
-    let Some(sender) = OVERLAY_DISPATCH_TX.get().and_then(Option::as_ref) else {
+    let dispatcher = OVERLAY_DISPATCH_TX.lock().unwrap();
+    let Some(dispatcher) = dispatcher.as_ref() else {
         tracing::warn!(
             request = request.kind(),
             "GNOME cursor dispatcher is unavailable"
         );
         return false;
     };
-    try_enqueue_overlay_request(sender, request)
+    try_enqueue_overlay_request(&dispatcher.sender, request)
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1471,6 +1513,7 @@ mod tests {
 
         runtime.block_on(async {
             sender
+                .sender
                 .try_send(OverlayDispatchRequest::Hide {
                     owner: "test-owner".to_owned(),
                 })
@@ -1478,6 +1521,7 @@ mod tests {
         });
 
         assert_eq!(observed_rx.recv_timeout(Duration::from_secs(1)), Ok(true));
+        sender.shutdown();
     }
 
     #[test]
@@ -1528,7 +1572,10 @@ mod tests {
                 owner: "test-owner".to_owned(),
             },
         ] {
-            sender.try_send(request).expect("queue cursor request");
+            sender
+                .sender
+                .try_send(request)
+                .expect("queue cursor request");
         }
 
         let observed: Vec<_> = (0..5)
@@ -1539,6 +1586,7 @@ mod tests {
             })
             .collect();
         assert_eq!(observed, ["pin", "move", "click_pulse", "hide", "remove"]);
+        sender.shutdown();
     }
 
     #[test]

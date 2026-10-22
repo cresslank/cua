@@ -236,6 +236,26 @@ pub fn register_scoped_cursor_outcome_reader(
     CursorOutcomeReaderRegistration { id }
 }
 
+// Linux retires and recreates these process registries. Release an empty
+// hashbrown allocation as its last owner leaves, without invoking arbitrary
+// callback destructors under the registration mutex.
+fn remove_registration<T>(registry: &Mutex<HashMap<u64, T>>, id: u64) {
+    #[cfg(target_os = "linux")]
+    {
+        let removed = {
+            let mut entries = registry.lock().unwrap();
+            let removed = entries.remove(&id);
+            if entries.is_empty() {
+                *entries = HashMap::new();
+            }
+            removed
+        };
+        drop(removed);
+    }
+    #[cfg(not(target_os = "linux"))]
+    registry.lock().unwrap().remove(&id);
+}
+
 pub struct CursorOutcomeReaderRegistration {
     id: u64,
 }
@@ -243,7 +263,7 @@ pub struct CursorOutcomeReaderRegistration {
 impl Drop for CursorOutcomeReaderRegistration {
     fn drop(&mut self) {
         if let Some(readers) = CURSOR_OUTCOME_READERS.get() {
-            readers.lock().unwrap().remove(&self.id);
+            remove_registration(readers, self.id);
         }
     }
 }
@@ -267,7 +287,7 @@ pub struct RecordingStateReaderRegistration {
 impl Drop for RecordingStateReaderRegistration {
     fn drop(&mut self) {
         if let Some(readers) = RECORDING_STATE_READERS.get() {
-            readers.lock().unwrap().remove(&self.id);
+            remove_registration(readers, self.id);
         }
     }
 }
@@ -1111,7 +1131,7 @@ pub struct SessionEndHookRegistration {
 
 impl Drop for SessionEndHookRegistration {
     fn drop(&mut self) {
-        hooks().lock().unwrap().remove(&self.id);
+        remove_registration(hooks(), self.id);
     }
 }
 
@@ -1131,7 +1151,7 @@ pub struct SessionReviveHookRegistration {
 
 impl Drop for SessionReviveHookRegistration {
     fn drop(&mut self) {
-        revive_hooks().lock().unwrap().remove(&self.id);
+        remove_registration(revive_hooks(), self.id);
     }
 }
 
@@ -1750,6 +1770,43 @@ pub fn active_session_count() -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn registration_retirement_releases_empty_capacity_and_drops_outside_lock() {
+        struct Probe(Box<dyn Fn() + Send + Sync>);
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                (self.0)();
+            }
+        }
+        let entries = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            u64,
+            Probe,
+        >::new()));
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for id in [1, 2] {
+            let weak = std::sync::Arc::downgrade(&entries);
+            let dropped = dropped.clone();
+            entries.lock().unwrap().insert(
+                id,
+                Probe(Box::new(move || {
+                    assert!(
+                        weak.upgrade().unwrap().try_lock().is_ok(),
+                        "callback destructor ran under registration lock"
+                    );
+                    dropped.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                })),
+            );
+        }
+        super::remove_registration(&entries, 1);
+        assert_eq!(entries.lock().unwrap().len(), 1);
+        super::remove_registration(&entries, 2);
+        assert_eq!(entries.lock().unwrap().capacity(), 0);
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 2);
+        super::remove_registration(&entries, 2);
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
