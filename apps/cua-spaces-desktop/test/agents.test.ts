@@ -240,6 +240,7 @@ describe.skipIf(!built)("agents", () => {
     expect(await code(bridge, "agents.setup")).toBe("unsupported");
     expect(await code(bridge, "agents.configure", {})).toBe("unsupported");
     expect(await code(bridge, "agents.setupDriver", { agents: ["codex"] })).toBe("unsupported");
+    expect(await code(bridge, "agents.signIn", { agent: "codex" })).toBe("unsupported");
     expect(await code(bridge, "agents.runs", {})).toBe("bad_args");
     expect(await code(bridge, "agents.pause", {})).toBe("bad_args");
   });
@@ -257,6 +258,18 @@ describe.skipIf(!built)("agents", () => {
     expect(configured.find((r) => r.agent === "claude-code")?.configured).toBe(true);
     expect(shapeProblems("agents.configure", configured)).toEqual([]);
     expect(await code(bridge, "agents.configure", { agents: "codex" })).toBe("bad_args");
+  });
+
+  it("starts an agent's own sign-in on this computer, and the rows say when it is done", async () => {
+    const { bridge } = makeBridge();
+    const rows = (await call(bridge, "agents.setup")) as { agent: string; signIn: string | null; signedIn: boolean }[];
+    expect(rows.find((r) => r.agent === "codex")).toMatchObject({ signIn: "ChatGPT", signedIn: false });
+    expect(rows.find((r) => r.agent === "claude-code")).toMatchObject({ signIn: null, signedIn: false });
+    const after = (await call(bridge, "agents.signIn", { agent: "codex" })) as typeof rows;
+    expect(setup.calls).toEqual(["sign-in:codex"]);
+    expect(after.find((r) => r.agent === "codex")?.signedIn).toBe(true);
+    expect(shapeProblems("agents.signIn", after)).toEqual([]);
+    expect(await code(bridge, "agents.signIn", {})).toBe("bad_args");
   });
 
   it("configures every detected agent when none are named", async () => {
@@ -399,7 +412,7 @@ describe.skipIf(!built)("agents", () => {
     expect(model.agents.keys.view.notice).toContain("keeps credentials in a file");
     const none = makeBridge({ tools: null }).model.agents.keys;
     expect(none.view.notice).toContain("need the cua daemon");
-    expect(agentKeysInput({ keys: [{ provider: "x", env: "", last4: "1234", added_ms: 1 }], available: false }, null)).toMatchObject({ keys: [], unavailable: "this machine can't keep keys" });
+    expect(agentKeysInput({ keys: [{ provider: "x", env: "", last4: "1234", added_ms: 1 }], available: false }, null)).toMatchObject({ keys: [], unavailable: "this computer can't keep keys" });
   });
 
   it("routes agentKeys.* to the daemon, with answers that never carry a key", async () => {

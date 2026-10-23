@@ -11,7 +11,7 @@
 //! | Relay         | `CUA_RELAY_URL`       | `https://relay.cua.ai`                   | `https://relay.staging.cua.ai`              |
 //! | Spaces API    | `CUA_SPACES_API_URL`  | `https://api.cua.ai`                     | `https://api.staging.cua.ai`                |
 //! | Account app   | `CUA_ACCOUNT_APP_URL` | `https://app.cua.ai`                     | `https://app.staging.cua.ai`                |
-//! | Spaces site   | `CUA_SPACES_SITE_URL` | `https://spaces.cua.ai`                  | `https://spaces.staging.cua.ai`             |
+//! | Spaces site   | `CUA_SPACES_SITE_URL` | `https://cua.ai`                         | `https://spaces.staging.cua.ai`             |
 //! | cua home      | `CUA_HOME`            | `~/.cua`                                 | `~/.cua/envs/staging`                       |
 //!
 //! A per-setting override always wins over `CUA_ENV`. With `CUA_ENV` unset,
@@ -125,14 +125,28 @@ impl CuaEnv {
     /// The default Spaces site (pairing links are `<site>/add/<code>`).
     pub fn spaces_site_url(self) -> &'static str {
         match self {
-            Self::Prod => "https://spaces.cua.ai",
+            Self::Prod => "https://cua.ai",
             Self::Staging => "https://spaces.staging.cua.ai",
         }
     }
 
-    /// The OS credential vault service the session is stored under
-    /// (production keeps `run.cua.ai`).
+    /// The OS credential vault service the session, the device key and the
+    /// other named secrets are stored under. The name is neutral on purpose:
+    /// it used to be the retired Cloud API host (see
+    /// [`CuaEnv::legacy_keyring_service`]).
     pub fn keyring_service(self) -> &'static str {
+        match self {
+            Self::Prod => "ai.cua.session",
+            Self::Staging => "ai.cua.session.staging",
+        }
+    }
+
+    /// The service older builds stored the session under (the retired Cloud
+    /// API host). Builds that use [`CuaEnv::keyring_service`] move an item
+    /// they find here once, then delete it. Remove this, and the move in
+    /// `cua-auth`, two releases or 60 days after the first release that has
+    /// the move, whichever is later (CUA-1877).
+    pub fn legacy_keyring_service(self) -> &'static str {
         match self {
             Self::Prod => "run.cua.ai",
             Self::Staging => "staging.run.cua.ai",
@@ -277,8 +291,9 @@ mod tests {
         assert_eq!(e.relay_url, "https://relay.cua.ai");
         assert_eq!(e.spaces_api_url, "https://api.cua.ai");
         assert_eq!(e.account_app_url, "https://app.cua.ai");
-        assert_eq!(e.spaces_site_url, "https://spaces.cua.ai");
-        assert_eq!(CuaEnv::Prod.keyring_service(), "run.cua.ai");
+        assert_eq!(e.spaces_site_url, "https://cua.ai");
+        assert_eq!(CuaEnv::Prod.keyring_service(), "ai.cua.session");
+        assert_eq!(CuaEnv::Prod.legacy_keyring_service(), "run.cua.ai");
         assert_eq!(CuaEnv::Prod.home_subdir(), None);
         // An unknown value never selects staging.
         assert_eq!(endpoints(&[("CUA_ENV", "stagign")]), e);
@@ -296,7 +311,11 @@ mod tests {
         assert_eq!(e.spaces_api_url, "https://api.staging.cua.ai");
         assert_eq!(e.account_app_url, "https://app.staging.cua.ai");
         assert_eq!(e.spaces_site_url, "https://spaces.staging.cua.ai");
-        assert_eq!(CuaEnv::Staging.keyring_service(), "staging.run.cua.ai");
+        assert_eq!(CuaEnv::Staging.keyring_service(), "ai.cua.session.staging");
+        assert_eq!(
+            CuaEnv::Staging.legacy_keyring_service(),
+            "staging.run.cua.ai"
+        );
         assert_eq!(CuaEnv::Staging.home_subdir(), Some("envs/staging"));
     }
 

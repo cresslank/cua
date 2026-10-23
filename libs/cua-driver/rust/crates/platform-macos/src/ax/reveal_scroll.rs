@@ -30,8 +30,6 @@ pub struct RevealOutcome {
     pub container_role: String,
     /// How far the content moved, in points, in the requested direction.
     pub moved: f64,
-    /// Nothing lay beyond the edge: the container is already at its end.
-    pub at_end: bool,
 }
 
 /// `[x, y, w, h]` in screen points.
@@ -165,7 +163,7 @@ pub fn pick_clamped(
 /// inner scroller is the page's AXWebArea. The groups between the hit
 /// element and that ancestor that clip content past their edge are tried
 /// first, innermost out; the scroll-role container is the last resort. The
-/// first one that moves wins, and the end is reported only when none moved.
+/// first one that moves wins.
 ///
 /// # Safety
 ///
@@ -184,7 +182,7 @@ pub unsafe fn reveal_scroll(
         return None;
     }
     let candidates = scroll_candidates(hit, direction);
-    let mut at_end = None;
+    // `hit` stays alive: reveal_in still addresses it, and every candidate is released below.
     let mut candidates = candidates.into_iter();
     while let Some((container, role)) = candidates.next() {
         if cua_driver_core::blocking::check_cancelled().is_err() {
@@ -196,15 +194,13 @@ pub unsafe fn reveal_scroll(
         );
         CFRelease(container as CFTypeRef);
         match outcome {
-            Some(outcome) if !outcome.at_end => {
+            Some(outcome) => {
                 for (rest, _) in candidates {
                     CFRelease(rest as CFTypeRef);
                 }
                 CFRelease(hit as CFTypeRef);
                 return Some(outcome);
             }
-            // Keep the outermost end: the scroll-role container comes last.
-            Some(outcome) => at_end = Some(outcome),
             None => {}
         }
     }
@@ -212,7 +208,7 @@ pub unsafe fn reveal_scroll(
         CFRelease(rest as CFTypeRef);
     }
     CFRelease(hit as CFTypeRef);
-    at_end
+    None
 }
 
 /// The elements at or above `element` to try, innermost first and retained:
@@ -388,11 +384,10 @@ unsafe fn reveal_in(
         (moved > 0.5).then(|| RevealOutcome {
             container_role: role.to_owned(),
             moved,
-            at_end: false,
         })
     } else if let Some(pick) = pick_clamped(viewport, direction, distance, &nodes) {
         // A clamped sliver: it scrolled when it now shows at a real size
-        // inside the viewport and a visible element moved (or left). Its old
+        // inside the viewport or a visible reference moved (or left). Its old
         // position is estimated from the row count, so the distance is
         // approximate.
         let reference = nodes
@@ -416,21 +411,8 @@ unsafe fn reveal_in(
         let reference_after = reference.and_then(|at| element_screen_rect(elements[at]));
         let shown =
             after.is_some_and(|rect| real_size(rect) && intersect(rect, viewport).is_some());
-        match content_moved(reference_before, reference_after) {
-            // Nothing visible moved: the container is at its end that way.
-            Some(false) => {
-                return finish(
-                    elements,
-                    Some(RevealOutcome {
-                        container_role: role.to_owned(),
-                        moved: 0.0,
-                        at_end: true,
-                    }),
-                )
-            }
-            Some(true) => {}
-            None if shown => {}
-            None => return finish(elements, None),
+        if content_moved(reference_before, reference_after) != Some(true) && !shown {
+            return finish(elements, None);
         }
         after.filter(|rect| real_size(*rect)).map(|after| {
             let past = (pick.rows as f64 - 1.0) * pick.pitch;
@@ -444,15 +426,10 @@ unsafe fn reveal_in(
             RevealOutcome {
                 container_role: role.to_owned(),
                 moved: moved.max(1.0),
-                at_end: false,
             }
         })
     } else {
-        Some(RevealOutcome {
-            container_role: role.to_owned(),
-            moved: 0.0,
-            at_end: true,
-        })
+        None
     };
     finish(elements, outcome)
 }
@@ -529,7 +506,7 @@ mod tests {
     }
 
     #[test]
-    fn at_the_end_or_with_only_containers_beyond_nothing_is_picked() {
+    fn without_candidates_beyond_the_viewport_nothing_is_picked() {
         let visible = vec![row(120.0), row(300.0), row(550.0)];
         assert_eq!(pick_reveal_target(VIEWPORT, "down", 120.0, &visible), None);
         // A page-sized wrapper reaching past the edge is not a target.
@@ -584,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn a_reveal_that_moves_nothing_visible_is_the_end() {
+    fn a_reveal_that_moves_nothing_visible_is_not_confirmed_movement() {
         let row = [518.0, 301.0, 600.0, 41.0];
         // Seen live at the top of the page: the reveal changed nothing.
         assert_eq!(content_moved(Some(row), Some(row)), Some(false));

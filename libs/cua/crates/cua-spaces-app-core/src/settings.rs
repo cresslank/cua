@@ -13,6 +13,7 @@ use crate::CoreError;
 use crate::about::UpdateChannel;
 use crate::experiments::{Experiment, Experiments};
 use crate::model::Location;
+use crate::sign_in::SignInFailure;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -121,11 +122,43 @@ pub fn load(path: &Path) -> AppSettings {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default();
+    migrate_sharing(path, &mut s);
     if s.new_ui.is_none() && s.experiments.web_ui {
         s.new_ui = Some(true);
     }
     s.experiments.web_ui = s.new_ui == Some(true);
     s
+}
+
+/// The migration marker next to the settings file. The shells round-trip
+/// [`AppSettings`] through their own mirrors, so the marker lives in a file of
+/// its own that no shell rewrites.
+fn migrations_path(path: &Path) -> std::path::PathBuf {
+    path.with_file_name("settings-migrations.json")
+}
+
+/// Sharing became on by default in 0.9.1 (CUA-1668). 0.9.0 saved
+/// `sharing: false` for anyone who toggled any experiment, without them
+/// choosing it, and left no record of an explicit choice. The first load
+/// without the marker turns a stored `false` on once and writes the marker
+/// (also on a fresh install, so a later "off" is never overridden); from then
+/// on the stored value is the user's. Best effort: a failed write only
+/// repeats the migration on the next load.
+fn migrate_sharing(path: &Path, s: &mut AppSettings) {
+    let marker = migrations_path(path);
+    if marker.exists() {
+        return;
+    }
+    if !s.experiments.sharing {
+        s.experiments.sharing = true;
+        if path.exists() && save(path, s).is_err() {
+            return;
+        }
+    }
+    if let Some(dir) = marker.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&marker, r#"{"sharingDefaultOn":true}"#);
 }
 
 /// `settings` with the New UI as this launch shows it: the user's choice,
@@ -268,12 +301,26 @@ pub enum SignInPhase {
         /// The code to confirm there, when the flow has one.
         #[serde(default)]
         user_code: Option<String>,
+        /// A browser opened on this computer (false: the page is to be
+        /// opened by hand, here or on another device).
+        #[serde(default = "yes")]
+        opened: bool,
     },
-    /// It failed.
+    /// It failed ([`crate::sign_in::failed`] makes it).
     Failed {
-        /// Why.
+        /// Why ([`crate::sign_in::SignInFailure`]).
+        #[serde(default)]
+        reason: SignInFailure,
+        /// The line shown: "Sign-in didn't finish." and the reason.
         message: String,
+        /// The error's own words, behind Details (never shown by default).
+        #[serde(default)]
+        detail: Option<String>,
     },
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// The usage-telemetry switch's state.
@@ -643,7 +690,7 @@ pub fn page(input: &SettingsInput) -> SettingsPage {
             r.enabled = true;
             account.push(r);
         }
-    } else if let SignInPhase::Waiting { user_code } = &input.sign_in {
+    } else if let SignInPhase::Waiting { user_code, .. } = &input.sign_in {
         let mut r = row(
             "sign-in-code",
             Text,
@@ -673,7 +720,7 @@ pub fn page(input: &SettingsInput) -> SettingsPage {
         );
         r.enabled = input.sign_in != SignInPhase::Starting;
         account.push(r);
-        if let SignInPhase::Failed { message } = &input.sign_in {
+        if let SignInPhase::Failed { message, .. } = &input.sign_in {
             account.push(row("sign-in-error", Error, message));
         }
     }
@@ -764,7 +811,7 @@ pub fn page(input: &SettingsInput) -> SettingsPage {
     }
 
     if let Some(t) = &input.telemetry {
-        let mut share = row("telemetry", Choice, "Share anonymous usage data");
+        let mut share = row("telemetry", Choice, "Share usage data to help improve Cua");
         share.options = vec![opt("on", "On", t.enabled), opt("off", "Off", !t.enabled)];
         if let Some(by) = t.locked_by.clone().filter(|b| !b.is_empty()) {
             share.enabled = false;
@@ -773,7 +820,7 @@ pub fn page(input: &SettingsInput) -> SettingsPage {
         let mut note = row(
             "telemetry-note",
             Note,
-            "Features used, sandbox types, durations and error categories. Never paths, names, prompts, screen content or Keyvault items.",
+            "Which features you use and when something goes wrong. Linked to your account through a random ID while you're signed in. Never your files, what you type or your screen.",
         );
         note.link_label = Some("What is collected".into());
         note.link_url = Some(TELEMETRY_DOCS_URL.into());
@@ -1047,7 +1094,8 @@ mod tests {
         assert_eq!(
             sign_in,
             SignInPhase::Waiting {
-                user_code: Some("AB-CD".into())
+                user_code: Some("AB-CD".into()),
+                opened: true,
             }
         );
     }
@@ -1393,5 +1441,43 @@ mod tests {
             ..Default::default()
         };
         assert!(resolve_new_ui(&fresh, "0.8.1-beta.1").experiments.web_ui);
+    }
+
+    #[test]
+    fn sharing_on_by_default_migrates_a_0_9_0_false_once() {
+        // Fresh install: on, and an "off" afterwards survives restarts.
+        let (dir, path) = temp_settings("sharing-fresh");
+        let s = load(&path);
+        assert!(s.experiments.sharing);
+        let off = choose_experiment(&s, "experiment:sharing", "off");
+        save(&path, &off).unwrap();
+        assert!(!load(&path).experiments.sharing);
+        assert!(!load(&path).experiments.sharing, "and again");
+        let _ = std::fs::remove_dir_all(dir);
+
+        // 0.9.0: toggling any experiment saved sharing false, no marker.
+        let (dir, path) = temp_settings("sharing-090");
+        std::fs::write(
+            &path,
+            r#"{"experiments":{"cuaVolume":true,"sharing":false}}"#,
+        )
+        .unwrap();
+        let s = load(&path);
+        assert!(s.experiments.sharing && s.experiments.cua_volume);
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["experiments"]["sharing"], true, "persisted");
+        // The user turns it off in 0.9.1: stays off across restarts.
+        save(&path, &choose_experiment(&s, "experiment:sharing", "off")).unwrap();
+        assert!(!load(&path).experiments.sharing);
+        assert!(!load(&path).experiments.sharing);
+        assert!(load(&path).experiments.cua_volume);
+        let _ = std::fs::remove_dir_all(dir);
+
+        // 0.9.0 settings with sharing already true stay true.
+        let (dir, path) = temp_settings("sharing-true");
+        std::fs::write(&path, r#"{"experiments":{"sharing":true}}"#).unwrap();
+        assert!(load(&path).experiments.sharing);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

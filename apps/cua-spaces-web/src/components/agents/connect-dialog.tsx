@@ -95,7 +95,7 @@ export function ConnectAgentDialog({ open, onOpenChange }: { open: boolean; onOp
 
           <section className="mt-5">
             <div className="mb-2 flex items-center justify-between gap-3">
-              <h3 className="text-xs font-semibold">On this machine</h3>
+              <h3 className="text-xs font-semibold">On this computer</h3>
               {rows && rows.length > 0 ? (
                 <Button size="sm" variant={pending.length ? "default" : "outline"} disabled={busy || pending.length === 0} onClick={setUpAll}>
                   {busy ? "Setting up…" : pending.length ? `Set up ${pending.length === 1 ? "1 agent" : `${pending.length} agents`}` : "All set up"}
@@ -148,11 +148,11 @@ function SetupRow({ row }: { row: AgentSetupRow }) {
     <li className="flex items-center gap-3 px-3 py-2">
       <div className="min-w-0 flex-1">
         <div className={cn("text-[13px]", !row.installed && "text-muted-foreground")}>{row.name}</div>
-        {row.installed && row.mcpConfig ? <div className="truncate font-mono text-2xs text-muted-foreground">{row.mcpConfig}</div> : null}
+        {(row.installed || row.configured) && row.mcpConfig ? <div className="truncate font-mono text-2xs text-muted-foreground">{row.mcpConfig}</div> : null}
       </div>
       <span className={cn("inline-flex shrink-0 items-center gap-1 text-xs", row.configured ? "text-foreground" : "text-muted-foreground")}>
         {row.configured ? <CheckIcon className="size-3.5 text-success" aria-hidden /> : null}
-        {!row.installed ? "Not installed" : row.configured ? "Set up" : "Not set up"}
+        {row.configured ? "Set up" : !row.installed ? "Not installed" : "Not set up"}
       </span>
     </li>
   );

@@ -702,7 +702,7 @@ fn apply_keyed_command(
         _ => None,
     };
     if let Some((target_x, target_y)) = seed_target {
-        render.seed_start_if_sentinel(&key, target_x, target_y, frame);
+        render.seed_start_if_unplaced(&key, target_x, target_y, frame);
     }
 
     let disabling = matches!(&cmd, OverlayCommand::SetEnabled(false));
@@ -1992,6 +1992,7 @@ mod tests {
     fn positioned_core() -> RenderStateCore {
         let mut core = RenderStateCore::new(CursorConfig::default());
         core.pos = (100.0, 100.0);
+        core.placed = true;
         core.motion.idle_hide_ms = 1_000.0;
         core
     }
@@ -2111,6 +2112,7 @@ mod tests {
         ];
         let mut core = positioned_core();
         core.pos = (400.0, 300.0);
+        core.placed = true;
         let cores = CursorMap::from([("session".to_owned(), core)]);
 
         assert_eq!(select_output(&layouts, 400.0, 300.0).unwrap().id, 4);
@@ -2140,6 +2142,7 @@ mod tests {
         ];
         let mut core = positioned_core();
         core.pos = (-2220.0, 980.0);
+        core.placed = true;
         let cores = CursorMap::from([("session".to_owned(), core)]);
         assert_eq!(visible_cores_for_output(&cores, &layouts, 3).len(), 1);
         assert!(visible_cores_for_output(&cores, &layouts, 4).is_empty());
@@ -2318,6 +2321,11 @@ mod tests {
     fn stable_visible_overlay_keeps_frame_cadence_for_resting_motion() {
         let mut core = positioned_core();
         core.idle_secs = 0.25;
+        core.pos = (-1.0e9, -1.0e9);
+        assert!(needs_frame_tick(&core));
+        core.placed = false;
+        assert!(!needs_frame_tick(&core));
+        core.placed = true;
         assert!(core.has_resting_motion());
         let mut cores = CursorMap::from([("cursor-a".to_owned(), core)]);
         assert_eq!(next_wait(&cores, false, false), WlWait::Frame);
@@ -2555,7 +2563,7 @@ mod tests {
         ));
         let core = state.render.cursors.get("session-a").unwrap();
         assert_eq!(core.session_label.as_deref(), Some("Synthetic session"));
-        assert!(!cursor_overlay::render_state::is_placed(core.pos));
+        assert!(!core.placed);
         assert!(state.outputs.is_empty());
         assert!(matches!(
             rx.try_recv(),
@@ -2685,7 +2693,11 @@ mod tests {
             &layouts,
             &HashSet::new(),
             &initialized(&layouts),
-            render.cursors.values().map(|core| core.pos),
+            render
+                .cursors
+                .values()
+                .filter(|core| core.placed)
+                .map(|core| core.pos),
         );
         assert_eq!(painted, HashSet::from([1, 2]));
         assert_eq!(targets, vec![FrameTarget { id: 1 }, FrameTarget { id: 2 }]);
@@ -2705,7 +2717,11 @@ mod tests {
             &layouts,
             &painted,
             &initialized(&layouts),
-            render.cursors.values().map(|core| core.pos),
+            render
+                .cursors
+                .values()
+                .filter(|core| core.placed)
+                .map(|core| core.pos),
         );
         assert_eq!(selected, HashSet::from([2]));
         assert_eq!(targets, vec![FrameTarget { id: 1 }, FrameTarget { id: 2 }]);

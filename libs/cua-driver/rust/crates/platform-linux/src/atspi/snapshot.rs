@@ -3,77 +3,149 @@
 //! Tokens and element keys are published together by the core generation
 //! registry.  `Snapshots` is a thin compatibility reader; it owns no second
 //! map and therefore cannot expose a token/cache split.
+//!
+//! A process-global `(pid, xid)` side index exists only so the upstream
+//! window-scope regression can show that a PID-only lookup names the wrong
+//! window. Token, keyboard, scroll, and secondary-click dispatch must carry
+//! the generation payload (or a walked object), never that lookup.
 
+use super::native::ObjectRef;
 use super::{AtspiIdentity, AtspiNode};
 use cua_driver_core::element_token::{
     MutationPermit, RegistryError, SnapshotCandidate, SnapshotIdentity,
 };
 use cua_driver_core::snapshot_store::{SnapshotPayload, SnapshotStore};
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// Both native addressing forms belong to the same immutable generation.
+///
+/// `identity` is required on the addressable payload so upstream token
+/// construction compiles. An unproven bus owner is omitted from `elements`
+/// and kept only in `keys`, so the Wayland exact-window route still retains
+/// its stable key without becoming an AT-SPI action target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CachedElement {
-    key: u64,
-    identity: Option<AtspiIdentity>,
+    pub key: u64,
+    pub identity: AtspiIdentity,
+    pub object_ref: Option<ObjectRef>,
+    pub role: String,
+    pub in_web_content: bool,
+    pub bounds: Option<(i32, i32, u32, u32)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CacheKey {
+    pub pid: u32,
+    pub xid: u64,
 }
 
 #[derive(Debug)]
 pub struct AtspiSnapshot {
     // Window-scoped walks keep application-wide (possibly sparse) indices.
+    // `keys` includes discovery-only nodes so the Wayland stable-key route
+    // does not compact them into a dense offset. `elements` is the proven
+    // AT-SPI subset.
+    keys: HashMap<usize, u64>,
+    elements: HashMap<usize, CachedElement>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CollectedElements {
+    keys: HashMap<usize, u64>,
     elements: HashMap<usize, CachedElement>,
 }
 
 fn collect_unique_elements<'a>(
     nodes: impl Iterator<Item = &'a AtspiNode>,
-) -> Result<HashMap<usize, CachedElement>, RegistryError> {
-    let mut keys = HashSet::new();
+) -> Result<CollectedElements, RegistryError> {
+    let mut seen_keys = HashSet::new();
     let mut identities = HashSet::new();
+    let mut keys = HashMap::new();
     let mut elements = HashMap::new();
     for node in nodes {
         let Some(index) = node.element_index else {
             continue;
         };
-        if !keys.insert(node.element_key) || elements.contains_key(&index) {
+        if !seen_keys.insert(node.element_key) || keys.contains_key(&index) {
             return Err(RegistryError::Collision);
         }
-        if let Some(native) = &node.identity {
-            if !identities.insert((native.bus_name.clone(), native.path.clone())) {
-                return Err(RegistryError::Collision);
-            }
+        keys.insert(index, node.element_key);
+        let Some(native) = &node.identity else {
+            continue;
+        };
+        if !identities.insert((native.bus_name.clone(), native.path.clone())) {
+            return Err(RegistryError::Collision);
         }
         elements.insert(
             index,
             CachedElement {
                 key: node.element_key,
-                identity: node.identity.clone(),
+                identity: native.clone(),
+                object_ref: node.object_ref.clone(),
+                role: node.role.clone(),
+                in_web_content: node.in_web_content,
+                bounds: None,
             },
         );
     }
-    Ok(elements)
+    Ok(CollectedElements { keys, elements })
+}
+
+fn index_envelope(keys: &HashMap<usize, u64>) -> Result<usize, RegistryError> {
+    match keys.keys().max() {
+        Some(index) => index.checked_add(1).ok_or(RegistryError::Collision),
+        None => Ok(0),
+    }
 }
 
 impl AtspiSnapshot {
     pub fn from_nodes(nodes: &[AtspiNode]) -> Self {
-        Self::try_from_nodes(nodes).expect("snapshot fixture has unique identities")
+        Self::from_nodes_with_bounds(nodes, &[])
     }
+
+    /// `bounds` are the screen frames the same walk produced, keyed by
+    /// element_index. Applied only to proven identities.
+    pub fn from_nodes_with_bounds(
+        nodes: &[AtspiNode],
+        bounds: &[(usize, i32, i32, u32, u32)],
+    ) -> Self {
+        Self::try_from_nodes_with_bounds(nodes, bounds)
+            .expect("snapshot fixture has unique identities")
+    }
+
     pub fn try_from_nodes(nodes: &[AtspiNode]) -> Result<Self, RegistryError> {
-        let elements = collect_unique_elements(nodes.iter())?;
-        if elements.keys().max() == Some(&usize::MAX) {
-            return Err(RegistryError::Collision);
+        Self::try_from_nodes_with_bounds(nodes, &[])
+    }
+
+    pub fn try_from_nodes_with_bounds(
+        nodes: &[AtspiNode],
+        bounds: &[(usize, i32, i32, u32, u32)],
+    ) -> Result<Self, RegistryError> {
+        let collected = collect_unique_elements(nodes.iter())?;
+        index_envelope(&collected.keys)?;
+        let mut elements = collected.elements;
+        for &(idx, x, y, w, h) in bounds {
+            if let Some(element) = elements.get_mut(&idx) {
+                element.bounds = Some((x, y, w, h));
+            }
         }
-        Ok(Self { elements })
+        Ok(Self {
+            keys: collected.keys,
+            elements,
+        })
     }
 }
 impl SnapshotPayload for AtspiSnapshot {
     type Element = CachedElement;
     fn len(&self) -> usize {
-        self.elements.keys().max().map_or(0, |i| i + 1)
+        self.keys.keys().max().map_or(0, |i| i + 1)
     }
     fn contains_index(&self, index: usize) -> bool {
-        self.elements.contains_key(&index)
+        // Membership is the sparse public index, including a discovery-only
+        // key. retain() is None until a proven AT-SPI identity exists.
+        self.keys.contains_key(&index)
     }
     fn retain(&self, index: usize) -> Option<CachedElement> {
         self.elements.get(&index).cloned()
@@ -107,22 +179,25 @@ impl Snapshots {
     ) -> Result<SnapshotCandidate, RegistryError> {
         let pid =
             i32::try_from(pid).map_err(|_| RegistryError::ProcessIncarnationUnavailable(-1))?;
-        let elements = collect_unique_elements(nodes.iter())?;
+        let collected = collect_unique_elements(nodes.iter())?;
         // Core validates the index envelope. Exact sparse membership is checked
         // below, both at argument resolution and at mutation admission.
-        let count = match elements.keys().max() {
-            Some(index) => index.checked_add(1).ok_or(RegistryError::Collision)?,
-            None => 0,
-        };
+        let count = index_envelope(&collected.keys)?;
         cua_driver_core::element_token::global().prepare_current(
             pid,
             xid,
             count,
-            Arc::new(AtspiSnapshot { elements }),
+            Arc::new(AtspiSnapshot {
+                keys: collected.keys,
+                elements: collected.elements,
+            }),
         )
     }
 
-    pub fn publish(&self, candidate: SnapshotCandidate) -> Result<u32, RegistryError> {
+    /// Publish a generation candidate. Named so it does not shadow
+    /// [`SnapshotStore::publish`], which upstream window-scope tests call as
+    /// `snapshots.publish(pid, window, payload)`.
+    pub fn publish_prepared(&self, candidate: SnapshotCandidate) -> Result<u32, RegistryError> {
         cua_driver_core::element_token::global().publish(candidate, Duration::from_secs(2))
     }
 
@@ -131,10 +206,7 @@ impl Snapshots {
     }
 
     pub fn get_element_key(&self, pid: u32, xid: u64, idx: usize) -> Option<u64> {
-        self.snapshot(pid, xid)?
-            .elements
-            .get(&idx)
-            .map(|element| element.key)
+        self.snapshot(pid, xid)?.keys.get(&idx).copied()
     }
 
     /// Admit mutation against exactly the generation resolved from the caller's
@@ -147,7 +219,7 @@ impl Snapshots {
         let permit = cua_driver_core::element_token::global().try_acquire_mutation(identity)?;
         let key = permit
             .payload::<AtspiSnapshot>()
-            .and_then(|snapshot| snapshot.elements.get(&idx).map(|element| element.key))
+            .and_then(|snapshot| snapshot.keys.get(&idx).copied())
             .ok_or(RegistryError::Stale)?;
         Ok((permit, key))
     }
@@ -208,9 +280,9 @@ impl Snapshots {
                         }}),
                     )
                 })?;
-            // Only routes carrying the retained native identity and generation
-            // permit through every mutation are qualified. Secondary clicks
-            // still use newly walked ordinals and remain refused.
+            // Keyboard, scroll, and secondary clicks are qualified only when
+            // they carry the retained native identity and generation permit.
+            // Every other snapshot-bound tool stays refused.
             if !matches!(
                 tool,
                 "click"
@@ -234,6 +306,41 @@ impl Snapshots {
         Ok(resolved)
     }
 
+    /// Read the generation-bound observed element without holding the mutation
+    /// permit. Callers that dispatch must acquire their own permit afterward.
+    pub fn load_cached_element(
+        identity: SnapshotIdentity,
+        idx: usize,
+    ) -> Result<CachedElement, RegistryError> {
+        let permit = cua_driver_core::element_token::global().try_acquire_mutation(identity)?;
+        let element = permit
+            .payload::<AtspiSnapshot>()
+            .and_then(|snapshot| snapshot.elements.get(&idx).cloned())
+            .ok_or(RegistryError::NotCurrent)?;
+        drop(permit);
+        Ok(element)
+    }
+
+    /// Identity for a window-membership walk. The permit is released before the
+    /// walk so dispatch can acquire it again.
+    pub fn observed_identity(
+        identity: SnapshotIdentity,
+        idx: usize,
+    ) -> Result<AtspiIdentity, RegistryError> {
+        let permit = cua_driver_core::element_token::global().try_acquire_mutation(identity)?;
+        let native = permit
+            .payload::<AtspiSnapshot>()
+            .and_then(|snapshot| {
+                snapshot
+                    .elements
+                    .get(&idx)
+                    .map(|element| element.identity.clone())
+            })
+            .ok_or(RegistryError::NotCurrent)?;
+        drop(permit);
+        Ok(native)
+    }
+
     /// Retain the X11 object/frame identity under the same generation permit as
     /// the Wayland key. Missing native identity is discovery-only, never an
     /// excuse to re-walk by ordinal or fall back to pixels.
@@ -245,7 +352,12 @@ impl Snapshots {
         let permit = cua_driver_core::element_token::global().try_acquire_mutation(identity)?;
         let native = permit
             .payload::<AtspiSnapshot>()
-            .and_then(|snapshot| snapshot.elements.get(&idx)?.identity.clone())
+            .and_then(|snapshot| {
+                snapshot
+                    .elements
+                    .get(&idx)
+                    .map(|element| element.identity.clone())
+            })
             .ok_or(RegistryError::Stale)?;
         Ok((permit, native))
     }
@@ -283,13 +395,21 @@ impl Snapshots {
         R: Send + 'static,
     {
         let permit = cua_driver_core::element_token::global().try_acquire_mutation(identity)?;
-        let element = permit
+        let snapshot = permit
             .payload::<AtspiSnapshot>()
-            .and_then(|snapshot| snapshot.elements.get(&idx).cloned())
             .ok_or(RegistryError::Stale)?;
+        let key = snapshot
+            .keys
+            .get(&idx)
+            .copied()
+            .ok_or(RegistryError::Stale)?;
+        let identity = snapshot
+            .elements
+            .get(&idx)
+            .map(|element| element.identity.clone());
         Ok(cua_driver_core::blocking::spawn(move || {
             let _permit = permit;
-            mutation(element.key, element.identity)
+            mutation(key, identity)
         }))
     }
 
@@ -308,6 +428,59 @@ pub(crate) fn with_retained_mutation<R>(
     let result = mutation();
     drop(permit);
     result
+}
+
+// -- compatibility (pid, xid) side index ------------------------------------
+// Not a dispatch authority. See the module comment.
+
+type SideIndex = HashMap<CacheKey, Arc<HashMap<usize, CachedElement>>>;
+
+fn side_store() -> &'static Mutex<SideIndex> {
+    static STORE: OnceLock<Mutex<SideIndex>> = OnceLock::new();
+    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record elements for the upstream window-scope regression. A collision
+/// refuses the insert instead of overwriting a retained window.
+pub(crate) fn update_snapshot(
+    pid: u32,
+    xid: u64,
+    nodes: &[AtspiNode],
+    bounds: &[(usize, i32, i32, u32, u32)],
+) -> AtspiSnapshot {
+    let snapshot = AtspiSnapshot::try_from_nodes_with_bounds(nodes, bounds).unwrap_or_else(|_| {
+        AtspiSnapshot {
+            keys: HashMap::new(),
+            elements: HashMap::new(),
+        }
+    });
+    side_store()
+        .lock()
+        .unwrap()
+        .insert(CacheKey { pid, xid }, Arc::new(snapshot.elements.clone()));
+    snapshot
+}
+
+/// Forget the side-index entry. The generation registry is retired separately.
+pub(crate) fn forget_window(pid: u32, xid: u64) {
+    side_store().lock().unwrap().remove(&CacheKey { pid, xid });
+}
+
+fn side_snapshot_for(pid: u32, xid: Option<u64>) -> Option<Arc<HashMap<usize, CachedElement>>> {
+    let store = side_store().lock().unwrap();
+    match xid {
+        Some(xid) => store.get(&CacheKey { pid, xid }).cloned(),
+        // The lookup the window-scope regression shows is unsafe: with no xid
+        // it returns whichever snapshot HashMap yields first for the pid.
+        None => store
+            .iter()
+            .find(|(key, _)| key.pid == pid)
+            .map(|(_, elements)| elements.clone()),
+    }
+}
+
+pub(crate) fn cached_element(pid: u32, xid: Option<u64>, idx: usize) -> Option<CachedElement> {
+    side_snapshot_for(pid, xid)?.get(&idx).cloned()
 }
 
 impl Default for Snapshots {
@@ -368,7 +541,7 @@ mod tests {
             for index in [7, 11] {
                 let resolved = cache.core.resolve(pid, &serde_json::json!({"element_token": cua_driver_core::element_token::token_for(id, index)})).unwrap();
                 assert!(
-                    matches!(resolved, cua_driver_core::element_token::ResolvedElement::Element {element, ..} if element.identity.as_ref().unwrap().path == format!("/node/{}", index + 100))
+                    matches!(resolved, cua_driver_core::element_token::ResolvedElement::Element {element, ..} if element.identity.path == format!("/node/{}", index + 100))
                 );
             }
             for index in [0, 1, 8, 999] {
@@ -442,7 +615,7 @@ mod tests {
             );
             let current = cache.core.resolve(pid, &serde_json::json!({"element_token": cua_driver_core::element_token::token_for(fresh, 5)})).unwrap();
             assert!(
-                matches!(current, cua_driver_core::element_token::ResolvedElement::Element {element, ..} if element.identity.as_ref().unwrap().path == "/node/205")
+                matches!(current, cua_driver_core::element_token::ResolvedElement::Element {element, ..} if element.identity.path == "/node/205")
             );
         });
     }
@@ -565,7 +738,7 @@ mod tests {
                 let pid = std::process::id();
                 let window = 0x7f30_0102;
                 let id = cache
-                    .publish(cache.prepare(pid, window, &[node(7, 41)]).unwrap())
+                    .publish_prepared(cache.prepare(pid, window, &[node(7, 41)]).unwrap())
                     .unwrap();
                 let token = cua_driver_core::element_token::token_for(id, 7);
                 assert!(cache
@@ -604,7 +777,7 @@ mod tests {
                 let window = 0x7f30_0101;
                 let candidate = cache.prepare(pid, window, &[node(7, 41)]).unwrap();
                 let expected_identity = candidate.identity();
-                let id = cache.publish(candidate).unwrap();
+                let id = cache.publish_prepared(candidate).unwrap();
                 let token = cua_driver_core::element_token::token_for(id, 7);
                 for tool in [
                     "type_text",
@@ -654,7 +827,7 @@ mod tests {
             let pid = std::process::id();
             let window = 0x7f30_0103;
             let id = cache
-                .publish(cache.prepare(pid, window, &[node(7, 41)]).unwrap())
+                .publish_prepared(cache.prepare(pid, window, &[node(7, 41)]).unwrap())
                 .unwrap();
             let token = cua_driver_core::element_token::token_for(id, 7);
             for tool in ["type_text", "press_key", "hotkey"] {
@@ -696,7 +869,7 @@ mod tests {
                 );
             }
             cache
-                .publish(cache.prepare(pid, window, &[node(7, 42)]).unwrap())
+                .publish_prepared(cache.prepare(pid, window, &[node(7, 42)]).unwrap())
                 .unwrap();
             for tool in ["type_text", "press_key", "hotkey"] {
                 assert_eq!(
@@ -733,7 +906,7 @@ mod tests {
             .prepare(pid, xid, &[node(11, 41), node(7, 99)])
             .unwrap();
         let identity = candidate.identity();
-        let public = cache.publish(candidate).unwrap();
+        let public = cache.publish_prepared(candidate).unwrap();
         assert_eq!(cache.element_count(pid, xid), 2);
         for (index, key) in [(11, 41), (7, 99)] {
             let token = cua_driver_core::element_token::token_for(public, index);
@@ -769,9 +942,9 @@ mod tests {
         );
         let mut unindexed = node(8, 41);
         unindexed.element_index = None;
-        let elements = collect_unique_elements([node(7, 41), unindexed].iter()).unwrap();
-        assert_eq!(elements.len(), 1);
-        assert!(!elements.contains_key(&8));
+        let collected = collect_unique_elements([node(7, 41), unindexed].iter()).unwrap();
+        assert_eq!(collected.keys.len(), 1);
+        assert!(!collected.keys.contains_key(&8));
     }
 
     #[test]
@@ -790,7 +963,7 @@ mod tests {
         discovery.identity = None;
         let candidate = cache.prepare(pid, 0x7f30_0003, &[discovery]).unwrap();
         let identity = candidate.identity();
-        cache.publish(candidate).unwrap();
+        cache.publish_prepared(candidate).unwrap();
         assert!(matches!(
             cache.acquire_observed_mutation(identity, 0),
             Err(RegistryError::Stale)
@@ -806,10 +979,10 @@ mod tests {
         let xid = 0x7f30_0004;
         let first = cache.prepare(pid, xid, &[node(5, 41)]).unwrap();
         let first_identity = first.identity();
-        let old_public = cache.publish(first).unwrap();
+        let old_public = cache.publish_prepared(first).unwrap();
         let second = cache.prepare(pid, xid, &[node(5, 99)]).unwrap();
         let second_identity = second.identity();
-        let public = cache.publish(second).unwrap();
+        let public = cache.publish_prepared(second).unwrap();
         assert!(cache.acquire_observed_mutation(first_identity, 5).is_err());
         assert_eq!(
             cache
@@ -820,7 +993,7 @@ mod tests {
             "/node/99"
         );
         let empty = cache.prepare(pid, xid, &[]).unwrap();
-        cache.publish(empty).unwrap();
+        cache.publish_prepared(empty).unwrap();
         for handle in [old_public, public] {
             let token = cua_driver_core::element_token::token_for(handle, 5);
             assert!(cache
@@ -841,10 +1014,10 @@ mod tests {
         let low = 0x7f30_0005;
         let high = (1_u64 << 40) | low;
         let low_id = cache
-            .publish(cache.prepare(pid, low, &[node(7, 41)]).unwrap())
+            .publish_prepared(cache.prepare(pid, low, &[node(7, 41)]).unwrap())
             .unwrap();
         let high_id = cache
-            .publish(cache.prepare(pid, high, &[node(11, 99)]).unwrap())
+            .publish_prepared(cache.prepare(pid, high, &[node(11, 99)]).unwrap())
             .unwrap();
         let high_token = cua_driver_core::element_token::token_for(high_id, 11);
         assert!(cache
@@ -878,7 +1051,7 @@ mod tests {
         let xid = 0x7f30_0006;
         let first = cache.prepare(pid, xid, &[node(5, 41)]).unwrap();
         let first_identity = first.identity();
-        cache.publish(first).unwrap();
+        cache.publish_prepared(first).unwrap();
         let (permit, retained) = cache.acquire_observed_mutation(first_identity, 5).unwrap();
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
@@ -933,7 +1106,7 @@ mod tests {
                     let xid = 0x7f30_0104;
                     let first = cache.prepare(pid, xid, &[node(7, 41)]).unwrap();
                     let identity = first.identity();
-                    let id = cache.publish(first).unwrap();
+                    let id = cache.publish_prepared(first).unwrap();
                     let token = cua_driver_core::element_token::token_for(id, 7);
                     assert!(cache
                         .resolve_for_tool(
@@ -982,7 +1155,7 @@ mod tests {
         let cache = Snapshots::new();
         let first = cache.prepare(pid, xid, &[node(0, 41)]).unwrap();
         let first_identity = first.identity();
-        cache.publish(first).unwrap();
+        cache.publish_prepared(first).unwrap();
         let (permit, key) = cache.acquire_element_mutation(first_identity, 0).unwrap();
         assert_eq!(key, 41);
 
@@ -1018,7 +1191,7 @@ mod tests {
         let cache = Snapshots::new();
         let first = cache.prepare(pid, xid, &[node(0, 41)]).unwrap();
         let first_identity = first.identity();
-        cache.publish(first).unwrap();
+        cache.publish_prepared(first).unwrap();
 
         let active = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);

@@ -5,25 +5,38 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { ArrowDownCircleIcon, KeyRoundIcon, LoaderCircleIcon, MonitorIcon, PlusIcon, PowerIcon, SearchIcon } from "lucide-react";
 import { useEffect, useRef, useState, type DragEvent } from "react";
 
-import { emptyHome, useBridge, useFirstSpaceOffers, useMachines, useNewSpaceWizard, useSpaceAccess, useSpaceFiles, useSpaces, useSpaceThumbnail, useWindowDropTarget, type Space } from "@/bridge";
+import { emptyHome, spaceResources, useAgents, useBridge, useChecklist, useResources, useFirstSpaceOffers, useMachines, useNewSpaceWizard, useSpaceAccess, useSpaceFiles, useSpaces, useSpaceThumbnail, useWindowDropTarget, type Space, type SpaceResources } from "@/bridge";
 import { EmptyHome } from "@/components/empty-home";
+import { ConnectAgentDialog } from "@/components/agents/connect-dialog";
+import { RunAgentDialog } from "@/components/agents/run-agent-dialog";
 import { GettingStarted } from "@/components/getting-started";
+import { SpaceReadyCard, useAgentOffer } from "@/components/space-ready-card";
+import { useFirstRunStep, useFirstSpaceMilestones } from "@/components/first-run-guide";
+import { FirstRunTodosCard, useFirstRunTodosShown } from "@/components/first-run-todos";
 import { OsIcon } from "@/components/os-icon";
 import { EmptyState, Page, PageHeader } from "@/components/page";
+import { ComputersResources } from "@/components/resources/computer-resources";
+import { CompactMeters } from "@/components/resources/meters";
 import { SpaceCanvas } from "@/components/space-canvas";
 import { StateLabel } from "@/components/state-dot";
 import { useTileVideo } from "@/components/video/tile-video";
 import { useNewSpace } from "@/hooks/use-new-space";
+import { useQuiet } from "@/hooks/use-quiet";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Segmented } from "@/components/ui/segmented";
 import { toast, toastError } from "@/components/ui/toast";
 import { creatingLine, thisComputerText } from "@/lib/host-labels";
 import { plural } from "@/lib/plural";
+import { spaceMeters } from "@/lib/resources";
 import { cn } from "@/lib/utils";
 import { createError, createProgress, machineName, matchesQuery, powerButton, powerError, realSpaces, spacePlace, spaceState, visibleSpaces, type SpaceFilter } from "@/lib/spaces";
 
-export const Route = createFileRoute("/spaces/")({ component: SpacesPage });
+export const Route = createFileRoute("/spaces/")({
+  component: SpacesPage,
+  // `?sort=size`: biggest on this Mac's disk first (the low-disk warning's "See what's using space").
+  validateSearch: (s: Record<string, unknown>): { sort?: "size" } => (s.sort === "size" ? { sort: "size" } : {}),
+});
 
 const FILTERS: { value: SpaceFilter; label: string }[] = [
   { value: "all", label: "All" },
@@ -37,6 +50,8 @@ function SpacesPage() {
   // Machines' own desktops are on Machines, not here.
   const spaces = realSpaces(all);
   const { data: machines = [] } = useMachines();
+  const { sort } = Route.useSearch();
+  const resources = useResources();
   const [filter, setFilter] = useState<SpaceFilter>("all");
   const [query, setQuery] = useState("");
   const newSpace = useNewSpace();
@@ -46,22 +61,78 @@ function SpacesPage() {
   const { core } = useBridge();
   const { env } = useNewSpaceWizard();
   const home = emptyHome(core, env.hostArch);
-  const shown = visibleSpaces(spaces, filter, (s) => matchesQuery(core, s, machineName(machines, s), query));
+  const visible = visibleSpaces(spaces, filter, (s) => matchesQuery(core, s, machineName(machines, s), query));
+  const onDisk = (s: Space) => spaceResources(resources, s.id)?.diskOnHost?.bytes ?? -1;
+  const shown = sort === "size" ? [...visible].sort((a, b) => onDisk(b) - onDisk(a)) : visible;
   const access = useSpaceAccess(spaces);
   const running = spaces.filter((s) => spaceState(s) === "running").length;
+  // After the first run's Finish later, its to-do list stands in for the checklist.
+  const firstRunTodos = useFirstRunTodosShown();
+  // The first Space is ready and no agent has worked in it yet: one action, "Run an agent here".
+  const { state: checklist } = useChecklist();
+  const { data: agents, isLoading: agentsLoading } = useAgents();
+  const readySpace = spaces.find((s) => spaceState(s) === "running");
+  const agentRan = checklist.done.run_agent || (agents?.runs.length ?? 0) > 0 || (agents?.agents.length ?? 0) > 0;
+  // Only once the agents are read: before that "no agent ran" isn't known, and the offer would show (and be
+  // counted as shown) for a moment on a computer whose agents already work.
+  const offer = useAgentOffer(Boolean(readySpace) && !agentsLoading && !agentRan);
+  const runHere = readySpace && !agentRan && offer.visible ? readySpace : undefined;
+  const [runOpen, setRunOpen] = useState(false);
+  // No Spaces yet (or the list could not be read): the SwiftUI app's empty home, as the first-run guide.
+  const guide = !error && !isLoading && spaces.length === 0 && home && home.tiles.length > 0 ? home : null;
+  // The suggested task's request, while the run dialog was opened from it.
+  const [runPrompt, setRunPrompt] = useState<string | undefined>();
+  const firstRunStep = useFirstRunStep();
+  useFirstSpaceMilestones(spaces);
+  const [connectOpen, setConnectOpen] = useState(false);
+  // The cards above the list (ready, checklist, computers) and the list come from separate host reads. Draw them
+  // together once those have answered, not one by one with the page jumping at each (CUA-1951).
+  const settled = useQuiet(
+    [isLoading, all.length, machines.length, Object.keys(checklist.done).length, checklist.dismissed, agents?.runs.length, agents?.agents.length, resources ? 1 : 0].join("|"),
+  );
 
   return (
     <Page>
       <PageHeader
         title="Spaces"
-        description={isLoading ? "Loading Spaces…" : `${plural(spaces.length, "Space")} on ${plural(machines.length, "machine")}, ${running} running`}
+        description={isLoading ? "Loading Spaces…" : `${plural(spaces.length, "Space")} on ${plural(machines.length, "computer")}, ${running} running`}
         actions={
           <Button onClick={newSpace}>
             <PlusIcon /> New Space
           </Button>
         }
       />
-      <GettingStarted />
+      {settled ? (
+        <>
+      {/* No Spaces yet: the guided first run comes first, above the checklist and computers (CUA-2062). */}
+      {guide ? <EmptyHome home={guide} unread={Boolean(listNotice)} /> : null}
+      <FirstRunTodosCard />
+      {runHere ? <SpaceReadyCard
+          space={runHere}
+          onRun={(task) => {
+            offer.clicked();
+            firstRunStep("task_started");
+            setRunPrompt(task.prompt);
+            setRunOpen(true);
+          }}
+          onDismiss={offer.dismiss}
+        /> : null}
+      {firstRunTodos ? null : <GettingStarted onRunAgent={runHere ? () => { setRunPrompt(undefined); setRunOpen(true); } : undefined} />}
+      {readySpace ? (
+        <>
+          <RunAgentDialog open={runOpen} space={readySpace} prompt={runPrompt} onOpenChange={setRunOpen} onManual={() => setConnectOpen(true)} onConnected={offer.completed} />
+          <ConnectAgentDialog open={connectOpen} onOpenChange={setConnectOpen} />
+        </>
+      ) : null}
+      <ComputersResources snapshot={resources} machines={machines} />
+      {sort === "size" ? (
+        <p data-sorted-by-size="" className="mb-3 flex items-center gap-2 px-1 text-xs text-muted-foreground">
+          Biggest first, by how much space each one uses on its computer.
+          <Link to="/spaces" search={{}} className="font-medium text-foreground underline-offset-2 hover:underline">
+            Show the usual order
+          </Link>
+        </p>
+      ) : null}
       <div className="mb-4 flex items-center gap-3">
         <Segmented aria-label="Filter by state" value={filter} options={FILTERS} onValueChange={setFilter} />
         {/* Find a Space by name, detail, id or machine (the SwiftUI sidebar's search). */}
@@ -88,11 +159,7 @@ function SpacesPage() {
         <EmptyState icon={<MonitorIcon />} title="Couldn't load Spaces">
           {error.message}
         </EmptyState>
-      ) : isLoading ? null : spaces.length === 0 && home && home.tiles.length > 0 ? (
-        // No Spaces yet (or the list could not be read): the SwiftUI app's
-        // empty home, under the header.
-        <EmptyHome home={home} unread={Boolean(listNotice)} />
-      ) : spaces.length === 0 ? (
+      ) : isLoading || guide ? null : spaces.length === 0 ? (
         <EmptyState
           icon={<MonitorIcon />}
           title="No Spaces yet"
@@ -102,7 +169,7 @@ function SpacesPage() {
             </Button>
           }
         >
-          Create one on {thisComputerText()} or on Cua Cloud.
+          Create one on {thisComputerText()}.
         </EmptyState>
       ) : shown.length === 0 && query.trim() ? (
         <EmptyState icon={<SearchIcon />} title="No matches">
@@ -116,16 +183,18 @@ function SpacesPage() {
         <ul className="grid grid-cols-[repeat(auto-fill,minmax(232px,1fr))] gap-4">
           {shown.map((space) => (
             <li key={space.id}>
-              <SpaceTile space={space} machine={machineName(machines, space)} accessKey={access.signedIn.has(space.id) ? access.accessKey(space.id) : undefined} />
+              <SpaceTile space={space} machine={machineName(machines, space)} resources={spaceResources(resources, space.id)} accessKey={access.signedIn.has(space.id) ? access.accessKey(space.id) : undefined} />
             </li>
           ))}
         </ul>
       )}
+        </>
+      ) : null}
     </Page>
   );
 }
 
-function SpaceTile({ space, machine, accessKey }: { space: Space; machine: string; accessKey?: string | null }) {
+function SpaceTile({ space, machine, resources, accessKey }: { space: Space; machine: string; resources: SpaceResources | null; accessKey?: string | null }) {
   const drop = useTileDrop(space);
   // A real window dragged over this tile (the host hit-tests the tiles' boxes and says which; macOS only).
   const windowOver = useWindowDropTarget() === space.id;
@@ -138,7 +207,7 @@ function SpaceTile({ space, machine, accessKey }: { space: Space; machine: strin
       data-window-over={windowOver || undefined}
       {...drop.handlers}
     >
-      <SpaceLink space={space} machine={machine} windowOver={windowOver} />
+      <SpaceLink space={space} machine={machine} resources={resources} windowOver={windowOver} />
       {drop.over ? <DropOverlay space={space} accepts={drop.over === "accept"} /> : null}
       {/* A drop on the tile still going in: the core's "Sending …" line. */}
       {drop.status?.kind === "working" && !drop.over ? (
@@ -259,7 +328,7 @@ function TilePower({ space }: { space: Space }) {
   );
 }
 
-function SpaceLink({ space, machine, windowOver = false }: { space: Space; machine: string; windowOver?: boolean }) {
+function SpaceLink({ space, machine, resources = null, windowOver = false }: { space: Space; machine: string; resources?: SpaceResources | null; windowOver?: boolean }) {
   return (
     <Link
       to="/spaces/$spaceId"
@@ -280,6 +349,12 @@ function SpaceLink({ space, machine, windowOver = false }: { space: Space; machi
           <div className="mt-0.5 truncate text-xs text-muted-foreground">
             {spaceState(space) === "creating" && space.detail ? creatingLine(space.detail) : spacePlace(space, machine)}
           </div>
+          {/* Downloading: how far, how fast, how long is left. */}
+          {spaceState(space) === "creating" && space.progress?.transfer ? (
+            <div data-create-transfer="" className="mt-0.5 truncate text-xs tabular-nums text-muted-foreground">
+              {space.progress.transfer}
+            </div>
+          ) : null}
           {createError(space) ? (
             <p data-create-error="" title={createError(space)!} className="mt-1 line-clamp-2 text-xs text-destructive">
               {createError(space)}
@@ -293,6 +368,8 @@ function SpaceLink({ space, machine, windowOver = false }: { space: Space; machi
         </div>
         <StateLabel state={spaceState(space)} space={space} className="mt-px shrink-0" />
       </div>
+      {/* What it was given and uses now, when its computer says. */}
+      {resources && (spaceState(space) === "running" || spaceState(space) === "stopped") ? <CompactMeters meters={spaceMeters(resources)} className="px-1.5 pt-1 pb-1.5" /> : null}
     </Link>
   );
 }

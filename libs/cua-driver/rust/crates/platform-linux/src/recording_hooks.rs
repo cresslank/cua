@@ -98,18 +98,30 @@ pub fn element_window_local_xy(
     capture_point: bool,
 ) -> Option<(u64, Option<(f64, f64)>)> {
     use cua_driver_core::element_token::ResolvedElement;
-    use cua_driver_core::snapshot_store::current_runtime_store;
+    use cua_driver_core::snapshot_store::{current_runtime_store, SnapshotPayload};
     use cua_driver_core::tool_args::ArgsExt;
+    let token = args
+        .get("element_token")
+        .and_then(serde_json::Value::as_str)?;
+    let pid = i32::try_from(pid).ok()?;
     let cache = current_runtime_store::<crate::atspi::snapshot::AtspiSnapshot>()?;
     let resolved = match cache.resolve(
-        i32::try_from(pid).ok()?,
-        &serde_json::json!({"element_token": args.get("element_token")
-            .and_then(serde_json::Value::as_str), "window_id": args.opt_u64("window_id")}),
+        pid,
+        &serde_json::json!({"element_token": token, "window_id": args.opt_u64("window_id")}),
     ) {
         Ok(resolved) => resolved,
         Err(refusal) => {
-            tracing::debug!(?refusal, "recording element target refused");
-            return None;
+            // A discovery-only key names its snapshot window but has no proven
+            // AT-SPI element, so retain() refuses. Use that window id rather
+            // than re-walking an ordinal.
+            let (generation, index) = cua_driver_core::element_token::global()
+                .resolve_generation(pid, token)
+                .ok()?;
+            let payload = generation
+                .payload::<crate::atspi::snapshot::AtspiSnapshot>()
+                .filter(|payload| payload.contains_index(index))?;
+            let _ = payload;
+            return Some((generation.lane_key().window_id, None));
         }
     };
     let ResolvedElement::Element { window_id, .. } = resolved else {

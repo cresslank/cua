@@ -9,7 +9,7 @@
 // runtimes, launch at login, usage data, the update channel, the
 // experiments, Welcome's "Show again", the coding agents (`model.agents`)
 // and the Keyvault's switches (`model.keyvault`).
-import type { AppLoginItemStatus, AppSettingsInput, AppTelemetryInput } from "../native/generated/index";
+import type { AppLoginItemStatus, AppSettingsInput, AppTeamInput, AppTelemetryInput } from "../native/generated/index";
 import type { AppModel } from "../model/app-model";
 import { words } from "../model/errors";
 import { bounded } from "../model/time";
@@ -81,13 +81,16 @@ export function experimentsPage(model: AppModel) {
 }
 
 /** `settings.get`'s answer: General, Experiments, the update channel (null:
- * no updater) and the global shortcut (null: none here). */
+ * no updater), the global shortcut (null: none here) and the account app. */
 export function settingsState(model: AppModel, parts: HostParts) {
   return {
     page: encode(settingsPage(model, parts)),
     experiments: encode(experimentsPage(model)),
     updateChannel: parts.updates.updater === null ? null : parts.updates.channelWord,
     globalShortcut: parts.system?.globalShortcut?.() ?? null,
+    // The account app (CUA_ENV, CUA_ACCOUNT_APP_URL): the page's core has no
+    // environment, so Upgrade's billing fallback names this one.
+    accountUrl: model.native.appAccountAppUrl(),
   };
 }
 
@@ -144,7 +147,7 @@ export function settingsMethods(ctx: BridgeContext): Handlers {
         model.changed("settings");
         return;
       case "default-location":
-        save({ defaultLocation: option === "cloud" ? model.native.AppLocation.Cloud : model.native.AppLocation.Local });
+        save({ defaultLocation: model.native.AppLocation.Local }); // Cua Cloud has ended
         return;
       case "auto-connect":
         save({ autoConnect: option === "on" });
@@ -171,6 +174,9 @@ export function settingsMethods(ctx: BridgeContext): Handlers {
         return;
       case "telemetry":
         model.telemetry?.setEnabled(option === "on");
+        // The switch sits beside the usage note (Welcome, Settings): the
+        // notice was seen.
+        model.telemetry?.acknowledgeNotice();
         model.changed("settings");
         return;
       default:
@@ -179,6 +185,17 @@ export function settingsMethods(ctx: BridgeContext): Handlers {
   };
 
   return {
+    // "Add a machine" and "Share": the account's Teams (Settings, Teams) and the current one.
+    "teams.list": async () => {
+      if (model.servicesIn) await bounded(10, () => model.teams.reload());
+      const input = model.teams.input();
+      const state = input.state as { tag: string; inner?: { teams?: AppTeamInput[] } };
+      const teams = state.tag === "Ready" ? (state.inner?.teams ?? []) : [];
+      return {
+        teams: teams.map((t) => ({ id: t.id, alias: t.alias, name: t.name, role: t.role, plan: t.plan })),
+        currentTeamId: input.currentTeamId ?? null,
+      };
+    },
     "settings.get": async () => {
       await load();
       return settingsState(model, parts());

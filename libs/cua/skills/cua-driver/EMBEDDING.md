@@ -347,7 +347,7 @@ both forms of settling. This knob does not change the focus-guard deadline.
 | --------------------------------------------- | ----------------------------- | -------------------------------------- |
 | Responsibility disclaim re-exec               | ON (owns its TCC identity)    | OFF (stays in the host's chain)        |
 | Tool execution process                        | `serve` daemon                | host-spawned `serve --embedded` daemon |
-| Daemon auto-relaunch via `open -a CuaDriver`  | Yes, when installed           | Never (would leave the host's chain)   |
+| Daemon auto-relaunch of the installed app     | Yes, when installed           | Never (would leave the host's chain)   |
 | TCC identity                                  | `com.trycua.driver`           | the host app                           |
 | Permission prompts / startup gate             | May prompt once               | **Never prompts**                      |
 | Settings → Privacy & Security entries         | CuaDriver                     | your app only                          |
@@ -368,7 +368,7 @@ would treat it as its own responsible process: your user would get a _second_ pr
 attributed to the driver binary, a second Settings entry, and capture/AX
 would fail until that second grant. That is the exact experience embedding exists
 to eliminate. Embedded mode short-circuits the disclaim re-exec
-(`responsibility.rs`) and the `open -a CuaDriver` daemon relaunch. MCP is
+(`responsibility.rs`) and the installed-app daemon relaunch. MCP is
 always a proxy, so the embedded daemon remains the single process that checks
 TCC and executes tools.
 

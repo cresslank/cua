@@ -4,11 +4,14 @@
 //! (via ChildWindowFromPointEx), so the message never reaches the top-level
 //! chrome that would call SetForegroundWindow in response to WM_LBUTTONDOWN.
 
-use anyhow::{bail, Result};
+use anyhow::{anyhow, bail, Result};
 use std::thread::sleep;
 use std::time::Duration;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::ScreenToClient;
+use windows::core::{Error, Owned};
+use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
+use windows::Win32::System::Diagnostics::Debug::{self, GetThreadContext, CONTEXT};
+use windows::Win32::System::Threading;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_HWHEEL,
     MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP,
@@ -17,11 +20,12 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     ChildWindowFromPointEx, GetAncestor, GetClassLongPtrW, GetCursorPos, GetForegroundWindow,
-    GetSystemMetrics, PostMessageW, SetCursorPos, WindowFromPoint, CS_DBLCLKS, CWP_SKIPDISABLED,
-    CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, GA_ROOT, GCL_STYLE, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDBLCLK,
-    WM_RBUTTONDOWN, WM_RBUTTONUP,
+    GetSystemMetrics, GetWindowLongPtrW, PostMessageW, SetCursorPos, SetWindowPos, WindowFromPoint,
+    CS_DBLCLKS, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, GA_ROOT, GCL_STYLE,
+    GWL_EXSTYLE, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WS_EX_TOPMOST,
 };
 
 const MK_LBUTTON: u32 = 0x0001;
@@ -44,6 +48,57 @@ fn exact_target_receives_point(target: u64, expected_pid: u32, sx: i32, sy: i32)
     !target_root.0.is_null()
         && target_root == actual_root
         && crate::win32::window_owner_pid(actual_root.0 as usize as u64) == Some(expected_pid)
+}
+
+#[repr(C, align(16))]
+struct AlignedContext(CONTEXT);
+
+struct SuspendedThread(Owned<HANDLE>);
+
+impl SuspendedThread {
+    fn suspend(hwnd: HWND) -> windows::core::Result<Option<Self>> {
+        let thread_id = unsafe { crate::input::GetWindowThreadProcessId(hwnd, None) };
+        if thread_id == 0 || thread_id == unsafe { Threading::GetCurrentThreadId() } {
+            return Ok(None);
+        }
+        let access = Threading::THREAD_SUSPEND_RESUME | Threading::THREAD_GET_CONTEXT;
+        let Ok(handle) = (unsafe { Threading::OpenThread(access, false, thread_id) }) else {
+            return Ok(None);
+        };
+        let handle = unsafe { Owned::new(handle) };
+        if unsafe { Threading::SuspendThread(*handle) } == u32::MAX {
+            return Ok(None);
+        }
+        let suspended = Self(handle);
+        let mut context = AlignedContext(CONTEXT::default());
+        #[cfg(target_arch = "x86_64")]
+        {
+            context.0.ContextFlags = Debug::CONTEXT_CONTROL_AMD64;
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            context.0.ContextFlags = Debug::CONTEXT_CONTROL_ARM64;
+        }
+        if unsafe { GetThreadContext(*suspended.0, &mut context.0) }.is_err() {
+            suspended.resume()?;
+            return Ok(None);
+        }
+        Ok(Some(suspended))
+    }
+
+    fn resume(self) -> windows::core::Result<()> {
+        if unsafe { Threading::ResumeThread(*self.0) } == u32::MAX {
+            return Err(Error::from_win32());
+        }
+        drop(unsafe { std::ptr::read(&std::mem::ManuallyDrop::new(self).0) });
+        Ok(())
+    }
+}
+
+impl Drop for SuspendedThread {
+    fn drop(&mut self) {
+        unsafe { Threading::ResumeThread(*self.0) };
+    }
 }
 
 fn posted_press_message(down: u32, double: u32, click_index: usize, wants_double: bool) -> u32 {
@@ -126,6 +181,25 @@ fn prove_post_recipient(
     Ok(())
 }
 
+/// Post a click at **client-area** coordinates of `root_hwnd`.
+///
+/// Resolves to the deepest child HWND at the click point before posting,
+/// so top-level browser/chrome windows don't activate in response.
+pub fn post_click(root: u64, x: i32, y: i32, count: usize, button: &str) -> Result<()> {
+    let root_hwnd = HWND(root as *mut _);
+
+    // Convert root-local client → screen.
+    let mut screen_pt = POINT { x, y };
+    unsafe {
+        let _ = ClientToScreen(root_hwnd, &mut screen_pt);
+    }
+
+    // Find deepest child and its local client coordinates.
+    let (target, client) = deepest_child(root_hwnd, screen_pt);
+
+    post_click_on(target, client.x, client.y, count, button)
+}
+
 /// Post a click at **screen** coordinates, resolving the deepest child of
 /// `root_hwnd` at that point.  Call this when you already have screen coords.
 pub fn post_click_screen(
@@ -140,31 +214,97 @@ pub fn post_click_screen(
     let screen_pt = POINT { x: sx, y: sy };
     let (target, client) = deepest_child(root_hwnd, screen_pt);
     prove_post_recipient(root_hwnd, target, expected_pid, "posted click resolution")?;
-    post_click_on(
-        root_hwnd,
+    let displaced_target = crate::win32::capture_foreground_target(root, Some(expected_pid))
+        .ok_or_else(|| anyhow!("posted click target identity is stale"))?;
+    let prev_fg_target = crate::win32::capture_current_foreground_target()
+        .filter(|previous| previous.hwnd() != root);
+
+    // Posted pointer messages are normally non-activating, but WebView hosts can
+    // call SetForegroundWindow from their event handlers. Keep the top-level
+    // categorically non-activatable until the complete burst has settled.
+    // PID-scoped arm refuses an ApplicationFrameHost HWND whose hosted app no
+    // longer owns the approved identity.
+    prove_post_recipient(root_hwnd, target, expected_pid, "posted click guard")?;
+    let mut noact = crate::input::NoActivateGuard::arm_for_pid(root_hwnd, expected_pid)?;
+    let mut result = post_click_burst(
         target,
-        expected_pid,
         client.x,
         client.y,
         count,
         button,
-    )
+        Some((root_hwnd, expected_pid)),
+    );
+    if let Err(restoration) = noact.finish() {
+        result = Err(match result {
+            Ok(()) => restoration,
+            Err(primary) => anyhow!("{primary}; cleanup failure: {restoration}"),
+        });
+    }
+    sleep(Duration::from_millis(50));
+    if let Some(previous) = prev_fg_target {
+        let restored = crate::win32::restore_foreground_target_if_still_displaced(
+            previous,
+            displaced_target,
+            Duration::from_millis(500),
+        );
+        if restored == crate::win32::ForegroundRestoreOutcome::Failed {
+            let restoration = anyhow!("foreground_restore_failed after posted click");
+            result = Err(match result {
+                Ok(()) => restoration,
+                Err(primary) => anyhow!("{primary}; cleanup failure: {restoration}"),
+            });
+        }
+    }
+    result
 }
 
 /// Internal: post click messages to `hwnd` using its own client coordinates.
-fn post_click_on(
-    root: HWND,
+///
+/// Test entry point. Production screen clicks go through [`post_click_screen`],
+/// which proves PID ownership and restores the prior foreground by hosted-UWP
+/// identity. This path keeps the upstream suspend-while-posting contract the
+/// leave-on-move tests assert.
+fn post_click_on(hwnd: HWND, x: i32, y: i32, count: usize, button: &str) -> Result<()> {
+    let prev_fg = unsafe { GetForegroundWindow() };
+    let target_root = unsafe {
+        let root = GetAncestor(hwnd, GA_ROOT);
+        if root.0.is_null() {
+            hwnd
+        } else {
+            root
+        }
+    };
+
+    // Posted pointer messages are normally non-activating, but WebView hosts can
+    // call SetForegroundWindow from their event handlers. Keep the top-level
+    // categorically non-activatable until the complete burst has settled.
+    let _noact = crate::input::NoActivateGuard::arm(hwnd);
+    post_click_burst(hwnd, x, y, count, button, None)?;
+    sleep(Duration::from_millis(50));
+    unsafe {
+        if !prev_fg.0.is_null() && prev_fg != target_root && GetForegroundWindow() == target_root {
+            // Re-exported name differs after the local mod.rs merge; the
+            // function still lives on the inject module.
+            crate::input::inject::force_foreground_attached(prev_fg);
+            sleep(Duration::from_millis(12));
+            crate::input::inject::force_foreground_attached(prev_fg);
+        }
+    }
+    Ok(())
+}
+
+/// Post the click burst while the target GUI thread is suspended so a
+/// `WM_MOUSEMOVE` handler cannot observe the press before the release is queued.
+///
+/// `owner` is the production exact-target proof. Tests pass `None`.
+fn post_click_burst(
     hwnd: HWND,
-    expected_pid: u32,
     x: i32,
     y: i32,
     count: usize,
     button: &str,
+    owner: Option<(HWND, u32)>,
 ) -> Result<()> {
-    prove_post_recipient(root, hwnd, expected_pid, "posted click preflight")?;
-    // UIPI check — Medium-IL daemon → High-IL target silently drops mouse
-    // messages just like keyboard ones. Surface an actionable error before
-    // PostMessage returns its misleading TRUE. See post_message_blocked_by_uipi.
     if let Some(msg) = crate::input::post_message_blocked_by_uipi(hwnd.0 as u64) {
         anyhow::bail!(msg);
     }
@@ -178,83 +318,86 @@ fn post_click_on(
     let wdown = WPARAM(mk_flag as usize);
     let wup = WPARAM(0);
     let wants_double = unsafe { (GetClassLongPtrW(hwnd, GCL_STYLE) as u32 & CS_DBLCLKS.0) != 0 };
-    let displaced_target =
-        crate::win32::capture_foreground_target(root.0 as usize as u64, Some(expected_pid))
-            .ok_or_else(|| anyhow::anyhow!("posted click target identity is stale"))?;
-    let prev_fg_target = crate::win32::capture_current_foreground_target()
-        .filter(|previous| previous.hwnd() != root.0 as usize as u64);
-
-    // Posted pointer messages are normally non-activating, but WebView hosts can
-    // call SetForegroundWindow from their event handlers. Keep the top-level
-    // categorically non-activatable until the complete burst has settled.
-    prove_post_recipient(root, hwnd, expected_pid, "posted click guard")?;
-    let mut noact = crate::input::NoActivateGuard::arm_for_pid(root, expected_pid)?;
-    let mut button_down_posted = false;
-    let mut result = (|| -> Result<()> {
-        for i in 0..count {
-            let press_msg = posted_press_message(down_msg, double_msg, i, wants_double);
-            unsafe {
-                // WM_MOUSEMOVE first so hover state is correct before the click.
-                prove_post_recipient(root, hwnd, expected_pid, "posted click mouse-move")?;
-                cua_driver_core::blocking::check_cancelled()?;
-                PostMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), lparam)?;
-                // Win32 controls do not infer a double-click from two posted DOWN
-                // messages. The second press must use WM_*BUTTONDBLCLK.
-                prove_post_recipient(root, hwnd, expected_pid, "posted click button-down")?;
-                cua_driver_core::blocking::check_cancelled()?;
-                PostMessageW(hwnd, press_msg, wdown, lparam)?;
-                button_down_posted = true;
-                sleep(Duration::from_millis(CLICK_DELAY_MS));
-                prove_post_recipient(root, hwnd, expected_pid, "posted click button-up")?;
-                PostMessageW(hwnd, up_msg, wup, lparam)?;
-                button_down_posted = false;
-            }
-            if i + 1 < count {
-                sleep(Duration::from_millis(80));
-            }
+    let unavailable = |error: Error| anyhow!("target thread: {error}");
+    for i in 0..count {
+        if let Some((root, expected_pid)) = owner {
+            prove_post_recipient(root, hwnd, expected_pid, "posted click")?;
         }
-        Ok(())
-    })();
-
-    if let Err(primary) = result {
-        result = if button_down_posted {
-            let cleanup =
-                prove_post_recipient(root, hwnd, expected_pid, "posted click release cleanup")
-                    .and_then(|()| unsafe {
-                        PostMessageW(hwnd, up_msg, wup, lparam).map_err(Into::into)
-                    });
-            match cleanup {
-                Ok(()) => Err(primary),
-                Err(cleanup_error) => Err(anyhow::anyhow!(
-                    "{primary}; cleanup failure: release-only posted button-up failed: {cleanup_error}"
-                )),
-            }
-        } else {
-            Err(primary)
+        cua_driver_core::blocking::check_cancelled()?;
+        let press_msg = posted_press_message(down_msg, double_msg, i, wants_double);
+        let suspended = SuspendedThread::suspend(hwnd).map_err(unavailable)?;
+        let posted = unsafe {
+            // WM_MOUSEMOVE first so hover state is correct before the click.
+            // All three messages are queued before the thread resumes, so a
+            // move handler cannot inject WM_MOUSELEAVE between press and release.
+            PostMessageW(hwnd, WM_MOUSEMOVE, WPARAM(0), lparam)
+                .and_then(|()| PostMessageW(hwnd, press_msg, wdown, lparam))
+                .and_then(|()| PostMessageW(hwnd, up_msg, wup, lparam))
         };
-    }
-    if let Err(restoration) = noact.finish() {
-        result = Err(match result {
-            Ok(()) => restoration,
-            Err(primary) => anyhow::anyhow!("{primary}; cleanup failure: {restoration}"),
-        });
-    }
-    sleep(Duration::from_millis(50));
-    if let Some(previous) = prev_fg_target {
-        let restored = crate::win32::restore_foreground_target_if_still_displaced(
-            previous,
-            displaced_target,
-            Duration::from_millis(500),
-        );
-        if restored == crate::win32::ForegroundRestoreOutcome::Failed {
-            let restoration = anyhow::anyhow!("foreground_restore_failed after posted click");
-            result = Err(match result {
-                Ok(()) => restoration,
-                Err(primary) => anyhow::anyhow!("{primary}; cleanup failure: {restoration}"),
-            });
+        if posted.is_err() {
+            // Down may have been queued without a matching up. A redundant up
+            // is ignored; a missing up leaves the button stuck.
+            let _ = unsafe { PostMessageW(hwnd, up_msg, wup, lparam) };
+        }
+        if let Some(suspended) = suspended {
+            suspended.resume().map_err(unavailable)?;
+        }
+        posted?;
+        if i + 1 < count {
+            sleep(Duration::from_millis(80));
         }
     }
-    result
+    Ok(())
+}
+
+/// Post a press-drag-release gesture via PostMessage.
+///
+/// Coordinates are root-hwnd client-area relative.
+pub fn post_drag(
+    hwnd: u64,
+    from_x: i32,
+    from_y: i32,
+    to_x: i32,
+    to_y: i32,
+    duration_ms: u64,
+    steps: usize,
+    button: &str,
+) -> Result<()> {
+    let root = HWND(hwnd as *mut _);
+    let (down_msg, up_msg, mk_flag) = match button {
+        "right" => (WM_RBUTTONDOWN, WM_RBUTTONUP, MK_RBUTTON),
+        "middle" => (WM_MBUTTONDOWN, WM_MBUTTONUP, MK_MBUTTON),
+        _ => (WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON),
+    };
+    let wparam = WPARAM(mk_flag as usize);
+    let steps = steps.max(1);
+    let step_delay_ms = if steps > 1 {
+        duration_ms / steps as u64
+    } else {
+        duration_ms
+    };
+
+    unsafe {
+        PostMessageW(root, down_msg, wparam, make_lparam(from_x, from_y))?;
+    }
+    sleep(Duration::from_millis(CLICK_DELAY_MS));
+
+    for i in 1..=steps {
+        let t = i as f64 / steps as f64;
+        let ix = from_x + ((to_x - from_x) as f64 * t).round() as i32;
+        let iy = from_y + ((to_y - from_y) as f64 * t).round() as i32;
+        unsafe {
+            PostMessageW(root, WM_MOUSEMOVE, wparam, make_lparam(ix, iy))?;
+        }
+        if step_delay_ms > 0 {
+            sleep(Duration::from_millis(step_delay_ms));
+        }
+    }
+
+    unsafe {
+        PostMessageW(root, up_msg, WPARAM(0), make_lparam(to_x, to_y))?;
+    }
+    Ok(())
 }
 
 /// Press-drag-release via PostMessage, resolving the **deepest child** at the
@@ -1069,9 +1212,9 @@ fn send_click_synthesized_mods_impl(
     Ok(())
 }
 
-/// Press-hold-move-release drag via `SendInput`. Companion to
-/// [`send_click_synthesized`] for the `drag` tool's `delivery_mode:"foreground"`
-/// path.
+/// Press-hold-move-release drag via `SendInput`, used by the `drag` tool's
+/// `scope:"desktop"` path, which intentionally acts on whatever is visible at
+/// the screen coordinates.
 ///
 /// Why a SendInput drag is needed at all: the PostMessage drag path posts
 /// `WM_LBUTTONDOWN` + `WM_MOUSEMOVE`s + `WM_LBUTTONUP` to the target HWND.
@@ -1087,6 +1230,10 @@ fn send_click_synthesized_mods_impl(
 /// `SetForegroundWindow` swap is rejected from non-UIAccess processes
 /// when foreground-lock is active; route through `cua-driver-uia.exe`
 /// for reliable operation.
+///
+/// Desktop scope raises z-order without stealing focus. When `expected_pid`
+/// is known, the press is still refused unless that exact window owns the
+/// start point.
 pub fn send_drag_synthesized(
     target: u64,
     expected_pid: Option<u32>,
@@ -1097,6 +1244,77 @@ pub fn send_drag_synthesized(
     duration_ms: u64,
     steps: usize,
     button: &str,
+) -> Result<()> {
+    send_drag_synthesized_impl(
+        target,
+        expected_pid,
+        sx_from,
+        sy_from,
+        sx_to,
+        sy_to,
+        duration_ms,
+        steps,
+        button,
+        false,
+    )
+}
+
+/// SendInput drag for an explicit window-targeted foreground request.
+///
+/// The drag is coordinate-routed: Windows delivers it to whatever window is
+/// under the pointer. The z-order-only raise used by the desktop path can
+/// silently fail to expose the target, and the whole stroke then lands in the
+/// window covering it. Like [`send_click_synthesized_active_mods`], this path
+/// activates the target instead, and it hit-tests the start point before the
+/// button goes down. When Windows refuses the activation, or another window
+/// still owns the start point, it returns `foreground_unavailable` without
+/// sending any mouse input.
+///
+/// Activation and restore use PID-attributed foreground identity so a hosted
+/// UWP app is not confused with the shared `ApplicationFrameHost` PID. The
+/// caller does not also poll-restore; this function confirms restoration.
+pub fn send_drag_synthesized_active(
+    target: u64,
+    expected_pid: Option<u32>,
+    sx_from: i32,
+    sy_from: i32,
+    sx_to: i32,
+    sy_to: i32,
+    duration_ms: u64,
+    steps: usize,
+    button: &str,
+) -> Result<()> {
+    send_drag_synthesized_impl(
+        target,
+        expected_pid,
+        sx_from,
+        sy_from,
+        sx_to,
+        sy_to,
+        duration_ms,
+        steps,
+        button,
+        true,
+    )
+}
+
+/// How long the active drag waits for the activated target to own its start
+/// point. Activation reorders windows synchronously in the common case; the
+/// short poll covers targets whose activation is still settling.
+const DRAG_START_HIT_TEST_TIMEOUT: Duration = Duration::from_millis(150);
+
+#[allow(clippy::too_many_arguments)]
+fn send_drag_synthesized_impl(
+    target: u64,
+    expected_pid: Option<u32>,
+    sx_from: i32,
+    sy_from: i32,
+    sx_to: i32,
+    sy_to: i32,
+    duration_ms: u64,
+    steps: usize,
+    button: &str,
+    activate: bool,
 ) -> Result<()> {
     let target = HWND(target as *mut _);
     if target.0.is_null() {
@@ -1146,253 +1364,259 @@ pub fn send_drag_synthesized(
         0
     };
 
+    let target_addr = target.0 as usize as u64;
+    let approved_pid = expected_pid.or_else(|| crate::win32::window_owner_pid(target_addr));
+
     unsafe {
-        let target_addr = target.0 as usize as u64;
-        let approved_pid = expected_pid
-            .or_else(|| crate::win32::window_owner_pid(target_addr))
-            .ok_or_else(|| anyhow::anyhow!("invalid or stale target hwnd"))?;
-        let target_before = crate::win32::capture_foreground_target(target_addr, Some(approved_pid))
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "foreground_unavailable: exact target HWND {:?} changed ownership before drag targeting; no window or input mutation was attempted",
-                    target.0
-                )
-            })?;
-        let prev_fg_target = match crate::win32::capture_current_foreground_target() {
-            Some(previous) if previous.hwnd() != target_addr => Some(previous),
-            Some(_) => None,
-            None => {
-                bail!(
-                    "foreground_restore_unavailable: a stable prior foreground identity could not be captured; no drag mutation was attempted"
-                )
+        let prev_fg = GetForegroundWindow();
+        let mut prev_cursor = POINT::default();
+        let _ = GetCursorPos(&mut prev_cursor);
+        // Capture whether the target was ALREADY always-on-top so we only demote
+        // below if WE promoted it (else we'd strip a legitimate topmost window).
+        let was_topmost = (GetWindowLongPtrW(target, GWL_EXSTYLE) as u32) & WS_EX_TOPMOST.0 != 0;
+
+        let prev_fg_target = if activate {
+            crate::win32::capture_current_foreground_target()
+        } else {
+            None
+        };
+        let target_before = if activate {
+            match approved_pid {
+                Some(pid) => Some(crate::win32::capture_foreground_target(target_addr, Some(pid)).ok_or_else(|| {
+                    anyhow!(
+                        "foreground_unavailable: exact target HWND {:?} changed ownership before drag targeting; no window or input mutation was attempted",
+                        target.0
+                    )
+                })?),
+                None => None,
+            }
+        } else {
+            None
+        };
+        if activate && prev_fg_target.is_none() {
+            bail!(
+                "foreground_restore_unavailable: a stable prior foreground identity could not be captured; no drag mutation was attempted"
+            );
+        }
+
+        // Undo the desktop path's z-order raise and put the user's cursor back.
+        // The active path leaves z-order alone and restores foreground by PID
+        // identity after the stroke. The cursor stays put when the release is
+        // unconfirmed: moving a cursor whose button may still be held would
+        // continue the drag.
+        let restore_z_order = |move_cursor: bool| {
+            if !activate {
+                if !was_topmost {
+                    let _ = SetWindowPos(
+                        target,
+                        HWND_NOTOPMOST,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                    );
+                }
+                if !prev_fg.0.is_null() && prev_fg != target {
+                    let _ = SetWindowPos(
+                        prev_fg,
+                        HWND_TOP,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+                    );
+                }
+            }
+            if move_cursor {
+                let _ = SetCursorPos(prev_cursor.x, prev_cursor.y);
             }
         };
-        let cursor_target = crate::win32::capture_current_cursor_target().ok_or_else(|| {
-            anyhow::anyhow!(
-                "cursor_restore_unavailable: stable prior cursor recipient could not be captured; no drag mutation was attempted"
-            )
-        })?;
-
-        let activated = crate::input::force_foreground_assisted_for_pid(target, approved_pid).0;
-        let foreground_target =
-            crate::win32::capture_foreground_target(target_addr, Some(approved_pid));
-        let exact_foreground = foreground_target.is_some_and(|approved| {
-            crate::win32::foreground_matches_target_or_owned_window(
-                approved,
-                GetForegroundWindow().0 as usize as u64,
-            )
-        });
-        if !activated || !exact_foreground {
-            let restore_failed = prev_fg_target.is_some_and(|previous| {
+        let restore_foreground = || {
+            if let (Some(previous), Some(displaced)) = (prev_fg_target, target_before) {
                 crate::win32::restore_foreground_target_if_still_displaced(
                     previous,
-                    target_before,
+                    displaced,
                     Duration::from_millis(500),
-                ) == crate::win32::ForegroundRestoreOutcome::Failed
-            });
-            bail!(
-                "foreground_unavailable: Windows did not confirm exact target HWND {:?} before foreground drag; no input was sent{}",
-                target.0,
-                if restore_failed {
-                    "; cleanup failure: foreground restoration was not confirmed"
-                } else {
-                    ""
-                }
-            );
-        }
-        let foreground_target = foreground_target.expect("exact foreground target checked above");
-
-        let mut drag_error = cua_driver_core::blocking::check_cancelled()
-            .err()
-            .map(anyhow::Error::from);
-        let mut button_down_maybe = false;
-        let mut last_authorized = (sx_from, sy_from);
-        if !exact_target_receives_point(target_addr, approved_pid, sx_from, sy_from) {
-            drag_error = Some(anyhow::anyhow!(
-                "foreground_unavailable: exact target does not own the drag start point; no input was sent"
-            ));
-        }
-
-        if drag_error.is_none() {
-            let (nfx, nfy) = norm(sx_from, sy_from);
-            if let Err(error) = cua_driver_core::blocking::check_cancelled() {
-                drag_error = Some(error.into());
-            }
-            if drag_error.is_none() {
-                let _ = SetCursorPos(sx_from, sy_from);
-            }
-            let still_authorized =
-                exact_target_receives_point(target_addr, approved_pid, sx_from, sy_from)
-                    && crate::win32::foreground_matches_target_or_owned_window(
-                        foreground_target,
-                        GetForegroundWindow().0 as usize as u64,
-                    );
-            if let Err(error) = cua_driver_core::blocking::check_cancelled() {
-                drag_error = Some(error.into());
-            } else if !still_authorized {
-                drag_error = Some(anyhow::anyhow!(
-                    "foreground_unavailable: exact target lost foreground or drag-start recipient authority before SendInput; no input was sent"
-                ));
+                )
             } else {
-                let prelude = [
-                    make_input(nfx, nfy, MOUSEEVENTF_MOVE),
-                    make_input(nfx, nfy, down_flag),
-                ];
-                let sent = SendInput(&prelude, std::mem::size_of::<INPUT>() as i32);
-                button_down_maybe = sent as usize >= prelude.len();
-                if sent as usize != prelude.len() {
-                    let cleanup = [make_input(0, 0, up_flag)];
-                    let cleanup_authorized = sent as usize >= 2
-                        && exact_target_receives_point(
-                            target_addr,
-                            approved_pid,
-                            last_authorized.0,
-                            last_authorized.1,
-                        )
-                        && crate::win32::foreground_matches_target_or_owned_window(
-                            foreground_target,
-                            GetForegroundWindow().0 as usize as u64,
-                        );
-                    let cleanup_sent = if cleanup_authorized {
-                        SendInput(&cleanup, std::mem::size_of::<INPUT>() as i32)
-                    } else {
-                        0
-                    };
-                    drag_error = Some(anyhow::anyhow!(
-                        "SendInput drag-prelude inserted {sent}/{} events; release cleanup {} and inserted {cleanup_sent}/{}",
-                        prelude.len(),
-                        if cleanup_authorized { "was authorized" } else { "was withheld because recipient authority was lost" },
-                        if cleanup_authorized { cleanup.len() } else { 0 }
-                    ));
-                    button_down_maybe = false;
-                }
+                crate::win32::ForegroundRestoreOutcome::Restored
             }
-        }
+        };
 
-        if drag_error.is_none() {
-            for i in 1..=steps {
-                let t = i as f64 / steps as f64;
-                let x = sx_from + ((sx_to - sx_from) as f64 * t).round() as i32;
-                let y = sy_from + ((sy_to - sy_from) as f64 * t).round() as i32;
-                let authorized_before_move =
-                    exact_target_receives_point(target_addr, approved_pid, x, y)
-                        && crate::win32::foreground_matches_target_or_owned_window(
-                            foreground_target,
-                            GetForegroundWindow().0 as usize as u64,
-                        );
-                if !authorized_before_move {
-                    drag_error = Some(anyhow::anyhow!(
-                        "foreground_unavailable: exact target lost foreground or recipient authority during drag; no further movement was sent"
-                    ));
-                    break;
-                }
-                let (nx, ny) = norm(x, y);
-                if let Err(error) = cua_driver_core::blocking::check_cancelled() {
-                    drag_error = Some(error.into());
-                    break;
-                }
-                let _ = SetCursorPos(x, y);
-                if !exact_target_receives_point(target_addr, approved_pid, x, y) {
-                    drag_error = Some(anyhow::anyhow!(
-                        "foreground_unavailable: drag recipient changed after cursor placement; no further SendInput movement was sent"
-                    ));
-                    break;
-                }
-                let mv = [make_input(nx, ny, MOUSEEVENTF_MOVE)];
-                if let Err(error) = cua_driver_core::blocking::check_cancelled() {
-                    drag_error = Some(error.into());
-                    break;
-                }
-                let moved = SendInput(&mv, std::mem::size_of::<INPUT>() as i32);
-                if moved as usize != mv.len() {
-                    drag_error = Some(anyhow::anyhow!(
-                        "SendInput drag movement inserted {moved}/{} events",
-                        mv.len()
-                    ));
-                    break;
-                }
-                last_authorized = (x, y);
-                if step_delay_ms > 0 {
-                    sleep(Duration::from_millis(step_delay_ms));
-                }
-            }
-        }
-
-        if drag_error.is_none()
-            && (!exact_target_receives_point(
-                target_addr,
-                approved_pid,
-                last_authorized.0,
-                last_authorized.1,
-            ) || !crate::win32::foreground_matches_target_or_owned_window(
-                foreground_target,
-                GetForegroundWindow().0 as usize as u64,
-            ))
-        {
-            drag_error = Some(anyhow::anyhow!(
-                "foreground_unavailable: exact target lost foreground or recipient authority before drag release"
-            ));
-        }
-        if button_down_maybe {
-            let release = [make_input(0, 0, up_flag)];
-            let release_authorized = exact_target_receives_point(
-                target_addr,
-                approved_pid,
-                last_authorized.0,
-                last_authorized.1,
-            ) && crate::win32::foreground_matches_target_or_owned_window(
-                foreground_target,
-                GetForegroundWindow().0 as usize as u64,
-            );
-            let released = if release_authorized {
-                SendInput(&release, std::mem::size_of::<INPUT>() as i32)
-            } else {
-                0
+        let noactivate = if activate {
+            let activated = match approved_pid {
+                Some(pid) => crate::input::force_foreground_assisted_for_pid(target, pid).0,
+                None => crate::input::force_foreground_assisted(target).0,
             };
-            if released as usize != release.len() {
-                let release_error = anyhow::anyhow!(
-                    "SendInput drag release {} and inserted {released}/{} events",
-                    if release_authorized {
-                        "was authorized"
+            let exact_foreground = match approved_pid {
+                Some(pid) => crate::win32::capture_foreground_target(target_addr, Some(pid))
+                    .is_some_and(|approved| {
+                        crate::win32::foreground_matches_target_or_owned_window(
+                            approved,
+                            GetForegroundWindow().0 as usize as u64,
+                        )
+                    }),
+                None => GetForegroundWindow() == target,
+            };
+            if !activated || !exact_foreground {
+                let restore_failed =
+                    restore_foreground() == crate::win32::ForegroundRestoreOutcome::Failed;
+                let actual = GetForegroundWindow();
+                bail!(
+                    "foreground_unavailable: Windows did not activate exact target HWND {:?} \
+                     (actual foreground HWND {:?}); no mouse input was sent{}",
+                    target.0,
+                    actual.0,
+                    if restore_failed {
+                        "; cleanup failure: foreground restoration was not confirmed"
                     } else {
-                        "was withheld because recipient authority was lost"
-                    },
-                    release.len()
+                        ""
+                    }
                 );
-                drag_error = Some(match drag_error {
-                    Some(error) => anyhow::anyhow!("{error}; cleanup failure: {release_error}"),
-                    None => release_error,
-                });
+            }
+            None
+        } else {
+            // Lock-free z-order raise (no focus steal) so the coordinate-routed
+            // drag lands on the target — same technique as send_click_synthesized.
+            // SetForegroundWindow is lock-denied without UIAccess and isn't needed
+            // for pointer input; NoActivateGuard keeps the press from activating it.
+            let guard = crate::input::NoActivateGuard::arm(target);
+            let _ = SetWindowPos(
+                target,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            );
+            Some(guard)
+        };
+
+        let point_owned_by_target = |sx: i32, sy: i32| -> bool {
+            match approved_pid {
+                Some(pid) => exact_target_receives_point(target_addr, pid, sx, sy),
+                None => true,
+            }
+        };
+
+        // A coordinate-routed press goes to whichever window owns the start
+        // point. Refuse before the button goes down unless that is the target.
+        if activate {
+            let deadline = std::time::Instant::now() + DRAG_START_HIT_TEST_TIMEOUT;
+            while !crate::input::inject::target_visible_at_point(target, sx_from, sy_from)
+                || !point_owned_by_target(sx_from, sy_from)
+            {
+                if std::time::Instant::now() >= deadline {
+                    let owner = WindowFromPoint(POINT {
+                        x: sx_from,
+                        y: sy_from,
+                    });
+                    let _ = restore_foreground();
+                    bail!(
+                        "foreground_unavailable: the drag start ({sx_from},{sy_from}) is covered \
+                         by HWND {:?}, not target HWND {:?}; no mouse input was sent",
+                        GetAncestor(owner, GA_ROOT).0,
+                        target.0
+                    );
+                }
+                sleep(Duration::from_millis(15));
+            }
+        } else if !point_owned_by_target(sx_from, sy_from) {
+            restore_z_order(true);
+            drop(noactivate);
+            bail!(
+                "foreground_unavailable: exact target does not own the drag start point; no input was sent"
+            );
+        }
+
+        // 1. Move + press at the start of the drag.
+        let (nfx, nfy) = norm(sx_from, sy_from);
+        let _ = SetCursorPos(sx_from, sy_from);
+        let prelude = [
+            make_input(nfx, nfy, MOUSEEVENTF_MOVE),
+            make_input(nfx, nfy, down_flag),
+        ];
+        let sent = SendInput(&prelude, std::mem::size_of::<INPUT>() as i32);
+        if sent as usize != prelude.len() {
+            // Records insert in order, so a short prelude never pressed the button.
+            restore_z_order(true);
+            let _ = restore_foreground();
+            drop(noactivate);
+            bail!(
+                "SendInput drag-prelude inserted {sent}/{} events",
+                prelude.len()
+            );
+        }
+
+        // 2. Interpolate the path. SetCursorPos + MOUSEEVENTF_MOVE in lockstep
+        //    so both the visible cursor and the system input queue track the
+        //    same path — WPF's drag-handler watches GetKeyState during each
+        //    move event. Stop further movement if the exact recipient is lost;
+        //    the release below still runs so the button cannot stay down.
+        let mut move_error: Option<anyhow::Error> = None;
+        let mut cursor_at = (sx_from, sy_from);
+        for i in 1..=steps {
+            if let Err(error) = cua_driver_core::blocking::check_cancelled() {
+                move_error = Some(error.into());
+                break;
+            }
+            let t = i as f64 / steps as f64;
+            let x = sx_from + ((sx_to - sx_from) as f64 * t).round() as i32;
+            let y = sy_from + ((sy_to - sy_from) as f64 * t).round() as i32;
+            if !point_owned_by_target(x, y) {
+                move_error = Some(anyhow!(
+                    "foreground_unavailable: exact target lost the drag point; no further movement was sent"
+                ));
+                break;
+            }
+            let (nx, ny) = norm(x, y);
+            let _ = SetCursorPos(x, y);
+            cursor_at = (x, y);
+            let mv = [make_input(nx, ny, MOUSEEVENTF_MOVE)];
+            if SendInput(&mv, std::mem::size_of::<INPUT>() as i32) != 1 {
+                move_error = Some(anyhow!(
+                    "SendInput inserted fewer drag moves than expected; the button was released."
+                ));
+                break;
+            }
+            if step_delay_ms > 0 {
+                sleep(Duration::from_millis(step_delay_ms));
             }
         }
+
+        // 3. Release at the end. The button is held at this point, so always
+        //    attempt the release. A second attempt is a best-effort recovery;
+        //    when it lands, the drag completed normally.
+        let (ntx, nty) = norm(sx_to, sy_to);
+        let release = [make_input(ntx, nty, up_flag)];
+        let released = SendInput(&release, std::mem::size_of::<INPUT>() as i32) == 1
+            || SendInput(&release, std::mem::size_of::<INPUT>() as i32) == 1;
 
         sleep(Duration::from_millis(40));
-        if !crate::win32::restore_cursor_target(cursor_target) {
-            let restore_error = anyhow::anyhow!(
-                "cursor_restore_failed: stable prior cursor destination was not confirmed after drag"
+        restore_z_order(released);
+        let foreground_restore = restore_foreground();
+        drop(noactivate);
+
+        if !released {
+            let (cx, cy) = cursor_at;
+            bail!(
+                "SendInput did not insert the drag's button release after a retry; the \
+                 button may still be held at screen ({cx},{cy}), so the cursor was left there."
             );
-            drag_error = Some(match drag_error {
-                Some(error) => anyhow::anyhow!("{error}; {restore_error}"),
-                None => restore_error,
-            });
         }
-        let restore_outcome = prev_fg_target.map(|previous| {
-            crate::win32::restore_foreground_target_if_still_displaced(
-                previous,
-                foreground_target,
-                Duration::from_millis(500),
-            )
-        });
-        if restore_outcome == Some(crate::win32::ForegroundRestoreOutcome::Failed) {
-            let restore_error = anyhow::anyhow!(
+        if foreground_restore == crate::win32::ForegroundRestoreOutcome::Failed {
+            let restore_error = anyhow!(
                 "foreground_restore_failed: drag ended, but Windows did not confirm restoration of the prior foreground window"
             );
-            drag_error = Some(match drag_error {
-                Some(error) => anyhow::anyhow!("{error}; {restore_error}"),
+            move_error = Some(match move_error {
+                Some(error) => anyhow!("{error}; cleanup failure: {restore_error}"),
                 None => restore_error,
             });
         }
-        if let Some(error) = drag_error {
+        if let Some(error) = move_error {
             return Err(error);
         }
     }
@@ -1640,8 +1864,261 @@ mod nc_hit_tests {
 
 #[cfg(test)]
 mod wheel_tests {
-    use super::{posted_press_message, wheel_mouse_data};
-    use windows::Win32::UI::WindowsAndMessaging::{WM_LBUTTONDBLCLK, WM_LBUTTONDOWN};
+    use super::{post_click_on, posted_press_message, wheel_mouse_data};
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+    use windows::core::{w, HSTRING, PCWSTR};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetWindowLongPtrW,
+        PeekMessageW, PostMessageW, RegisterClassW, SetWindowLongPtrW, UnregisterClassW,
+        CS_DBLCLKS, GWLP_USERDATA, MSG, PM_REMOVE, WINDOW_EX_STYLE, WM_LBUTTONDBLCLK,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WNDCLASSW, WS_POPUP,
+    };
+
+    const TRACE_CAPACITY: usize = 1024;
+    const PUMP_TIMEOUT: Duration = Duration::from_secs(10);
+
+    struct MouseTrace {
+        len: AtomicUsize,
+        messages: [AtomicU32; TRACE_CAPACITY],
+    }
+
+    impl MouseTrace {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                len: AtomicUsize::new(0),
+                messages: std::array::from_fn(|_| AtomicU32::new(0)),
+            })
+        }
+
+        fn record(&self, msg: u32) {
+            let index = self.len.fetch_add(1, Ordering::AcqRel);
+            if let Some(slot) = self.messages.get(index) {
+                slot.store(msg, Ordering::Release);
+            }
+        }
+
+        fn snapshot(&self) -> Vec<u32> {
+            let len = self.len.load(Ordering::Acquire);
+            assert!(
+                len <= TRACE_CAPACITY,
+                "trace overflowed with {len} messages"
+            );
+            self.messages[..len]
+                .iter()
+                .map(|msg| msg.load(Ordering::Acquire))
+                .collect()
+        }
+    }
+
+    unsafe extern "system" fn leave_on_move_window_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        let trace = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const MouseTrace;
+        if let Some(trace) = trace.as_ref() {
+            if matches!(
+                msg,
+                WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_LBUTTONUP | WM_MOUSELEAVE
+            ) {
+                trace.record(msg);
+            }
+        }
+        if msg == WM_MOUSEMOVE {
+            let _ = PostMessageW(hwnd, WM_MOUSELEAVE, WPARAM(0), LPARAM(0));
+        }
+        DefWindowProcW(hwnd, msg, wparam, lparam)
+    }
+
+    struct PumpedWindow {
+        hwnd: HWND,
+        trace: Arc<MouseTrace>,
+        stop: Arc<AtomicBool>,
+        stopped: mpsc::Receiver<()>,
+        pump: Option<JoinHandle<()>>,
+    }
+
+    impl PumpedWindow {
+        fn spawn(class_name: &'static str) -> Self {
+            let trace = MouseTrace::new();
+            let pump_trace = Arc::clone(&trace);
+            let stop = Arc::new(AtomicBool::new(false));
+            let pump_stop = Arc::clone(&stop);
+            let (hwnd_tx, hwnd_rx) = mpsc::channel();
+            let (stopped_tx, stopped) = mpsc::channel();
+            let pump = std::thread::spawn(move || unsafe {
+                let instance = GetModuleHandleW(None).expect("module handle");
+                let class_name = HSTRING::from(class_name);
+                let class = WNDCLASSW {
+                    style: CS_DBLCLKS,
+                    lpfnWndProc: Some(leave_on_move_window_proc),
+                    hInstance: instance.into(),
+                    lpszClassName: PCWSTR(class_name.as_ptr()),
+                    ..Default::default()
+                };
+                assert_ne!(RegisterClassW(&class), 0, "register window class");
+                let hwnd = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    class.lpszClassName,
+                    w!(""),
+                    WS_POPUP,
+                    0,
+                    0,
+                    100,
+                    100,
+                    None,
+                    None,
+                    instance,
+                    None,
+                )
+                .expect("create leave-on-move window");
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, Arc::as_ptr(&pump_trace) as isize);
+                hwnd_tx.send(hwnd.0 as isize).expect("send window handle");
+                let mut msg = MSG::default();
+                while !pump_stop.load(Ordering::Acquire) {
+                    if PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                        DispatchMessageW(&msg);
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
+                let _ = DestroyWindow(hwnd);
+                let _ = UnregisterClassW(class.lpszClassName, instance);
+                drop(pump_trace);
+                let _ = stopped_tx.send(());
+            });
+            let hwnd = hwnd_rx
+                .recv_timeout(PUMP_TIMEOUT)
+                .expect("leave-on-move window");
+            Self {
+                hwnd: HWND(hwnd as *mut _),
+                trace,
+                stop,
+                stopped,
+                pump: Some(pump),
+            }
+        }
+
+        fn finish(mut self, expected: usize) -> Vec<u32> {
+            let deadline = Instant::now() + PUMP_TIMEOUT;
+            while self.trace.len.load(Ordering::Acquire) < expected {
+                assert!(
+                    Instant::now() < deadline,
+                    "pump recorded {expected} messages in time"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.stop.store(true, Ordering::Release);
+            self.stopped
+                .recv_timeout(PUMP_TIMEOUT)
+                .expect("pump thread stopped in time");
+            let pump = self.pump.take().expect("pump thread");
+            pump.join().expect("pump thread panicked");
+            self.trace.snapshot()
+        }
+    }
+
+    impl Drop for PumpedWindow {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            if self.stopped.recv_timeout(PUMP_TIMEOUT).is_ok() {
+                if let Some(pump) = self.pump.take() {
+                    let _ = pump.join();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn posted_click_is_delivered_when_calling_thread_cannot_be_paused() {
+        unsafe {
+            let instance = GetModuleHandleW(None).expect("module handle");
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(leave_on_move_window_proc),
+                hInstance: instance.into(),
+                lpszClassName: w!("CuaPostedClickCallingThread"),
+                ..Default::default()
+            };
+            assert_ne!(RegisterClassW(&class), 0);
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                class.lpszClassName,
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                100,
+                100,
+                None,
+                None,
+                instance,
+                None,
+            )
+            .expect("create window");
+            let trace = MouseTrace::new();
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, Arc::as_ptr(&trace) as isize);
+            assert!(super::SuspendedThread::suspend(hwnd).unwrap().is_none());
+            post_click_on(hwnd, 5, 5, 1, "left").expect("post without pause");
+            let mut msg = MSG::default();
+            while PeekMessageW(&mut msg, hwnd, 0, 0, PM_REMOVE).as_bool() {
+                DispatchMessageW(&msg);
+            }
+            assert_eq!(
+                trace.snapshot(),
+                [WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSELEAVE]
+            );
+            DestroyWindow(hwnd).expect("destroy window");
+            UnregisterClassW(class.lpszClassName, instance).expect("unregister class");
+        }
+    }
+
+    #[test]
+    fn posted_click_release_is_queued_before_the_leave_its_move_triggers() {
+        let window = PumpedWindow::spawn("CuaPostedClickLeaveOnMoveRace");
+        for _ in 0..200 {
+            post_click_on(window.hwnd, 5, 5, 1, "left").expect("post click");
+        }
+        let trace = window.finish(200 * 4);
+
+        for (click, messages) in trace.chunks(4).enumerate() {
+            assert_eq!(
+                messages,
+                [WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSELEAVE],
+                "click {click}"
+            );
+        }
+        assert_eq!(trace.len(), 200 * 4);
+    }
+
+    #[test]
+    fn posted_double_click_queues_move_press_release_per_click() {
+        let window = PumpedWindow::spawn("CuaPostedClickLeaveOnMoveDouble");
+        post_click_on(window.hwnd, 5, 5, 2, "left").expect("post double click");
+        let clicks: Vec<u32> = window
+            .finish(2 * 4)
+            .into_iter()
+            .filter(|&msg| msg != WM_MOUSELEAVE)
+            .collect();
+
+        assert_eq!(
+            clicks,
+            [
+                WM_MOUSEMOVE,
+                WM_LBUTTONDOWN,
+                WM_LBUTTONUP,
+                WM_MOUSEMOVE,
+                WM_LBUTTONDBLCLK,
+                WM_LBUTTONUP
+            ]
+        );
+    }
 
     #[test]
     fn posted_double_click_uses_the_win32_double_click_message() {

@@ -13,11 +13,7 @@ on:
     paths:
       - "libs/cua/**"
       - "libs/spaces-sdk-swift/**"
-      # cua-test-fixtures and the Spaces suites link a real driver core.
-      - "libs/cua-spacesd/**"
-      - "libs/cua-driver/rust/**"
-      - "libs/fleet/sdk/**"
-      - "libs/fleet/sdk-schema/**"
+      - "libs/cua-spacesd/tests/spaces-e2e/**"
       - ".github/workflows/ci-cua-sdk.yml"
   push:
     branches: [main]
@@ -27,8 +23,6 @@ on:
       # cua-test-fixtures and the Spaces suites link a real driver core.
       - "libs/cua-spacesd/**"
       - "libs/cua-driver/rust/**"
-      - "libs/fleet/sdk/**"
-      - "libs/fleet/sdk-schema/**"
       - ".github/workflows/ci-cua-sdk.yml"
   workflow_dispatch:
 
@@ -36,7 +30,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-cua-sdk-${{ github.workflow }}-${{ github.ref }}
+  group: ci-cua-sdk-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   # Only superseded PR runs are cancelled. A main run always finishes, so
   # rust-cache saves the warm build that PR runs restore (cancelled main runs
   # never saved one, and every smoke job compiled cold).
@@ -57,13 +51,14 @@ env:
 
 jobs:
   rust:
+    if: ${{ !startsWith(github.head_ref, 'release-please--branches--') }}
     name: rust (${{ matrix.os }})
     runs-on: ${{ (matrix.os == 'macos-latest' || matrix.os == 'macos-26') && vars.FORK_MACOS_CI_ENABLED == 'true' && vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'ci-cua-sdk/rust') && fromJSON(vars.FORK_MACOS_RUNNER) || matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-26, windows-latest]
+        os: ${{ fromJSON((github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--') || contains(github.event.pull_request.labels.*.name, 'ci:full')) && '["ubuntu-latest","macos-26","windows-latest"]' || '["ubuntu-latest"]') }}
     defaults:
       run:
         working-directory: libs/cua
@@ -150,17 +145,42 @@ jobs:
             exit 1
           fi
 
+  # What a release publishes to crates.io (cd-cua-sdk.yml): cua-sdk,
+  # cua-spacesd-client and every workspace crate they need, packaged and
+  # built from their .crate files the way crates.io users get them, with no
+  # protoc installed. Fails when a change makes any of them unpublishable
+  # (a path dependency without a version, a file embedded from outside the
+  # crate, a dependency on an unpublished crate).
+  crates-dry-run:
+    if: ${{ !startsWith(github.head_ref, 'release-please--branches--') }}
+    name: crates.io dry run
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: ./.github/actions/linux-rust-prep
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.97.1
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
+        with:
+          workspaces: libs/cua
+      - name: cargo publish --dry-run
+        run: |
+          if command -v protoc; then echo "protoc must not be installed here" >&2; exit 1; fi
+          libs/cua/scripts/publish-crates.sh
+
   # The Spaces suites (cua-spaces, cua-daemon, cua-sdk) against a real
   # cua-spacesd server core in process. A standalone workspace so libs/cua
   # never depends on the driver workspace (see the boundary check above).
   spaces-e2e:
+    if: ${{ !startsWith(github.head_ref, 'release-please--branches--') }}
     name: spaces e2e (${{ matrix.os }})
     runs-on: ${{ (matrix.os == 'macos-latest' || matrix.os == 'macos-26') && vars.FORK_MACOS_CI_ENABLED == 'true' && vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'ci-cua-sdk/spaces-e2e') && fromJSON(vars.FORK_MACOS_RUNNER) || matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-26]
+        os: ${{ fromJSON((github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--') || contains(github.event.pull_request.labels.*.name, 'ci:full')) && '["ubuntu-latest","macos-26"]' || '["ubuntu-latest"]') }}
     defaults:
       run:
         working-directory: libs/cua-spacesd/tests/spaces-e2e
@@ -188,13 +208,14 @@ jobs:
           CUA_ENV_TEST_SANDBOX: "1"
 
   bindings:
+    if: ${{ !startsWith(github.head_ref, 'release-please--branches--') }}
     name: bindings drift (${{ matrix.os }})
     runs-on: ${{ (matrix.os == 'macos-latest' || matrix.os == 'macos-26') && vars.FORK_MACOS_CI_ENABLED == 'true' && vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'ci-cua-sdk/bindings') && fromJSON(vars.FORK_MACOS_RUNNER) || matrix.os }}
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-26]
+        os: ${{ fromJSON((github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--') || contains(github.event.pull_request.labels.*.name, 'ci:full')) && '["ubuntu-latest","macos-26"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: ./.github/actions/linux-rust-prep
@@ -222,6 +243,7 @@ jobs:
           cargo run --locked -q -p cua-spaces --bin cua-spaces-control-fixtures -- --check
 
   kotlin:
+    if: ${{ !startsWith(github.head_ref, 'release-please--branches--') }}
     # The generated binding must compile (an exported `close` once clashed
     # with AutoCloseable.close; uniffi.toml renames such methods).
     name: kotlin compile
@@ -234,6 +256,7 @@ jobs:
         run: gradle --no-daemon -p libs/cua/kotlin compileKotlin
 
   python:
+    if: ${{ !startsWith(github.head_ref, 'release-please--branches--') }}
     name: python smoke (${{ matrix.os }})
     runs-on: ${{ (matrix.os == 'macos-latest' || matrix.os == 'macos-26') && vars.FORK_MACOS_CI_ENABLED == 'true' && vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'ci-cua-sdk/python') && fromJSON(vars.FORK_MACOS_RUNNER) || matrix.os }}
     # A cold Windows run builds cua-sdk (release), the fixtures and the CLI:
@@ -242,7 +265,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-26, windows-latest]
+        os: ${{ fromJSON((github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--') || contains(github.event.pull_request.labels.*.name, 'ci:full')) && '["ubuntu-latest","macos-26","windows-latest"]' || '["ubuntu-latest"]') }}
     defaults:
       run:
         shell: bash
@@ -277,6 +300,7 @@ jobs:
           uv run --no-project --isolated --python 3.12 --with pytest --with "$WHEEL" pytest -q -p no:cacheprovider tests
 
   node:
+    if: ${{ !startsWith(github.head_ref, 'release-please--branches--') }}
     name: node smoke (${{ matrix.os }})
     runs-on: ${{ (matrix.os == 'macos-latest' || matrix.os == 'macos-26') && vars.FORK_MACOS_CI_ENABLED == 'true' && vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'ci-cua-sdk/node') && fromJSON(vars.FORK_MACOS_RUNNER) || matrix.os }}
     # A cold macOS run (release cua-sdk, fixtures, both CLIs) passed 45
@@ -285,7 +309,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-26]
+        os: ${{ fromJSON((github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--') || contains(github.event.pull_request.labels.*.name, 'ci:full')) && '["ubuntu-latest","macos-26"]' || '["ubuntu-latest"]') }}
     defaults:
       run:
         working-directory: libs/cua
@@ -315,6 +339,7 @@ jobs:
         run: npm --prefix typescript test
 
   browser:
+    if: ${{ !startsWith(github.head_ref, 'release-please--branches--') }}
     name: browser (wasm32) build + smoke
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -351,6 +376,7 @@ jobs:
 
   swift:
     name: swift smoke (macOS)
+    if: ${{ !startsWith(github.head_ref, 'release-please--branches--') && (github.event_name != 'pull_request' || startsWith(github.head_ref, 'release-please--') || contains(github.event.pull_request.labels.*.name, 'ci:full')) }}
     runs-on: ${{ vars.FORK_MACOS_CI_ENABLED == 'true' && vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'ci-cua-sdk/swift') && fromJSON(vars.FORK_MACOS_RUNNER) || 'macos-26' }}
     # Cold, the release cua-sdk build alone nears 45 minutes on macos-26.
     timeout-minutes: 90

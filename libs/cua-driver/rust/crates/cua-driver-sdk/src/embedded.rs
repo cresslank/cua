@@ -8,6 +8,7 @@ use cua_driver_contract::{
 };
 use cua_driver_core::daemon::{request_daemon_metadata, DaemonMetadata};
 use cua_driver_core::key_pacing::KEY_GAP_ENV;
+use cua_driver_core::step_pacing::BATCH_PACING_ENV;
 use cua_driver_core::window_observation::{WINDOW_CHANGE_POLL_ENV, WINDOW_CHANGE_TIMEOUT_ENV};
 use std::collections::BTreeMap;
 use std::process::Stdio;
@@ -853,6 +854,7 @@ pub(crate) fn allowed_environment_name(name: &str) -> bool {
         || cua_driver_core::input_pacing::ALL
             .iter()
             .any(|k| upper == k.env)
+        || upper == BATCH_PACING_ENV
         || matches!(
             upper.as_str(),
             "PATH"
@@ -939,6 +941,8 @@ pub(crate) fn inherited_runtime_environment_name(name: &str) -> bool {
             | "XDG_DATA_DIRS"
             | "XDG_DATA_HOME"
             | "XDG_SESSION_DESKTOP"
+            | "DESKTOP_SESSION"
+            | "NO_AT_BRIDGE"
             | "XDG_STATE_HOME"
     )
 }
@@ -1888,6 +1892,53 @@ mod tests {
     }
 
     #[test]
+    fn desktop_identity_and_accessibility_controls_reach_the_child() {
+        for name in [
+            "XDG_CURRENT_DESKTOP",
+            "XDG_SESSION_DESKTOP",
+            "DESKTOP_SESSION",
+            "NO_AT_BRIDGE",
+            "CUA_DRIVER_RS_DISABLE_A11Y_ADVERTISE",
+            "CUA_DRIVER_RS_A11Y_ADVERTISE_MODE",
+        ] {
+            assert!(
+                inherited_runtime_environment_name(name),
+                "{name} must reach a child through the inherited Linux preparation set"
+            );
+            assert!(
+                !allowed_environment_name(name),
+                "caller-provided environment must not override {name}"
+            );
+            let inherited = [(name.to_owned(), "inherited".to_owned())];
+            let host = EmbeddedEnvironmentVariable {
+                name: name.into(),
+                value: "host".into(),
+            };
+            let reached = |values: Vec<EmbeddedEnvironmentVariable>| -> Vec<String> {
+                values
+                    .into_iter()
+                    .filter(|variable| variable.name == name)
+                    .map(|variable| variable.value)
+                    .collect()
+            };
+            assert_eq!(
+                reached(merge_safe_environment(inherited.clone(), &[])),
+                ["inherited".to_owned()],
+                "{name}"
+            );
+            assert!(
+                reached(merge_safe_environment(std::iter::empty(), &[host.clone()])).is_empty(),
+                "{name} must not be injectable by an SDK override"
+            );
+            assert_eq!(
+                reached(merge_safe_environment(inherited, &[host])),
+                ["inherited".to_owned()],
+                "{name} inherited value must survive an SDK override"
+            );
+        }
+    }
+
+    #[test]
     fn metadata_validation_requires_same_process_and_contract() {
         let metadata = DaemonMetadata {
             driver_version: env!("CARGO_PKG_VERSION").into(),
@@ -2085,6 +2136,20 @@ mod tests {
                 "{name} rejected as an explicit override"
             );
         }
+    }
+
+    /// `CUA_DRIVER_BATCH_PACING` must reach an embedded child, or a host that
+    /// sets it to record full-speed cursor motion is silently overridden.
+    #[test]
+    fn batch_pacing_env_propagates() {
+        assert!(allowed_environment_name("CUA_DRIVER_BATCH_PACING"));
+        let merged = merge_safe_environment(
+            [("CUA_DRIVER_BATCH_PACING".to_owned(), "full".to_owned())],
+            &[],
+        );
+        assert!(merged
+            .iter()
+            .any(|v| v.name.eq_ignore_ascii_case("CUA_DRIVER_BATCH_PACING") && v.value == "full"));
     }
 
     #[cfg(target_os = "windows")]

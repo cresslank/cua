@@ -257,6 +257,31 @@
               "null"
             ]
           },
+          "hint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_call": {
+            "additionalProperties": false,
+            "properties": {
+              "arguments": {
+                "type": "object"
+              },
+              "tool": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tool",
+              "arguments"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -694,6 +719,31 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "hint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_call": {
+            "additionalProperties": false,
+            "properties": {
+              "arguments": {
+                "type": "object"
+              },
+              "tool": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tool",
+              "arguments"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -2255,6 +2305,31 @@
               "null"
             ]
           },
+          "hint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_call": {
+            "additionalProperties": false,
+            "properties": {
+              "arguments": {
+                "type": "object"
+              },
+              "tool": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tool",
+              "arguments"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -2482,6 +2557,31 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "hint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_call": {
+            "additionalProperties": false,
+            "properties": {
+              "arguments": {
+                "type": "object"
+              },
+              "tool": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tool",
+              "arguments"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -3111,6 +3211,31 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "hint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_call": {
+            "additionalProperties": false,
+            "properties": {
+              "arguments": {
+                "type": "object"
+              },
+              "tool": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tool",
+              "arguments"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -3856,6 +3981,31 @@
               "null"
             ]
           },
+          "hint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_call": {
+            "additionalProperties": false,
+            "properties": {
+              "arguments": {
+                "type": "object"
+              },
+              "tool": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tool",
+              "arguments"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -4127,6 +4277,31 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "hint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_call": {
+            "additionalProperties": false,
+            "properties": {
+              "arguments": {
+                "type": "object"
+              },
+              "tool": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tool",
+              "arguments"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },
@@ -4777,6 +4952,31 @@
               "null"
             ]
           },
+          "hint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_call": {
+            "additionalProperties": false,
+            "properties": {
+              "arguments": {
+                "type": "object"
+              },
+              "tool": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tool",
+              "arguments"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -5419,6 +5619,31 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "hint": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_call": {
+            "additionalProperties": false,
+            "properties": {
+              "arguments": {
+                "type": "object"
+              },
+              "tool": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tool",
+              "arguments"
+            ],
+            "type": [
+              "object",
               "null"
             ]
           },

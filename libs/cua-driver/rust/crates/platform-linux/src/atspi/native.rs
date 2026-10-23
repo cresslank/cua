@@ -1398,10 +1398,18 @@ async fn resolve_window_frame(
         return correlate_hyprland_frame(&frames, &clients, target);
     }
     if seeds.len() == 1 {
-        // One top-level: the caller's window is the only thing this
-        // application could be showing, and no geometry round-trip can make
-        // that more certain.
-        return Some(0);
+        // One top-level: on X11, and on compositors without a GNOME Shell,
+        // the caller's window is the only thing this application could be
+        // showing, and no geometry round-trip can make that more certain.
+        // GNOME's AT-SPI tree can omit a window the Shell has mapped, so
+        // there the Shell must vouch for it (`lone_top_level_renders`).
+        let proven = !crate::wayland::is_wayland()
+            || bounded_blocking(move || lone_top_level_proves_window(pid, xid))
+                .await
+                .unwrap_or(false);
+        if proven {
+            return Some(0);
+        }
     }
     let windows = if crate::wayland::is_wayland() {
         crate::wayland::list_windows_dispatch(Some(pid))
@@ -2898,7 +2906,7 @@ fn list_windows_blocking(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo>
                     )
                     .unwrap_or((observed_x, observed_y));
                     // Stable, non-zero, unique per (pid, frame ordinal).
-                    let xid = (((cpid as u64) << 16) | (i as u64)).max(1);
+                    let xid = accessibility_window_id(cpid, i);
                     let z_index = z_index_from_stacking(&stacking, cpid, &title);
                     out.push(WindowInfo {
                         xid,
@@ -3768,7 +3776,7 @@ fn exact_window_top_level_key(roots: &[(u64, usize)], pid: u32, window_id: u64) 
 
     let direct = unique
         .iter()
-        .filter(|(_, ordinal)| (((pid as u64) << 16) | (*ordinal as u64)).max(1) == window_id)
+        .filter(|(_, ordinal)| accessibility_window_id(pid, *ordinal) == window_id)
         .map(|(key, _)| *key)
         .collect::<Vec<_>>();
     match direct.as_slice() {
@@ -5032,7 +5040,7 @@ pub fn scroll_observed_element(
             }
 
             Err(anyhow!(
-                "element {idx} exposes neither directional scroll actions nor Value"
+                "the element exposes neither directional scroll actions nor Value"
             ))
         },
         || Err(anyhow!("observed scroll timed out for pid {pid}")),
@@ -5727,6 +5735,10 @@ pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> 
             let target = action_nodes
                 .get(idx)
                 .ok_or_else(|| anyhow!("element {idx} not found"))?;
+            // Pid-only bounds have no requested window. xid 0 is a no-op in
+            // gnome_window_bound_element_async; window-scoped reads use
+            // get_element_bounds_for_window, which already requires a correlated frame.
+            gnome_window_bound_element_async(pid, 0, target.frame_ordinal, None).await?;
             if !target.has_component {
                 return Err(anyhow!("element {idx} exposes no Component interface"));
             }
@@ -6096,9 +6108,10 @@ fn window_to_screen_offset(pid: u32, xid: u64, title: Option<&str>) -> Option<(i
         // compositor exposes no geometry. Keep that observation as the final
         // fallback so stale default placement cannot override Sway IPC or a
         // shell helper's authoritative frame.
-        return prefer_authoritative_wayland_origin(
+        return wayland_window_origin(
             authoritative,
-            crate::wayland::observed_window_origin(pid),
+            || crate::wayland::observed_window_origin(pid),
+            crate::wayland::shell_helper::available,
         );
     }
     // Resolve a usable window xid. `xid == 0` means "no hint" (get_element_bounds
@@ -6142,7 +6155,7 @@ fn authoritative_wayland_origin(pid: u32, xid: u64, title: Option<&str>) -> Opti
                 })
                 .flatten()
         })
-        .or_else(|| crate::wayland::shell_helper::window_origin_for_pid(pid))
+        .or_else(|| crate::wayland::shell_helper::window_origin(pid, xid))
         .or_else(|| title.and_then(crate::wayland::sway_ipc::window_origin_for_title))
 }
 
@@ -6151,6 +6164,31 @@ fn prefer_authoritative_wayland_origin(
     observed: Option<(i32, i32)>,
 ) -> Option<(i32, i32)> {
     authoritative.or(observed)
+}
+
+/// [`prefer_authoritative_wayland_origin`] for one window's element geometry.
+/// The observation is keyed by PID alone, so it may be a sibling window's
+/// origin. An attested GNOME Shell helper reports every window's exact frame;
+/// when it has none for this window, the observation must not stand in.
+fn wayland_window_origin(
+    authoritative: Option<(i32, i32)>,
+    observed: impl FnOnce() -> Option<(i32, i32)>,
+    shell_reports_exact_frames: impl FnOnce() -> bool,
+) -> Option<(i32, i32)> {
+    if authoritative.is_some() || shell_reports_exact_frames() {
+        return authoritative;
+    }
+    observed()
+}
+
+/// A window-bound geometry query that must refuse instead of falling back to
+/// `CoordType::Screen`: the attested GNOME Shell helper reports exact frames,
+/// and Mutter's Screen extents are not screen coordinates.
+fn exact_wayland_origin_required(xid: u64) -> bool {
+    xid != 0
+        && crate::wayland::is_wayland()
+        && !crate::wayland::hyprland::is_session()
+        && crate::wayland::shell_helper::available()
 }
 
 fn combine_wayland_content_offsets(
@@ -6360,6 +6398,275 @@ fn scoped_component_nodes<'a, T>(
     })
 }
 
+const WINDOW_SCOPE_UNPROVEN: &str = "the accessibility frame of this GNOME window is unproven \
+     and its process has other windows";
+const ELEMENT_OUTSIDE_WINDOW: &str = "element does not belong to the requested window";
+
+/// A window-bound element request failed its window-membership proof. Callers
+/// acting for an exact window refuse on it instead of acting elsewhere.
+#[derive(Debug)]
+pub struct WindowMembershipUnproven(&'static str);
+
+impl std::fmt::Display for WindowMembershipUnproven {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+impl std::error::Error for WindowMembershipUnproven {}
+
+pub fn is_window_membership_unproven(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<WindowMembershipUnproven>().is_some()
+}
+
+/// The AT-SPI window list's handle for top-level `ordinal` of `pid`: stable,
+/// non-zero and unique per (pid, ordinal).
+pub(crate) fn accessibility_window_id(pid: u32, ordinal: usize) -> u64 {
+    ((u64::from(pid) << 16) | ordinal as u64).max(1)
+}
+
+/// GNOME ties an AT-SPI top-level to a Shell window only through frame
+/// correlation. Without it, a window-bound query would admit every same-PID
+/// window's nodes and project them with the requested window's origin, so a
+/// sibling's control could be hit-tested or bounded as the requested one.
+///
+/// A correlated `scoped_frame` is proof. Otherwise the attested Shell must
+/// list exactly one window for the PID, the requested one. With no attested
+/// Shell, a GNOME session proves nothing, except that the AT-SPI window list's
+/// own handle for an application's first top-level names that top-level
+/// (`accessibility_handle`). Compositors without a GNOME Shell keep their
+/// route.
+pub(crate) fn gnome_window_scope_proven(
+    xid: u64,
+    scoped_frame: Option<usize>,
+    accessibility_handle: bool,
+    gnome_session: impl FnOnce() -> bool,
+    pid_shell_windows: impl FnOnce() -> Option<Vec<u64>>,
+) -> bool {
+    if xid == 0 || scoped_frame.is_some() {
+        return true;
+    }
+    match pid_shell_windows() {
+        Some(ids) => ids == [xid],
+        None => accessibility_handle || !gnome_session(),
+    }
+}
+
+/// Whether an application's lone AT-SPI top-level renders window `xid` on a
+/// Wayland session outside Hyprland.
+pub(crate) fn lone_top_level_renders(
+    pid: u32,
+    xid: u64,
+    gnome_session: impl FnOnce() -> bool,
+    pid_shell_windows: impl FnOnce() -> Option<Vec<u64>>,
+) -> bool {
+    gnome_window_scope_proven(
+        xid,
+        None,
+        xid == accessibility_window_id(pid, 0),
+        gnome_session,
+        pid_shell_windows,
+    )
+}
+
+fn lone_top_level_proves_window(pid: u32, xid: u64) -> bool {
+    lone_top_level_renders(
+        pid,
+        xid,
+        crate::wayland::shell_helper::gnome_shell_session,
+        || crate::wayland::shell_helper::trusted_window_ids_for_pid(pid),
+    )
+}
+
+/// An element answers a window-bound query only from a proven window scope,
+/// and only from that window's top-level when one was correlated.
+fn window_bound_element(
+    element_frame: usize,
+    scoped_frame: Option<usize>,
+    scope_proven: impl FnOnce() -> bool,
+) -> Result<()> {
+    if !scope_proven() {
+        return Err(WindowMembershipUnproven(WINDOW_SCOPE_UNPROVEN).into());
+    }
+    if scoped_frame.is_some_and(|scope| element_frame != scope) {
+        return Err(WindowMembershipUnproven(ELEMENT_OUTSIDE_WINDOW).into());
+    }
+    Ok(())
+}
+
+/// The window-scope rule for a walk of window `xid`. X11 and Hyprland keep
+/// their own routes.
+fn window_scope_proven(pid: u32, xid: u64, scoped_frame: Option<usize>) -> bool {
+    if !crate::wayland::is_wayland() || crate::wayland::hyprland::is_session() {
+        return true;
+    }
+    gnome_window_scope_proven(
+        xid,
+        scoped_frame,
+        false,
+        crate::wayland::shell_helper::gnome_shell_session,
+        || crate::wayland::shell_helper::trusted_window_ids_for_pid(pid),
+    )
+}
+
+/// [`window_scope_proven`] from async code. Cases that need no Shell query
+/// answer at once; the rest run off the runtime and refuse on timeout.
+async fn window_scope_proven_async(pid: u32, xid: u64, scoped_frame: Option<usize>) -> bool {
+    if xid == 0
+        || scoped_frame.is_some()
+        || !crate::wayland::is_wayland()
+        || crate::wayland::hyprland::is_session()
+    {
+        return true;
+    }
+    bounded_blocking(move || window_scope_proven(pid, xid, scoped_frame))
+        .await
+        .unwrap_or(false)
+}
+
+/// [`window_bound_element`] where GNOME's rules apply: Wayland outside
+/// Hyprland with an attested Shell helper or a GNOME session. X11, Hyprland
+/// and compositors without a GNOME Shell keep their routes.
+fn gnome_window_bound_element(
+    pid: u32,
+    xid: u64,
+    element_frame: usize,
+    scoped_frame: Option<usize>,
+) -> Result<()> {
+    if xid == 0 || !crate::wayland::is_wayland() || crate::wayland::hyprland::is_session() {
+        return Ok(());
+    }
+    let shell_windows = crate::wayland::shell_helper::trusted_window_ids_for_pid(pid);
+    if shell_windows.is_none() && !crate::wayland::shell_helper::gnome_shell_session() {
+        return Ok(());
+    }
+    window_bound_element(element_frame, scoped_frame, || {
+        gnome_window_scope_proven(xid, scoped_frame, false, || true, || shell_windows)
+    })
+}
+
+async fn gnome_window_bound_element_async(
+    pid: u32,
+    xid: u64,
+    element_frame: usize,
+    scoped_frame: Option<usize>,
+) -> Result<()> {
+    if xid == 0 || !crate::wayland::is_wayland() || crate::wayland::hyprland::is_session() {
+        return Ok(());
+    }
+    bounded_blocking(move || gnome_window_bound_element(pid, xid, element_frame, scoped_frame))
+        .await
+        .unwrap_or_else(|| {
+            Err(WindowMembershipUnproven("the window-membership check timed out").into())
+        })
+}
+
+/// Whether a snapshot of window `xid` may bind its elements to that window as
+/// element tokens. Hyprland needs a correlated top-level. Elsewhere a native
+/// walk's correlated top-level counts, or else the window-scope rule for an
+/// uncorrelated walk: always on X11 and on compositors without a GNOME Shell,
+/// and on GNOME only when the attested Shell lists exactly `xid` for the PID.
+pub(crate) fn snapshot_binds_window(
+    hyprland_session: bool,
+    window_scoped: bool,
+    trusted: bool,
+    unscoped_walk_proven: impl FnOnce() -> bool,
+) -> bool {
+    if hyprland_session {
+        return window_scoped;
+    }
+    (trusted && window_scoped) || unscoped_walk_proven()
+}
+
+pub fn snapshot_binds_window_for(pid: u32, xid: u64, window_scoped: bool, trusted: bool) -> bool {
+    snapshot_binds_window(
+        crate::wayland::is_wayland() && crate::wayland::hyprland::is_session(),
+        window_scoped,
+        trusted,
+        || window_scope_proven(pid, xid, None),
+    )
+}
+
+/// The element a window-bound action names: an index into the walk the
+/// action makes, or the AT-SPI identity a snapshot observed.
+pub enum WindowElement {
+    Index(usize),
+    Identity(super::AtspiIdentity),
+}
+
+impl WindowElement {
+    fn find<'v, 'a>(&self, visited: &'v [Visited<'a>]) -> Option<&'v Visited<'a>> {
+        match self {
+            Self::Index(idx) => visited.iter().filter(|v| is_indexable(v)).nth(*idx),
+            Self::Identity(identity) => visited
+                .iter()
+                .find(|v| v.identity.as_ref() == Some(identity)),
+        }
+    }
+}
+
+/// What [`require_window_element`] established for an element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowProof {
+    /// A fresh walk scoped to the window found the element there. The action
+    /// must act on that element and never re-resolve an index.
+    Proven,
+    /// The session keeps its own route (X11, Hyprland, compositors without a
+    /// GNOME Shell); no proof was needed.
+    NotRequired,
+}
+
+/// Membership of an element found at `element_frame` (`None` when the fresh
+/// walk no longer has it) in a window-bound walk.
+pub(crate) fn window_element_membership(
+    element_frame: Option<usize>,
+    scoped_frame: Option<usize>,
+    scope_proven: impl FnOnce() -> bool,
+) -> Result<()> {
+    let frame = element_frame.ok_or(WindowMembershipUnproven(
+        "the element is no longer in the application's accessibility tree",
+    ))?;
+    window_bound_element(frame, scoped_frame, scope_proven)
+}
+
+/// Fresh-walk proof that `element` still belongs to window `xid`, for an
+/// action on behalf of that window. The walk is scoped to `xid` and judged by
+/// the rule window-bound bounds use. X11, Hyprland and compositors without a
+/// GNOME Shell keep their own routes ([`WindowProof::NotRequired`]).
+pub fn require_window_element(pid: u32, xid: u64, element: WindowElement) -> Result<WindowProof> {
+    if xid == 0 || !crate::wayland::is_wayland() || crate::wayland::hyprland::is_session() {
+        return Ok(WindowProof::NotRequired);
+    }
+    let shell_windows = crate::wayland::shell_helper::trusted_window_ids_for_pid(pid);
+    if shell_windows.is_none() && !crate::wayland::shell_helper::gnome_shell_session() {
+        return Ok(WindowProof::NotRequired);
+    }
+    bounded_for(
+        INDEX_RESOLVE_BUDGET,
+        async move {
+            let conn = shared_connection().await?;
+            let Collected {
+                visited,
+                scoped_frame,
+                ..
+            } = collect_visited_bounded(&conn, pid, xid, None, None)
+                .await?
+                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+            let element_frame = element.find(&visited).map(|v| v.frame_ordinal);
+            window_element_membership(element_frame, scoped_frame, || {
+                gnome_window_scope_proven(xid, scoped_frame, false, || true, || shell_windows)
+            })
+            .map(|()| WindowProof::Proven)
+        },
+        || {
+            Err(WindowMembershipUnproven(
+                "the window-membership walk timed out (app unresponsive to AT-SPI)",
+            )
+            .into())
+        },
+    )
+}
+
 /// Screen-coordinate bounds for the exact visited sequence rendered into the
 /// current snapshot. Nodes without a usable Component interface, or whose
 /// extents query fails/times out, are omitted rather than borrowing another
@@ -6407,6 +6714,16 @@ async fn element_bounds_for_visited_with_completeness(
         && crate::wayland::hyprland::is_session()
         && (offset.is_none() || scoped_frame.is_none())
     {
+        return (Vec::new(), true);
+    }
+    if offset.is_none()
+        && bounded_blocking(move || exact_wayland_origin_required(xid))
+            .await
+            .unwrap_or(true)
+    {
+        return (Vec::new(), true);
+    }
+    if !window_scope_proven_async(pid, xid, scoped_frame).await {
         return (Vec::new(), true);
     }
     let coord = if offset.is_some() {
@@ -6910,7 +7227,8 @@ mod coord_tests {
         is_indexable_capabilities, is_passive_role, is_showing_state, is_web_process_bus,
         listing_state, passive_marker, prefer_authoritative_wayland_origin, push_action_name_slot,
         rebase_renderer_window_offset, require_affirmative_ack, screen_extent_rebase,
-        select_click_target, selected_key_at_point, ApplicationSelection, OP_DEADLINE,
+        select_click_target, selected_key_at_point, wayland_window_origin, ApplicationSelection,
+        OP_DEADLINE,
     };
     use super::{element_key_for_object, RawObjectRef};
     use super::{
@@ -7452,6 +7770,26 @@ mod coord_tests {
         assert_eq!(
             prefer_authoritative_wayland_origin(None, Some((120, 120))),
             Some((120, 120))
+        );
+    }
+
+    #[test]
+    fn an_attested_shell_without_the_exact_frame_admits_no_pid_observation() {
+        let observed = || Some((120, 120));
+        assert_eq!(
+            wayland_window_origin(Some((600, 0)), observed, || true),
+            Some((600, 0))
+        );
+        assert_eq!(wayland_window_origin(None, observed, || true), None);
+        // Without a Shell helper (Sway, KDE, GNOME without it) the
+        // observation stays the last fallback.
+        assert_eq!(
+            wayland_window_origin(None, observed, || false),
+            Some((120, 120))
+        );
+        assert_eq!(
+            wayland_window_origin(Some((0, 0)), observed, || false),
+            Some((0, 0))
         );
     }
 
@@ -8071,4 +8409,1316 @@ pub(crate) fn walk_bounds_usable(
         }
     }
     Some((x, y, w, h))
+}
+
+// --- Upstream retained-object dispatch ----------------------------------------
+// These address the D-Bus object a snapshot observed. They do not consult
+// the PID-only side index and they do not inherit AT_SPI_BUS_ADDRESS.
+// Blocking work stays on cua_driver_core::blocking::spawn via bounded_for.
+
+fn require_exact_origin(offset: Option<(i32, i32)>, xid: u64, required: bool) -> Result<()> {
+    if offset.is_none() && required {
+        return Err(anyhow!(
+            "window {xid} has no exact frame from the GNOME Shell helper"
+        ));
+    }
+    Ok(())
+}
+
+const REF_ACTION_BUDGET: Duration = Duration::from_secs(3);
+
+fn raw_ref(object_ref: &ObjectRef) -> RawObjectRef {
+    RawObjectRef {
+        name: object_ref.bus.clone(),
+        path: object_ref.path.clone(),
+    }
+}
+
+/// Current action names of an Action proxy, index-aligned with `do_action`.
+async fn action_names(ap: &atspi::proxy::action::ActionProxy<'_>) -> Vec<String> {
+    let n = call(ap.n_actions()).await.and_then(|r| r.ok()).unwrap_or(0);
+    let mut names = Vec::with_capacity(n.max(0) as usize);
+    for i in 0..n {
+        names.push(
+            call(ap.get_name(i))
+                .await
+                .and_then(|r| r.ok())
+                .unwrap_or_default(),
+        );
+    }
+    names
+}
+
+/// The snapshot-cached object no longer answers on the bus (or never did):
+/// the observation is stale and must not be retargeted by index.
+#[derive(Debug)]
+pub struct CachedElementGone(pub String);
+impl std::fmt::Display for CachedElementGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for CachedElementGone {}
+
+/// Open a cached accessible and prove it is still alive (one role read).
+async fn live_accessible<'a>(
+    conn: &'a AccessibilityConnection,
+    object_ref: &ObjectRef,
+) -> Result<(AccessibleProxy<'a>, String)> {
+    let acc = match call(accessible_for(conn, &raw_ref(object_ref))).await {
+        Some(Ok(acc)) => acc,
+        Some(Err(error)) => {
+            return Err(CachedElementGone(format!("cached element unreachable: {error}")).into())
+        }
+        None => return Err(anyhow!("cached element did not answer in time")),
+    };
+    let role = match call(acc.get_role_name()).await {
+        Some(Ok(role)) => role,
+        Some(Err(error)) => {
+            return Err(CachedElementGone(format!("cached element is gone: {error}")).into())
+        }
+        None => return Err(anyhow!("cached element did not answer in time")),
+    };
+    Ok((acc, role))
+}
+
+/// [`perform_action`] on a snapshot-cached element identity. Same contract:
+/// `Ok((action_name, suspected_noop))`. Errors when the object no longer
+/// exists so the caller can fall back to resolving the index afresh.
+pub fn perform_action_ref(object_ref: &ObjectRef) -> Result<(String, bool, bool)> {
+    bounded_for(
+        REF_ACTION_BUDGET,
+        async {
+            let conn = shared_connection().await?;
+            let (acc, role) = live_accessible(&conn, object_ref).await?;
+            let proxies = acc
+                .proxies()
+                .await
+                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
+            let ap = proxies
+                .action()
+                .await
+                .map_err(|e| anyhow!("Action unavailable: {e}"))?;
+            let actions = action_names(&ap).await;
+            let suspected_noop = actions.is_empty() || is_passive_role(&role);
+            let chosen = activation_index(&role, &actions)
+                .ok_or_else(|| anyhow!("element does not advertise a safe activation action"))?;
+            // See `perform_action`'s `unacknowledged`: an unanswered doAction
+            // is unknown, not dispatched-implies-success, and must not be
+            // folded into `rejected`/`suspected_noop` (which would claim the
+            // toolkit declined it) nor silently reported as a plain success.
+            let mut unacknowledged = false;
+            let rejected = match call(ap.do_action(chosen as i32)).await {
+                Some(Ok(accepted)) => !accepted,
+                Some(Err(e)) => return Err(anyhow!("doAction failed: {e}")),
+                // The request was delivered; a GTK item whose action opens a
+                // dialog (nested main loop) only replies once that dialog
+                // closes. Treat the timeout as dispatched-but-unconfirmed:
+                // falling back to another route would fire the item twice.
+                None => {
+                    dlog!("doAction dispatched but not acknowledged in time");
+                    unacknowledged = true;
+                    false
+                }
+            };
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok((
+                actions.get(chosen).cloned().unwrap_or_default(),
+                suspected_noop || rejected,
+                unacknowledged,
+            ))
+        },
+        || Err(anyhow!("perform_action (cached element) timed out")),
+    )
+}
+
+/// Screen bounds of a snapshot-cached element identity: one `GetExtents`
+/// round-trip, no tree re-walk. `Err` when the object is gone or does not
+/// answer within [`REF_ACTION_BUDGET`]; the caller decides whether to re-walk.
+/// The X11 origin lookup runs on the caller's (blocking) thread before the
+/// runtime is entered, so no synchronous X11 I/O happens under `block_on`.
+pub fn element_bounds_ref(
+    object_ref: &ObjectRef,
+    pid: u32,
+    xid: u64,
+    in_web_content: bool,
+) -> Result<(i32, i32, u32, u32)> {
+    if in_web_content {
+        return Err(anyhow!(
+            "web-content bounds need the document origin; re-walk"
+        ));
+    }
+    let offset = window_to_screen_offset(pid, xid, None);
+    require_exact_origin(offset, xid, exact_wayland_origin_required(xid))?;
+    let coord = if offset.is_some() {
+        CoordType::Window
+    } else {
+        CoordType::Screen
+    };
+    let display = (!crate::wayland::is_wayland())
+        .then(x11_display_size)
+        .flatten();
+    let origin_attested = native_wayland_origin_attested(pid, xid);
+    bounded_for(
+        REF_ACTION_BUDGET,
+        async {
+            let conn = shared_connection().await?;
+            let (acc, _) = live_accessible(&conn, object_ref).await?;
+            let proxies = match call(acc.proxies()).await {
+                Some(Ok(proxies)) => proxies,
+                Some(Err(e)) => return Err(anyhow!("interface proxies unavailable: {e}")),
+                None => return Err(anyhow!("cached element did not answer in time")),
+            };
+            let component = match call(proxies.component()).await {
+                Some(Ok(component)) => component,
+                Some(Err(e)) => return Err(anyhow!("Component unavailable: {e}")),
+                None => return Err(anyhow!("cached element did not answer in time")),
+            };
+            if coord == CoordType::Window {
+                if let Some(Ok(raw)) = call(component.get_extents(CoordType::Screen)).await {
+                    if screen_answer_overrides_window(raw, display, origin_attested) {
+                        return project_screen_extents(raw, (0, 0), None)
+                            .ok_or_else(|| anyhow!("cached element reports no on-screen extents"));
+                    }
+                }
+            }
+            let extents = match call(component.get_extents(coord)).await {
+                Some(Ok(extents)) => extents,
+                Some(Err(e)) => return Err(anyhow!("getExtents failed: {e}")),
+                None => return Err(anyhow!("getExtents did not answer in time")),
+            };
+            project_screen_extents(extents, offset.unwrap_or((0, 0)), None)
+                .ok_or_else(|| anyhow!("cached element reports no on-screen extents"))
+        },
+        || Err(anyhow!("element_bounds (cached element) timed out")),
+    )
+}
+
+/// Whether a snapshot-cached element is currently on screen: its own AT-SPI
+/// state set carries `Showing` (a GTK menu item whose menu is closed, or a
+/// widget on an unmapped notebook page, lacks it even though the object
+/// still exists). `Ok(true)` when the toolkit exposes no state set.
+pub fn element_showing_ref(object_ref: &ObjectRef) -> Result<bool> {
+    bounded_for(
+        REF_ACTION_BUDGET,
+        async {
+            let conn = shared_connection().await?;
+            let (acc, _) = live_accessible(&conn, object_ref).await?;
+            match call(acc.get_state()).await {
+                Some(Ok(state)) => Ok(is_showing_state(&state)),
+                Some(Err(_)) => Ok(true),
+                None => Err(anyhow!("cached element did not answer in time")),
+            }
+        },
+        || Err(anyhow!("element_showing (cached element) timed out")),
+    )
+}
+
+/// [`focus_element`] on a snapshot-cached element identity.
+pub fn focus_element_ref(object_ref: &ObjectRef) -> Result<bool> {
+    bounded_for(
+        REF_ACTION_BUDGET,
+        async {
+            let conn = shared_connection().await?;
+            let (acc, _) = live_accessible(&conn, object_ref).await?;
+            let proxies = acc
+                .proxies()
+                .await
+                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
+            let component = proxies
+                .component()
+                .await
+                .map_err(|e| anyhow!("Component interface unavailable: {e}"))?;
+            let accepted = match call(component.grab_focus()).await {
+                Some(Ok(focused)) => focused,
+                Some(Err(e)) => return Err(anyhow!("Component.GrabFocus failed: {e}")),
+                None => return Err(anyhow!("Component.GrabFocus timed out")),
+            };
+            if !accepted {
+                return Ok(false);
+            }
+            let settle_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+            while tokio::time::Instant::now() < settle_deadline {
+                match tokio::time::timeout(Duration::from_millis(100), acc.get_state()).await {
+                    Ok(Ok(state)) if state.contains(State::Focused) => return Ok(true),
+                    _ => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            }
+            Ok(false)
+        },
+        || Err(anyhow!("focus_element (cached element) timed out")),
+    )
+}
+
+/// Focus-free EditableText write for a retained object reference. GrabFocus is
+/// only the fallback after a direct write, matching the observed route, and
+/// never carries a second mutation permit.
+async fn write_into_editable_acc(
+    acc: &AccessibleProxy<'_>,
+    has_component: bool,
+    text: &str,
+) -> Result<bool> {
+    let proxies = acc
+        .proxies()
+        .await
+        .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
+    if write_through_editable_proxies(&proxies, text, None).await? {
+        return Ok(true);
+    }
+    if has_component {
+        if let Ok(comp) = proxies.component().await {
+            match call(comp.grab_focus()).await {
+                Some(Ok(true)) => dlog!("GrabFocus succeeded"),
+                Some(Ok(false)) => dlog!("GrabFocus returned false"),
+                Some(Err(e)) => dlog!("GrabFocus failed: {e}"),
+                None => dlog!("GrabFocus timed out"),
+            }
+        }
+    }
+    write_through_editable_proxies(&proxies, text, None).await
+}
+
+/// [`type_into_editable_at`] on a snapshot-cached element identity.
+pub fn type_into_editable_ref(object_ref: &ObjectRef, text: &str) -> Result<()> {
+    bounded_for(
+        REF_ACTION_BUDGET,
+        async {
+            let conn = shared_connection().await?;
+            let (acc, _) = live_accessible(&conn, object_ref).await?;
+            let ifaces = match call(acc.get_interfaces()).await {
+                Some(Ok(ifaces)) => ifaces,
+                _ => return Err(anyhow!("cached element interfaces unavailable")),
+            };
+            if !ifaces.contains(Interface::EditableText) {
+                return Err(anyhow!("cached element is not editable"));
+            }
+            if write_into_editable_acc(&acc, ifaces.contains(Interface::Component), text).await? {
+                Ok(())
+            } else {
+                Err(anyhow!("EditableText write was rejected"))
+            }
+        },
+        || Err(anyhow!("type_into_editable (cached element) timed out")),
+    )
+}
+
+/// Invoke the original target's semantic actions, pacing multi-page requests
+/// with descendant motion. `Err` means no mutation was attempted; an incomplete
+/// `ScrollProgress` preserves uncertainty after an attempted mutation. An
+/// identity the fresh walk no longer has is [`CachedElementGone`].
+pub fn scroll_element(
+    pid: u32,
+    element: &WindowElement,
+    direction: &str,
+    amount: usize,
+    by: cua_driver_contract::ScrollBy,
+) -> Result<ScrollProgress> {
+    let attempted = std::cell::Cell::new(false);
+    let acknowledged = std::cell::Cell::new(0);
+    let result = bounded(
+        async {
+            let conn = shared_connection().await?;
+            let visited = collect_visited(&conn, pid)
+                .await?
+                .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
+            let target = element.find(&visited).ok_or_else(|| match element {
+                WindowElement::Index(idx) => {
+                    anyhow!("element {idx} not found (total: {})", visited.len())
+                }
+                WindowElement::Identity(_) => CachedElementGone(
+                    "the observed element is no longer in the application's accessibility tree"
+                        .into(),
+                )
+                .into(),
+            })?;
+            let proxies = target
+                .acc
+                .proxies()
+                .await
+                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
+            let wanted = match direction {
+                "up" => ["scrollup", "scrollbackward"],
+                "left" => ["scrollleft", "scrollbackward"],
+                "right" => ["scrollright", "scrollforward"],
+                _ => ["scrolldown", "scrollforward"],
+            };
+            let mut selected = None;
+            let mut action_proxy = None;
+            if let Ok(action) = proxies.action().await {
+                let count = call(action.n_actions())
+                    .await
+                    .and_then(|result| result.ok())
+                    .unwrap_or(0);
+                for action_index in 0..count {
+                    if let Some(Ok(name)) = call(action.get_name(action_index)).await {
+                        let normalized: String = name
+                            .chars()
+                            .filter(|ch| ch.is_ascii_alphanumeric())
+                            .flat_map(|ch| ch.to_lowercase())
+                            .collect();
+                        if wanted.iter().any(|candidate| *candidate == normalized) {
+                            selected = Some(action_index);
+                            break;
+                        }
+                    }
+                }
+                action_proxy = Some(action);
+            }
+
+            if let (Some(action), Some(action_index)) = (action_proxy, selected) {
+                let mut observation = None;
+                if by == cua_driver_contract::ScrollBy::Page && amount > 1 {
+                    let component = proxies.component().await?;
+                    let target_index = visited
+                        .iter()
+                        .position(|node| std::ptr::eq(node, target))
+                        .unwrap();
+                    let mut probes = Vec::new();
+                    // Fix probe identities before dispatch; never replace vanished descendants.
+                    for index in
+                        descendant_indices(visited.iter().map(|node| node.depth), target_index)
+                    {
+                        if !visited[index].has_component {
+                            continue;
+                        }
+                        if let Some(Ok(proxies)) = call(visited[index].acc.proxies()).await {
+                            if let Some(Ok(probe)) = call(proxies.component()).await {
+                                probes.push(probe);
+                            }
+                        }
+                    }
+                    for coord in [CoordType::Window, CoordType::Screen] {
+                        let mut usable = Vec::new();
+                        for probe in &probes {
+                            if sample_page_probes(&component, std::slice::from_ref(probe), coord)
+                                .await
+                                .is_ok()
+                            {
+                                usable.push(probe.clone());
+                                if usable.len() == 8 {
+                                    break;
+                                }
+                            }
+                        }
+                        if !usable.is_empty() {
+                            let baseline = sample_page_probes(&component, &usable, coord).await?;
+                            observation = Some((component.clone(), usable, coord, baseline));
+                            break;
+                        }
+                    }
+                    if observation.is_none() {
+                        return Err(anyhow!("no usable descendant scroll probes"));
+                    }
+                }
+                scroll_sequence(
+                    amount,
+                    observation.as_ref().map(|o| o.3.clone()),
+                    &attempted,
+                    &acknowledged,
+                    || async { action.do_action(action_index).await.map_err(Into::into) },
+                    |baseline| async {
+                        let (component, probes, coord, _) = observation
+                            .as_ref()
+                            .expect("page probes selected before dispatch");
+                        let mut motion = PageMotion::new(baseline);
+                        let started = tokio::time::Instant::now();
+                        loop {
+                            let sample = sample_page_probes(component, probes, *coord).await?;
+                            let settled = motion.observe(&sample, direction);
+                            dlog!(
+                                "scroll sequence sample elapsed_ms={} positions={sample:?} settled={settled}",
+                                started.elapsed().as_millis()
+                            );
+                            if settled {
+                                return Ok(sample);
+                            }
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        }
+                    },
+                )
+                .await?;
+                return Ok(());
+            }
+
+            if target.has_value {
+                let value = proxies
+                    .value()
+                    .await
+                    .map_err(|e| anyhow!("Value interface unavailable: {e}"))?;
+                let current = call(value.current_value())
+                    .await
+                    .and_then(|result| result.ok())
+                    .ok_or_else(|| anyhow!("scroll value lookup timed out"))?;
+                let minimum = call(value.minimum_value())
+                    .await
+                    .and_then(|result| result.ok())
+                    .unwrap_or(current);
+                let maximum = call(value.maximum_value())
+                    .await
+                    .and_then(|result| result.ok())
+                    .unwrap_or(current);
+                let increment = call(value.minimum_increment())
+                    .await
+                    .and_then(|result| result.ok())
+                    .filter(|increment| *increment > 0.0)
+                    .unwrap_or(1.0);
+                let sign = if matches!(direction, "up" | "left") {
+                    -1.0
+                } else {
+                    1.0
+                };
+                let next =
+                    (current + sign * increment * amount.max(1) as f64).clamp(minimum, maximum);
+                attempted.set(true);
+                call(value.set_current_value(next))
+                    .await
+                    .and_then(|result| result.ok())
+                    .ok_or_else(|| anyhow!("scroll value update timed out"))?;
+                acknowledged.set(1);
+                return Ok(());
+            }
+
+            Err(anyhow!(
+                "the element exposes neither directional scroll actions nor Value"
+            ))
+        },
+        || Err(anyhow!("scroll_element timed out for pid {pid}")),
+    );
+    finish_scroll(result, attempted.get(), acknowledged.get())
+}
+
+/// Give an indexed element keyboard focus through AT-SPI Component.GrabFocus
+/// without activating or raising its toplevel window.
+///
+/// `GrabFocus` acknowledges the request before Chromium/Electron necessarily
+/// updates its renderer-owned focused control. Sending key events immediately
+/// after the acknowledgement can therefore split one string between the old
+/// and new controls. Wait for the target's Focused state to become observable;
+/// an acknowledgement without read-back is not sufficient for global input.
+
+/// Error-message prefix when an element offers neither `EditableText` nor
+/// `Value`: the tool layer branches to the keyboard fallback on it.
+pub const NO_VALUE_ROUTE: &str = "no_value_route";
+
+pub fn is_no_value_route(error: &anyhow::Error) -> bool {
+    error.to_string().starts_with(NO_VALUE_ROUTE)
+}
+
+/// A spin button / spin scale only parses its entry text on activate (Return
+/// or focus-out); after an EditableText write, fire the element's `activate`
+/// action when it exposes one so the numeric value commits. Best effort.
+async fn commit_editable_write(proxies: &atspi::proxy::proxy_ext::Proxies<'_>) {
+    let Some(Ok(ap)) = call(proxies.action()).await else {
+        return;
+    };
+    let names = action_names(&ap).await;
+    if let Some(index) = names
+        .iter()
+        .position(|name| normalized_action_verb(name) == "activate")
+    {
+        let _ = call(ap.do_action(index as i32)).await;
+    }
+}
+
+/// The focus-free write shared by the index and cached-ref entry points.
+/// SetValue never calls Component.GrabFocus: GTK may activate and raise the
+/// toplevel in response, violating the background contract. Toolkits that
+/// expose EditableText only while focused get an honest `NO_VALUE_ROUTE`.
+async fn set_value_on(
+    acc: &AccessibleProxy<'_>,
+    has_value: bool,
+    value: &str,
+    label: &str,
+) -> Result<()> {
+    let proxies = acc
+        .proxies()
+        .await
+        .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
+    if let Ok(et) = proxies.editable_text().await {
+        // Replace whole contents (parity with the Windows/macOS set_value,
+        // which overwrite rather than insert at the caret).
+        if et.set_text_contents(value).await.unwrap_or(false) {
+            commit_editable_write(&proxies).await;
+            return Ok(());
+        }
+        // Some toolkits reject SetTextContents but accept an insert at the
+        // caret offset; clear-then-insert as a fallback.
+        let off = match proxies.text().await {
+            Ok(tp) => tp.caret_offset().await.unwrap_or(0),
+            Err(_) => 0,
+        };
+        let len = value.chars().count() as i32;
+        if et.insert_text(off, value, len).await.unwrap_or(false) {
+            commit_editable_write(&proxies).await;
+            return Ok(());
+        }
+    }
+    if has_value {
+        let v: f64 = value
+            .parse()
+            .map_err(|_| anyhow!("value '{value}' is not numeric for a Value element"))?;
+        proxies
+            .value()
+            .await
+            .map_err(|e| anyhow!("Value unavailable: {e}"))?
+            .set_current_value(v)
+            .await
+            .map_err(|e| anyhow!("setCurrentValue failed: {e}"))?;
+        return Ok(());
+    }
+    Err(anyhow!(
+        "{NO_VALUE_ROUTE}: {label} exposes neither EditableText nor Value"
+    ))
+}
+
+/// [`set_value`] on a snapshot-cached element identity (the exact object the
+/// caller's `element_index` named, not the same ordinal in a fresh walk).
+pub fn set_value_ref(object_ref: &ObjectRef, value: &str) -> Result<()> {
+    bounded_for(
+        REF_ACTION_BUDGET,
+        async {
+            let conn = shared_connection().await?;
+            let (acc, _) = live_accessible(&conn, object_ref).await?;
+            let ifaces = match call(acc.get_interfaces()).await {
+                Some(Ok(ifaces)) => ifaces,
+                _ => return Err(anyhow!("cached element interfaces unavailable")),
+            };
+            set_value_on(
+                &acc,
+                ifaces.contains(Interface::Value),
+                value,
+                "cached element",
+            )
+            .await
+        },
+        || Err(anyhow!("set_value (cached element) timed out")),
+    )
+}
+
+/// Error prefix: a selection container (combo box, list) has no option
+/// with the requested text.
+pub const NO_SUCH_OPTION: &str = "no_such_option";
+
+pub fn is_no_such_option(error: &anyhow::Error) -> bool {
+    error.to_string().starts_with(NO_SUCH_OPTION)
+}
+
+/// Options scanned under one combo box or list.
+const OPTION_SCAN_CAP: usize = 200;
+
+fn is_option_role(role: &str) -> bool {
+    matches!(
+        role.trim().to_ascii_lowercase().as_str(),
+        "menu item" | "check menu item" | "radio menu item" | "list item" | "option"
+    )
+}
+
+/// A combo box's options live in a child menu (GTK) or list (Qt).
+fn is_option_container_role(role: &str) -> bool {
+    matches!(
+        role.trim().to_ascii_lowercase().as_str(),
+        "menu" | "popup menu" | "list" | "list box" | "window"
+    )
+}
+
+/// Index of the option `value` names: an exact match first, then one that
+/// differs only in case or surrounding space.
+pub fn match_option(names: &[String], value: &str) -> Option<usize> {
+    names.iter().position(|name| name == value).or_else(|| {
+        let wanted = value.trim().to_lowercase();
+        names
+            .iter()
+            .position(|name| name.trim().to_lowercase() == wanted)
+    })
+}
+
+/// Outcome of picking an option of a selection container.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OptionPick {
+    /// The option was selected or activated.
+    Picked { name: String },
+    /// No option has that text; nothing was changed.
+    NoMatch { options: Vec<String> },
+    /// The element lists no options (or cannot select them).
+    Unavailable,
+}
+
+struct OptionNode {
+    oref: RawObjectRef,
+    name: String,
+    /// Position among its container's children: the model row of a GTK
+    /// combo box, which its `Selection.SelectChild` takes.
+    index: i32,
+}
+
+/// The options under `oref`: item children, or the items of its popup menu
+/// or list child (one level down), in order.
+async fn list_options(conn: &AccessibilityConnection, oref: &RawObjectRef) -> Vec<OptionNode> {
+    let zconn = conn.connection();
+    let mut options = Vec::new();
+    let Some(Ok(children)) = call(raw_children(zconn, oref)).await else {
+        return options;
+    };
+    for (position, child) in children.into_iter().enumerate() {
+        if options.len() >= OPTION_SCAN_CAP {
+            break;
+        }
+        let Some(Ok(acc)) = call(accessible_for(conn, &child)).await else {
+            continue;
+        };
+        let role = call(acc.get_role_name())
+            .await
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
+        if is_option_role(&role) {
+            let name = call(acc.name())
+                .await
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            options.push(OptionNode {
+                oref: child,
+                name,
+                index: position as i32,
+            });
+            continue;
+        }
+        if !is_option_container_role(&role) {
+            continue;
+        }
+        let Some(Ok(items)) = call(raw_children(zconn, &child)).await else {
+            continue;
+        };
+        for (index, item) in items.into_iter().enumerate() {
+            if options.len() >= OPTION_SCAN_CAP {
+                break;
+            }
+            let Some(Ok(item_acc)) = call(accessible_for(conn, &item)).await else {
+                continue;
+            };
+            let item_role = call(item_acc.get_role_name())
+                .await
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            if !is_option_role(&item_role) {
+                continue;
+            }
+            let name = call(item_acc.name())
+                .await
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            options.push(OptionNode {
+                oref: item,
+                name,
+                index: index as i32,
+            });
+        }
+    }
+    options
+}
+
+/// Pick the option `value` names on a snapshot-cached selection container
+/// (a GTK combo box) through its own `Selection.SelectChild`: the toolkit
+/// sets the active row and emits its `changed` signal, focus-free and
+/// without opening the popup.
+pub fn select_option_ref(object_ref: &ObjectRef, value: &str) -> Result<OptionPick> {
+    bounded_for(
+        REF_ACTION_BUDGET,
+        async {
+            let conn = shared_connection().await?;
+            let (acc, _) = live_accessible(&conn, object_ref).await?;
+            let ifaces = match call(acc.get_interfaces()).await {
+                Some(Ok(ifaces)) => ifaces,
+                _ => return Ok(OptionPick::Unavailable),
+            };
+            if !ifaces.contains(Interface::Selection) {
+                return Ok(OptionPick::Unavailable);
+            }
+            let options = list_options(&conn, &raw_ref(object_ref)).await;
+            if options.is_empty() {
+                return Ok(OptionPick::Unavailable);
+            }
+            let names: Vec<String> = options.iter().map(|o| o.name.clone()).collect();
+            let Some(found) = match_option(&names, value) else {
+                return Ok(OptionPick::NoMatch { options: names });
+            };
+            let option = &options[found];
+            let proxies = acc
+                .proxies()
+                .await
+                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
+            let selection = proxies
+                .selection()
+                .await
+                .map_err(|e| anyhow!("Selection unavailable: {e}"))?;
+            match call(selection.select_child(option.index)).await {
+                Some(Ok(true)) => Ok(OptionPick::Picked {
+                    name: option.name.clone(),
+                }),
+                Some(Ok(false)) => Err(anyhow!(
+                    "Selection.SelectChild({}) was refused for option {:?}",
+                    option.index,
+                    option.name
+                )),
+                Some(Err(e)) => Err(anyhow!("Selection.SelectChild failed: {e}")),
+                None => Err(anyhow!("Selection.SelectChild did not answer in time")),
+            }
+        },
+        || Err(anyhow!("select option (cached element) timed out")),
+    )
+}
+
+/// Activate the option `value` names in the open popup of a snapshot-cached
+/// combo box (its items exist and act only while it is open): the option's
+/// own click/activate action selects it and closes the popup.
+pub fn activate_option_ref(object_ref: &ObjectRef, value: &str) -> Result<OptionPick> {
+    bounded_for(
+        REF_ACTION_BUDGET,
+        async {
+            let conn = shared_connection().await?;
+            live_accessible(&conn, object_ref).await?;
+            let options = list_options(&conn, &raw_ref(object_ref)).await;
+            if options.is_empty() {
+                return Ok(OptionPick::Unavailable);
+            }
+            let names: Vec<String> = options.iter().map(|o| o.name.clone()).collect();
+            let Some(found) = match_option(&names, value) else {
+                return Ok(OptionPick::NoMatch { options: names });
+            };
+            let option = &options[found];
+            let acc = match call(accessible_for(&conn, &option.oref)).await {
+                Some(Ok(acc)) => acc,
+                _ => return Err(anyhow!("option {:?} is gone", option.name)),
+            };
+            let role = call(acc.get_role_name())
+                .await
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+            let proxies = acc
+                .proxies()
+                .await
+                .map_err(|e| anyhow!("interface proxies unavailable: {e}"))?;
+            let ap = proxies
+                .action()
+                .await
+                .map_err(|e| anyhow!("option {:?} has no Action: {e}", option.name))?;
+            let actions = action_names(&ap).await;
+            let chosen = activation_index(&role, &actions).ok_or_else(|| {
+                anyhow!("option {:?} advertises no activation action", option.name)
+            })?;
+            match call(ap.do_action(chosen as i32)).await {
+                Some(Ok(true)) => Ok(OptionPick::Picked {
+                    name: option.name.clone(),
+                }),
+                Some(Ok(false)) => Err(anyhow!("option {:?} refused its action", option.name)),
+                Some(Err(e)) => Err(anyhow!("option action failed: {e}")),
+                None => Err(anyhow!("option action did not answer in time")),
+            }
+        },
+        || Err(anyhow!("activate option (cached element) timed out")),
+    )
+}
+
+/// Whether a snapshot-cached combo box's popup is open: any of its options
+/// is SHOWING.
+pub fn options_showing_ref(object_ref: &ObjectRef) -> bool {
+    bounded_for(
+        REF_ACTION_BUDGET,
+        async {
+            let conn = shared_connection().await?;
+            for option in list_options(&conn, &raw_ref(object_ref)).await {
+                if let Some(Ok(acc)) = call(accessible_for(&conn, &option.oref)).await {
+                    if let Some(Ok(state)) = call(acc.get_state()).await {
+                        if is_showing_state(&state) {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            Ok(false)
+        },
+        || Ok(false),
+    )
+    .unwrap_or(false)
+}
+
+/// Name of the selected child of a `Selection` element (a combo box's
+/// active option), for the `set_value` read-back.
+async fn selected_child_name(
+    conn: &AccessibilityConnection,
+    proxies: &atspi::proxy::proxy_ext::Proxies<'_>,
+) -> Option<String> {
+    let selection = call(proxies.selection()).await?.ok()?;
+    if call(selection.n_selected_children()).await?.ok()? < 1 {
+        return None;
+    }
+    let child = call(selection.get_selected_child(0)).await?.ok()?;
+    let raw = RawObjectRef::from_atspi(&child)?;
+    let acc = call(accessible_for(conn, &raw)).await?.ok()?;
+    call(acc.name()).await?.ok()
+}
+
+/// Current value of a cached element for read-back after a write: the
+/// `Value` interface's number, else the `Text` content. `None` when the
+/// element exposes neither (or does not answer in time).
+pub fn read_value_ref(object_ref: &ObjectRef) -> Result<Option<String>> {
+    bounded_for(
+        REF_ACTION_BUDGET,
+        async {
+            let conn = shared_connection().await?;
+            let (acc, _) = live_accessible(&conn, object_ref).await?;
+            let ifaces = match call(acc.get_interfaces()).await {
+                Some(Ok(ifaces)) => ifaces,
+                _ => return Ok(None),
+            };
+            let proxies = match call(acc.proxies()).await {
+                Some(Ok(proxies)) => proxies,
+                _ => return Ok(None),
+            };
+            if ifaces.contains(Interface::Value) {
+                if let Some(Ok(vp)) = call(proxies.value()).await {
+                    if let Some(Ok(v)) = call(vp.current_value()).await {
+                        return Ok(Some(format_value(v)));
+                    }
+                }
+            }
+            if ifaces.contains(Interface::Text) {
+                if let Some(Ok(tp)) = call(proxies.text()).await {
+                    let count = call(tp.character_count())
+                        .await
+                        .and_then(|r| r.ok())
+                        .unwrap_or(0);
+                    if let Some(Ok(t)) = call(tp.get_text(0, count.min(4096))).await {
+                        return Ok(Some(t));
+                    }
+                }
+            }
+            if ifaces.contains(Interface::Selection) {
+                return Ok(selected_child_name(&conn, &proxies).await);
+            }
+            Ok(None)
+        },
+        || Err(anyhow!("read_value (cached element) timed out")),
+    )
+}
+
+mod window_scope_tests {
+    use super::{
+        accessibility_window_id, gnome_window_scope_proven, lone_top_level_renders,
+        project_screen_extents, scoped_component_nodes, select_click_target, window_bound_element,
+        ELEMENT_OUTSIDE_WINDOW, WINDOW_SCOPE_UNPROVEN,
+    };
+
+    /// `(frame_ordinal, has_component, window-local extents)`.
+    type Node = (usize, bool, (i32, i32, i32, i32));
+
+    // One PID owns Shell windows 1 (sibling A, AT-SPI frame 0) and 2
+    // (requested B, frame 1). Both frames have a button at window-local
+    // (10,10); B sits at compositor origin (600,0).
+    const PID: u32 = 6079;
+    const SIBLING_A: u64 = 1;
+    const REQUESTED_B: u64 = 2;
+    const NODES: [Node; 2] = [(0, true, (10, 10, 20, 20)), (1, true, (10, 10, 40, 40))];
+    const B_ORIGIN: (i32, i32) = (600, 0);
+
+    fn project(
+        nodes: &[Node],
+        scoped_frame: Option<usize>,
+    ) -> Vec<(usize, i32, i32, u32, u32, bool)> {
+        scoped_component_nodes(nodes, scoped_frame, |node| (node.0, node.1))
+            .filter_map(|(idx, node)| {
+                project_screen_extents(node.2, B_ORIGIN, None)
+                    .map(|(x, y, w, h)| (idx, x, y, w, h, false))
+            })
+            .collect()
+    }
+
+    /// `perform_action_at_screen_point` on window B in a GNOME session: the
+    /// scope gate, then the projection of admitted nodes with B's origin,
+    /// then the hit-test.
+    fn click_b(
+        nodes: &[Node],
+        scoped_frame: Option<usize>,
+        pid_shell_windows: Option<Vec<u64>>,
+        x: i32,
+        y: i32,
+    ) -> Result<Option<usize>, &'static str> {
+        if !gnome_window_scope_proven(
+            REQUESTED_B,
+            scoped_frame,
+            false,
+            || true,
+            || pid_shell_windows,
+        ) {
+            return Err(WINDOW_SCOPE_UNPROVEN);
+        }
+        Ok(select_click_target(&project(nodes, scoped_frame), x, y))
+    }
+
+    #[test]
+    fn without_the_gate_the_unresolved_walk_selects_the_sibling() {
+        assert_eq!(
+            select_click_target(&project(&NODES, None), 615, 15),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn unresolved_frame_with_a_same_pid_sibling_refuses() {
+        for shell_windows in [
+            Some(vec![SIBLING_A, REQUESTED_B]),
+            Some(vec![REQUESTED_B, SIBLING_A]),
+            Some(vec![REQUESTED_B, REQUESTED_B]),
+            Some(vec![SIBLING_A]),
+            Some(vec![]),
+            None,
+        ] {
+            assert_eq!(
+                click_b(&NODES, None, shell_windows.clone(), 615, 15),
+                Err(WINDOW_SCOPE_UNPROVEN),
+                "{shell_windows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proven_scope_selects_the_requested_window() {
+        assert_eq!(
+            click_b(&NODES, Some(1), Some(vec![SIBLING_A, REQUESTED_B]), 615, 15),
+            Ok(Some(1))
+        );
+    }
+
+    #[test]
+    fn a_single_shell_window_keeps_the_unscoped_walk() {
+        // One Shell window whose app publishes a second top-level (a popover)
+        // that frame correlation cannot place.
+        let nodes = [(0, true, (10, 10, 40, 40)), (1, true, (200, 200, 30, 30))];
+        let single = Some(vec![REQUESTED_B]);
+        assert_eq!(click_b(&nodes, None, single.clone(), 615, 15), Ok(Some(0)));
+        assert_eq!(click_b(&nodes, None, single, 815, 215), Ok(Some(1)));
+    }
+
+    #[test]
+    fn element_bounds_apply_the_same_rule() {
+        let siblings = || {
+            gnome_window_scope_proven(
+                REQUESTED_B,
+                None,
+                false,
+                || true,
+                || Some(vec![SIBLING_A, REQUESTED_B]),
+            )
+        };
+        for frame in [0, 1] {
+            assert_eq!(
+                window_bound_element(frame, None, siblings)
+                    .unwrap_err()
+                    .to_string(),
+                WINDOW_SCOPE_UNPROVEN
+            );
+        }
+
+        let correlated = || {
+            gnome_window_scope_proven(
+                REQUESTED_B,
+                Some(1),
+                false,
+                || panic!("a correlated frame needs no session check"),
+                || panic!("a correlated frame needs no Shell window list"),
+            )
+        };
+        assert!(window_bound_element(1, Some(1), correlated).is_ok());
+        assert_eq!(
+            window_bound_element(0, Some(1), correlated)
+                .unwrap_err()
+                .to_string(),
+            ELEMENT_OUTSIDE_WINDOW
+        );
+
+        let single = || {
+            gnome_window_scope_proven(
+                REQUESTED_B,
+                None,
+                false,
+                || true,
+                || Some(vec![REQUESTED_B]),
+            )
+        };
+        assert!(window_bound_element(0, None, single).is_ok());
+
+        // No window context keeps application-wide bounds.
+        assert!(gnome_window_scope_proven(
+            0,
+            None,
+            false,
+            || panic!("no window, no session check"),
+            || panic!("no window, no Shell query")
+        ));
+    }
+
+    #[test]
+    fn the_rule_follows_the_attested_shell_not_the_desktop_name() {
+        // An attested Shell applies the rule whatever the session reports.
+        let siblings = Some(vec![SIBLING_A, REQUESTED_B]);
+        assert!(!gnome_window_scope_proven(
+            REQUESTED_B,
+            None,
+            false,
+            || false,
+            || siblings
+        ));
+        // GNOME without an attested Shell refuses; compositors without a
+        // GNOME Shell keep their own route.
+        assert!(!gnome_window_scope_proven(
+            REQUESTED_B,
+            None,
+            false,
+            || true,
+            || None
+        ));
+        assert!(gnome_window_scope_proven(
+            REQUESTED_B,
+            None,
+            false,
+            || false,
+            || None
+        ));
+    }
+
+    // AT-SPI exports one top-level (frame 0) for the PID. Window B's tree is
+    // not exported, so when the Shell also lists sibling A, that top-level is
+    // A's; its button at window-local (10,10) sits under B's click (615,15).
+    const LONE_TOP_LEVEL: [Node; 1] = [(0, true, (10, 10, 20, 20))];
+
+    /// `resolve_window_frame` for `xid` on a Wayland session outside
+    /// Hyprland. Geometry correlation adds nothing: a Shell stable sequence
+    /// names no X11 window.
+    fn resolve(
+        xid: u64,
+        top_levels: usize,
+        gnome_session: bool,
+        pid_shell_windows: Option<Vec<u64>>,
+    ) -> Option<usize> {
+        (top_levels == 1
+            && lone_top_level_renders(PID, xid, || gnome_session, || pid_shell_windows))
+        .then_some(0)
+    }
+
+    /// `element_bounds_by_walk` for an element of `frame` in B on GNOME.
+    fn bounds_b(
+        frame: usize,
+        scoped_frame: Option<usize>,
+        pid_shell_windows: Option<Vec<u64>>,
+    ) -> Result<(), String> {
+        window_bound_element(frame, scoped_frame, || {
+            gnome_window_scope_proven(
+                REQUESTED_B,
+                scoped_frame,
+                false,
+                || true,
+                || pid_shell_windows,
+            )
+        })
+        .map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn without_the_shell_rule_a_lone_top_level_selects_the_sibling() {
+        // Before: one top-level was proof on every session.
+        let scope = Some(0);
+        let siblings = Some(vec![SIBLING_A, REQUESTED_B]);
+        assert_eq!(
+            click_b(&LONE_TOP_LEVEL, scope, siblings, 615, 15),
+            Ok(Some(0))
+        );
+    }
+
+    #[test]
+    fn a_lone_top_level_proves_nothing_while_the_shell_lists_another_window() {
+        for shell_windows in [
+            vec![SIBLING_A, REQUESTED_B],
+            vec![REQUESTED_B, SIBLING_A],
+            vec![REQUESTED_B, REQUESTED_B],
+            vec![SIBLING_A],
+            vec![],
+        ] {
+            let scope = resolve(REQUESTED_B, 1, true, Some(shell_windows.clone()));
+            assert_eq!(scope, None, "{shell_windows:?}");
+            assert_eq!(
+                click_b(&LONE_TOP_LEVEL, scope, Some(shell_windows.clone()), 615, 15),
+                Err(WINDOW_SCOPE_UNPROVEN),
+                "{shell_windows:?}"
+            );
+            assert_eq!(
+                bounds_b(0, scope, Some(shell_windows.clone())),
+                Err(WINDOW_SCOPE_UNPROVEN.to_owned()),
+                "{shell_windows:?}"
+            );
+            // The attested Shell decides even when the session check says
+            // the compositor is not GNOME.
+            assert_eq!(
+                resolve(REQUESTED_B, 1, false, Some(shell_windows.clone())),
+                None,
+                "{shell_windows:?}"
+            );
+        }
+        // The AT-SPI handle for frame 0 is no proof while a Shell answers.
+        let handle = accessibility_window_id(PID, 0);
+        assert_eq!(resolve(handle, 1, true, Some(vec![SIBLING_A])), None);
+    }
+
+    #[test]
+    fn a_lone_top_level_resolves_when_the_shell_lists_only_the_requested_window() {
+        let only_b = Some(vec![REQUESTED_B]);
+        let scope = resolve(REQUESTED_B, 1, true, only_b.clone());
+        assert_eq!(scope, Some(0));
+        assert_eq!(
+            click_b(&LONE_TOP_LEVEL, scope, only_b.clone(), 615, 15),
+            Ok(Some(0))
+        );
+        assert_eq!(bounds_b(0, scope, only_b), Ok(()));
+    }
+
+    #[test]
+    fn without_an_attested_shell_gnome_trusts_only_the_accessibility_handle() {
+        // A Shell sequence ID while no attested Shell answers proves nothing.
+        let scope = resolve(REQUESTED_B, 1, true, None);
+        assert_eq!(scope, None);
+        assert_eq!(
+            click_b(&LONE_TOP_LEVEL, scope, None, 615, 15),
+            Err(WINDOW_SCOPE_UNPROVEN)
+        );
+        assert_eq!(
+            bounds_b(0, scope, None),
+            Err(WINDOW_SCOPE_UNPROVEN.to_owned())
+        );
+        // The AT-SPI window list's own handle for the PID's first top-level
+        // names it, so a single-window app keeps working without the helper.
+        assert_eq!(
+            resolve(accessibility_window_id(PID, 0), 1, true, None),
+            Some(0)
+        );
+        assert_eq!(
+            resolve(accessibility_window_id(PID, 1), 1, true, None),
+            None
+        );
+        assert_eq!(
+            resolve(accessibility_window_id(PID + 1, 0), 1, true, None),
+            None
+        );
+    }
+
+    #[test]
+    fn other_sessions_keep_the_lone_top_level_route() {
+        // Sway and KDE have no GNOME session and no Shell helper.
+        assert_eq!(resolve(REQUESTED_B, 1, false, None), Some(0));
+        // Several top-levels, or none, go to geometry correlation.
+        for top_levels in [0, 2, 3] {
+            assert_eq!(resolve(REQUESTED_B, top_levels, true, None), None);
+        }
+    }
+
+    #[test]
+    fn accessibility_handles_match_the_window_list() {
+        assert_eq!(accessibility_window_id(6079, 0), 6079 << 16);
+        assert_eq!(accessibility_window_id(6079, 3), (6079 << 16) | 3);
+        assert_eq!(accessibility_window_id(0, 0), 1);
+    }
+}
+
+#[cfg(test)]
+mod token_scope_tests {
+    use super::{
+        gnome_window_scope_proven, is_window_membership_unproven, lone_top_level_renders,
+        snapshot_binds_window, window_element_membership, ELEMENT_OUTSIDE_WINDOW,
+        WINDOW_SCOPE_UNPROVEN,
+    };
+
+    // One PID owns Shell windows A and B; `get_window_state` reads B.
+    const PID: u32 = 6079;
+    const SIBLING_A: u64 = 1;
+    const REQUESTED_B: u64 = 2;
+
+    /// The binding decision `get_window_state` makes for B on GNOME with an
+    /// attested Shell: the walk's frame resolution, then the token rule.
+    fn binds_b(shell_windows: &[u64], top_levels: usize) -> bool {
+        let shell = || Some(shell_windows.to_vec());
+        let window_scoped =
+            top_levels == 1 && lone_top_level_renders(PID, REQUESTED_B, || true, shell);
+        snapshot_binds_window(false, window_scoped, true, || {
+            gnome_window_scope_proven(REQUESTED_B, None, false, || true, shell)
+        })
+    }
+
+    #[test]
+    fn an_unproven_gnome_snapshot_binds_no_tokens() {
+        for (shell_windows, top_levels) in [
+            (&[SIBLING_A, REQUESTED_B][..], 1),
+            (&[REQUESTED_B, SIBLING_A][..], 1),
+            (&[SIBLING_A, REQUESTED_B][..], 2),
+            (&[SIBLING_A][..], 1),
+            (&[][..], 1),
+        ] {
+            assert!(
+                !binds_b(shell_windows, top_levels),
+                "{shell_windows:?} with {top_levels} top-level(s)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_window_snapshot_binds() {
+        assert!(binds_b(&[REQUESTED_B], 1));
+        // A popover top-level beside the window: the Shell still vouches.
+        assert!(binds_b(&[REQUESTED_B], 2));
+    }
+
+    #[test]
+    fn x11_hyprland_and_other_compositors_bind_as_before() {
+        for window_scoped in [false, true] {
+            for trusted in [false, true] {
+                // X11 and compositors without a GNOME Shell: the uncorrelated
+                // walk rule holds, so the previous `true` stands.
+                assert!(snapshot_binds_window(false, window_scoped, trusted, || {
+                    gnome_window_scope_proven(REQUESTED_B, None, false, || false, || None)
+                }));
+                // Hyprland keeps its correlated-top-level rule.
+                assert_eq!(
+                    snapshot_binds_window(true, window_scoped, trusted, || {
+                        panic!("Hyprland asks no Shell")
+                    }),
+                    window_scoped
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn action_time_membership_uses_the_bounds_rule() {
+        let proven = |scoped: Option<usize>, shell: Vec<u64>| {
+            move || gnome_window_scope_proven(REQUESTED_B, scoped, false, || true, || Some(shell))
+        };
+        let gone = window_element_membership(None, Some(0), || true).unwrap_err();
+        assert!(is_window_membership_unproven(&gone));
+        let sibling =
+            window_element_membership(Some(0), None, proven(None, vec![SIBLING_A, REQUESTED_B]))
+                .unwrap_err();
+        assert!(is_window_membership_unproven(&sibling));
+        assert_eq!(sibling.to_string(), WINDOW_SCOPE_UNPROVEN);
+        let outside = window_element_membership(
+            Some(0),
+            Some(1),
+            proven(Some(1), vec![SIBLING_A, REQUESTED_B]),
+        )
+        .unwrap_err();
+        assert!(is_window_membership_unproven(&outside));
+        assert_eq!(outside.to_string(), ELEMENT_OUTSIDE_WINDOW);
+        assert!(window_element_membership(
+            Some(1),
+            Some(1),
+            proven(Some(1), vec![SIBLING_A, REQUESTED_B])
+        )
+        .is_ok());
+        assert!(window_element_membership(Some(0), None, proven(None, vec![REQUESTED_B])).is_ok());
+    }
 }

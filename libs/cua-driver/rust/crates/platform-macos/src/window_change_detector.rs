@@ -377,13 +377,28 @@ impl Snapshot {
     fn detect_bounded_with(
         self,
         bounds: WindowObservationBounds,
-        observe: impl FnMut() -> (Vec<WindowInfo>, Option<i32>),
+        observe: impl FnMut() -> (Vec<WindowInfo>, Option<i32>) + Send + 'static,
+    ) -> Changes {
+        self.detect_bounded_reporting(bounds, REPORT_WINDOW, observe)
+    }
+
+    /// [`detect_bounded_with`](Self::detect_bounded_with) with an explicit
+    /// report window: how long the result waits for a change before the rest
+    /// of the deadline runs detached on the async path. The synchronous poll
+    /// itself returns after `report_window` so a quiet action does not pay the
+    /// whole deadline. A raw watcher thread is not spawned here: the fork's
+    /// remainder is the bounded post-action reaper (`hold_observation`).
+    fn detect_bounded_reporting(
+        self,
+        bounds: WindowObservationBounds,
+        report_window: Duration,
+        observe: impl FnMut() -> (Vec<WindowInfo>, Option<i32>) + Send + 'static,
     ) -> Changes {
         if bounds.skips_observation() {
             drop(self);
             return Changes::not_polled();
         }
-        self.detect_with(bounds.timeout, bounds.poll, observe)
+        self.detect_with(report_window.min(bounds.timeout), bounds.poll, observe)
     }
 
     /// Finish off the async executor. Long-lived hosts take one immediate
@@ -398,17 +413,21 @@ impl Snapshot {
         let authority = cua_driver_core::blocking::ActionLeaseScope::capture();
         let report_ids = ids.clone();
         let started = Instant::now();
+        // Read pacing on this task: a blocking worker does not inherit the
+        // batch marker. A batched step returns after the shorter window.
+        let report_window = cua_driver_core::step_pacing::report_window(REPORT_WINDOW);
         let mut changes = self
             .finish_with(
                 bounds,
                 background,
+                report_window,
                 move || loop {
                     let current = observe_host();
                     let changed = Self::diff(&report_ids, &current.0).0;
                     if !background
                         || !changed.is_empty()
                         || current.1 != front
-                        || started.elapsed() >= REPORT_WINDOW.min(bounds.timeout)
+                        || started.elapsed() >= report_window.min(bounds.timeout)
                     {
                         return current;
                     }
@@ -456,6 +475,7 @@ impl Snapshot {
         mut self,
         bounds: WindowObservationBounds,
         background: bool,
+        report_window: Duration,
         mut observe: impl FnMut() -> (Vec<WindowInfo>, Option<i32>) + Send + 'static,
         hold: impl FnOnce(SuppressionLease, Instant, u64) -> Result<(), SuppressionLease>
             + Send
@@ -468,7 +488,7 @@ impl Snapshot {
         let generation = crate::post_action::generation();
         cua_driver_core::blocking::spawn(move || {
             if !background {
-                return self.detect_bounded_with(bounds, observe);
+                return self.detect_bounded_reporting(bounds, report_window, observe);
             }
             let (current, current_front) = observe();
             let (new_windows, _) = Self::diff(&self.window_ids, &current);
@@ -560,10 +580,7 @@ impl Snapshot {
 
 /// The host's visible layer-0 windows.
 fn host_windows() -> Vec<WindowInfo> {
-    windows::visible_windows()
-        .into_iter()
-        .filter(|w| w.layer == 0)
-        .collect()
+    windows::visible_windows_without_spaces()
 }
 
 /// One live observation for the poll loop: layer-0 windows and the frontmost pid.
@@ -572,6 +589,19 @@ fn observe_host() -> (Vec<WindowInfo>, Option<i32>) {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+/// Time-boxed observation of a window list that never changes, as for an
+/// action that opens nothing. Support for the step-latency benchmark.
+#[cfg(test)]
+pub(crate) fn observe_quiet_window_list(bounds: WindowObservationBounds, report_window: Duration) {
+    let snap = WindowChangeDetector::capture_from(HashSet::new(), Some(7), false, None);
+    let _ = snap.detect_bounded_reporting(bounds, report_window, || (Vec::new(), Some(7)));
+    end_tail();
+}
+
+/// The report window of a direct call. Support for the step-latency benchmark.
+#[cfg(test)]
+pub(crate) const DIRECT_REPORT_WINDOW: Duration = REPORT_WINDOW;
 
 #[cfg(test)]
 mod tests {
@@ -596,6 +626,7 @@ mod tests {
                 .finish_with(
                     observation_bounds_from(Some("2000"), None),
                     true,
+                    REPORT_WINDOW,
                     move || {
                         calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         (
@@ -637,6 +668,7 @@ mod tests {
                 .finish_with(
                     observation_bounds_from(Some("0"), None),
                     background,
+                    REPORT_WINDOW,
                     || panic!("zero timeout must not observe"),
                     |_, _, _| panic!("zero timeout must not hold"),
                 )
@@ -655,6 +687,7 @@ mod tests {
             .finish_with(
                 observation_bounds_from(Some("20"), Some("5")),
                 false,
+                REPORT_WINDOW,
                 || (vec![], None),
                 |_, _, _| panic!("synchronous mode must not hold"),
             )
@@ -861,14 +894,15 @@ mod tests {
     #[test]
     fn a_poll_that_ran_is_polled_even_when_it_times_out() {
         let snap = WindowChangeDetector::capture_from(HashSet::from([1]), Some(7), false, None);
-        let mut observations = 0;
+        let observations = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls = observations.clone();
         let changes =
-            snap.detect_bounded_with(observation_bounds_from(Some("30"), Some("10")), || {
-                observations += 1;
+            snap.detect_bounded_with(observation_bounds_from(Some("30"), Some("10")), move || {
+                calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 (vec![win(1, 7, "App", "Main")], Some(7))
             });
         assert!(changes.polled);
-        assert!(observations >= 1);
+        assert!(observations.load(std::sync::atomic::Ordering::SeqCst) >= 1);
         assert!(changes.new_windows.is_empty());
         assert!(!changes.foreground_changed);
     }
@@ -914,5 +948,68 @@ mod tests {
             snap_none._lease.is_none(),
             "no frontmost pid means no lease"
         );
+    }
+
+    /// A quiet poll returns after the report window, not the whole deadline.
+    #[test]
+    fn a_quiet_poll_returns_after_the_report_window() {
+        let snap = WindowChangeDetector::capture_from(HashSet::from([1]), Some(7), false, None);
+        let started = Instant::now();
+        let changes = snap
+            .detect_bounded_with(observation_bounds_from(Some("3000"), Some("10")), || {
+                (vec![win(1, 7, "App", "Main")], Some(7))
+            });
+        let elapsed = started.elapsed();
+        assert!(changes.polled);
+        assert!(!changes.needs_restore());
+        assert!(elapsed >= REPORT_WINDOW, "returned after {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "returned after {elapsed:?}"
+        );
+    }
+
+    /// A step of a batch returns after the shorter batch report window.
+    ///
+    /// The upper bound is a wall-clock comparison, so a loaded runner can
+    /// overshoot it once; a few attempts keep the test from flaking.
+    #[test]
+    fn a_batched_quiet_poll_returns_after_the_batch_report_window() {
+        use cua_driver_core::step_pacing::BATCH_REPORT_WINDOW;
+        let mut elapsed = Duration::ZERO;
+        for _ in 0..5 {
+            let snap = WindowChangeDetector::capture_from(HashSet::from([1]), Some(7), false, None);
+            let started = Instant::now();
+            let changes = snap.detect_bounded_reporting(
+                observation_bounds_from(Some("3000"), Some("10")),
+                BATCH_REPORT_WINDOW,
+                || (vec![win(1, 7, "App", "Main")], Some(7)),
+            );
+            elapsed = started.elapsed();
+            assert!(changes.polled);
+            assert!(!changes.needs_restore());
+            assert!(elapsed >= BATCH_REPORT_WINDOW, "returned after {elapsed:?}");
+            if elapsed < REPORT_WINDOW {
+                break;
+            }
+        }
+        assert!(
+            elapsed < REPORT_WINDOW,
+            "a batched step waited as long as a direct call: {elapsed:?}"
+        );
+    }
+
+    /// A deadline inside the report window behaves as before: the poll stops
+    /// at the deadline.
+    #[test]
+    fn a_short_deadline_leaves_no_detached_tail() {
+        let snap = WindowChangeDetector::capture_from(HashSet::from([1]), Some(7), false, None);
+        let started = Instant::now();
+        let changes = snap
+            .detect_bounded_with(observation_bounds_from(Some("40"), Some("10")), || {
+                (vec![win(1, 7, "App", "Main")], Some(7))
+            });
+        assert!(!changes.needs_restore());
+        assert!(started.elapsed() < REPORT_WINDOW);
     }
 }

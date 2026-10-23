@@ -161,7 +161,7 @@ fn invoke(backend: Arc<Backend>, tool: &str, extra: serde_json::Value) -> ToolRe
                 role:"push button".into(),name:None,value:None,checked:None,enabled:Some(true),selected:None,description:None,
                 actions:vec![],depth:0,parent_element_index:None,in_web_content:false,object_ref:None,
             };
-            let id=state.snapshots.publish(state.snapshots.prepare(pid,0x7f30_0110,&[node]).unwrap()).unwrap();
+            let id=state.snapshots.publish_prepared(state.snapshots.prepare(pid,0x7f30_0110,&[node]).unwrap()).unwrap();
             let mut args=json!({"pid":pid,"element_token":cua_driver_core::element_token::token_for(id,7),"delivery_mode":"foreground"});
             args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
             match tool { "click" => ClickTool {state}.invoke(args).await,

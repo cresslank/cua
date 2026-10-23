@@ -159,14 +159,25 @@ fn exact_prompt_button(
             format!("multiple exact {label} actions matched the browser consent prompt"),
         )
         .with_detail(serde_json::json!({
-            "candidates": matches.iter().map(|node| serde_json::json!({
-                "element_index": node.element_index,
-                "element_key": node.element_key,
-                "depth": node.depth,
-                "role": node.role,
-                "actions": node.actions,
-                "parent_element_index": node.parent_element_index,
-            })).collect::<Vec<_>>()
+            "candidates": matches.iter().map(|node| {
+                let parent = node.parent_element_index.and_then(|parent_index| {
+                    nodes.iter().find(|candidate| candidate.element_index == Some(parent_index))
+                });
+                let frame = bounds.iter().find(|(index, ..)| node.element_index == Some(*index));
+                serde_json::json!({
+                    "element_index": node.element_index,
+                    "element_key": node.element_key,
+                    "depth": node.depth,
+                    "role": node.role,
+                    "actions": node.actions,
+                    "parent_element_index": node.parent_element_index,
+                    "parent_role": parent.map(|parent| parent.role.as_str()),
+                    "parent_name": parent.and_then(|parent| parent.name.as_deref()),
+                    "bounds": frame.map(|(_, x, y, width, height)| serde_json::json!({
+                        "x": x, "y": y, "width": width, "height": height,
+                    })),
+                })
+            }).collect::<Vec<_>>()
         }))),
     }
 }
@@ -183,6 +194,52 @@ fn exact_cancel_button(
     bounds: &[(usize, i32, i32, u32, u32)],
 ) -> Result<Option<ExactAllowAction>, BrowserRefusal> {
     exact_prompt_button(nodes, bounds, "cancel")
+}
+
+fn exact_button_center(
+    bounds: &[(usize, i32, i32, u32, u32)],
+    element_index: usize,
+) -> anyhow::Result<(i32, i32)> {
+    let (_, x, y, width, height) = bounds
+        .iter()
+        .find(|(index, _, _, width, height)| *index == element_index && *width > 1 && *height > 1)
+        .ok_or_else(|| anyhow::anyhow!("the exact Allow action had empty screen bounds"))?;
+    let center_x = x
+        .checked_add(i32::try_from(width / 2)?)
+        .ok_or_else(|| anyhow::anyhow!("Allow button center x overflowed"))?;
+    let center_y = y
+        .checked_add(i32::try_from(height / 2)?)
+        .ok_or_else(|| anyhow::anyhow!("Allow button center y overflowed"))?;
+    Ok((center_x, center_y))
+}
+
+/// Pointer fallback after an acknowledged accessibility action left the prompt
+/// up. Re-walk, match the semantic Allow control, and inject through the
+/// carried exact-target proof. Bounds are this walk's frame, not another
+/// snapshot, and there is no index-only action path beside the rewalk.
+fn trusted_allow_click(target: &crate::wayland::ExactTargetProof) -> anyhow::Result<()> {
+    crate::wayland::validate_exact_target(target)?;
+    let pid = target.pid();
+    let window_id = target.window_id();
+    let tree = crate::atspi::walk_tree(pid, window_id, None);
+    let allow = exact_allow_button(&tree.nodes, &tree.bounds)
+        .map_err(|error| anyhow::anyhow!(error.message))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("the exact Chromium remote-debugging consent action became stale")
+        })?;
+    let (center_x, center_y) = exact_button_center(&tree.bounds, allow.element_index)?;
+    crate::wayland::validate_exact_target(target)?;
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        // AT-SPI screen bounds are layout coordinates, not desktop-frame
+        // points. Keep the carried exact target; click's native pointer space
+        // applies the layout origin.
+        crate::wayland::click(target.clone(), center_x, center_y, 1, 1)
+    } else {
+        crate::input::with_x11_foreground(window_id, 80, || {
+            crate::wayland::validate_exact_target(target)?;
+            crate::input::send_click_xtest_desktop(center_x, center_y, 1, 1)
+        })
+    }
 }
 
 pub fn dismiss(pid: u32, window_id: u64) -> Result<bool, BrowserRefusal> {
@@ -302,6 +359,8 @@ pub async fn handle(
         })?;
     let deadline = Instant::now() + Duration::from_secs(4);
     let mut saw_prompt = false;
+    let mut accessibility_action_at = None;
+    let mut trusted_click_attempted = false;
     loop {
         check_deadline(deadline)?;
         crate::wayland::validate_exact_target(&target).map_err(|error| {
@@ -324,7 +383,7 @@ pub async fn handle(
         let prompt_present = remote_debugging_prompt_present(&tree.nodes);
         saw_prompt |= prompt_present;
         match exact_allow_button(&tree.nodes, &tree.bounds)? {
-            Some(allow) => {
+            Some(allow) if accessibility_action_at.is_none() => {
                 let expected_action = allow.action.clone();
                 let action_target = target.clone();
                 let result = consent_action(&request.action, deadline, move || {
@@ -350,9 +409,27 @@ pub async fn handle(
                 // The verified helper re-walks at action time, matches the
                 // stable D-Bus object key and complete semantic identity,
                 // selects this named action, and rejects do_action(false).
-                return Ok(BrowserConsentOutcome::Accepted);
+                // Acceptance waits until that prompt actually leaves; a dialog
+                // that stays is not a second, weaker do_action.
+                accessibility_action_at = Some(Instant::now());
+            }
+            Some(_)
+                if !trusted_click_attempted
+                    && accessibility_action_at.is_some_and(|attempted| {
+                        attempted.elapsed() >= Duration::from_millis(150)
+                    }) =>
+            {
+                let action_target = target.clone();
+                consent_action(&request.action, deadline, move || {
+                    trusted_allow_click(&action_target)
+                })
+                .await?;
+                trusted_click_attempted = true;
             }
             None if saw_prompt && !prompt_present => {
+                if accessibility_action_at.is_some() {
+                    return Ok(BrowserConsentOutcome::Accepted);
+                }
                 return Err(refusal(
                     BrowserRefusalCode::BrowserConsentRevoked,
                     "the browser consent prompt disappeared without an explicitly acknowledged Allow action",

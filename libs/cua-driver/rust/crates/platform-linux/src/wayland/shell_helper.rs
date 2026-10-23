@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 use crate::x11::WindowInfo;
 
 const DEST: &str = "org.cua.WinRects";
+const COMPOSITOR_DEST: &str = "org.gnome.Shell";
 const PATH: &str = "/org/cua/WinRects";
 const IFACE: &str = "org.cua.WinRects";
 const DBUS_DEST: &str = "org.freedesktop.DBus";
@@ -648,56 +649,110 @@ fn gdbus_call_with_timeout(method: &str, args: &[String], timeout: Duration) -> 
 }
 
 /// Resolve the helper's immutable unique bus name and prove that it is hosted
-/// by this user's system-installed GNOME Shell process. Protocol-sensitive
-/// callers can additionally require the extension's current API. Addressing
-/// the unique name closes the race where another process replaces the public
-/// name after ownership is checked.
+/// by this user's system-installed GNOME Shell process. The helper owner must
+/// also own `org.gnome.Shell`, so a nested or development Shell cannot serve
+/// the session compositor. Protocol-sensitive callers can additionally require
+/// the extension's current API. Every name, credential, trust, and process-pin
+/// check is repeated after that version call, so a re-owned name or recycled
+/// PID cannot lend its answer to the attested owner.
 fn shell_owner(require_helper_api: bool) -> Option<String> {
-    let owner_raw = gdbus_call_target(
+    let owner = unique_bus_owner(DEST)?;
+    if unique_bus_owner(COMPOSITOR_DEST)? != owner {
+        return None;
+    }
+    let (pid, uid) = connection_identity(&owner)?;
+    if uid != current_uid() {
+        return None;
+    }
+    let pin = pin_process(pid)?;
+    if !is_trusted_gnome_shell(pid) {
+        return None;
+    }
+    let version = if require_helper_api {
+        Some(helper_version(&owner)?)
+    } else {
+        None
+    };
+    if unique_bus_owner(DEST)? != owner
+        || unique_bus_owner(COMPOSITOR_DEST)? != owner
+        || connection_identity(&owner)? != (pid, uid)
+        || !is_trusted_gnome_shell(pid)
+        || !process_still_pinned(pid, &pin)
+    {
+        return None;
+    }
+    if require_helper_api && version? < REQUIRED_HELPER_API_VERSION {
+        return None;
+    }
+    Some(owner)
+}
+
+fn unique_bus_owner(name: &str) -> Option<String> {
+    let raw = gdbus_call_target(
         DBUS_DEST,
         DBUS_PATH,
         &format!("{DBUS_IFACE}.GetNameOwner"),
-        &[DEST.to_owned()],
+        &[name.to_owned()],
         Duration::from_millis(800),
     )?;
-    let owner = parse_quoted_string(&owner_raw)?;
-    if !owner.starts_with(':') {
-        return None;
-    }
+    parse_quoted_string(&raw).filter(|owner| owner.starts_with(':'))
+}
 
-    let pid_raw = gdbus_call_target(
-        DBUS_DEST,
-        DBUS_PATH,
-        &format!("{DBUS_IFACE}.GetConnectionUnixProcessID"),
-        std::slice::from_ref(&owner),
-        Duration::from_millis(800),
-    )?;
-    let uid_raw = gdbus_call_target(
-        DBUS_DEST,
-        DBUS_PATH,
-        &format!("{DBUS_IFACE}.GetConnectionUnixUser"),
-        std::slice::from_ref(&owner),
-        Duration::from_millis(800),
-    )?;
-    let pid = parse_first_u32(&pid_raw)?;
-    let uid = parse_first_u32(&uid_raw)?;
-    if uid != current_uid() || !is_trusted_gnome_shell(pid) {
-        return None;
-    }
-
-    if require_helper_api {
-        let version_raw = gdbus_call_target(
-            &owner,
-            PATH,
-            &format!("{IFACE}.GetVersion"),
-            &[],
+fn connection_identity(owner: &str) -> Option<(u32, u32)> {
+    let scalar = |method: &str| {
+        let raw = gdbus_call_target(
+            DBUS_DEST,
+            DBUS_PATH,
+            &format!("{DBUS_IFACE}.{method}"),
+            &[owner.to_owned()],
             Duration::from_millis(800),
         )?;
-        if parse_first_u32(&version_raw)? < REQUIRED_HELPER_API_VERSION {
-            return None;
-        }
-    }
-    Some(owner)
+        parse_first_u32(&raw)
+    };
+    Some((
+        scalar("GetConnectionUnixProcessID")?,
+        scalar("GetConnectionUnixUser")?,
+    ))
+}
+
+fn helper_version(owner: &str) -> Option<u32> {
+    let raw = gdbus_call_target(
+        owner,
+        PATH,
+        &format!("{IFACE}.GetVersion"),
+        &[],
+        Duration::from_millis(800),
+    )?;
+    parse_first_u32(&raw)
+}
+
+/// An open `/proc/PID` directory. If the process exits and its PID is reused,
+/// the directory reached by that path is a different inode.
+fn pin_process(pid: u32) -> Option<std::fs::File> {
+    let process_directory = std::fs::File::open(format!("/proc/{pid}")).ok()?;
+    process_directory
+        .metadata()
+        .ok()?
+        .is_dir()
+        .then_some(process_directory)
+}
+
+fn process_still_pinned(pid: u32, pin: &std::fs::File) -> bool {
+    let (Ok(pinned), Ok(current)) = (pin.metadata(), std::fs::metadata(format!("/proc/{pid}")))
+    else {
+        return false;
+    };
+    current.dev() == pinned.dev() && current.ino() == pinned.ino()
+}
+
+/// Whether GNOME Shell is this session's compositor. A daemon started without
+/// `XDG_CURRENT_DESKTOP` still counts when `org.gnome.Shell` has a unique owner.
+pub fn gnome_shell_session() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|desktops| {
+        desktops
+            .split(':')
+            .any(|desktop| desktop.eq_ignore_ascii_case("gnome"))
+    }) || unique_bus_owner(COMPOSITOR_DEST).is_some()
 }
 
 fn parse_quoted_string(raw: &str) -> Option<String> {
@@ -917,11 +972,31 @@ fn parse_screen_size(raw: &str) -> Option<(u32, u32)> {
 /// extents so accessibility frames line up with pixels. Older helpers omit the
 /// buffer fields and fall back to the frame origin.
 pub fn window_origin_for_pid(pid: u32) -> Option<(i32, i32)> {
-    let matches = read_shell_windows()?
-        .into_iter()
-        .filter(|window| window.pid == pid)
-        .collect::<Vec<_>>();
-    (matches.len() == 1).then(|| (matches[0].buffer_x, matches[0].buffer_y))
+    window_origin(pid, 0)
+}
+
+/// Screen origin of the exact compositor frame `window_id` owned by `pid`.
+///
+/// A zero `window_id` is a PID-only query and needs that PID to own exactly
+/// one window. A nonzero id matches the public incarnation id published by
+/// [`list_windows`], or the native Shell sequence when that sequence is unique
+/// for the PID. The buffer origin is returned so AT-SPI `CoordType::Window`
+/// coordinates keep GTK client-side shadow extents; the frame rectangle is not
+/// a substitute, and a duplicated identity is not authoritative.
+pub fn window_origin(pid: u32, window_id: u64) -> Option<(i32, i32)> {
+    select_window_origin(&read_shell_windows()?, pid, window_id)
+}
+
+fn select_window_origin(windows: &[ShellWindow], pid: u32, window_id: u64) -> Option<(i32, i32)> {
+    let mut matches = windows.iter().filter(|window| {
+        window.pid == pid
+            && (window_id == 0 || window.public_id == window_id || window.native_id == window_id)
+    });
+    let window = matches.next()?;
+    matches
+        .next()
+        .is_none()
+        .then_some((window.buffer_x, window.buffer_y))
 }
 
 /// Enumerate GNOME Shell toplevels when the compositor helper is available.
@@ -1706,6 +1781,27 @@ mod tests {
         assert_eq!(windows.len(), 1);
         assert!(windows[0].is_on_screen);
         assert_eq!(windows[0].capture_current, Some(false));
+    }
+
+    #[test]
+    fn window_origin_uses_buffer_and_refuses_ambiguous_siblings() {
+        let raw = r#"'([{"id":46,"target_id":"epoch-a:46","helper_epoch":"epoch-a","protocol_version":4,"pid":6079,"title":"Main","x":10,"y":20,"buffer_x":1,"buffer_y":2,"w":100,"h":80},{"id":47,"target_id":"epoch-a:47","helper_epoch":"epoch-a","protocol_version":4,"pid":6079,"title":"Dialog","x":600,"y":0,"buffer_x":590,"buffer_y":-8,"w":100,"h":80},{"id":48,"target_id":"epoch-a:48","helper_epoch":"epoch-a","protocol_version":4,"pid":6080,"title":"Other","x":1200,"y":4,"buffer_x":1190,"buffer_y":0,"w":40,"h":40}])'"#;
+        let windows = parse_shell_windows(raw).expect("protocol-4 windows");
+        let main = windows
+            .iter()
+            .find(|window| window.native_id == 46)
+            .unwrap();
+        assert_eq!(
+            select_window_origin(&windows, 6079, main.public_id),
+            Some((1, 2))
+        );
+        assert_eq!(select_window_origin(&windows, 6079, 46), Some((1, 2)));
+        assert_eq!(select_window_origin(&windows, 6079, 47), Some((590, -8)));
+        // Two windows of this PID, or an id owned by someone else, have no origin.
+        assert_eq!(select_window_origin(&windows, 6079, 0), None);
+        assert_eq!(select_window_origin(&windows, 6079, 48), None);
+        assert_eq!(select_window_origin(&windows, 6080, 0), Some((1190, 0)));
+        assert_eq!(select_window_origin(&windows, 6080, 48), Some((1190, 0)));
     }
 
     #[test]

@@ -408,6 +408,56 @@ const FfiConverterTypeActionEvidence = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * A call an agent can make next: `{tool, arguments}`.
+ */
+export type ActionNextCall = {
+    tool: string,
+    /**
+     * The call's arguments. A JSON object on the wire; the SDK records carry
+     * the same object as JSON text.
+     */
+    arguments: string
+}
+
+/**
+ * Generated factory for {@link ActionNextCall} record objects.
+ */
+export const ActionNextCall = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<ActionNextCall, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<ActionNextCall>,
+    });
+})();
+
+const FfiConverterTypeActionNextCall = (() => {
+    type TypeName = ActionNextCall;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                tool: FfiConverterString.read(from),
+                arguments: FfiConverterString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterString.write(value.tool, into);
+            FfiConverterString.write(value.arguments, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterString.allocationSize(value.tool) +
+             FfiConverterString.allocationSize(value.arguments);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export enum ActionEffect {
     Confirmed,
     Partial,
@@ -503,7 +553,20 @@ export type ActionResult = {
     /**
      * Present only with `effect: refused`.
      */
-    error?: ActionError
+    error?: ActionError,
+    /**
+     * What to do next, in one short sentence. Present when the effect is
+     * `unverifiable` or `suspected_noop`, so an unconfirmed action points at
+     * the next step instead of leaving the agent to guess. Also carries a
+     * suggestion to chain steps with `run_steps` after several direct actions
+     * in a row.
+     */
+    hint?: string,
+    /**
+     * The call that moves the task forward, always safe to run as is (a read,
+     * or a call that keeps the user's window where it is).
+     */
+    nextCall?: ActionNextCall
 }
 
 /**
@@ -533,7 +596,9 @@ const FfiConverterTypeActionResult = (() => {
                 evidence: FfiConverterOptionalSequenceTypeActionEvidence.read(from),
                 escalation: FfiConverterOptionalTypeActionEscalation.read(from),
                 summary: FfiConverterOptionalString.read(from),
-                error: FfiConverterOptionalTypeActionError.read(from)
+                error: FfiConverterOptionalTypeActionError.read(from),
+                hint: FfiConverterOptionalString.read(from),
+                nextCall: FfiConverterOptionalTypeActionNextCall.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -544,6 +609,8 @@ const FfiConverterTypeActionResult = (() => {
             FfiConverterOptionalTypeActionEscalation.write(value.escalation, into);
             FfiConverterOptionalString.write(value.summary, into);
             FfiConverterOptionalTypeActionError.write(value.error, into);
+            FfiConverterOptionalString.write(value.hint, into);
+            FfiConverterOptionalTypeActionNextCall.write(value.nextCall, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterTypeActionEffect.allocationSize(value.effect) +
@@ -552,7 +619,9 @@ const FfiConverterTypeActionResult = (() => {
              FfiConverterOptionalSequenceTypeActionEvidence.allocationSize(value.evidence) +
              FfiConverterOptionalTypeActionEscalation.allocationSize(value.escalation) +
              FfiConverterOptionalString.allocationSize(value.summary) +
-             FfiConverterOptionalTypeActionError.allocationSize(value.error);
+             FfiConverterOptionalTypeActionError.allocationSize(value.error) +
+             FfiConverterOptionalString.allocationSize(value.hint) +
+             FfiConverterOptionalTypeActionNextCall.allocationSize(value.nextCall);
 
         }
     };
@@ -6636,6 +6705,9 @@ const FfiConverterOptionalTypeActionEscalation = new FfiConverterOptional(FfiCon
 // FfiConverter for ActionError | undefined
 const FfiConverterOptionalTypeActionError = new FfiConverterOptional(FfiConverterTypeActionError);
 
+// FfiConverter for ActionNextCall | undefined
+const FfiConverterOptionalTypeActionNextCall = new FfiConverterOptional(FfiConverterTypeActionNextCall);
+
 // FfiConverter for number | undefined
 const FfiConverterOptionalFloat64 = new FfiConverterOptional(FfiConverterFloat64);
 
@@ -6790,6 +6862,7 @@ export default Object.freeze({
     FfiConverterTypeActionEscalationTarget,
     FfiConverterTypeActionEvidence,
     FfiConverterTypeActionEvidenceKind,
+    FfiConverterTypeActionNextCall,
     FfiConverterTypeActionResult,
     FfiConverterTypeActionRoute,
     FfiConverterTypeActionTarget,

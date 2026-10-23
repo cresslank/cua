@@ -300,6 +300,7 @@ impl Tool for HotkeyTool {
         // key equivalent in a native app that is not in front, run that menu
         // item in the background instead (verified for Save), or refuse when
         // macOS keeps it disabled. No key events are sent on this route.
+        let mut key_scope: Option<crate::input::skylight::WindowKeyScope> = None;
         if !fg && px.is_none() {
             if let (Some(wid), Some(combo)) = (
                 window_id,
@@ -321,14 +322,40 @@ impl Tool for HotkeyTool {
                     Err(error) => return ToolResult::error(format!("Task error: {error}")),
                 };
                 if let Some(item) = menu_item {
-                    return super::invoke_menu::run_in_background(
+                    // The menu command acts on the app's key window. Make the
+                    // addressed window key first, confirmed, or refuse: never
+                    // act on another window (CUA-1767).
+                    match super::acquire_key_scope(pid, Some(wid), false).await {
+                        Ok(scope) => key_scope = scope,
+                        Err(refusal) => return refusal,
+                    }
+                    if let Some(ptr) = element_ptr {
+                        // The menu command acts on the focused element. The
+                        // guard stays alive until run_in_background dispatches.
+                        let focused = cua_driver_core::blocking::spawn(move || {
+                            focus_hotkey_element(pid, ptr)
+                        })
+                        .await;
+                        if !matches!(focused, Ok(Ok(()))) {
+                            return ToolResult::error(
+                                "hotkey: the requested element did not take focus, so its menu \
+                                 command was not run.",
+                            );
+                        }
+                    }
+                    let menu_result = super::invoke_menu::run_in_background(
                         pid,
                         wid,
                         item.path,
-                        super::invoke_menu::MenuRequest::KeyEquivalent(key_display),
+                        super::invoke_menu::MenuRequest::KeyEquivalent(key_display.clone()),
                         element_guard.clone(),
                     )
                     .await;
+                    // Only unavailable background menus may fall back to keys;
+                    // target-safety refusals must survive this route unchanged.
+                    if !menu_allows_key_fallback(&menu_result) {
+                        return menu_result;
+                    }
                 }
             }
         }
@@ -386,7 +413,9 @@ impl Tool for HotkeyTool {
                     pid,
                     wid,
                     element_ptr,
-                    cua_driver_core::background_input::BackgroundAction::GenericKey,
+                    super::window_keyboard_action(
+                        cua_driver_core::background_input::BackgroundAction::GenericKey,
+                    ),
                 )
                 .await
                 {
@@ -399,6 +428,14 @@ impl Tool for HotkeyTool {
         } else {
             None
         };
+
+        // Key post: the addressed window must be the confirmed key window.
+        if key_scope.is_none() {
+            match super::acquire_key_scope(pid, window_id, fg).await {
+                Ok(scope) => key_scope = scope,
+                Err(refusal) => return refusal,
+            }
+        }
 
         // Web-content AX nodes can acknowledge AXFocused without moving the
         // renderer's real first responder. That makes a direct focus write an
@@ -478,6 +515,8 @@ impl Tool for HotkeyTool {
             }
         };
 
+        let _hold_key_scope = &key_scope;
+
         // A focus click already moved the cursor. Otherwise place a named
         // session's cursor on the element, its remembered position, or the
         // window centre, so a keyboard-first session stays visible.
@@ -555,27 +594,11 @@ impl Tool for HotkeyTool {
                             )?;
                             Ok(())
                         }
-                        // Screen Sharing is an input forwarder: modifier flags
-                        // on a PID-routed base-key event are not relayed to the
-                        // guest. Emit the physical modifier down/base/up
-                        // sequence through the guarded foreground HID path.
-                        (true, false, Some(wid), None)
-                            if crate::input::keyboard::is_screen_sharing_pid(pid) =>
-                        {
+                        (true, false, Some(wid), None) => {
                             crate::input::skylight::with_foreground_hid_activation(
                                 pid as libc::pid_t,
                                 wid,
                                 || crate::input::keyboard::press_key_bare_global(&key, &m),
-                            )?;
-                            Ok(())
-                        }
-                        // foreground rung: briefly front the window so NSMenu key
-                        // equivalents dispatch, then restore prior frontmost.
-                        (true, false, Some(wid), None) => {
-                            crate::input::skylight::with_menu_shortcut_activation(
-                                pid as libc::pid_t,
-                                wid,
-                                || crate::input::keyboard::hotkey_no_auth(pid, &key, &m),
                             )?;
                             Ok(())
                         }
@@ -615,6 +638,15 @@ impl Tool for HotkeyTool {
     }
 }
 
+fn menu_allows_key_fallback(result: &ToolResult) -> bool {
+    result.is_error == Some(true)
+        && result
+            .structured_content
+            .as_ref()
+            .and_then(|v| v["code"].as_str())
+            == Some("background_unavailable")
+}
+
 fn delivered_structured(foreground: bool) -> Value {
     serde_json::json!({
         "path": if foreground { "key_events_fg" } else { "key_events" },
@@ -626,6 +658,20 @@ fn delivered_structured(foreground: bool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_safety_refusals_do_not_fall_back_to_keys() {
+        for code in ["window_not_key", "background_unavailable"] {
+            let result =
+                ToolResult::error("refused").with_structured(serde_json::json!({ "code": code }));
+            assert_eq!(
+                menu_allows_key_fallback(&result),
+                code == "background_unavailable"
+            );
+        }
+        assert!(!menu_allows_key_fallback(&ToolResult::error("unknown")));
+        assert!(!menu_allows_key_fallback(&ToolResult::text("done")));
+    }
 
     #[test]
     fn a_delivered_combo_suggests_no_resend() {

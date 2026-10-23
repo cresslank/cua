@@ -52,6 +52,7 @@ env:
 
 jobs:
   unit:
+    if: ${{ !startsWith(github.head_ref, 'release-please--branches--') }}
     name: Rust macOS unit
     runs-on: ${{ vars.FORK_MACOS_CI_ENABLED == 'true' && vars.FORK_MACOS_RUNNER && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && !contains(fromJSON(vars.FORK_MACOS_EXCLUDE || '[]'), 'ci-rust-macos/unit') && fromJSON(vars.FORK_MACOS_RUNNER) || 'macos-latest' }}
     timeout-minutes: 30
@@ -77,14 +78,14 @@ jobs:
       - name: Run cua-driver-core unit tests on macOS
         working-directory: libs/cua-driver/rust
         run: cargo test --locked -p cua-driver-core --lib
-      - name: Run macOS protocol schema contract
+      - name: Run macOS protocol schema and status pid-file contracts
         working-directory: libs/cua-driver/rust
         env:
           CUA_TEST_REQUIRE_DRIVER_BIN: "1"
           CUA_TEST_DRIVER_STDERR: "1"
         run: |
           cargo build --locked -p cua-driver
-          cargo test --locked -p cua-driver --test protocol_schema_test
+          cargo test --locked -p cua-driver --test protocol_schema_test --test status_pid_file_cli_test
       # Desktop E2E suites are #[ignore] and run in the Lume harness. Their
       # hermetic oracle and parser tests run here as a whole crate, including
       # the macOS-gated ones that have no other runner: the harness's FIFO

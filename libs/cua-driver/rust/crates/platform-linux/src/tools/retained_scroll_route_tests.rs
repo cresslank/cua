@@ -156,7 +156,9 @@ fn invoke(backend: Arc<Backend>, foreground: bool) -> ToolResult {
                     };
                     let id = state
                         .snapshots
-                        .publish(state.snapshots.prepare(pid, 0x7f30_0106, &[node]).unwrap())
+                        .publish_prepared(
+                            state.snapshots.prepare(pid, 0x7f30_0106, &[node]).unwrap(),
+                        )
                         .unwrap();
                     ScrollTool { state }.invoke(json!({
                 "pid":pid, "element_token":cua_driver_core::element_token::token_for(id, 7),

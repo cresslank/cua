@@ -1206,6 +1206,15 @@ fn window_record_json(w: &crate::x11::WindowInfo) -> Value {
     })
 }
 
+fn visible_live_desktop_windows(
+    mut windows: Vec<crate::x11::WindowInfo>,
+) -> Vec<crate::x11::WindowInfo> {
+    windows.retain(|window| {
+        window.is_on_screen && window.pid.is_none_or(crate::proc_fs::is_process_live)
+    });
+    windows
+}
+
 #[cfg(test)]
 mod list_windows_tests {
     use super::*;
@@ -2123,9 +2132,23 @@ impl Tool for GetWindowStateTool {
         };
 
         let result = cua_driver_core::blocking::spawn(move || -> anyhow::Result<_> {
-            let tree_result = want_tree.then(|| crate::atspi::walk_tree_bounded_within(
-                pid, xid, query_for_walk.as_deref(), max_elements, max_depth, walk_timeout,
-            ));
+            // Skip the AT-SPI walk on the capture-only path
+            // (include_accessibility_tree:false).
+            let tree_result = if want_tree {
+                Some(crate::atspi::walk_tree_bounded_within(
+                    pid,
+                    xid,
+                    query_for_walk.as_deref(),
+                    max_elements,
+                    max_depth,
+                    walk_timeout,
+                ))
+            } else {
+                None
+            };
+            let binds_window = tree_result.as_ref().is_some_and(|tree| {
+                crate::atspi::snapshot_binds_window(pid, xid, tree.window_scoped, tree.trusted)
+            });
             // Bounds and element indices come from the same captured AT-SPI
             // traversal. Joining two live walks by ordinal mis-associated
             // Chromium controls when its lazy subtree changed between walks.
@@ -2226,12 +2249,19 @@ impl Tool for GetWindowStateTool {
             } else {
                 None
             };
-            Ok((tree_result, screenshot, bounds, screenshot_error, overlays))
+            Ok((
+                tree_result,
+                screenshot,
+                bounds,
+                screenshot_error,
+                overlays,
+                binds_window,
+            ))
         })
         .await;
 
         match result {
-            Ok(Ok((tree_opt, shot_opt, bounds, screenshot_error, overlays))) => {
+            Ok(Ok((tree_opt, shot_opt, bounds, screenshot_error, overlays, binds_window))) => {
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": xid, "pid": pid });
                 let screenshot_scale = shot_opt.as_ref().map(|(_, _, w, _, original_w, _)| {
@@ -2275,9 +2305,9 @@ impl Tool for GetWindowStateTool {
                     // Build the immutable AT-SPI payload outside registry locks,
                     // then publish token metadata and cache rows as one generation.
                     // This is fallible; Linux has no production `expect` wrapper.
-                    let target_scoped = !(crate::wayland::is_wayland()
-                        && crate::wayland::hyprland::is_session())
-                        || tr.window_scoped;
+                    // Bind elements only when the walk proved this window.
+                    // `snapshot_binds_window` replaces the Hyprland-only check.
+                    let target_scoped = binds_window;
                     let snapshot_id = if observation_only {
                         None
                     } else {
@@ -3683,31 +3713,10 @@ fn resolve_launched_windows(
     let started = std::time::Instant::now();
     loop {
         let all = crate::wayland::list_windows_dispatch(None);
-        let own: Vec<_> = all
-            .iter()
-            .filter(|w| w.pid == Some(launcher_pid))
-            .cloned()
-            .collect();
-        if !own.is_empty() {
-            return LaunchedWindows {
-                pid: Some(launcher_pid),
-                windows: own,
-                handed_off: false,
-            };
-        }
-        let fresh: Vec<_> = all
-            .iter()
-            .filter(|w| !before.contains(&w.xid) && w.pid.is_some())
-            .filter(|w| window_matches_launch(w, query))
-            .cloned()
-            .collect();
-        if let Some(pid) = fresh.first().and_then(|w| w.pid) {
-            let windows = fresh.into_iter().filter(|w| w.pid == Some(pid)).collect();
-            return LaunchedWindows {
-                pid: Some(pid),
-                windows,
-                handed_off: true,
-            };
+        if let Some(launched) = settle_launch(&all, launcher_pid, query, before, |w| {
+            crate::x11::window_is_splash(w.xid)
+        }) {
+            return launched;
         }
         let launcher_exited = process_exited(launcher_pid);
         let budget = if launcher_exited {
@@ -3724,6 +3733,39 @@ fn resolve_launched_windows(
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
+}
+
+fn settle_launch(
+    all: &[crate::x11::WindowInfo],
+    launcher_pid: u32,
+    query: &str,
+    before: &std::collections::HashSet<u64>,
+    is_splash: impl Fn(&crate::x11::WindowInfo) -> bool,
+) -> Option<LaunchedWindows> {
+    let own: Vec<_> = all
+        .iter()
+        .filter(|w| w.pid == Some(launcher_pid) && !is_splash(w))
+        .cloned()
+        .collect();
+    if !own.is_empty() {
+        return Some(LaunchedWindows {
+            pid: Some(launcher_pid),
+            windows: own,
+            handed_off: false,
+        });
+    }
+    let fresh: Vec<_> = all
+        .iter()
+        .filter(|w| !before.contains(&w.xid) && w.pid.is_some())
+        .filter(|w| window_matches_launch(w, query) && !is_splash(w))
+        .cloned()
+        .collect();
+    let pid = fresh.first()?.pid?;
+    Some(LaunchedWindows {
+        pid: Some(pid),
+        windows: fresh.into_iter().filter(|w| w.pid == Some(pid)).collect(),
+        handed_off: true,
+    })
 }
 
 #[cfg(test)]
@@ -3787,23 +3829,19 @@ fn with_foreground_diagnostics(
     structured
 }
 
-/// Resolve an AT-SPI element's center in window-local coordinates.
+/// Resolve a token element's center in window-local coordinates.
 ///
 /// Returns `(xid, window_local_x, window_local_y)`.
-/// Looks up element bounds via native AT-SPI, finds the owning window
-/// (via `xid_hint` or the first window for `pid`), then converts screen-absolute
-/// → window-local coords via compositor metadata on Wayland or
-/// XTranslateCoordinates on X11.
+/// Looks up the element's bounds (see [`crate::atspi::token_bounds`]), finds
+/// the owning window (via `xid_hint` or the first window for `pid`), then
+/// converts screen-absolute → window-local coords via compositor metadata on
+/// Wayland or XTranslateCoordinates on X11.
 fn resolve_element_local_coords(
     pid: u32,
-    idx: usize,
+    token: &crate::atspi::TokenElement,
     xid_hint: Option<u64>,
 ) -> anyhow::Result<(u64, f64, f64)> {
-    let (bx, by, bw, bh) = if let Some(xid) = xid_hint {
-        crate::atspi::get_element_bounds_for_window(pid, xid, idx)?
-    } else {
-        crate::atspi::get_element_bounds(pid, idx)?
-    };
+    let (bx, by, bw, bh) = crate::atspi::token_bounds(pid, xid_hint, token)?;
     let screen_cx = bx as f64 + bw as f64 / 2.0;
     let screen_cy = by as f64 + bh as f64 / 2.0;
 
@@ -3850,21 +3888,72 @@ fn resolve_element_local_coords(
     Ok((xid, local_x, local_y))
 }
 
-fn element_screen_center(pid: u32, idx: usize, xid: Option<u64>) -> anyhow::Result<(f64, f64)> {
-    element_screen_center_and_rect(pid, idx, xid).map(|(center, _)| center)
+/// An element whose AT-SPI extents do not fall inside its own toplevel: GTK4
+/// reports empty extents for some widgets (a text view centre resolves to
+/// (0,0), the GNOME hot corner), and a real pointer click there would hit
+/// whatever is under that screen point. Refused before any input is sent.
+#[derive(Debug)]
+struct ElementBoundsUnusable {
+    idx: usize,
+    local: (f64, f64),
+    window: (u32, u32),
+}
+
+impl std::fmt::Display for ElementBoundsUnusable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "element [{}] resolves to window-local ({:.0}, {:.0}), outside its {}x{} window; \
+             the toolkit reported unusable AT-SPI extents, so no pointer input was sent",
+            self.idx, self.local.0, self.local.1, self.window.0, self.window.1
+        )
+    }
+}
+impl std::error::Error for ElementBoundsUnusable {}
+
+/// `resolve_element_local_coords` plus the sanity check that the centre lies
+/// inside the window it belongs to. Blocking.
+fn checked_element_local_coords(
+    pid: u32,
+    token: &crate::atspi::TokenElement,
+    xid_hint: Option<u64>,
+) -> anyhow::Result<(u64, f64, f64)> {
+    let (xid, lx, ly) = resolve_element_local_coords(pid, token, xid_hint)?;
+    if crate::wayland::wayland_input_enabled() {
+        return Ok((xid, lx, ly));
+    }
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    use x11rb::rust_connection::RustConnection;
+    let (conn, _) = RustConnection::connect(None)?;
+    let geom = conn.get_geometry(xid as u32)?.reply()?;
+    let (w, h) = (u32::from(geom.width), u32::from(geom.height));
+    if lx < 0.0 || ly < 0.0 || lx >= f64::from(w) || ly >= f64::from(h) {
+        return Err(ElementBoundsUnusable {
+            idx: token.index,
+            local: (lx, ly),
+            window: (w, h),
+        }
+        .into());
+    }
+    Ok((xid, lx, ly))
+}
+
+fn element_screen_center(
+    pid: u32,
+    token: &crate::atspi::TokenElement,
+    xid: Option<u64>,
+) -> anyhow::Result<(f64, f64)> {
+    element_screen_center_and_rect(pid, token, xid).map(|(center, _)| center)
 }
 
 /// The element's screen centre plus its AT-SPI extents as the overlay's
 /// `[x, y, width, height]`, both from one bounds lookup (same screen space).
 fn element_screen_center_and_rect(
     pid: u32,
-    idx: usize,
+    token: &crate::atspi::TokenElement,
     xid: Option<u64>,
 ) -> anyhow::Result<((f64, f64), [f64; 4])> {
-    let (bx, by, bw, bh) = match xid {
-        Some(xid) => crate::atspi::get_element_bounds_for_window(pid, xid, idx)?,
-        None => crate::atspi::get_element_bounds(pid, idx)?,
-    };
+    let (bx, by, bw, bh) = crate::atspi::token_bounds(pid, xid, token)?;
     let rect = [bx as f64, by as f64, bw as f64, bh as f64];
     Ok(((rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0), rect))
 }
@@ -3884,6 +3973,110 @@ fn frame_target_rect(bounds: Option<(i32, i32, u32, u32)>, sx: f64, sy: f64) -> 
         .then_some(rect)
 }
 
+fn window_scope_unproven_refusal(tool: &str, xid: u64, reason: &str) -> ToolResult {
+    let message = format!(
+        "{tool}: the element's membership in window_id {xid} is unproven ({reason}); \
+         call get_window_state again"
+    );
+    ToolResult::error(message.clone()).with_structured(json!({
+        "status": "refused",
+        "refusal": { "code": "window_scope_unproven", "message": message }
+    }))
+}
+
+/// Prove from a fresh walk that the token's observed element is still in the
+/// token's window, then carry that element to dispatch. `Ok(None)` without a
+/// token. Refuses before any dispatch. X11, Hyprland and compositors without
+/// a GNOME Shell need no proof.
+async fn prove_token_element(
+    pid: u32,
+    resolved: &cua_driver_core::element_token::ResolvedElement,
+    tool: &str,
+) -> Result<Option<crate::atspi::TokenElement>, ToolResult> {
+    let cua_driver_core::element_token::ResolvedElement::Element {
+        window_id,
+        element_index,
+        snapshot_identity,
+        ..
+    } = resolved
+    else {
+        return Ok(None);
+    };
+    let xid = *window_id;
+    let idx = *element_index;
+    let identity = *snapshot_identity;
+    // Same short-circuit as `require_window_element`: X11, Hyprland, and
+    // sessions without a Wayland display have no GNOME window-membership walk.
+    if xid == 0 || !crate::wayland::is_wayland() || crate::wayland::hyprland::is_session() {
+        return Ok(None);
+    }
+    let loaded = cua_driver_core::blocking::spawn(move || {
+        let native_id = crate::atspi::Snapshots::observed_identity(identity, idx)
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        let proof = crate::atspi::require_window_element(
+            pid,
+            xid,
+            crate::atspi::WindowElement::Identity(native_id),
+        )?;
+        let element = crate::atspi::Snapshots::load_cached_element(identity, idx).ok();
+        Ok::<_, anyhow::Error>((element, proof))
+    })
+    .await
+    .unwrap_or_else(|error| Err(anyhow::anyhow!("task error: {error}")));
+    match loaded {
+        Ok((Some(element), proof)) => {
+            token_element_for(tool, xid, idx, element, Ok(proof)).map(Some)
+        }
+        Ok((None, _proof)) => Ok(None),
+        Err(error) => Err(window_scope_unproven_refusal(tool, xid, &error.to_string())),
+    }
+}
+
+fn token_element_for(
+    tool: &str,
+    xid: u64,
+    index: usize,
+    observed: crate::atspi::snapshot::CachedElement,
+    proof: anyhow::Result<crate::atspi::WindowProof>,
+) -> Result<crate::atspi::TokenElement, ToolResult> {
+    proof
+        .map(|proof| crate::atspi::TokenElement::new(index, observed, proof))
+        .map_err(|error| window_scope_unproven_refusal(tool, xid, &error.to_string()))
+}
+
+/// The object an element token observed no longer answers: the token is
+/// stale. Nothing reached that object, and it is never retargeted by index
+/// after a window proof.
+fn stale_observed_element(tool: &str, idx: usize, error: &anyhow::Error) -> Option<ToolResult> {
+    error
+        .is::<crate::atspi::native::CachedElementGone>()
+        .then(|| {
+            ToolResult::error(format!(
+                "{tool}: stale_element_token: observed AT-SPI object [{idx}] is no longer \
+                 present ({error}); re-snapshot with get_window_state"
+            ))
+            .with_structured(json!({ "code": "stale_element_token", "effect": "none" }))
+        })
+}
+
+/// The cursor glides to an element before its click. A failed lookup skips
+/// only the glide, except a window-membership failure, which refuses.
+#[cfg(test)]
+fn element_click_placement(
+    placement: anyhow::Result<(u64, f64, f64)>,
+    xid: Option<u64>,
+) -> Result<Option<(u64, f64, f64)>, ToolResult> {
+    match placement {
+        Ok(point) => Ok(Some(point)),
+        Err(error) if crate::atspi::is_window_membership_unproven(&error) => Err(
+            window_scope_unproven_refusal("click", xid.unwrap_or(0), &error.to_string()),
+        ),
+        Err(_) => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod token_window_scope_tests;
 fn window_local_to_screen(xid: u64, x: f64, y: f64) -> anyhow::Result<(f64, f64)> {
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::ConnectionExt as _;
@@ -6091,11 +6284,11 @@ fn current_pointer_position() -> Option<(f64, f64)> {
 fn explicit_keyboard_cursor_target(
     pid: u32,
     xid: u64,
-    element_index: Option<usize>,
+    element: Option<&crate::atspi::TokenElement>,
     pixel_target: Option<(f64, f64)>,
 ) -> Option<(f64, f64)> {
-    if let Some(element_index) = element_index {
-        let (sx, sy) = element_screen_center(pid, element_index, (xid != 0).then_some(xid)).ok()?;
+    if let Some(element) = element {
+        let (sx, sy) = element_screen_center(pid, element, (xid != 0).then_some(xid)).ok()?;
         return Some((sx, sy));
     }
 
@@ -6121,7 +6314,7 @@ async fn announce_keyboard_target(
     args: &Value,
     pid: u32,
     xid: u64,
-    element_index: Option<usize>,
+    element: Option<crate::atspi::TokenElement>,
     pixel_target: Option<(f64, f64)>,
 ) {
     if !cua_driver_core::cursor_hook::cursor_hook_enabled() {
@@ -6129,7 +6322,7 @@ async fn announce_keyboard_target(
     }
     let cursor_id = resolve_cursor_key(args);
     let target = cua_driver_core::blocking::spawn(move || {
-        explicit_keyboard_cursor_target(pid, xid, element_index, pixel_target)
+        explicit_keyboard_cursor_target(pid, xid, element.as_ref(), pixel_target)
             .or_else(|| (xid != 0).then(|| keyboard_window_center(xid)).flatten())
     })
     .await
@@ -6145,7 +6338,7 @@ async fn position_named_session_keyboard_cursor(
     args: &Value,
     pid: u32,
     xid: u64,
-    element_index: Option<usize>,
+    element: Option<crate::atspi::TokenElement>,
     pixel_target: Option<(f64, f64)>,
     preserve_legacy_element_visual: bool,
 ) {
@@ -6156,11 +6349,9 @@ async fn position_named_session_keyboard_cursor(
     let named_cursor_id = named_session_cursor_key(args);
     let cursor_id = match named_cursor_id {
         Some(ref cursor_id) => cursor_id.clone(),
-        None if preserve_legacy_element_visual && element_index.is_some() => {
-            resolve_cursor_key(args)
-        }
+        None if preserve_legacy_element_visual && element.is_some() => resolve_cursor_key(args),
         None => {
-            announce_keyboard_target(args, pid, xid, element_index, pixel_target).await;
+            announce_keyboard_target(args, pid, xid, element, pixel_target).await;
             return;
         }
     };
@@ -6172,7 +6363,7 @@ async fn position_named_session_keyboard_cursor(
             .and_then(|cursor| cursor.x.zip(cursor.y))
     });
     let explicit = cua_driver_core::blocking::spawn(move || {
-        explicit_keyboard_cursor_target(pid, xid, element_index, pixel_target)
+        explicit_keyboard_cursor_target(pid, xid, element.as_ref(), pixel_target)
     })
     .await
     .ok()
@@ -6821,6 +7012,11 @@ impl Tool for ClickTool {
             Ok(r) => r,
             Err(e) => return e,
         };
+        // Window-scope proof precedes dispatch. Click keeps the retained
+        // observed-mutation route, so the token itself is not re-dispatched.
+        if let Err(refusal) = prove_token_element(pid, &resolved, "click").await {
+            return refusal;
+        }
         let (elem_idx_resolved, snapshot_identity) = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element {
                 element_index,
@@ -7708,6 +7904,10 @@ impl Tool for TypeTextTool {
             Ok(r) => r,
             Err(e) => return e,
         };
+        let token = match prove_token_element(pid, &resolved, "type_text").await {
+            Ok(token) => token,
+            Err(refusal) => return refusal,
+        };
         let (resolved_elem_idx, resolved_window_id, snapshot_identity) = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element {
                 element_index,
@@ -7846,14 +8046,14 @@ impl Tool for TypeTextTool {
                         &args,
                         pid,
                         xid,
-                        None,
+                        token.clone(),
                         None,
                         true,
                     )
                     .await;
                 }
             } else {
-                announce_keyboard_target(&args, pid, xid, None, px.zip(py)).await;
+                announce_keyboard_target(&args, pid, xid, token.clone(), px.zip(py)).await;
             }
             let owner = named_session_cursor_key(&args);
             let (_cancellation, dispatch) =
@@ -7890,7 +8090,7 @@ impl Tool for TypeTextTool {
             &args,
             pid,
             xid,
-            None,
+            token.clone(),
             px.zip(py),
             true,
         )
@@ -7982,7 +8182,9 @@ impl Tool for TypeTextTool {
                     type_text_structured("key_events", text_len, false),
                     outcome,
                 )),
-                Ok(Err(e)) => ToolResult::error(e.to_string()),
+                Ok(Err(e)) => resolved_elem_idx
+                    .and_then(|idx| stale_observed_element("type_text", idx, &e))
+                    .unwrap_or_else(|| ToolResult::error(e.to_string())),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
         }
@@ -8338,6 +8540,10 @@ impl Tool for PressKeyTool {
             Ok(r) => r,
             Err(e) => return e,
         };
+        let token = match prove_token_element(pid, &resolved, "press_key").await {
+            Ok(token) => token,
+            Err(refusal) => return refusal,
+        };
         let (resolved_element_index, snapshot_identity) = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element {
                 element_index,
@@ -8491,7 +8697,7 @@ impl Tool for PressKeyTool {
                     &args,
                     pid,
                     xid,
-                    None,
+                    token.clone(),
                     None,
                     false,
                 )
@@ -8505,7 +8711,7 @@ impl Tool for PressKeyTool {
             &args,
             pid,
             xid,
-            None,
+            token.clone(),
             px.zip(py),
             false,
         )
@@ -8583,7 +8789,9 @@ impl Tool for PressKeyTool {
                     "Pressed key '{key}' (via Wayland virtual-keyboard)."
                 ))
                 .with_structured(with_foreground_diagnostics(json!({}), outcome)),
-                Ok(Err(e)) => ToolResult::error(e.to_string()),
+                Ok(Err(e)) => resolved_element_index
+                    .and_then(|idx| stale_observed_element("press_key", idx, &e))
+                    .unwrap_or_else(|| ToolResult::error(e.to_string())),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             };
         }
@@ -8740,6 +8948,10 @@ impl Tool for HotkeyTool {
         {
             Ok(resolved) => resolved,
             Err(error) => return error,
+        };
+        let token = match prove_token_element(pid, &resolved, "hotkey").await {
+            Ok(token) => token,
+            Err(refusal) => return refusal,
         };
         let (resolved_element_index, snapshot_identity) = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element {
@@ -8922,7 +9134,7 @@ impl Tool for HotkeyTool {
                     &args,
                     pid,
                     xid,
-                    None,
+                    token.clone(),
                     None,
                     false,
                 )
@@ -8936,7 +9148,7 @@ impl Tool for HotkeyTool {
             &args,
             pid,
             xid,
-            None,
+            token.clone(),
             px.zip(py),
             false,
         )
@@ -9091,6 +9303,10 @@ impl Tool for SetValueTool {
             Ok(r) => r,
             Err(e) => return e,
         };
+        let token = match prove_token_element(pid, &resolved, "set_value").await {
+            Ok(token) => token,
+            Err(refusal) => return refusal,
+        };
         let (idx, resolved_window_id, snapshot_identity) = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element {
                 element_index,
@@ -9135,8 +9351,16 @@ impl Tool for SetValueTool {
         };
         let value_for_task = value.clone();
         let xid = exact_window_id.unwrap_or(0);
-        position_named_session_keyboard_cursor(&self.state, &args, pid, xid, Some(idx), None, true)
-            .await;
+        position_named_session_keyboard_cursor(
+            &self.state,
+            &args,
+            pid,
+            xid,
+            token.clone(),
+            None,
+            true,
+        )
+        .await;
         let proof_for_value = exact_target_proof.clone();
         let state_for_value = self.state.clone();
         let value_task = match self.state.snapshots.spawn_observed_mutation(
@@ -9488,7 +9712,9 @@ fn retained_scroll_chromium_background_refuses_before_native_resolution() {
                     };
                     let id = state
                         .snapshots
-                        .publish(state.snapshots.prepare(pid, 0x7f30_0105, &[node]).unwrap())
+                        .publish_prepared(
+                            state.snapshots.prepare(pid, 0x7f30_0105, &[node]).unwrap(),
+                        )
                         .unwrap();
                     let token = cua_driver_core::element_token::token_for(id, 7);
                     let args = json!({
@@ -9725,6 +9951,10 @@ impl Tool for ScrollTool {
             Ok(r) => r,
             Err(e) => return e,
         };
+        let token = match prove_token_element(pid, &resolved, "scroll").await {
+            Ok(token) => token,
+            Err(refusal) => return refusal,
+        };
         let xid_opt: Option<u64> = match &resolved {
             cua_driver_core::element_token::ResolvedElement::Element { window_id, .. } => {
                 Some(*window_id)
@@ -9887,6 +10117,7 @@ impl Tool for ScrollTool {
                 );
             }
             let owner = named_session_cursor_key(&args);
+            let element = token.clone();
             let (_cancellation, dispatch) =
                 match spawn_isolated_hyprland(&args, move |cancellation| {
                     let point = pixel_target;
@@ -12881,7 +13112,7 @@ impl Tool for CheckPermissionsTool {
         PERMS_DEF.get_or_init(|| ToolDef {
             name: "check_permissions".into(),
             description: "Check required permissions for cua-driver-rs on Linux.".into(),
-            input_schema: json!({"type":"object","properties":{},"additionalProperties":false}),
+            input_schema: json!({"type":"object","properties":{"prompt":{"type":"boolean","description":"Ignored: Linux has no permission prompts."}},"additionalProperties":false}),
             read_only: true,
             destructive: false,
             idempotent: true,
@@ -12949,6 +13180,16 @@ impl Tool for CheckPermissionsTool {
         ToolResult::text(status_text)
             .with_structured(json!({ "x11": x11_ok, "wayland": wayland_display.is_some(), "wayland_enabled": crate::wayland::wayland_enabled(), "atspi": atspi_ok, "dbus_session_bus_address": dbus_address, "xsend_event": x11_ok }))
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn check_permissions_accepts_the_status_prompt_argument() {
+    let result = build_registry_with_provider(false, None)
+        .invoke("check_permissions", json!({ "prompt": false }))
+        .await;
+    let wire = serde_json::to_value(&result).unwrap();
+    assert!(wire["structuredContent"].get("x11").is_some(), "{wire}");
 }
 
 // ── get_config ────────────────────────────────────────────────────────────────
@@ -13241,7 +13482,7 @@ impl Tool for GetAccessibilityTreeTool {
         GAX_DEF.get_or_init(|| ToolDef {
             name: "get_accessibility_tree".into(),
             description: "Return a lightweight snapshot of the desktop: running processes and \
-                on-screen visible X11 windows with their bounds and owner pid.\n\n\
+                on-screen visible windows with their bounds and owner pid.\n\n\
                 For the full AT-SPI subtree of a single window (with interactive element indices \
                 you can click by), use get_window_state instead — this is a fast discovery read."
                 .into(),
@@ -13256,11 +13497,15 @@ impl Tool for GetAccessibilityTreeTool {
         let (procs, windows) = cua_driver_core::blocking::spawn(|| {
             (
                 crate::proc_fs::list_processes(),
-                crate::x11::list_windows(None),
+                visible_live_desktop_windows(crate::wayland::list_windows_dispatch(None)),
             )
         })
         .await
         .unwrap_or_default();
+
+        if crate::wayland::is_wayland() {
+            crate::wayland::remember_observed_window_origins(&windows);
+        }
 
         let mut lines = vec![format!(
             "{} running process(es), {} visible window(s)",
@@ -13302,10 +13547,7 @@ impl Tool for GetAccessibilityTreeTool {
 
         let structured = json!({
             "processes": procs.iter().map(|p| json!({"pid":p.pid,"name":p.name})).collect::<Vec<_>>(),
-            "windows": windows.iter().map(|w| json!({
-                "window_id": w.xid, "pid": w.pid, "title": w.title,
-                "x": w.x, "y": w.y, "width": w.width, "height": w.height
-            })).collect::<Vec<_>>()
+            "windows": windows.iter().map(window_record_json).collect::<Vec<_>>()
         });
         ToolResult::text(lines.join("\n")).with_structured(structured)
     }
@@ -14765,7 +15007,7 @@ mod click_button_schema_tests {
             .snapshots
             .prepare(pid, xid, &[value_node(key)])
             .unwrap();
-        let snapshot_id = state.snapshots.publish(candidate).unwrap();
+        let snapshot_id = state.snapshots.publish_prepared(candidate).unwrap();
         cua_driver_core::element_token::format_token(snapshot_id, 0)
     }
 

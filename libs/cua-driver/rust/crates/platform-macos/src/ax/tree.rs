@@ -208,6 +208,21 @@ pub fn walk_tree_bounded(
     )
 }
 
+pub(crate) fn walk_native_chrome_bounded(
+    pid: i32,
+    window_id: u32,
+    max_elements: usize,
+) -> TreeWalkResult {
+    walk_tree_with_web_content(
+        pid,
+        Some(window_id),
+        None,
+        DEFAULT_MAX_DEPTH,
+        WalkBudget::nodes_only(max_elements),
+        false,
+    )
+}
+
 /// [`walk_tree_bounded`] under a caller's [`WalkBudget`]: the walk also stops
 /// when the budget's `timeout_ms` runs out, returning the partial tree. Each
 /// AX call is bounded by the per-element messaging timeout, so the walk
@@ -217,7 +232,18 @@ pub fn walk_tree_budgeted(
     window_id: Option<u32>,
     query: Option<&str>,
     max_depth: usize,
+    budget: WalkBudget,
+) -> TreeWalkResult {
+    walk_tree_with_web_content(pid, window_id, query, max_depth, budget, true)
+}
+
+fn walk_tree_with_web_content(
+    pid: i32,
+    window_id: Option<u32>,
+    query: Option<&str>,
+    max_depth: usize,
     mut budget: WalkBudget,
+    include_web_content: bool,
 ) -> TreeWalkResult {
     let mut nodes: Vec<AXNode> = Vec::new();
     let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
@@ -307,6 +333,7 @@ pub fn walk_tree_budgeted(
                 &mut budget,
                 &mut collapsed_rows,
                 max_depth,
+                include_web_content,
             );
         }
 
@@ -432,6 +459,7 @@ unsafe fn walk_children(
     budget: &mut WalkBudget,
     collapsed_rows: &mut usize,
     max_depth: usize,
+    include_web_content: bool,
 ) {
     if child_depth > max_depth {
         return;
@@ -459,6 +487,7 @@ unsafe fn walk_children(
             budget,
             collapsed_rows,
             max_depth,
+            include_web_content,
         );
     }
     if let Some(rows) = collapsed {
@@ -486,6 +515,7 @@ unsafe fn walk_element(
     budget: &mut WalkBudget,
     collapsed_rows: &mut usize,
     max_depth: usize,
+    include_web_content: bool,
 ) {
     if depth > max_depth {
         return;
@@ -506,6 +536,9 @@ unsafe fn walk_element(
     let role = attrs.role.take().unwrap_or_else(|| "AXUnknown".into());
 
     let in_web_content = in_web_content || is_web_content_role(&role);
+    if in_web_content && !include_web_content {
+        return;
+    }
 
     // Skip pure layout containers that have no interesting content.
     if role == "AXScrollArea" || role == "AXGroup" {
@@ -526,6 +559,7 @@ unsafe fn walk_element(
             budget,
             collapsed_rows,
             max_depth,
+            include_web_content,
         );
         return;
     }
@@ -586,6 +620,7 @@ unsafe fn walk_element(
             budget,
             collapsed_rows,
             max_depth,
+            include_web_content,
         );
         return;
     }
@@ -723,6 +758,7 @@ unsafe fn walk_element(
         budget,
         collapsed_rows,
         max_depth,
+        include_web_content,
     );
 }
 

@@ -882,7 +882,11 @@ export default class WinRectsExtension extends Extension {
                 }
             }
             record.badgeLabel.opacity = Math.round(255 * labelAlpha);
-            if (labelAlpha <= 0.001) record.badgeLabel.hide();
+            if (labelAlpha <= 0.001) {
+                if (record.badgeLabel.visible && record.cursorX !== null && record.cursorY !== null)
+                    this._positionBadge(record, record.cursorX, record.cursorY, 0);
+                record.badgeLabel.hide();
+            }
             record.deliveryChip.opacity = Math.round(255 * chipAlpha);
             record.targetChip.opacity = Math.round(255 * chipAlpha);
             // Exact-target gating is load-bearing: animation may never reveal a global cursor.
@@ -893,6 +897,20 @@ export default class WinRectsExtension extends Extension {
             return GLib.SOURCE_CONTINUE;
         });
         return record;
+    }
+
+    _revealRecordBadge(record) {
+        if (!record.badgeLabel || !record.sessionLabel)
+            return;
+        const target = record.targetId ? this._resolveTarget(record.targetId) : null;
+        if (!(record.requestedVisible && target && this._isTargetVisible(target)))
+            return;
+        record.badgeLabel.show();
+        if (record.cursorX !== null && record.cursorY !== null)
+            this._positionBadge(record, record.cursorX, record.cursorY, 0);
+        record.badgeRevealedAt = nowSeconds();
+        record.badge.opacity = 255;
+        record.badge.show();
     }
 
     _positionBadge(record, x, y, duration) {
@@ -1629,6 +1647,7 @@ export default class WinRectsExtension extends Extension {
     MoveCursorForAsync([owner, targetId, x, y], invocation) {
         try {
             const record = this._cursorFor(this._cursorOwner(owner, invocation));
+            const revealBadge = !record.actor.visible;
             record.targetId = targetId;
             record.requestedVisible = true;
             record.cursorX = x; record.cursorY = y;
@@ -1640,6 +1659,7 @@ export default class WinRectsExtension extends Extension {
                 mode: Clutter.AnimationMode.EASE_OUT_CUBIC,
             });
             this._positionBadge(record, x, y, 480);
+            if (revealBadge) this._revealRecordBadge(record);
             invocation.return_value(null);
         } catch (error) {
             invocation.return_dbus_error('org.cua.WinRects.CursorRejected', String(error));
@@ -1649,6 +1669,7 @@ export default class WinRectsExtension extends Extension {
     ClickPulseForAsync([owner, targetId, x, y], invocation) {
         try {
             const record = this._cursorFor(this._cursorOwner(owner, invocation));
+            const revealBadge = !record.actor.visible;
             record.targetId = targetId;
             record.requestedVisible = true;
             record.actor.set_position(x - ACTOR_CENTER, y - ACTOR_CENTER);
@@ -1657,16 +1678,8 @@ export default class WinRectsExtension extends Extension {
             if (['idle', 'navigate', 'click'].includes(record.action))
                 this._setRecordCursorState(record, 'click', record.delivery, record.target);
             this._syncCursorVisibility(record);
-            record.actor.ease({
-                scale_x: 1.5,
-                scale_y: 1.5,
-                duration: 130,
-                mode: Clutter.AnimationMode.EASE_OUT_QUAD,
-                onComplete: () => {
-                    if (record.actor)
-                        record.actor.ease({scale_x: 1, scale_y: 1, duration: 130});
-                },
-            });
+            record.actor.queue_repaint();
+            if (revealBadge) this._revealRecordBadge(record);
             invocation.return_value(null);
         } catch (error) {
             invocation.return_dbus_error('org.cua.WinRects.CursorRejected', String(error));
@@ -1748,6 +1761,9 @@ export default class WinRectsExtension extends Extension {
                 record.badge.hide();
                 record.badgeRevealedAt = null;
                 record.modifierFadeAt = null;
+                record.delivery = '';
+                record.target = '';
+                this._updateModifierChips(record);
             }
             invocation.return_value(null);
         } catch (error) {
@@ -1789,6 +1805,11 @@ export default class WinRectsExtension extends Extension {
     // WinRects v1 compatibility methods fail closed. Keeping the D-Bus
     // signatures makes version skew deterministic rather than accidentally
     // falling through to global Shell chrome or unqualified activation.
+    // Legacy global Capture stays fail-closed. GNOME 50 stage capture must
+    // use Shell.Screenshot.screenshot(false), never screenshot_stage_to_content:
+    // the stage path copies a cursor sprite and can crash Shell on a 0x0 remote
+    // pointer. Exact-target capture uses paint_to_content plus cursor-free
+    // composite_to_stream. This method must not fall through to a portal screenshot.
     CaptureAsync(_params, invocation) {
         invocation.return_dbus_error(
             'org.cua.WinRects.UpgradeRequired',

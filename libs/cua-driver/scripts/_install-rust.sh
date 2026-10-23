@@ -119,6 +119,8 @@ if [[ "$_cua_install_common_loaded" == "0" ]]; then
     printf 'warning: could not load _install-common.sh (on-disk + network); daemon kill skipped\n' >&2
     stop_cua_driver_daemons() { :; }
     show_cua_driver_daemon_survivors() { :; }
+    unregister_other_cua_driver_copies() { :; }
+    cua_driver_lsregister_path() { return 1; }
 fi
 
 REPO="trycua/cua"
@@ -188,6 +190,27 @@ TMP_DIR=$(mktemp -d)
 
 log() { printf '==> %s\n' "$*"; }
 err() { printf 'error: %s\n' "$*" >&2; }
+
+print_path_hint() {
+    log "WARNING: $BIN_DIR is not on PATH."
+    echo "Add it for your shell with:"
+    local run_prefix=""
+    case "${SHELL:-}" in
+        */fish)
+            printf '  fish_add_path "%s"\n' "$BIN_DIR"
+            ;;
+        */nu|*/nushell)
+            printf '  $env.PATH = ($env.PATH | prepend "%s")\n' "$BIN_DIR"
+            run_prefix="^"
+            ;;
+        *)
+            echo "POSIX-compatible shells:"
+            printf '  export PATH="%s:$PATH"\n' "$BIN_DIR"
+            ;;
+    esac
+    echo "Or run the installed binary directly:"
+    printf '  %s"%s" --version\n' "$run_prefix" "$BIN_LINK"
+}
 
 # Return the source form of an app's designated code-signing requirement.
 macos_designated_requirement() {
@@ -324,8 +347,22 @@ release_install_lock() {
 # Combine TMP_DIR cleanup with lock release in a single trap so neither
 # clobbers the other. INT/TERM also re-raise via $? so the user-visible
 # exit code reflects the signal.
+# The release archive is unpacked into $TMP_DIR, which includes a CuaDriver.app
+# that is deleted on exit. Make sure LaunchServices never keeps that dead copy:
+# a registered temp copy can later be what `open -a CuaDriver` or a permission
+# row resolves to.
+forget_staged_macos_app() {
+    [[ "$(uname -s 2>/dev/null)" == "Darwin" && -n "${SRC_APP:-}" && -d "$SRC_APP" ]] || return 0
+    local lsregister
+    lsregister="$(cua_driver_lsregister_path 2>/dev/null || true)"
+    if [[ -x "$lsregister" ]]; then
+        "$lsregister" -u "$SRC_APP" >/dev/null 2>&1 || true
+    fi
+}
+
 cleanup_on_exit() {
     restore_macos_app_backup_on_exit
+    forget_staged_macos_app
     rm -rf "$TMP_DIR" 2>/dev/null || true
     release_install_lock
 }
@@ -610,51 +647,6 @@ for cmd in curl tar; do
     fi
 done
 
-sha256_file() {
-    local file="$1"
-    if command -v sha256sum >/dev/null 2>&1; then
-        sha256sum "$file" | awk '{print $1}'
-    elif command -v shasum >/dev/null 2>&1; then
-        shasum -a 256 "$file" | awk '{print $1}'
-    else
-        err "sha256sum or shasum not found on PATH; cannot verify release checksum"
-        return 1
-    fi
-}
-
-verify_release_checksum() {
-    local archive_path="$1"
-    local archive_name="$2"
-    local checksums_url="$3"
-    local checksums_file="$TMP_DIR/checksums.txt"
-    local expected actual
-
-    log "downloading checksums $checksums_url"
-    if ! curl -fsSL -o "$checksums_file" "$checksums_url"; then
-        err "failed to download release checksums from $checksums_url"
-        exit 1
-    fi
-
-    expected=$(awk -v name="$archive_name" '
-        length($1) == 64 && $1 ~ /^[0-9A-Fa-f]+$/ && $2 == name { print tolower($1); found=1; exit }
-        END { if (!found) exit 1 }
-    ' "$checksums_file") || {
-        err "checksum for $archive_name not found in release checksums"
-        err "  expected an entry in $checksums_url"
-        exit 1
-    }
-
-    actual=$(sha256_file "$archive_path") || exit 1
-    if [[ "$actual" != "$expected" ]]; then
-        err "checksum mismatch for $archive_name"
-        err "  expected: $expected"
-        err "  actual:   $actual"
-        exit 1
-    fi
-
-    log "verified SHA256 for $archive_name"
-}
-
 # --- Resolve release tag ------------------------------------------------
 #
 # Version is resolved in priority order:
@@ -671,7 +663,7 @@ verify_release_checksum() {
 # asset — see the recovery at the download step below.
 #
 # ~~~ BAKED_VERSION: auto-updated after release publication — do not edit ~~~
-CUA_DRIVER_RS_BAKED_VERSION="0.35.2" # published-installer-version
+CUA_DRIVER_RS_BAKED_VERSION="0.37.0" # published-installer-version
 # ~~~ END_BAKED_VERSION ~~~
 #
 # Withdrawn releases (for example, a macOS archive published unsigned) are
@@ -910,8 +902,8 @@ version_is_at_least() {
 # macOS — fetch the directory tarball (cua-driver-rs-vN-darwin-universal.tar.gz).
 #   The directory layout includes `CuaDriver.app/` alongside the bare
 #   binary, which we need to install into /Applications so the TCC
-#   auto-relaunch path in `cua-driver-rs mcp` can resolve
-#   `com.trycua.driver` via `open -n -g -a CuaDriver`. The
+#   auto-relaunch path in `cua-driver-rs mcp` can launch the installed
+#   `com.trycua.driver` app by its exact path. The
 #   directory variant carries the same universal binary as the
 #   bare-binary tarball, so users on both Apple Silicon and Intel
 #   get a working install from one download.
@@ -1261,7 +1253,7 @@ fi
 # $HOME_DIR/packages/releases/<v>/ + current symlink layout used on
 # Linux. Reason: /Applications/CuaDriver.app placement is the
 # anchor for both TCC attribution (cdhash + bundle id) and
-# LaunchServices' `open -a CuaDriver` discovery — symlinking the
+# LaunchServices' bundle-id discovery — symlinking the
 # .app from /Applications to a versioned dir under $HOME_DIR breaks
 # both. The asymmetry is deliberate; rollback on macOS = reinstall
 # an older release tag.
@@ -1396,8 +1388,9 @@ if [[ "$OS" == "Darwin" && -n "$SRC_APP" && -d "$SRC_APP" ]]; then
         exit 1
     fi
 
-    # Register synchronously so both `open -a CuaDriver` and `tccutil reset`
-    # resolve the replacement bundle rather than a stale LaunchServices entry.
+    # Register synchronously so both `permissions grant` (which launches the
+    # bundle by its exact path) and `tccutil reset` resolve the replacement
+    # bundle rather than a stale LaunchServices entry.
     LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
     if [[ -x "$LSREGISTER" ]] \
        && "$LSREGISTER" -f "$APP_DEST" >/dev/null 2>&1; then
@@ -1436,6 +1429,10 @@ if [[ "$OS" == "Darwin" && -n "$SRC_APP" && -d "$SRC_APP" ]]; then
     rm -rf "$MACOS_APP_BACKUP" || true
     ln -sf "$APP_BINARY" "$BIN_LINK"
     log "symlinked $BIN_LINK -> $APP_BINARY"
+    # Other copies of the app (an old release in ~/Downloads, the Trash, a
+    # benchmark folder) make macOS open the wrong app and label the permission
+    # rows with the wrong name. Forget them; their files stay where they are.
+    unregister_other_cua_driver_copies "$APP_DEST" || true
     if ! macos_reset_tcc_after_requirement_change "$REQUIREMENT_COMPATIBILITY"; then
         exit 1
     fi
@@ -1467,7 +1464,6 @@ else
         cp -R "$SRC_WAYLAND_HELPER/." "$VERSIONED_DIR/wayland-helper/"
 
         log "GNOME helper bundled for explicit staged rollout; installed helper unchanged"
-
     fi
     log "installed $VERSIONED_DIR/$BINARY_NAME (version $VERSION, target $TARGET)"
 
@@ -1570,21 +1566,20 @@ CUA_DRIVER_RELEASE_VERSION="$VERSION" \
 disown 2>/dev/null || true
 
 # Auto-extend PATH for users whose shell doesn't already include BIN_DIR.
-if [[ "$NO_MODIFY_PATH" != "1" ]] && [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
     SHELL_RC=""
     case "${SHELL:-}" in
         */zsh)  SHELL_RC="$HOME/.zshrc"  ;;
         */bash) SHELL_RC="$HOME/.bashrc" ;;
     esac
-    if [[ -n "$SHELL_RC" ]]; then
+    if [[ "$NO_MODIFY_PATH" != "1" ]] && [[ -n "$SHELL_RC" ]]; then
         {
             printf '\n# Added by cua-driver-rs installer — see https://github.com/trycua/cua\n'
             printf 'export PATH="%s:$PATH"\n' "$BIN_DIR"
         } >> "$SHELL_RC"
         log "appended PATH update to $SHELL_RC — open a new shell or run \`source $SHELL_RC\`"
-    else
-        log "WARNING: $BIN_DIR is not on PATH; add it manually."
     fi
+    print_path_hint
 fi
 
 echo ""
@@ -1626,17 +1621,11 @@ else
     # Network fetch failed — print a one-line essentials fallback so the
     # user always gets enough to recover, even if hint-text fetching is
     # blocked. Skip everything else.
-    echo "Next steps: $BIN_LINK --version  |  $BIN_LINK mcp-config  |  $BIN_LINK skills install"
+    echo "Next steps: $BIN_LINK permissions grant  |  $BIN_LINK mcp-config --client <name>  |  $BIN_LINK list-tools"
     echo "Docs: https://github.com/trycua/cua/tree/main/libs/cua-driver/rust"
 fi
 
 case "$(uname -s)" in
-    Darwin)
-        echo ""
-        echo "macOS TCC: grant Accessibility + Screen Recording on first run:"
-        echo "  open -n -g -a CuaDriver --args serve"
-        echo "  $BIN_LINK check_permissions"
-        ;;
     Linux)
         echo ""
         echo "Auto-start at logon (optional):"
