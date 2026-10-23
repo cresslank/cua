@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    OnceLock,
+    Arc, Mutex, OnceLock,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -68,16 +68,317 @@ enum WlOverlayCmd {
     },
     Remove(CursorKey),
     Revive(CursorKey),
+    Probe(Sender<anyhow::Result<bool>>),
+    #[cfg(test)]
     Shutdown,
 }
 
-static TX: OnceLock<Sender<WlOverlayCmd>> = OnceLock::new();
+// Shared by the two native Wayland owners. The registry owns the join handle;
+// callers get generation-bound handles, never a borrowed static Sender.
+pub(super) const RETIRE_TIMEOUT: Duration = Duration::from_secs(1);
+
+pub(super) struct WorkerControl {
+    stopped: AtomicBool,
+    stop_tx: Mutex<Option<Sender<()>>>,
+    pub(super) stop_rx: Receiver<()>,
+    sockets: Mutex<HashMap<usize, (std::os::unix::net::UnixStream, bool)>>,
+    next_socket: std::sync::atomic::AtomicUsize,
+    available: OnceLock<bool>,
+}
+
+impl WorkerControl {
+    pub(super) fn new() -> Arc<Self> {
+        let (tx, rx) = bounded(0);
+        Arc::new(Self {
+            stopped: AtomicBool::new(false),
+            stop_tx: Mutex::new(Some(tx)),
+            stop_rx: rx,
+            sockets: Mutex::new(HashMap::new()),
+            next_socket: std::sync::atomic::AtomicUsize::new(0),
+            available: OnceLock::new(),
+        })
+    }
+
+    pub(super) fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    pub(super) fn stop(&self) {
+        // Install/protect and stop share this lock: no late socket can escape
+        // retirement, and no input can start on a socket already interrupted.
+        let sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
+        self.stopped.store(true, Ordering::Release);
+        self.stop_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        for (socket, input_pending) in sockets.values() {
+            if !input_pending {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+
+    pub(super) fn track(self: &Arc<Self>, conn: &Connection) -> anyhow::Result<TrackedSocket> {
+        use std::os::fd::AsFd;
+        // Connection::as_fd is the public Wayland socket FD. Duplicate it while
+        // borrowed and keep the duplicate alive: shutdown never targets a reused
+        // integer FD, never closes a foreign handle, and does not take the
+        // backend's read/dispatch lock while interrupting a blocked roundtrip.
+        let socket = std::os::unix::net::UnixStream::from(conn.as_fd().try_clone_to_owned()?);
+        let mut sockets = self.sockets.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(!self.stopped(), "Wayland worker generation retired");
+        let id = self.next_socket.fetch_add(1, Ordering::Relaxed);
+        sockets.insert(id, (socket, false));
+        Ok(TrackedSocket {
+            control: self.clone(),
+            id,
+        })
+    }
+}
+
+/// Connect through the standard named socket with bounded local admission.
+/// WAYLAND_SOCKET is already connected; let wayland-client consume its inherited
+/// descriptor via its public API rather than constructing a borrowed raw FD.
+pub(super) fn connect_tracked(
+    control: &Arc<WorkerControl>,
+) -> anyhow::Result<(Connection, TrackedSocket)> {
+    anyhow::ensure!(!control.stopped(), "Wayland worker generation retired");
+    let conn = if std::env::var_os("WAYLAND_SOCKET").is_some() {
+        Connection::connect_to_env()?
+    } else {
+        let display = std::path::PathBuf::from(
+            std::env::var_os("WAYLAND_DISPLAY").unwrap_or_else(|| "wayland-0".into()),
+        );
+        let path = if display.is_absolute() {
+            display
+        } else {
+            let runtime = std::path::PathBuf::from(
+                std::env::var_os("XDG_RUNTIME_DIR")
+                    .ok_or_else(|| anyhow::anyhow!("missing XDG_RUNTIME_DIR"))?,
+            );
+            anyhow::ensure!(runtime.is_absolute(), "XDG_RUNTIME_DIR must be absolute");
+            runtime.join(display)
+        };
+        let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+        socket.connect_timeout(&socket2::SockAddr::unix(path)?, Duration::from_millis(250))?;
+        Connection::from_socket(socket.into())?
+    };
+    let socket = control.track(&conn)?;
+    Ok((conn, socket))
+}
+
+pub(super) struct TrackedSocket {
+    control: Arc<WorkerControl>,
+    id: usize,
+}
+
+impl TrackedSocket {
+    // Once input might be queued, disconnect is NOT a consumption/cancellation
+    // acknowledgement. Protect the socket until a successful final sync; a
+    // stuck compositor then causes an explicit bounded shutdown error while
+    // the owned worker keeps its focus/raw-input lease. Never detach it.
+    pub(super) fn protect_input(&self) -> anyhow::Result<()> {
+        let mut sockets = self
+            .control
+            .sockets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(!self.control.stopped(), "Wayland worker generation retired");
+        sockets.get_mut(&self.id).expect("tracked socket").1 = true;
+        Ok(())
+    }
+}
+
+impl Drop for TrackedSocket {
+    fn drop(&mut self) {
+        self.control
+            .sockets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+pub(super) struct WorkerSender<C> {
+    tx: Sender<C>,
+    pub(super) control: Arc<WorkerControl>,
+}
+
+impl<C> Clone for WorkerSender<C> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            control: self.control.clone(),
+        }
+    }
+}
+
+impl<C> WorkerSender<C> {
+    pub(super) fn send(&self, cmd: C) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.control.stopped(), "Wayland worker generation retired");
+        // Preserve ordinary pointer backpressure, but cancellation always wakes
+        // admission, even when the worker is blocked and its queue is full.
+        crossbeam_channel::select_biased! {
+            recv(self.control.stop_rx) -> _ => anyhow::bail!("Wayland worker generation retired"),
+            send(self.tx, cmd) -> result => result.map_err(|_| anyhow::anyhow!("Wayland worker channel closed")),
+        }
+    }
+
+    fn try_send(&self, cmd: C) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.control.stopped(), "Wayland worker generation retired");
+        self.tx
+            .try_send(cmd)
+            .map_err(|_| anyhow::anyhow!("Wayland worker queue full or closed"))
+    }
+
+    pub(super) fn reply<R>(&self, rx: Receiver<anyhow::Result<R>>) -> anyhow::Result<R> {
+        crossbeam_channel::select_biased! {
+            recv(self.control.stop_rx) -> _ => Err(anyhow::anyhow!("Wayland worker generation retired; in-flight work remains owned until confirmed")),
+            recv(rx) -> result => result.map_err(|_| anyhow::anyhow!("Wayland worker reply channel closed"))?,
+        }
+    }
+}
+
+struct WorkerOwner<C> {
+    sender: WorkerSender<C>,
+    join: thread::JoinHandle<()>,
+}
+
+struct WorkerState<C> {
+    admitted: bool,
+    retiring: usize,
+    owner: Option<WorkerOwner<C>>,
+}
+
+pub(super) struct WorkerRegistry<C> {
+    state: Mutex<WorkerState<C>>,
+}
+
+impl<C: Send + 'static> WorkerRegistry<C> {
+    pub(super) fn new() -> Self {
+        Self {
+            state: Mutex::new(WorkerState {
+                admitted: true,
+                retiring: 0,
+                owner: None,
+            }),
+        }
+    }
+
+    pub(super) fn sender(
+        &self,
+        name: &str,
+        capacity: usize,
+        run: impl FnOnce(Receiver<C>, Arc<WorkerControl>) + Send + 'static,
+    ) -> anyhow::Result<WorkerSender<C>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(
+            state.admitted,
+            "Wayland worker generation retired; explicit restart required"
+        );
+        if state.owner.is_none() {
+            let (tx, rx) = bounded(capacity);
+            let control = WorkerControl::new();
+            let worker_control = control.clone();
+            let join = thread::Builder::new()
+                .name(name.to_owned())
+                .spawn(move || {
+                    struct OnExit(Arc<WorkerControl>);
+                    impl Drop for OnExit {
+                        fn drop(&mut self) {
+                            self.0.stop();
+                        }
+                    }
+                    let _exit = OnExit(worker_control.clone());
+                    run(rx, worker_control);
+                })?;
+            state.owner = Some(WorkerOwner {
+                sender: WorkerSender { tx, control },
+                join,
+            });
+        }
+        let sender = &state.owner.as_ref().expect("worker owner").sender;
+        anyhow::ensure!(
+            !sender.control.stopped(),
+            "Wayland worker generation stopped"
+        );
+        Ok(sender.clone())
+    }
+
+    pub(super) fn shutdown(&self) -> anyhow::Result<()> {
+        let deadline = Instant::now() + RETIRE_TIMEOUT;
+        {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.admitted = false;
+            state.retiring += 1;
+            if let Some(owner) = &state.owner {
+                owner.sender.control.stop();
+            }
+        }
+        let result = (|| loop {
+            {
+                let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                match state.owner.as_ref() {
+                    None => return Ok(()),
+                    Some(owner) if owner.join.is_finished() => {
+                        let owner = state.owner.take().expect("finished worker");
+                        return owner
+                            .join
+                            .join()
+                            .map_err(|_| anyhow::anyhow!("Wayland worker panicked"));
+                    }
+                    _ => {}
+                }
+            }
+            anyhow::ensure!(Instant::now() < deadline,
+                "Wayland worker retirement exceeded 1s; generation fenced, join handle and any pending input/focus lease retained");
+            thread::sleep(Duration::from_millis(2));
+        })();
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retiring -= 1;
+        result
+    }
+
+    pub(super) fn restart(&self) -> anyhow::Result<()> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(
+            state.retiring == 0,
+            "Wayland worker retirement still in progress"
+        );
+        if state.admitted
+            && state
+                .owner
+                .as_ref()
+                .is_none_or(|owner| !owner.sender.control.stopped())
+        {
+            return Ok(());
+        }
+        state.admitted = false;
+        if let Some(owner) = &state.owner {
+            anyhow::ensure!(
+                owner.join.is_finished(),
+                "previous Wayland worker has not retired"
+            );
+            let owner = state.owner.take().expect("finished worker");
+            owner
+                .join
+                .join()
+                .map_err(|_| anyhow::anyhow!("Wayland worker panicked"))?;
+        }
+        state.admitted = true;
+        Ok(())
+    }
+}
+
+static OWNER: OnceLock<WorkerRegistry<WlOverlayCmd>> = OnceLock::new();
 // Starts false deliberately: the platform registration path must explicitly
 // opt the native Wayland overlay in with the daemon's CursorConfig. This keeps
 // lazy forwarding from bypassing --no-overlay before any window exists.
 static CONFIG_ENABLED: AtomicBool = AtomicBool::new(false);
 static CONFIG_TEMPLATE: OnceLock<CursorConfig> = OnceLock::new();
-static LAYER_SHELL_AVAILABLE: OnceLock<bool> = OnceLock::new();
 
 struct LayerShellProbe;
 
@@ -97,18 +398,33 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for LayerShellProbe {
 /// backend. This lets an older compositor helper remain a real fallback when
 /// the compositor does not advertise `zwlr_layer_shell_v1`.
 pub fn available() -> bool {
-    *LAYER_SHELL_AVAILABLE.get_or_init(|| {
-        let Ok(conn) = Connection::connect_to_env() else {
-            return false;
-        };
-        let Ok((globals, _queue)) = registry_queue_init::<LayerShellProbe>(&conn) else {
-            return false;
-        };
-        globals.contents().with_list(|list| {
-            list.iter()
-                .any(|global| global.interface == "zwlr_layer_shell_v1")
-        })
-    })
+    let Ok(sender) = tx() else { return false };
+    if let Some(available) = sender.control.available.get() {
+        return !sender.control.stopped() && *available;
+    }
+    let (reply, rx) = bounded(1);
+    if sender.send(WlOverlayCmd::Probe(reply)).is_err() {
+        return false;
+    }
+    match sender.reply(rx) {
+        Ok(available) if !sender.control.stopped() => {
+            let _ = sender.control.available.set(available);
+            available
+        }
+        _ => {
+            sender.control.stop();
+            false
+        }
+    }
+}
+
+fn probe_layer_shell(control: &Arc<WorkerControl>) -> anyhow::Result<bool> {
+    let (conn, _socket) = connect_tracked(control)?;
+    let (globals, _queue) = registry_queue_init::<LayerShellProbe>(&conn)?;
+    Ok(globals.contents().with_list(|list| {
+        list.iter()
+            .any(|global| global.interface == "zwlr_layer_shell_v1")
+    }))
 }
 
 pub fn set_config(config: CursorConfig) {
@@ -120,47 +436,35 @@ pub fn set_config(config: CursorConfig) {
 /// positioned cursor starts the compositor connection. The shared render map
 /// preserves explicit motion overrides and remembers defaults for future keys.
 pub fn set_default_glide_duration(session: Option<&str>, value: f64) -> anyhow::Result<()> {
-    if ensure_started() {
-        if let Some(tx) = tx() {
-            // A stalled compositor must not block a config call. Report
-            // failed admission instead of silently losing the new default.
-            tx.try_send(WlOverlayCmd::SetDefaultGlideDuration {
-                session: session.map(str::to_owned),
-                value,
-            })
-            .map_err(|error| anyhow::anyhow!("Wayland cursor config queue unavailable: {error}"))?;
-        }
+    if CONFIG_ENABLED.load(Ordering::Acquire) {
+        let tx = tx()?;
+        // A stalled compositor must not block a config call. Report
+        // failed admission instead of silently losing the new default.
+        tx.try_send(WlOverlayCmd::SetDefaultGlideDuration {
+            session: session.map(str::to_owned),
+            value,
+        })
+        .map_err(|error| anyhow::anyhow!("Wayland cursor config queue unavailable: {error}"))?;
     }
     Ok(())
 }
 
-fn tx() -> Option<&'static Sender<WlOverlayCmd>> {
-    TX.get()
+fn registry() -> &'static WorkerRegistry<WlOverlayCmd> {
+    OWNER.get_or_init(WorkerRegistry::new)
 }
 
-/// Lazily start the owner thread. Idempotent — safe to call from every
-/// MCP tool invocation; subsequent calls are no-ops. The thread connects to
-/// Wayland only after receiving a renderer command for a live cursor key.
+fn tx() -> anyhow::Result<WorkerSender<WlOverlayCmd>> {
+    registry().sender("cua-overlay-wl", 64, |rx, control| {
+        if let Err(e) = owner_thread_owned(rx, control) {
+            tracing::warn!("cua-overlay-wl thread exited with error: {e}");
+        }
+        crate::overlay::release_arrivals();
+    })
+}
+
+/// Lazy startup is allowed only within the explicitly admitted SDK generation.
 pub fn ensure_started() -> bool {
-    if !CONFIG_ENABLED.load(Ordering::Acquire) {
-        return false;
-    }
-    TX.get_or_init(|| {
-        let (tx, rx) = bounded::<WlOverlayCmd>(64);
-        thread::Builder::new()
-            .name("cua-overlay-wl".into())
-            .spawn(move || {
-                if let Err(e) = owner_thread(rx) {
-                    tracing::warn!("cua-overlay-wl thread exited with error: {e}");
-                }
-                // No frame will ever be painted again: unblock every pointer
-                // action still waiting for its glide to arrive.
-                crate::overlay::release_arrivals();
-            })
-            .expect("spawn cua-overlay-wl thread");
-        tx
-    });
-    true
+    CONFIG_ENABLED.load(Ordering::Acquire) && tx().is_ok()
 }
 
 /// Translate a generic [`OverlayMsg`] (the cross-platform command shape)
@@ -175,10 +479,7 @@ pub fn forward(msg: &OverlayMsg) -> bool {
     // Remove still suppresses late commands, and Revive preserves ordering.
     // Starting this thread does not connect to Wayland: lifecycle-only cleanup
     // must never create layer surfaces just to destroy them again.
-    if !ensure_started() {
-        return false;
-    }
-    let Some(tx) = tx() else { return false };
+    let Ok(tx) = tx() else { return false };
     map_overlay_msg(msg).is_some_and(|cmd| tx.try_send(cmd).is_ok())
 }
 
@@ -203,12 +504,15 @@ fn should_forward(config_enabled: bool, msg: &OverlayMsg) -> bool {
         )
 }
 
-/// Cleanly stop the owner thread. Tests use this; production code typically
-/// lets the thread die at process exit.
-pub fn shutdown() {
-    if let Some(tx) = tx() {
-        let _ = tx.send(WlOverlayCmd::Shutdown);
-    }
+/// Fence admission, interrupt compositor reads, and join within one second.
+/// A timeout keeps the join handle owned and admission closed; retry shutdown.
+pub fn shutdown() -> anyhow::Result<()> {
+    registry().shutdown()
+}
+
+/// Called only for a new SDK lifetime, never by lazy forwarding/configuration.
+pub fn restart() -> anyhow::Result<()> {
+    registry().restart()
 }
 
 // ── owner thread ─────────────────────────────────────────────────────────
@@ -610,13 +914,33 @@ fn ensure_layer_surface(state: &mut OverlayState, id: u32, qh: &QueueHandle<Over
 /// refused actions; none has a position to paint. Return the first positioned
 /// command unapplied so the active loop can drain it and later transitions
 /// together, in their original order.
+#[cfg(test)]
 fn wait_for_renderer_command(
     rx: &Receiver<WlOverlayCmd>,
     state: &mut OverlayState,
 ) -> Option<WlOverlayCmd> {
-    while let Ok(command) = rx.recv() {
+    wait_for_renderer_command_owned(rx, state, &WorkerControl::new())
+}
+
+fn wait_for_renderer_command_owned(
+    rx: &Receiver<WlOverlayCmd>,
+    state: &mut OverlayState,
+    control: &Arc<WorkerControl>,
+) -> Option<WlOverlayCmd> {
+    loop {
+        let command = crossbeam_channel::select_biased! {
+            recv(control.stop_rx) -> _ => return None,
+            recv(rx) -> result => result.ok()?,
+        };
+        if control.stopped() {
+            return None;
+        }
         match command {
+            #[cfg(test)]
             WlOverlayCmd::Shutdown => return None,
+            WlOverlayCmd::Probe(reply) => {
+                let _ = reply.try_send(probe_layer_shell(control));
+            }
             WlOverlayCmd::SetDefaultGlideDuration { session, value } => {
                 state
                     .render
@@ -640,18 +964,25 @@ fn wait_for_renderer_command(
             WlOverlayCmd::Cmd { .. } => {}
         }
     }
-    None
 }
 
+#[cfg(test)]
 fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
+    owner_thread_owned(rx, WorkerControl::new())
+}
+
+fn owner_thread_owned(
+    rx: Receiver<WlOverlayCmd>,
+    control: Arc<WorkerControl>,
+) -> anyhow::Result<()> {
     let template = CONFIG_TEMPLATE.get().cloned().unwrap_or_default();
     let mut state = OverlayState::new(template);
-    let Some(first_command) = wait_for_renderer_command(&rx, &mut state) else {
+    let Some(first_command) = wait_for_renderer_command_owned(&rx, &mut state, &control) else {
         return Ok(());
     };
 
     dbg("connecting after positioned cursor command");
-    let conn = Connection::connect_to_env()?;
+    let (conn, _socket) = connect_tracked(&control)?;
     let mut queue = conn.new_event_queue::<OverlayState>();
     let qh = queue.handle();
     let _registry = conn.display().get_registry(&qh, ());
@@ -717,6 +1048,9 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
     let mut frame_tick_needed = false;
     let mut startup_command = Some(first_command);
     loop {
+        if control.stopped() {
+            break;
+        }
         let wait = next_wait(
             &state.render.cursors,
             frame_tick_needed,
@@ -725,7 +1059,7 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
         let wake = startup_command
             .take()
             .map(WlWake::Command)
-            .unwrap_or_else(|| wait_for_work(&rx, wait));
+            .unwrap_or_else(|| wait_for_work_owned(&rx, wait, &control));
         let (first_cmd, timed_out) = match wake {
             WlWake::Command(cmd) => (Some(cmd), None),
             WlWake::Timeout => (None, Some(wait)),
@@ -742,7 +1076,15 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
         let frame = output_frame(&state);
         loop {
             let received = pending.take().map(Ok).unwrap_or_else(|| rx.try_recv());
+            if control.stopped() {
+                shutdown = true;
+                break;
+            }
             match received {
+                Ok(WlOverlayCmd::Probe(reply)) => {
+                    let _ = reply.try_send(Ok(true));
+                }
+                #[cfg(test)]
                 Ok(WlOverlayCmd::Shutdown) => {
                     shutdown = true;
                     break;
@@ -830,7 +1172,9 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
     for output in state.outputs.values_mut() {
         output.destroy_surfaces();
     }
-    queue.roundtrip(&mut state)?;
+    if !control.stopped() {
+        queue.roundtrip(&mut state)?;
+    }
     Ok(())
 }
 
@@ -847,6 +1191,26 @@ enum WlWake {
     Disconnected,
 }
 
+fn wait_for_work_owned(
+    rx: &Receiver<WlOverlayCmd>,
+    wait: WlWait,
+    control: &WorkerControl,
+) -> WlWake {
+    let timeout = match wait {
+        WlWait::Frame => Duration::from_millis(16),
+        WlWait::Deadline(timeout) | WlWait::Maintenance(timeout) => timeout,
+    };
+    crossbeam_channel::select_biased! {
+        recv(control.stop_rx) -> _ => WlWake::Disconnected,
+        recv(rx) -> result => match result {
+            Ok(cmd) => WlWake::Command(cmd),
+            Err(_) => WlWake::Disconnected,
+        },
+        default(timeout) => WlWake::Timeout,
+    }
+}
+
+#[cfg(test)]
 fn wait_for_work(rx: &Receiver<WlOverlayCmd>, wait: WlWait) -> WlWake {
     match wait {
         WlWait::Frame => match rx.recv_timeout(Duration::from_millis(16)) {
@@ -1424,6 +1788,199 @@ impl Dispatch<WlRegion, ()> for OverlayState {
 mod tests {
     use super::*;
     use cursor_overlay::KeyedOverlayCommand;
+
+    #[test]
+    fn owned_overlay_cold_double_retirement_and_fresh_generation() {
+        let registry = WorkerRegistry::<WlOverlayCmd>::new();
+        registry.shutdown().unwrap();
+        registry.shutdown().unwrap();
+        assert!(registry
+            .sender("cold-denied", 1, |_, _| panic!("must stay cold"))
+            .is_err());
+        registry.restart().unwrap();
+        let old = registry
+            .sender("overlay-test-idle", 1, |rx, control| {
+                owner_thread_owned(rx, control).unwrap();
+            })
+            .unwrap();
+        old.send(WlOverlayCmd::Remove("fixture".into())).unwrap();
+        registry.shutdown().unwrap();
+        assert!(old.send(WlOverlayCmd::Revive("fixture".into())).is_err());
+        assert!(old.control.sockets.lock().unwrap().is_empty());
+        assert!(registry.state.lock().unwrap().owner.is_none());
+        assert!(registry.sender("still-denied", 1, |_, _| {}).is_err());
+        registry.restart().unwrap();
+        let fresh = registry
+            .sender("overlay-test-fresh", 1, |rx, control| {
+                owner_thread_owned(rx, control).unwrap();
+            })
+            .unwrap();
+        assert!(!Arc::ptr_eq(&old.control, &fresh.control));
+        assert!(old.send(WlOverlayCmd::Shutdown).is_err());
+        registry.shutdown().unwrap();
+    }
+
+    #[test]
+    fn owned_concurrent_retirement_cannot_be_reopened_or_late_attach() {
+        let registry = Arc::new(WorkerRegistry::<()>::new());
+        let (release, wait) = bounded::<()>(0);
+        let old = registry
+            .sender("wayland-test-retire-race", 1, move |_, control| {
+                let _ = control.stop_rx.recv();
+                wait.recv().unwrap();
+            })
+            .unwrap();
+        let retiring = registry.clone();
+        let shutdown = thread::spawn(move || retiring.shutdown());
+        assert!(old
+            .control
+            .stop_rx
+            .recv_timeout(Duration::from_secs(3))
+            .is_err());
+        assert!(registry.restart().is_err());
+        assert!(registry.sender("no-lazy-reopen", 1, |_, _| {}).is_err());
+        let (client, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let conn = Connection::from_socket(client).unwrap();
+        assert!(old.control.track(&conn).is_err());
+        assert!(old.control.sockets.lock().unwrap().is_empty());
+        release.send(()).unwrap();
+        shutdown.join().unwrap().unwrap();
+        registry.restart().unwrap();
+        assert!(old.send(()).is_err());
+        registry.shutdown().unwrap();
+    }
+
+    // A real Wayland Connection speaks only wl_display.sync to this private
+    // socket pair. No environment changes, compositor, surface or input event.
+    fn read_sync(peer: &mut std::os::unix::net::UnixStream) -> u32 {
+        use std::io::Read;
+        peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut request = [0u8; 12];
+        peer.read_exact(&mut request).unwrap();
+        assert_eq!(u32::from_ne_bytes(request[..4].try_into().unwrap()), 1);
+        assert_eq!(
+            u32::from_ne_bytes(request[4..8].try_into().unwrap()),
+            12 << 16
+        );
+        u32::from_ne_bytes(request[8..].try_into().unwrap())
+    }
+
+    #[test]
+    fn owned_stuck_roundtrip_full_queue_and_old_caller_cancel() {
+        use std::io::Read;
+        let registry = WorkerRegistry::<Sender<anyhow::Result<()>>>::new();
+        let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let old = registry
+            .sender("wayland-test-stalled", 1, move |rx, control| {
+                let reply = rx.recv().unwrap();
+                let conn = Connection::from_socket(client).unwrap();
+                let _socket = control.track(&conn).unwrap();
+                let result = conn.roundtrip().map(|_| ()).map_err(anyhow::Error::from);
+                assert!(
+                    result.is_err(),
+                    "shutdown must interrupt a blocked protocol read"
+                );
+                let _ = reply.try_send(result);
+            })
+            .unwrap();
+        let (reply, receive) = bounded(1);
+        old.send(reply).unwrap();
+        read_sync(&mut peer); // proves the owner is stalled waiting for a reply
+        let (queued_reply, queued_receive) = bounded(1);
+        old.send(queued_reply).unwrap();
+        assert!(
+            old.try_send(bounded(1).0).is_err(),
+            "best-effort queue admission never blocks"
+        );
+        let waiting = old.clone();
+        let caller = thread::spawn(move || waiting.reply(receive));
+        registry.shutdown().unwrap();
+        assert!(caller.join().unwrap().is_err());
+        assert!(queued_receive.try_recv().is_err());
+        assert!(old.send(bounded(1).0).is_err());
+        assert!(old.control.sockets.lock().unwrap().is_empty());
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            peer.read(&mut byte).unwrap(),
+            0,
+            "all client socket handles closed"
+        );
+    }
+
+    #[test]
+    fn owned_stuck_reply_wait_is_preserved_until_bounded_shutdown() {
+        let registry = WorkerRegistry::<Sender<anyhow::Result<()>>>::new();
+        let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let sender = registry
+            .sender("wayland-test-request-timeout", 1, move |rx, control| {
+                let reply = rx.recv().unwrap();
+                let conn = Connection::from_socket(client).unwrap();
+                let _socket = control.track(&conn).unwrap();
+                let _ = reply.try_send(conn.roundtrip().map(|_| ()).map_err(anyhow::Error::from));
+            })
+            .unwrap();
+        let (reply, receive) = bounded(1);
+        sender.send(reply).unwrap();
+        read_sync(&mut peer);
+        let waiting = sender.clone();
+        let caller = thread::spawn(move || waiting.reply(receive));
+        thread::sleep(RETIRE_TIMEOUT + Duration::from_millis(20));
+        assert!(
+            !caller.is_finished(),
+            "ordinary requests retain their original wait semantics"
+        );
+        let start = Instant::now();
+        registry.shutdown().unwrap();
+        assert!(caller.join().unwrap().is_err());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(sender.send(bounded(1).0).is_err());
+    }
+
+    #[test]
+    fn owned_unconfirmed_input_keeps_lease_and_join_handle_until_sync() {
+        use std::io::Write;
+        struct FakeLease(Arc<AtomicBool>);
+        impl Drop for FakeLease {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let worker_dropped = dropped.clone();
+        let registry = WorkerRegistry::<()>::new();
+        let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let old = registry
+            .sender("wayland-test-protected", 1, move |_, control| {
+                let conn = Connection::from_socket(client).unwrap();
+                let socket = control.track(&conn).unwrap();
+                let _lease = FakeLease(worker_dropped);
+                socket.protect_input().unwrap();
+                // Only sync is transmitted; protection simulates queued input.
+                conn.roundtrip().unwrap();
+            })
+            .unwrap();
+        let callback = read_sync(&mut peer);
+        let start = Instant::now();
+        assert!(registry
+            .shutdown()
+            .unwrap_err()
+            .to_string()
+            .contains("retained"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(!dropped.load(Ordering::Acquire));
+        assert!(registry.state.lock().unwrap().owner.is_some());
+        assert!(registry.restart().is_err());
+        assert!(old.send(()).is_err());
+        let mut response = Vec::new();
+        response.extend_from_slice(&callback.to_ne_bytes());
+        response.extend_from_slice(&(12u32 << 16).to_ne_bytes());
+        response.extend_from_slice(&0u32.to_ne_bytes());
+        peer.write_all(&response).unwrap();
+        registry.shutdown().unwrap();
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(old.control.sockets.lock().unwrap().is_empty());
+        registry.restart().unwrap();
+    }
 
     fn message(cmd: OverlayCommand) -> OverlayMsg {
         OverlayMsg::Cmd(KeyedOverlayCommand {
@@ -2219,7 +2776,9 @@ mod tests {
             y: 20.0,
             heading_radians: None,
         });
-        let had_thread = TX.get().is_some();
+        let had_thread = OWNER
+            .get()
+            .is_some_and(|registry| registry.state.lock().unwrap().owner.is_some());
         assert!(!should_forward(false, &msg));
         assert!(!should_forward(
             false,
@@ -2230,6 +2789,11 @@ mod tests {
             &OverlayMsg::Revive("session-a".to_owned())
         ));
         assert!(!ensure_started());
-        assert_eq!(TX.get().is_some(), had_thread);
+        assert_eq!(
+            OWNER
+                .get()
+                .is_some_and(|registry| registry.state.lock().unwrap().owner.is_some()),
+            had_thread
+        );
     }
 }

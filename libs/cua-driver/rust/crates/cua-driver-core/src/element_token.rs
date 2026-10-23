@@ -164,6 +164,10 @@ impl Drop for RuntimeNonceClaim {
     fn drop(&mut self) {
         let mut claimed = claimed_runtime_nonces().lock().unwrap();
         let removed = claimed.remove(&self.nonce);
+        #[cfg(target_os = "linux")]
+        if claimed.is_empty() {
+            *claimed = HashSet::new();
+        }
         debug_assert!(removed, "active runtime nonce claim must be unique");
     }
 }
@@ -1286,10 +1290,37 @@ impl Default for TokenRegistry {
         Self::new()
     }
 }
+#[cfg(not(target_os = "linux"))]
 pub fn global() -> &'static TokenRegistry {
     static REGISTRY: OnceLock<TokenRegistry> = OnceLock::new();
     REGISTRY.get_or_init(TokenRegistry::new)
 }
+#[cfg(target_os = "linux")]
+static GLOBAL: Mutex<Option<Arc<TokenRegistry>>> = Mutex::new(None);
+
+#[cfg(target_os = "linux")]
+pub fn global() -> Arc<TokenRegistry> {
+    GLOBAL
+        .lock()
+        .unwrap()
+        .get_or_insert_with(|| Arc::new(TokenRegistry::new()))
+        .clone()
+}
+
+/// Retirement must not create the token registry just to empty it.
+#[cfg(target_os = "linux")]
+pub(crate) fn global_if_initialized() -> Option<Arc<TokenRegistry>> {
+    GLOBAL.lock().unwrap().clone()
+}
+
+/// The last Linux SDK owner releases the registry after its scopes retire.
+/// Existing permits/borrowers retain ownership until their own cancellation.
+#[cfg(target_os = "linux")]
+pub fn release_global() {
+    let registry = GLOBAL.lock().unwrap().take();
+    drop(registry);
+}
+
 pub fn format_token(snapshot_id: u32, element_index: usize) -> String {
     format!("s{snapshot_id:08x}:{element_index}")
 }

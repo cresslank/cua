@@ -57,7 +57,7 @@ jobs:
           fi
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 update
           sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::https::Timeout=15 install -y --no-install-recommends \
-            valgrind xvfb xauth dbus-x11 clang pkg-config libdbus-1-dev \
+            valgrind xvfb xauth dbus-x11 at-spi2-core clang pkg-config libdbus-1-dev \
             libpipewire-0.3-dev libspa-0.2-dev libei-dev libxkbcommon-dev \
             libx11-dev libxi-dev libxtst-dev libxext-dev
       - name: Build cua-driver

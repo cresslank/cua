@@ -16,13 +16,14 @@
 //!    advertised node id, negotiate Video/Raw format, dequeue one frame
 //!    with `STREAM_FLAG_MAP_BUFFERS`, copy pixels, PNG-encode, stop.
 //!
-//! The session + restore_token are persisted in a process-local
-//! `OnceLock<PortalScreencastSession>` so only the first call across the
-//! process lifetime triggers the consent dialog; later calls reuse the
-//! same PipeWire node id.
+//! The session is cached only for the current SDK lifetime; retirement closes
+//! the session, owned bus connection and executor. Captures retain duplicated
+//! PipeWire descriptors rather than borrowing process-static session storage.
 
 use std::os::fd::AsRawFd;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use ashpd::desktop::screencast::{
     CursorMode, OpenPipeWireRemoteOptions, Screencast, SelectSourcesOptions, SourceType,
@@ -31,88 +32,177 @@ use ashpd::desktop::screencast::{
 use ashpd::desktop::{CreateSessionOptions, PersistMode, Session};
 use ashpd::enumflags2::BitFlags;
 
-/// A live portal ScreenCast session held across calls. Expensive to
-/// create (system consent dialog) and cheap to reuse — the OnceLock
-/// keeps it alive until the requesting process exits.
+/// One SDK-generation owner. Initialization is serialized, but cancellation
+/// never needs the mutex held by a pending consent request.
+#[derive(Default)]
+struct Owner {
+    stopped: AtomicBool,
+    session: Mutex<Option<PortalScreencastSession>>,
+}
+
 struct PortalScreencastSession {
-    _session: Session<Screencast>,
+    rt: tokio::runtime::Runtime,
+    connection: zbus::Connection,
+    session: Session<Screencast>,
     streams: Streams,
     fd: std::os::fd::OwnedFd,
 }
 
-unsafe impl Send for PortalScreencastSession {}
-unsafe impl Sync for PortalScreencastSession {}
+impl PortalScreencastSession {
+    fn close(self) {
+        super::portal::off_runtime(move || {
+            let Self {
+                rt,
+                connection,
+                session,
+                streams,
+                fd,
+            } = self;
+            drop(fd);
+            drop(streams);
+            rt.block_on(async {
+                super::portal::close_session(&session).await;
+                drop(session);
+                super::portal::close_connection(connection).await;
+            });
+            rt.shutdown_timeout(super::portal::RUNTIME_SHUTDOWN_TIMEOUT);
+        });
+    }
+}
 
-static SESSION: OnceLock<PortalScreencastSession> = OnceLock::new();
+static SESSION: Mutex<Option<Arc<Owner>>> = Mutex::new(None);
+static ENABLED: AtomicBool = AtomicBool::new(true);
 
-/// Capture the user-selected window via `xdg-desktop-portal` ScreenCast.
-/// On first invocation per process the portal dialog asks the user to
-/// pick a window or monitor; subsequent calls reuse the same node
-/// transparently. Returns PNG bytes of the latest frame on the stream.
+pub(crate) fn restart() {
+    ENABLED.store(true, Ordering::Release);
+}
+
+/// Capture the selected source; consent is reused until SDK retirement.
 pub fn screenshot_window_via_portal() -> anyhow::Result<Vec<u8>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    super::portal::off_runtime(screenshot_window_blocking)
+}
+
+fn screenshot_window_blocking() -> anyhow::Result<Vec<u8>> {
+    anyhow::ensure!(
+        ENABLED.load(Ordering::Acquire),
+        "portal ScreenCast owner is shutting down"
+    );
+    let owner = {
+        let mut slot = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+        anyhow::ensure!(
+            ENABLED.load(Ordering::Acquire),
+            "portal ScreenCast owner is shutting down"
+        );
+        slot.get_or_insert_with(|| Arc::new(Owner::default()))
+            .clone()
+    };
+    let (fd, node_id) = {
+        let mut slot = owner.session.lock().unwrap_or_else(|e| e.into_inner());
+        if owner.stopped.load(Ordering::Acquire) {
+            anyhow::bail!("portal ScreenCast owner is shutting down");
+        }
+        if slot.is_none() {
+            *slot = Some(create_portal_session(&owner.stopped)?);
+        }
+        if owner.stopped.load(Ordering::Acquire) {
+            anyhow::bail!("portal ScreenCast owner is shutting down");
+        }
+        let session = slot.as_ref().unwrap();
+        let node_id = session
+            .streams
+            .streams()
+            .iter()
+            .next()
+            .map(|stream| stream.pipe_wire_node_id())
+            .ok_or_else(|| anyhow::anyhow!("portal advertised no streams"))?;
+        // Duplicate under the owner lock, not from a borrowed static/raw fd.
+        // Closing the session during capture may end the stream, never reuse its fd.
+        (session.fd.try_clone()?, node_id)
+    };
+    capture_one_frame(fd.as_raw_fd(), node_id)
+}
+
+/// Cancel consent, close session/socket while the executor lives, and consume
+/// that executor. Existing captures retain independently owned fd handles.
+/// A timed-out initializer remains fenced; repeated shutdown is safe.
+pub fn shutdown() {
+    ENABLED.store(false, Ordering::Release);
+    let deadline = Instant::now() + super::portal::OWNER_SHUTDOWN_TIMEOUT;
+    let Some(mut slot) = super::portal::lock_until(&SESSION, deadline) else {
+        tracing::warn!("portal ScreenCast shutdown already in progress");
+        return;
+    };
+    let Some(owner) = slot.as_ref() else { return };
+    owner.stopped.store(true, Ordering::Release);
+    // Reserve the two bounded close calls and executor teardown inside the
+    // owner budget rather than adding them after an exhausted lock deadline.
+    let initialization_deadline =
+        deadline - super::portal::CLOSE_TIMEOUT * 2 - super::portal::RUNTIME_SHUTDOWN_TIMEOUT;
+    let Some(mut session) = super::portal::lock_until(&owner.session, initialization_deadline)
+    else {
+        tracing::warn!("portal ScreenCast initializer did not stop; owner remains fenced");
+        return;
+    };
+    let retired = session.take();
+    drop(session);
+    if let Some(retired) = retired {
+        retired.close();
+    }
+    *slot = None;
+}
+
+fn create_portal_session(stopped: &AtomicBool) -> anyhow::Result<PortalScreencastSession> {
+    // zbus must continue driving the session between screenshots.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
         .enable_all()
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build tokio runtime for ashpd: {e}"))?;
-
-    if SESSION.get().is_none() {
-        let sess = rt.block_on(create_portal_session())?;
-        let _ = SESSION.set(sess);
+    let mut connection = None;
+    let mut session = None;
+    let result = rt.block_on(super::portal::until_stopped(stopped, async {
+        let conn = super::portal::fresh_session_connection().await?;
+        connection = Some(conn.clone());
+        let proxy = Screencast::with_connection(conn).await
+            .map_err(|e| anyhow::anyhow!("portal ScreenCast proxy unreachable: {e}. Install xdg-desktop-portal-gnome / xdg-desktop-portal-kde."))?;
+        session = Some(proxy.create_session(CreateSessionOptions::default()).await
+            .map_err(|e| anyhow::anyhow!("portal create_session failed: {e}"))?);
+        let session = session.as_ref().unwrap();
+        let select_opts = SelectSourcesOptions::default()
+            .set_sources(BitFlags::<SourceType>::from(SourceType::Window) | SourceType::Monitor)
+            .set_cursor_mode(CursorMode::Embedded)
+            .set_persist_mode(PersistMode::Application);
+        proxy.select_sources(session, select_opts).await
+            .map_err(|e| anyhow::anyhow!("portal select_sources failed: {e}"))?
+            .response().map_err(|e| anyhow::anyhow!("portal select_sources response error: {e}"))?;
+        let streams = proxy.start(session, None, StartCastOptions::default()).await
+            .map_err(|e| anyhow::anyhow!("portal start failed: {e}"))?
+            .response().map_err(|e| anyhow::anyhow!("portal start response error (user denied?): {e}"))?;
+        let fd = proxy.open_pipe_wire_remote(session, OpenPipeWireRemoteOptions::default()).await
+            .map_err(|e| anyhow::anyhow!("portal open_pipe_wire_remote failed: {e}"))?;
+        Ok((streams, fd))
+    }));
+    match result {
+        Ok((streams, fd)) => Ok(PortalScreencastSession {
+            rt,
+            connection: connection.unwrap(),
+            session: session.unwrap(),
+            streams,
+            fd,
+        }),
+        Err(error) => {
+            rt.block_on(async {
+                if let Some(session) = session {
+                    super::portal::close_session(&session).await;
+                }
+                if let Some(connection) = connection {
+                    super::portal::close_connection(connection).await;
+                }
+            });
+            rt.shutdown_timeout(super::portal::RUNTIME_SHUTDOWN_TIMEOUT);
+            Err(error)
+        }
     }
-    let session = SESSION
-        .get()
-        .ok_or_else(|| anyhow::anyhow!("portal ScreenCast session unavailable"))?;
-
-    let node_id = session
-        .streams
-        .streams()
-        .iter()
-        .next()
-        .map(|s| s.pipe_wire_node_id())
-        .ok_or_else(|| anyhow::anyhow!("portal advertised no streams"))?;
-
-    capture_one_frame(session.fd.as_raw_fd(), node_id)
-}
-
-async fn create_portal_session() -> anyhow::Result<PortalScreencastSession> {
-    let proxy = Screencast::new()
-        .await
-        .map_err(|e| anyhow::anyhow!("portal ScreenCast proxy unreachable: {e}. Install xdg-desktop-portal-gnome / xdg-desktop-portal-kde."))?;
-
-    let session = proxy
-        .create_session(CreateSessionOptions::default())
-        .await
-        .map_err(|e| anyhow::anyhow!("portal create_session failed: {e}"))?;
-
-    let select_opts = SelectSourcesOptions::default()
-        .set_sources(BitFlags::<SourceType>::from(SourceType::Window) | SourceType::Monitor)
-        .set_cursor_mode(CursorMode::Embedded)
-        .set_persist_mode(PersistMode::Application);
-
-    proxy
-        .select_sources(&session, select_opts)
-        .await
-        .map_err(|e| anyhow::anyhow!("portal select_sources failed: {e}"))?
-        .response()
-        .map_err(|e| anyhow::anyhow!("portal select_sources response error: {e}"))?;
-
-    let streams = proxy
-        .start(&session, None, StartCastOptions::default())
-        .await
-        .map_err(|e| anyhow::anyhow!("portal start failed: {e}"))?
-        .response()
-        .map_err(|e| anyhow::anyhow!("portal start response error (user denied?): {e}"))?;
-
-    let fd = proxy
-        .open_pipe_wire_remote(&session, OpenPipeWireRemoteOptions::default())
-        .await
-        .map_err(|e| anyhow::anyhow!("portal open_pipe_wire_remote failed: {e}"))?;
-
-    Ok(PortalScreencastSession {
-        _session: session,
-        streams,
-        fd,
-    })
 }
 
 /// Pull one frame off the PipeWire stream advertised by the portal,
@@ -442,24 +532,132 @@ fn encode_frame_to_png(
 /// Probe whether the portal ScreenCast interface is reachable on the
 /// session bus without taking an actual capture (avoids cached consent).
 pub fn probe_screencast_portal() -> anyhow::Result<bool> {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| anyhow::anyhow!("failed to build tokio runtime: {e}"))?;
-    rt.block_on(async {
-        let conn = zbus::Connection::session()
-            .await
-            .map_err(|e| anyhow::anyhow!("session bus unreachable: {e}"))?;
-        let proxy = zbus::fdo::DBusProxy::new(&conn)
-            .await
-            .map_err(|e| anyhow::anyhow!("dbus proxy creation failed: {e}"))?;
-        let bus_name: zbus::names::BusName = "org.freedesktop.portal.Desktop"
-            .try_into()
-            .map_err(|e| anyhow::anyhow!("bus name parse failed: {e}"))?;
-        let has_owner = proxy
-            .name_has_owner(bus_name)
-            .await
-            .map_err(|e| anyhow::anyhow!("name_has_owner failed: {e}"))?;
-        Ok(has_owner)
-    })
+    super::portal_screenshot::probe_portal()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::portal::tests::{private_bus_test, FakePortal};
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn shutdown_cancels_consent_closes_session_and_allows_retry() {
+        private_bus_test(
+            concat!(
+                module_path!(),
+                "::shutdown_cancels_consent_closes_session_and_allows_retry"
+            ),
+            || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let (entered, entering) = mpsc::channel();
+                let (closed, closing) = mpsc::channel();
+                let service = rt.block_on(
+                    FakePortal {
+                        entered,
+                        closed,
+                        stall_close: true,
+                    }
+                    .serve(),
+                );
+                for _ in 0..2 {
+                    restart();
+                    let capture = std::thread::spawn(screenshot_window_via_portal);
+                    let name = entering.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let old = SESSION.lock().unwrap().as_ref().unwrap().clone();
+                    let started = Instant::now();
+                    shutdown();
+                    assert!(started.elapsed() < Duration::from_secs(3));
+                    assert_eq!(
+                        capture.join().unwrap().unwrap_err().to_string(),
+                        "portal owner is shutting down"
+                    );
+                    assert!(old.stopped.load(Ordering::Acquire));
+                    assert!(old.session.lock().unwrap().is_none());
+                    closing.recv_timeout(Duration::from_secs(1)).unwrap();
+                    rt.block_on(async {
+                        super::super::portal::tests::assert_name_gone(&service, &name).await;
+                    });
+                    shutdown();
+                    assert!(SESSION.lock().unwrap().is_none());
+                }
+                rt.block_on(super::super::portal::close_connection(service));
+                rt.shutdown_timeout(super::super::portal::RUNTIME_SHUTDOWN_TIMEOUT);
+            },
+        );
+    }
+
+    #[test]
+    fn shutdown_closes_ready_session_without_invalidating_capture_fd() {
+        private_bus_test(
+            concat!(
+                module_path!(),
+                "::shutdown_closes_ready_session_without_invalidating_capture_fd"
+            ),
+            || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let (entered, _) = mpsc::channel();
+                let (closed, closing) = mpsc::channel();
+                let service = rt.block_on(
+                    FakePortal {
+                        entered,
+                        closed,
+                        stall_close: false,
+                    }
+                    .serve(),
+                );
+                let owned_rt = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let connection = owned_rt
+                    .block_on(super::super::portal::fresh_session_connection())
+                    .unwrap();
+                let name = connection.unique_name().unwrap().to_string();
+                let session = owned_rt.block_on(async {
+                    Screencast::with_connection(connection.clone())
+                        .await
+                        .unwrap()
+                        .create_session(CreateSessionOptions::default())
+                        .await
+                        .unwrap()
+                });
+                let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+                let fd: std::os::fd::OwnedFd = socket.into();
+                let capture_fd = fd.try_clone().unwrap();
+                let streams = Streams::default();
+                let owner = Arc::new(Owner::default());
+                *owner.session.lock().unwrap() = Some(PortalScreencastSession {
+                    rt: owned_rt,
+                    connection,
+                    session,
+                    streams,
+                    fd,
+                });
+                *SESSION.lock().unwrap() = Some(owner);
+                // Async callers are allowed to retire this sync API too.
+                rt.block_on(async {
+                    shutdown();
+                });
+                closing.recv_timeout(Duration::from_secs(1)).unwrap();
+                assert!(unsafe { libc::fcntl(capture_fd.as_raw_fd(), libc::F_GETFD) } >= 0);
+                rt.block_on(async {
+                    super::super::portal::tests::assert_name_gone(&service, &name).await;
+                });
+                shutdown();
+                rt.block_on(super::super::portal::close_connection(service));
+                rt.shutdown_timeout(super::super::portal::RUNTIME_SHUTDOWN_TIMEOUT);
+            },
+        );
+    }
 }

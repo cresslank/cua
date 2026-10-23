@@ -384,7 +384,13 @@ def run_e2e(driver: Path, artifact_dir: Path, smoke_dir: Path, env: dict[str, st
 
     try:
         ready = False
-        for _ in range(120):
+        # Instrumenting the hardened runtime's cold startup can exceed a minute
+        # on hosted runners. Keep a bounded wall-clock budget, not a retry count
+        # that also accumulates each readiness client's runtime.
+        readiness_timeout = 180.0
+        readiness_started = time.monotonic()
+        readiness_deadline = readiness_started + readiness_timeout
+        while time.monotonic() < readiness_deadline:
             if process.poll() is not None:
                 raise RunnerFailure("cua-driver server exited before readiness")
             try:
@@ -403,7 +409,10 @@ def run_e2e(driver: Path, artifact_dir: Path, smoke_dir: Path, env: dict[str, st
                 break
             time.sleep(0.5)
         if not ready:
-            raise RunnerFailure("cua-driver server did not become ready within 60 seconds")
+            raise RunnerFailure(
+                f"cua-driver server did not become ready within {readiness_timeout:g} seconds"
+            )
+        print(f"cua-driver server ready after {time.monotonic() - readiness_started:.1f} seconds")
 
         readiness = load_json(artifact_dir / "readiness.json")
         expect(

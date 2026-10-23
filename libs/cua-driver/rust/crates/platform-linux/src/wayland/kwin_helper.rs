@@ -169,36 +169,38 @@ fn snapshot_for_owner(owner: &str) -> Option<Vec<KwinWindow>> {
             .build()
             .ok()?;
 
-        runtime.block_on(async move {
-            let connection = tokio::time::timeout(CALL_TIMEOUT, zbus::Connection::session())
+        let result = runtime.block_on(super::portal::with_connection(|connection| async move {
+            let result = async {
+                let proxy = tokio::time::timeout(
+                    CALL_TIMEOUT,
+                    zbus::Proxy::new(&connection, owner.as_str(), PATH, IFACE),
+                )
                 .await
                 .ok()?
                 .ok()?;
-            let proxy = tokio::time::timeout(
-                CALL_TIMEOUT,
-                zbus::Proxy::new(&connection, owner.as_str(), PATH, IFACE),
-            )
-            .await
-            .ok()?
-            .ok()?;
 
-            for attempt in 0..3 {
-                let raw = tokio::time::timeout(
-                    CALL_TIMEOUT,
-                    proxy.call::<_, _, String>("GetWindows", &()),
-                )
-                .await
-                .ok()
-                .and_then(Result::ok);
-                if let Some(snapshot) = raw.as_deref().and_then(parse_snapshot) {
-                    return Some(snapshot);
+                for attempt in 0..3 {
+                    let raw = tokio::time::timeout(
+                        CALL_TIMEOUT,
+                        proxy.call::<_, _, String>("GetWindows", &()),
+                    )
+                    .await
+                    .ok()
+                    .and_then(Result::ok);
+                    if let Some(snapshot) = raw.as_deref().and_then(parse_snapshot) {
+                        return Some(snapshot);
+                    }
+                    if attempt < 2 {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                 }
-                if attempt < 2 {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
-                }
+                None
             }
-            None
-        })
+            .await;
+            Ok(result)
+        }));
+        runtime.shutdown_timeout(super::portal::RUNTIME_SHUTDOWN_TIMEOUT);
+        result.ok().flatten()
     })
     .join()
     .ok()

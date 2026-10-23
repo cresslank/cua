@@ -2482,6 +2482,49 @@ mod tests {
         shutdown.await.unwrap().unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn shutdown_cancels_a_stuck_admitted_call_and_fences_new_requests() {
+        let _runtime_test = crate::runtime::TEST_RUNTIME_LOCK.lock().await;
+        let driver = CuaDriver::try_create_for_host(DriverHostOptions {
+            cursor: cursor_overlay::CursorConfig {
+                enabled: false,
+                ..Default::default()
+            },
+            host_owns_permission_ux: false,
+            host_bundle_id: None,
+            claude_code_compatibility: false,
+            prepare_desktop_environment: false,
+            register_host_tools: Some(register_slow_host_tool),
+            authorization_host: None,
+            activity_observer: None,
+        })
+        .unwrap();
+        let caller = driver.clone();
+        let action =
+            tokio::spawn(
+                async move { caller.call_tool("health_report".into(), "{}".into()).await },
+            );
+        SLOW_HOST_TOOL_STARTED
+            .get_or_init(tokio::sync::Notify::new)
+            .notified()
+            .await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), driver.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(action.await.unwrap(), Err(DriverError::Shutdown)));
+        assert!(matches!(
+            driver.call_tool("health_report".into(), "{}".into()).await,
+            Err(DriverError::Shutdown)
+        ));
+        driver.shutdown().await.unwrap();
+        // No release notification: shutdown must actually cancel the held work.
+        let replacement = desktop_free_compatibility_driver();
+        assert!(replacement.is_available());
+        replacement.shutdown().await.unwrap();
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn session_zero_refuses_runtime_creation_before_platform_dispatch() {

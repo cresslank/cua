@@ -1,24 +1,56 @@
 //! Persistent session-bus transport for synchronous compositor helpers.
 //! A separate runtime also serves callers already inside Tokio without nested block_on.
+mod runtime;
+
 use std::sync::{mpsc, OnceLock};
 use std::time::Duration;
-use tokio::sync::Mutex;
 use zbus::{Connection, Message};
 
-static CONNECTION: Mutex<Option<Connection>> = Mutex::const_new(None);
+fn owner() -> &'static runtime::Owner {
+    static OWNER: OnceLock<runtime::Owner> = OnceLock::new();
+    OWNER.get_or_init(runtime::Owner::default)
+}
 
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("compositor D-Bus runtime")
-    })
+fn cursor_owner() -> &'static runtime::Owner {
+    static OWNER: OnceLock<runtime::Owner> = OnceLock::new();
+    OWNER.get_or_init(runtime::Owner::default)
+}
+
+pub(super) fn restart() {
+    owner().restart();
+    cursor_owner().restart();
+}
+
+pub(super) fn cursor_call(destination: &str, method: &str, args: &[String]) -> Option<String> {
+    call_on(
+        cursor_owner(),
+        destination,
+        super::PATH,
+        method,
+        args,
+        Duration::from_secs(25),
+    )
+}
+
+/// Retire the current transport generation without initializing a cold one.
+/// A later lifecycle can lazily create a fresh executor and session connection.
+pub(super) fn shutdown() {
+    owner().shutdown();
+    cursor_owner().shutdown();
 }
 
 pub(super) fn call(
+    destination: &str,
+    path: &str,
+    method: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Option<String> {
+    call_on(owner(), destination, path, method, args, timeout)
+}
+
+fn call_on(
+    owner: &runtime::Owner,
     destination: &str,
     path: &str,
     method: &str,
@@ -31,20 +63,23 @@ pub(super) fn call(
     let args = args.to_vec();
     let action_lease = cua_driver_core::blocking::ActionLeaseScope::capture();
     let (tx, rx) = mpsc::sync_channel(1);
-    runtime().spawn(async move {
-        let action_lease = action_lease;
+    owner.spawn(move |generation| async move {
+        let mut used = None;
         let result = tokio::time::timeout(timeout, async {
             let connection = {
-                let mut shared = CONNECTION.lock().await;
+                let mut shared = generation.connection.lock().await;
                 if shared.is_none() {
                     *shared = Some(
-                        Connection::session()
-                            .await
-                            .map_err(|_| Failure::Transport)?,
+                        generation.session(
+                            Connection::session()
+                                .await
+                                .map_err(|_| Failure::Transport)?,
+                        ),
                     );
                 }
                 shared.as_ref().ok_or(Failure::Transport)?.clone()
             };
+            used = Some(connection.clone());
             // A connection wait may outlive the native caller. Do not begin a
             // new focus mutation after cancellation; terminal reconciliation
             // methods must remain available for unconditional restoration.
@@ -53,19 +88,21 @@ pub(super) fn call(
                     .run(cua_driver_core::blocking::check_cancelled)
                     .map_err(|_| Failure::Reply)?;
             }
-            invoke(&connection, &destination, &path, &method, &args).await
+            invoke(&connection.connection, &destination, &path, &method, &args).await
         })
         .await
         .unwrap_or(Err(Failure::Transport));
-        // A timeout or transport error may mean the session bus went away.
-        // Reconnect on the next call; never replay a possibly applied mutation.
-        // An error reply (no helper on the bus, a refused capture) keeps the
-        // connection: reconnecting would not change the answer.
+        // Never replay a possibly applied mutation. Retire only the connection
+        // this request used: an older failure cannot evict its replacement.
+        // Its last user schedules a bounded close without interrupting peers.
         if matches!(result, Err(Failure::Transport)) {
-            CONNECTION.lock().await.take();
+            if let Some(connection) = used.as_ref() {
+                generation.retire(connection).await;
+            }
         }
+        drop(used);
         let _ = tx.send(result.ok());
-    });
+    })?;
     rx.recv_timeout(timeout + Duration::from_millis(100))
         .ok()
         .flatten()
@@ -129,12 +166,35 @@ async fn invoke(
         {
             send!((interface.as_str(), property.as_str()))
         }
-        // Cursor lifetime belongs to the dedicated connection/dispatcher;
+        ("MoveCursorFor" | "ClickPulseFor", [owner, target, x, y]) => {
+            let x = x.parse::<i32>().map_err(|_| Failure::Reply)?;
+            let y = y.parse::<i32>().map_err(|_| Failure::Reply)?;
+            send!((owner.as_str(), target.as_str(), x, y))
+        }
+        ("SetCursorColorFor" | "SetSessionLabelFor", [owner, value]) => {
+            send!((owner.as_str(), value.as_str()))
+        }
+        ("SetCursorStateFor", [owner, action, delivery, target, active]) => {
+            let active = active.parse::<bool>().map_err(|_| Failure::Reply)?;
+            send!((
+                owner.as_str(),
+                action.as_str(),
+                delivery.as_str(),
+                target.as_str(),
+                active
+            ))
+        }
+        ("HideCursorFor" | "RemoveCursor", [owner]) => send!((owner.as_str(),)),
+        // Cursor calls use a separate owned transport generation/unique name;
         // legacy global capture/activation are never routed by this transport.
         _ => return Err(Failure::Reply),
     };
     let body = reply.body();
     let decoded = match member {
+        "MoveCursorFor" | "ClickPulseFor" | "SetCursorColorFor" | "SetCursorStateFor"
+        | "SetSessionLabelFor" | "HideCursorFor" | "RemoveCursor" => {
+            body.deserialize::<()>().ok().map(|()| String::new())
+        }
         "GetNameOwner" => body
             .deserialize::<String>()
             .ok()
@@ -203,8 +263,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn typed_roundtrips_on_one_private_connection() {
+    fn private_bus() -> Option<(tempfile::TempDir, PrivateBus, String)> {
         // Use an explicit config: a sandbox (Nix) has no session.conf, and
         // then the daemon exits without printing an address.
         let dir = tempfile::tempdir().unwrap();
@@ -229,7 +288,7 @@ mod tests {
             Ok(child) => PrivateBus(child),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!("skipping: dbus-daemon is not installed");
-                return;
+                return None;
             }
             Err(error) => panic!("private test bus: {error}"),
         };
@@ -238,6 +297,194 @@ mod tests {
             .read_line(&mut address)
             .unwrap();
         assert!(!address.trim().is_empty(), "dbus-daemon printed no address");
+        Some((dir, bus, address))
+    }
+
+    fn install_private_connection(owner: &runtime::Owner, address: String) -> String {
+        let (tx, rx) = mpsc::sync_channel(1);
+        owner
+            .spawn(move |generation| async move {
+                let connection = zbus::connection::Builder::address(address.trim())
+                    .unwrap()
+                    .build()
+                    .await
+                    .unwrap();
+                let name = connection.unique_name().unwrap().to_string();
+                *generation.connection.lock().await = Some(generation.session(connection));
+                tx.send(name).unwrap();
+            })
+            .unwrap();
+        rx.recv_timeout(Duration::from_secs(2)).unwrap()
+    }
+
+    async fn assert_name_gone(observer: &Connection, name: &str) {
+        let proxy = zbus::fdo::DBusProxy::new(observer).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while proxy
+                .name_has_owner(name.try_into().unwrap())
+                .await
+                .unwrap()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("transport's bus name survived teardown");
+    }
+
+    #[tokio::test]
+    async fn teardown_closes_private_connection_and_reopens() {
+        let Some((_dir, _bus, address)) = private_bus() else {
+            return;
+        };
+        let service = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .name("org.cua.WinRects")
+            .unwrap()
+            .serve_at("/org/cua/WinRects", Helper)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let owner = std::sync::Arc::new(runtime::Owner::default());
+        // Cold and repeated teardown do not initialize a runtime/connection.
+        owner.shutdown();
+        for _ in 0..2 {
+            owner.restart();
+            let name = install_private_connection(&owner, address.clone());
+            let caller = owner.clone();
+            assert_eq!(
+                tokio::task::spawn_blocking(move || call_on(
+                    &caller,
+                    "org.cua.WinRects",
+                    "/org/cua/WinRects",
+                    "org.cua.WinRects.GetVersion",
+                    &[],
+                    Duration::from_secs(2),
+                ))
+                .await
+                .unwrap()
+                .as_deref(),
+                Some("(uint32 14,)")
+            );
+            // Exercise shutdown inside a different, current-thread Tokio runtime.
+            owner.shutdown();
+            owner.shutdown();
+            assert_name_gone(&service, &name).await;
+        }
+        service.close().await.unwrap();
+    }
+
+    struct HoldingHelper(tokio::sync::mpsc::UnboundedSender<()>);
+
+    #[zbus::interface(name = "org.cua.HoldingHelper")]
+    impl HoldingHelper {
+        async fn query_foreground(&self, _transaction: &str) -> String {
+            self.0.send(()).unwrap();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn teardown_cancels_stalled_rpc_and_closes_its_connection() {
+        let Some((_dir, _bus, address)) = private_bus() else {
+            return;
+        };
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let service = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .name("org.cua.HoldingHelper")
+            .unwrap()
+            .serve_at("/org/cua/HoldingHelper", HoldingHelper(started_tx))
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let owner = std::sync::Arc::new(runtime::Owner::default());
+        let name = install_private_connection(&owner, address);
+        let caller = owner.clone();
+        let request = tokio::task::spawn_blocking(move || {
+            call_on(
+                &caller,
+                "org.cua.HoldingHelper",
+                "/org/cua/HoldingHelper",
+                "org.cua.HoldingHelper.QueryForeground",
+                &["pending".into()],
+                Duration::from_secs(10),
+            )
+        });
+        tokio::time::timeout(Duration::from_secs(2), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let start = std::time::Instant::now();
+        owner.shutdown();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(request.await.unwrap(), None);
+        assert_name_gone(&service, &name).await;
+        service.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retired_connection_waits_for_peer_and_cannot_evict_replacement() {
+        let Some((_dir, _bus, address)) = private_bus() else {
+            return;
+        };
+        let observer = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let owner = runtime::Owner::default();
+        let (tx, rx) = mpsc::sync_channel(1);
+        owner
+            .spawn(move |generation| async move {
+                let connect = || {
+                    zbus::connection::Builder::address(address.trim())
+                        .unwrap()
+                        .build()
+                };
+                let old = generation.session(connect().await.unwrap());
+                let name = old.connection.unique_name().unwrap().to_string();
+                *generation.connection.lock().await = Some(old.clone());
+                let peer = old.clone();
+                generation.retire(&old).await;
+                let replacement = generation.session(connect().await.unwrap());
+                *generation.connection.lock().await = Some(replacement.clone());
+                // Simulate a second old request failing after reconnect completed.
+                generation.retire(&old).await;
+                assert!(std::sync::Arc::ptr_eq(
+                    generation.connection.lock().await.as_ref().unwrap(),
+                    &replacement,
+                ));
+                drop(old);
+                assert_eq!(
+                    invoke(
+                        &peer.connection,
+                        "org.freedesktop.DBus",
+                        "/org/freedesktop/DBus",
+                        "org.freedesktop.DBus.GetNameOwner",
+                        &["org.freedesktop.DBus".into()],
+                    )
+                    .await
+                    .as_deref(),
+                    Ok("('org.freedesktop.DBus',)")
+                );
+                drop(peer);
+                tx.send(name).unwrap();
+            })
+            .unwrap();
+        let old_name = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_name_gone(&observer, &old_name).await;
+        owner.shutdown();
+        observer.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn typed_roundtrips_on_one_private_connection() {
+        let Some((_dir, _bus, address)) = private_bus() else {
+            return;
+        };
         let service = zbus::connection::Builder::address(address.trim())
             .unwrap()
             .name("org.cua.WinRects")

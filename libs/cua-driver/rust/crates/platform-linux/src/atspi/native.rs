@@ -43,9 +43,9 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(3);
 const OP_TIMEOUT: Duration = Duration::from_secs(25);
 /// Startup may run before `serve` binds its socket or MCP reads stdin. A
 /// reachable but wedged accessibility bus must not hold either entry point
-/// forever. The worker is deliberately left running after this readiness
-/// budget so a late registry reply can still establish the process-lifetime
-/// listener.
+/// forever. Initialization remains owned after this readiness budget so a
+/// late registry reply can still establish the listener; shutdown cancels and
+/// awaits it.
 const LISTENER_STARTUP_TIMEOUT: Duration = Duration::from_secs(3);
 
 tokio::task_local! {
@@ -420,123 +420,17 @@ macro_rules! dlog {
     };
 }
 
-/// Shared multi-threaded Tokio runtime for the blocking AT-SPI entry points.
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .expect("build AT-SPI tokio runtime")
-    })
-}
-
-static SHARED_CONNECTION: tokio::sync::OnceCell<AccessibilityConnection> =
-    tokio::sync::OnceCell::const_new();
-
-/// Keep one AT-SPI connection and registry registration alive for the daemon
-/// lifetime. WebKitGTK only publishes its WebProcess accessibility subtree
-/// while the registry reports an interested listener.
-async fn shared_connection() -> Result<&'static AccessibilityConnection> {
-    SHARED_CONNECTION
-        .get_or_try_init(|| async {
-            let bus_address = crate::a11y::trusted_accessibility_bus_address()?;
-            let address = bus_address
-                .parse()
-                .map_err(|error| anyhow!("invalid trusted AT-SPI bus address: {error}"))?;
-            let conn = AccessibilityConnection::from_address(address)
-                .await
-                .map_err(|error| anyhow!("AT-SPI connect failed: {error}"))?;
-            conn.add_registry_event::<atspi::ObjectEvents>()
-                .await
-                .map_err(|error| anyhow!("AT-SPI object-event registration failed: {error}"))?;
-            // Registry interest alone does not install D-Bus match rules.
-            // Keep upstream's typed subscriptions on this trusted connection.
-            conn.register_event::<atspi::events::object::StateChangedEvent>()
-                .await
-                .map_err(|error| anyhow!("AT-SPI state-changed subscription failed: {error}"))?;
-            conn.register_event::<atspi::events::object::ActiveDescendantChangedEvent>()
-                .await
-                .map_err(|error| {
-                    anyhow!("AT-SPI active-descendant subscription failed: {error}")
-                })?;
-            Ok(conn)
-        })
-        .await
-        .inspect(|conn| {
-            static TRACKER: OnceLock<()> = OnceLock::new();
-            TRACKER.get_or_init(|| spawn_focus_tracker(conn));
-        })
-}
-
-/// Object path of the accessible that most recently reported `focused=true`,
-/// keyed by the emitting application's bus name. Maintained by
-/// [`spawn_focus_tracker`]; consulted by the focus-aware typing paths.
-fn focus_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
-    static MAP: OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
-        OnceLock::new();
-    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// Object path of the active descendant most recently reported per bus
-/// (`object:active-descendant-changed`): the current cell of a focused grid.
-fn active_descendant_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
-    static MAP: OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
-        OnceLock::new();
-    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
-}
-
-/// Record the focused-object path for `bus` from one `object:state-changed:focused` event.
-fn note_focus_event(bus: &str, path: &str, enabled: bool) {
-    let mut map = focus_map().lock().unwrap();
-    if enabled {
-        map.insert(bus.to_owned(), path.to_owned());
-    } else if map.get(bus).is_some_and(|current| current == path) {
-        map.remove(bus);
-    }
-}
-
-/// Consume the shared connection's event stream for the daemon lifetime,
-/// remembering the last focused accessible per application bus.
-fn spawn_focus_tracker(conn: &'static AccessibilityConnection) {
-    runtime().spawn(async move {
-        use futures_util::StreamExt;
-        let stream = conn.event_stream();
-        futures_util::pin_mut!(stream);
-        while let Some(event) = stream.next().await {
-            if let Ok(atspi::Event::Object(atspi::ObjectEvents::ActiveDescendantChanged(active))) =
-                &event
-            {
-                if let Some(bus) = active.item.name_as_str() {
-                    active_descendant_map()
-                        .lock()
-                        .unwrap()
-                        .insert(bus.to_owned(), active.descendant.path_as_str().to_owned());
-                }
-                continue;
-            }
-            let Ok(atspi::Event::Object(atspi::ObjectEvents::StateChanged(changed))) = event else {
-                continue;
-            };
-            if changed.state != State::Focused {
-                continue;
-            }
-            let Some(bus) = changed.item.name_as_str() else {
-                continue;
-            };
-            note_focus_event(bus, changed.item.path_as_str(), changed.enabled);
-        }
-        dlog!("AT-SPI focus tracker stream ended");
-    });
-}
+// All async resources belong to a restartable generation, not process statics.
+mod lifecycle;
+use lifecycle::{active_descendant_map, focus_map, runtime, shared_connection};
+pub use lifecycle::{ensure_listener_active, restart, shutdown};
 
 /// The accessible that currently holds keyboard focus inside `pid`'s
 /// application, resolved from the focus-event log (no tree walk). `None` when
 /// no focus event was seen for the app or the recorded object no longer
 /// reports `Focused`.
 async fn focused_accessible_via_events<'a>(
-    conn: &'a AccessibilityConnection,
+    conn: &AccessibilityConnection,
     pid: u32,
 ) -> Option<(AccessibleProxy<'a>, ObjectRef)> {
     let app = app_for_pid(conn, pid).await.ok()??;
@@ -553,102 +447,6 @@ async fn focused_accessible_via_events<'a>(
         return None;
     }
     Some((acc, ObjectRef { bus, path }))
-}
-
-/// Establish the process-lifetime listener before accessibility-aware apps are
-/// launched. Idempotent; later calls reuse the same connection.
-pub fn ensure_listener_active() -> Result<()> {
-    crate::a11y::trusted_accessibility_bus_address()?;
-    wait_for_listener_startup(LISTENER_STARTUP_TIMEOUT, || {
-        runtime().block_on(async { shared_connection().await.map(|_| ()) })
-    })
-}
-
-fn wait_for_listener_startup(
-    timeout: Duration,
-    connect: impl FnOnce() -> Result<()> + Send + 'static,
-) -> Result<()> {
-    let (completed_tx, completed_rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("cua-atspi-listener".into())
-        .spawn(move || {
-            let _ = completed_tx.send(connect());
-        })
-        .map_err(|error| anyhow!("could not spawn AT-SPI listener initialization: {error}"))?;
-    match completed_rx.recv_timeout(timeout) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(anyhow!(
-            "AT-SPI listener initialization did not complete within {} ms",
-            timeout.as_millis()
-        )),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(anyhow!("AT-SPI listener initialization thread panicked"))
-        }
-    }
-}
-
-#[cfg(test)]
-mod listener_startup_tests {
-    use super::wait_for_listener_startup;
-    use anyhow::anyhow;
-    use std::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc, Condvar, Mutex,
-    };
-    use std::time::{Duration, Instant};
-    #[test]
-    fn healthy_listener_initialization_completes_before_readiness_returns() {
-        let flag = Arc::new(AtomicBool::new(false));
-        let worker = flag.clone();
-        wait_for_listener_startup(Duration::from_secs(1), move || {
-            worker.store(true, Ordering::SeqCst);
-            Ok(())
-        })
-        .unwrap();
-        assert!(flag.load(Ordering::SeqCst));
-    }
-    #[test]
-    fn unreachable_listener_initialization_returns_its_error() {
-        let error = wait_for_listener_startup(Duration::from_secs(1), || {
-            Err(anyhow!("synthetic AT-SPI connection failure"))
-        })
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("synthetic AT-SPI connection failure"));
-    }
-    #[test]
-    fn stalled_listener_is_bounded_and_refuses_readiness() {
-        let gate = Arc::new((Mutex::new(false), Condvar::new()));
-        let wg = gate.clone();
-        let done = Arc::new(AtomicBool::new(false));
-        let wd = done.clone();
-        let started = Instant::now();
-        let error = wait_for_listener_startup(Duration::from_millis(50), move || {
-            let (l, c) = &*wg;
-            let g = l.lock().unwrap();
-            drop(c.wait_while(g, |v| !*v).unwrap());
-            wd.store(true, Ordering::SeqCst);
-            Ok(())
-        })
-        .expect_err("stalled startup must refuse readiness");
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(error
-            .to_string()
-            .contains("listener initialization did not complete"));
-        assert!(
-            !done.load(Ordering::SeqCst),
-            "timed-out worker should still own its in-flight initialization"
-        );
-        let (l, c) = &*gate;
-        *l.lock().unwrap() = true;
-        c.notify_one();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
-            std::thread::yield_now();
-        }
-        assert!(done.load(Ordering::SeqCst));
-    }
 }
 
 /// A node discovered during the pre-order walk, with its proxy retained so the
@@ -796,8 +594,9 @@ fn is_web_process_bus(name: &str) -> bool {
 }
 
 /// Build an `AccessibleProxy` for an arbitrary (bus name, path) in the tree.
-/// Uses owned `String`s for destination/path so the resulting `BusName`/
-/// `ObjectPath` are `'static` and the proxy borrows only the connection.
+/// Uses owned `String`s for destination/path. zbus clones the connection into
+/// the proxy, so retained targets own their handles rather than borrowing a
+/// process-lifetime connection. Shutdown explicitly closes that shared socket.
 ///
 /// `cache_properties(No)` is load-bearing, not just an optimization: with the
 /// zbus default (`Lazily`) the first property read on the proxy — our
@@ -816,7 +615,7 @@ fn is_web_process_bus(name: &str) -> bool {
 /// from `proxies()` already use `CacheProperties::No`.
 /// Build the proxy on the shared bus connection, never the peer socket.
 async fn accessible_via_bus<'a>(
-    conn: &'a AccessibilityConnection,
+    conn: &AccessibilityConnection,
     oref: &RawObjectRef,
 ) -> Result<AccessibleProxy<'a>> {
     if !sandbox_gate_allows(conn.connection(), &oref.name).await {
@@ -839,7 +638,7 @@ async fn accessible_via_bus<'a>(
 }
 
 async fn accessible_for<'a>(
-    conn: &'a AccessibilityConnection,
+    conn: &AccessibilityConnection,
     oref: &RawObjectRef,
 ) -> Result<AccessibleProxy<'a>> {
     // Always the session a11y bus. WebKitGTK's late WebProcess children use a
@@ -1120,7 +919,7 @@ struct ResolvedApp<'a> {
 /// pid only: focus and hit-testing callers walk objects without the sandbox
 /// ownership checks the snapshot walk applies).
 async fn app_for_pid<'a>(
-    conn: &'a AccessibilityConnection,
+    conn: &AccessibilityConnection,
     pid: u32,
 ) -> Result<Option<AccessibleProxy<'a>>> {
     Ok(match resolve_app_for_pid(conn, pid, false).await? {
@@ -1143,7 +942,7 @@ fn process_name(pid: u32) -> Option<String> {
 /// sandbox (see [`sandbox_peer`]), for callers that enforce its ownership
 /// rules on every object they walk.
 async fn resolve_app_for_pid<'a>(
-    conn: &'a AccessibilityConnection,
+    conn: &AccessibilityConnection,
     pid: u32,
     admit_sandbox: bool,
 ) -> Result<AppLookup<'a>> {
@@ -1318,7 +1117,7 @@ async fn bus_owner_pid(dbus: &atspi::zbus::fdo::DBusProxy<'_>, unique_name: &str
 /// pyatspi `walk`/`collect` traversal so element indices stay stable.
 #[allow(dead_code)]
 async fn collect_visited<'a>(
-    conn: &'a AccessibilityConnection,
+    conn: &AccessibilityConnection,
     pid: u32,
 ) -> Result<Option<Vec<Visited<'a>>>> {
     collect_visited_bounded(conn, pid, 0, None, None)
@@ -1659,7 +1458,7 @@ async fn resolve_window_frame(
 /// Issue #22865: caps protect against Electron / large web apps that produce
 /// 10k+ element trees and blow context windows.
 async fn collect_visited_bounded<'a>(
-    conn: &'a AccessibilityConnection,
+    conn: &AccessibilityConnection,
     pid: u32,
     xid: u64,
     max_elements: Option<usize>,
@@ -1673,7 +1472,7 @@ async fn collect_visited_bounded<'a>(
 /// the snapshot walk keeps collapsed, since a toolkit that never marks its
 /// entries SHOWING (gail) cannot show the walk that a `doAction` opened one.
 async fn collect_visited_bounded_opts<'a>(
-    conn: &'a AccessibilityConnection,
+    conn: &AccessibilityConnection,
     pid: u32,
     xid: u64,
     max_elements: Option<usize>,
@@ -1691,7 +1490,7 @@ async fn collect_visited_bounded_opts<'a>(
 }
 
 async fn collect_visited_in_gate<'a>(
-    conn: &'a AccessibilityConnection,
+    conn: &AccessibilityConnection,
     pid: u32,
     xid: u64,
     max_elements: Option<usize>,
@@ -2839,7 +2638,8 @@ pub(super) fn walk_tree_bounded_with_timeout(
         let walk = REGISTRY_INCOMPLETE.scope(
             std::cell::Cell::new(None),
             OP_DEADLINE.scope(deadline, async {
-                let conn = shared_connection().await?;
+                let connection = shared_connection().await?;
+                let conn = &connection;
                 let walked =
                     collect_visited_bounded(conn, pid, xid, max_elements, max_depth).await?;
                 // Unproven absence is a failed lookup, which the caller retries,
@@ -3002,9 +2802,10 @@ fn list_windows_blocking(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo>
     } else {
         crate::x11::list_windows(filter_pid)
     };
-    runtime().block_on(async {
+    let result = runtime().block_on(async {
         let work = async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let zconn = conn.connection();
             let root = match call(conn.root_accessible_on_registry()).await {
                 Some(Ok(r)) => r,
@@ -3160,7 +2961,7 @@ fn list_windows_blocking(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo>
             }
             Ok::<_, anyhow::Error>(out)
         };
-        match tokio::time::timeout(OP_TIMEOUT, work).await {
+        Ok(match tokio::time::timeout(OP_TIMEOUT, work).await {
             Ok(Ok(v)) => v,
             Ok(Err(e)) => {
                 dlog!("atspi list_windows failed: {e}");
@@ -3170,8 +2971,9 @@ fn list_windows_blocking(filter_pid: Option<u32>) -> Vec<crate::x11::WindowInfo>
                 dlog!("atspi list_windows timed out");
                 Vec::new()
             }
-        }
-    })
+        })
+    });
+    result.unwrap_or_default()
 }
 
 /// Pick the editable node to write into, by priority:
@@ -3312,7 +3114,8 @@ async fn write_through_editable_proxies(
 pub fn type_into_editable(pid: u32, text: &str) -> Result<()> {
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let visited = collect_visited(conn, pid)
                 .await?
                 .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
@@ -3330,7 +3133,8 @@ pub fn type_into_editable(pid: u32, text: &str) -> Result<()> {
 pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let visited = collect_visited(conn, pid)
                 .await?
                 .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
@@ -3375,7 +3179,8 @@ pub fn type_into_editable_at(pid: u32, idx: usize, text: &str) -> Result<()> {
 pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let visited = match collect_visited(conn, pid).await? {
                 Some(v) => v,
                 None => return Ok(false),
@@ -3491,7 +3296,8 @@ pub fn insert_text(pid: u32, text: &str) -> Result<bool> {
 pub fn focused_is_editable(pid: u32) -> Result<Option<bool>> {
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let visited = match collect_visited(conn, pid).await? {
                 Some(v) => v,
                 None => return Ok(None),
@@ -3784,7 +3590,8 @@ pub fn invoke_menu_path(
     let window_id = target_proof.window_id();
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             for depth in 0..path.len() {
                 let proof_for_read = target_proof.clone();
                 cua_driver_core::blocking::spawn(move || {
@@ -3843,7 +3650,8 @@ pub fn invoke_menu_path(
 pub fn perform_action(pid: u32, idx: usize) -> Result<(String, bool)> {
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let visited = collect_visited(conn, pid)
                 .await?
                 .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
@@ -3893,7 +3701,8 @@ pub fn perform_action_in_exact_window(
     let window_id = target_proof.window_id();
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let Collected {
                 visited,
                 scoped_frame,
@@ -4013,7 +3822,8 @@ pub fn perform_verified_action_by_key(
     let window_id = target_proof.window_id();
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let visited = collect_visited(conn, pid)
                 .await?
                 .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
@@ -4287,7 +4097,8 @@ impl ObservedClickTarget {
         if state.contains(State::Defunct) || !is_enabled_state(&state) {
             anyhow::bail!("stale_element_token: observed object is defunct or disabled");
         }
-        let conn = shared_connection().await?;
+        let connection = shared_connection().await?;
+        let conn = &connection;
         verify_observed_frame_ancestry(identity, |address| live_parent_address(conn, address))
             .await?;
         // Recheck ownership AFTER the ancestry round trips as well. No further
@@ -4671,7 +4482,8 @@ pub fn resolve_observed_target(
     }
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let Collected {
                 visited,
                 scoped_frame,
@@ -5307,7 +5119,8 @@ mod retained_scroll_tests {
 pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let visited = collect_visited(conn, pid)
                 .await?
                 .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
@@ -5377,7 +5190,8 @@ pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
 pub fn perform_action_at_point(pid: u32, win_x: i32, win_y: i32) -> Result<Option<String>> {
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let visited = match collect_visited(conn, pid).await? {
                 Some(v) => v,
                 None => return Ok(None),
@@ -5481,7 +5295,8 @@ pub fn perform_action_at_screen_point(
     let xid = target_proof.window_id();
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let Collected {
                 visited,
                 scoped_frame,
@@ -5503,7 +5318,9 @@ pub fn perform_action_at_screen_point(
             // correctly; Screen is (0,0)) plus the window's screen origin (the
             // GNOME Shell helper on Wayland, _GTK_FRAME_EXTENTS on X11). When no
             // offset resolves, fall back to CoordType::Screen (correct on Qt/GTK3).
-            let offset = window_to_screen_offset(pid, xid, None);
+            let offset = bounded_blocking(move || window_to_screen_offset(pid, xid, None))
+                .await
+                .flatten();
             let coord = if offset.is_some() {
                 CoordType::Window
             } else {
@@ -5726,7 +5543,8 @@ async fn revalidate_exact_window_element_ancestry(
 pub fn set_value(pid: u32, idx: usize, value: &str) -> Result<()> {
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let visited = collect_visited(conn, pid)
                 .await?
                 .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
@@ -5801,7 +5619,8 @@ pub fn set_value_in_exact_window(
     let window_id = target_proof.window_id();
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let Collected {
                 visited,
                 scoped_frame,
@@ -5896,7 +5715,8 @@ pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> 
     }
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let visited = collect_visited(conn, pid)
                 .await?
                 .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
@@ -5921,7 +5741,10 @@ pub fn get_element_bounds(pid: u32, idx: usize) -> Result<(i32, i32, u32, u32)> 
             // Prefer WINDOW coords + a deterministic screen offset — fixes GTK4,
             // whose CoordType::Screen collapses every element to (0,0). Fall back to
             // Screen on Wayland / when no X11 window resolves (offset is None).
-            match window_to_screen_offset(pid, 0, None) {
+            match bounded_blocking(move || window_to_screen_offset(pid, 0, None))
+                .await
+                .flatten()
+            {
                 Some((ox, oy)) => {
                     let (x, y, w, h) = comp
                         .get_extents(CoordType::Window)
@@ -5966,7 +5789,8 @@ pub fn get_element_bounds_for_window(
     }
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let Collected {
                 visited,
                 scoped_frame,
@@ -6006,7 +5830,8 @@ pub fn get_verified_element_bounds_by_key(
 ) -> Result<(i32, i32, u32, u32)> {
     bounded(
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let visited = collect_visited(conn, pid)
                 .await?
                 .ok_or_else(|| anyhow!("no AT-SPI application for pid {pid}"))?;
@@ -6047,7 +5872,10 @@ pub fn get_verified_element_bounds_by_key(
                 .component()
                 .await
                 .map_err(|error| anyhow!("Component unavailable: {error}"))?;
-            match window_to_screen_offset(pid, window_id, None) {
+            match bounded_blocking(move || window_to_screen_offset(pid, window_id, None))
+                .await
+                .flatten()
+            {
                 Some((offset_x, offset_y)) => {
                     let (x, y, width, height) = component
                         .get_extents(CoordType::Window)
@@ -7871,24 +7699,16 @@ mod budget_tests {
     #[test]
     fn focus_log_tracks_latest_focused_object_per_bus_and_clears_on_blur() {
         let bus = ":9.test-focus-log";
-        note_focus_event(bus, "/a", true);
-        assert_eq!(
-            focus_map().lock().unwrap().get(bus).map(String::as_str),
-            Some("/a")
-        );
-        note_focus_event(bus, "/b", true);
-        assert_eq!(
-            focus_map().lock().unwrap().get(bus).map(String::as_str),
-            Some("/b")
-        );
+        let map = Mutex::new(std::collections::HashMap::new());
+        lifecycle::note_focus_event(&map, bus, "/a", true);
+        assert_eq!(map.lock().unwrap().get(bus).map(String::as_str), Some("/a"));
+        lifecycle::note_focus_event(&map, bus, "/b", true);
+        assert_eq!(map.lock().unwrap().get(bus).map(String::as_str), Some("/b"));
         // A blur for a stale object must not erase the newer focus.
-        note_focus_event(bus, "/a", false);
-        assert_eq!(
-            focus_map().lock().unwrap().get(bus).map(String::as_str),
-            Some("/b")
-        );
-        note_focus_event(bus, "/b", false);
-        assert!(focus_map().lock().unwrap().get(bus).is_none());
+        lifecycle::note_focus_event(&map, bus, "/a", false);
+        assert_eq!(map.lock().unwrap().get(bus).map(String::as_str), Some("/b"));
+        lifecycle::note_focus_event(&map, bus, "/b", false);
+        assert!(map.lock().unwrap().get(bus).is_none());
     }
 
     #[test]
@@ -8156,7 +7976,8 @@ pub fn focused_control(pid: u32) -> Option<(String, String)> {
     bounded_for(
         Duration::from_millis(400),
         async {
-            let conn = shared_connection().await?;
+            let connection = shared_connection().await?;
+            let conn = &connection;
             let Some((acc, focused_ref)) = focused_accessible_via_events(conn, pid).await else {
                 return Ok(None);
             };

@@ -1221,7 +1221,12 @@ pub fn retire_runtime_scope(runtime_scope: &str) -> usize {
             retired += cache.retire();
         }
     }
-    retired + element_token::global().clear_runtime_scope(runtime_scope)
+    #[cfg(target_os = "linux")]
+    let registry_retired = element_token::global_if_initialized()
+        .map_or(0, |registry| registry.clear_runtime_scope(runtime_scope));
+    #[cfg(not(target_os = "linux"))]
+    let registry_retired = element_token::global().clear_runtime_scope(runtime_scope);
+    retired + registry_retired
 }
 #[cfg(test)]
 mod hardened_tests {
