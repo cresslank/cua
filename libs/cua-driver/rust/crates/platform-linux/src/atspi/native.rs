@@ -33,6 +33,7 @@ pub mod hit;
 
 // Flatpak apps register on the accessibility bus through their sandbox's proxy.
 mod sandbox_peer;
+mod tab_documents;
 
 // Point-owner redirection is deferred: it can substitute another native object.
 
@@ -523,9 +524,9 @@ struct Visited<'a> {
     /// buttons). The tree says so, so the caller can scroll it into view or
     /// prefer an on-screen control.
     offscreen: bool,
-    /// Children this walk deliberately did not enumerate: the items of a
-    /// menu that is not open (every closed LibreOffice menu would otherwise
-    /// put ~500 frameless entries ahead of the document).
+    /// Children this walk deliberately did not enumerate: a closed menu's
+    /// items, or a background tab document's contents. Background roots remain
+    /// in the reading with an explicit skipped-contents note.
     collapsed_children: Option<usize>,
     actions: Vec<String>,
     has_editable: bool,
@@ -1657,6 +1658,11 @@ async fn collect_visited_in_gate<'a>(
         .map(|cap| cap.max(CHILD_ENUMERATION_CAP))
         .unwrap_or(CHILD_ENUMERATION_CAP);
 
+    // Positive evidence is scoped to an application top-level, never the PID:
+    // a showing document in another browser window says nothing about this one.
+    let mut showing_documents = std::collections::HashMap::<usize, RawObjectRef>::new();
+    let mut document_peeked = std::collections::HashSet::new();
+
     while let Some((oref, depth, inherited_web_doc, top_level_key, frame_ordinal)) = stack.pop() {
         if budget == 0 {
             dlog!("node budget exhausted; truncating walk");
@@ -1786,10 +1792,55 @@ async fn collect_visited_in_gate<'a>(
             call(acc.get_state()),
             call(raw_child_count(zconn, &oref)),
         );
+        let role = match role_r {
+            Some(Ok(r)) => r,
+            _ => String::new(),
+        };
+        let top_level_document = !in_web_doc && tab_documents::is_tab_document(&role);
+        let mut background_document = false;
+        if top_level_document {
+            if let Some(Ok(state)) = state_r.as_ref() {
+                if state.contains(State::Showing) {
+                    showing_documents.insert(frame_ordinal, oref.clone());
+                } else {
+                    // Only once per window, and only when a known non-showing
+                    // document would otherwise consume the selected tab's cap.
+                    // The pending stack carries ancestor context: never inspect
+                    // a nested document or another top-level window as a peer.
+                    if !showing_documents.contains_key(&frame_ordinal)
+                        && document_peeked.insert(frame_ordinal)
+                    {
+                        let pending = stack
+                            .iter()
+                            .filter(|(_, _, web, _, frame)| !web && *frame == frame_ordinal)
+                            .map(|(object, ..)| object.clone())
+                            .collect();
+                        if let Some(witness) =
+                            tab_documents::find_showing(conn, pending, deadline).await
+                        {
+                            showing_documents.insert(frame_ordinal, witness);
+                        }
+                    }
+                    if let Some(witness) = showing_documents.get(&frame_ordinal) {
+                        background_document = tab_documents::still_showing(conn, witness).await;
+                    }
+                }
+            }
+        }
         // Fetch the child list only for real containers within the cap: leaves
         // (the majority of nodes) save a round-trip, and a huge container is
-        // never enumerated (see CHILD_ENUMERATION_CAP).
+        // never enumerated (see CHILD_ENUMERATION_CAP). Keep a background
+        // document's root and count, but do not even enumerate its descendants.
+        let background_child_count = background_document.then(|| {
+            count_r
+                .as_ref()
+                .and_then(|count| count.as_ref().ok())
+                .copied()
+                .unwrap_or(0)
+                .max(0) as usize
+        });
         let children_r: Option<Result<Vec<RawObjectRef>>> = match count_r {
+            _ if background_document => Some(Ok(Vec::new())),
             Some(Ok(count)) if count <= 0 => Some(Ok(Vec::new())),
             Some(Ok(count)) if count as usize > child_cap => {
                 huge_containers.push((count as usize, visited.len()));
@@ -1800,10 +1851,6 @@ async fn collect_visited_in_gate<'a>(
             // historical unconditional fetch.
             Some(Err(_)) => call(raw_children(zconn, &oref)).await,
             None => None,
-        };
-        let role = match role_r {
-            Some(Ok(r)) => r,
-            _ => String::new(),
         };
         let mut name = match name_r {
             Some(Ok(n)) => n,
@@ -2024,7 +2071,7 @@ async fn collect_visited_in_gate<'a>(
                 }
             }
         }
-        let mut collapsed_children = None;
+        let mut collapsed_children = background_child_count;
         if descend && closed_menu {
             if let Some(Ok(children)) = &children_r {
                 collapsed_children = Some(children.len());
@@ -2345,7 +2392,13 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
                 .then(|| format!(" (description \"{}\")", v.description));
             let collapsed_note = v
                 .collapsed_children
-                .map(|n| format!(" (closed menu, {n} items; click it to open)"))
+                .map(|n| {
+                    if tab_documents::is_tab_document(&v.role) {
+                        " (background tab; contents skipped)".to_owned()
+                    } else {
+                        format!(" (closed menu, {n} items; click it to open)")
+                    }
+                })
                 .unwrap_or_default();
             let unlabelled_shown = unlabelled_note
                 .as_ref()
@@ -2362,9 +2415,11 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
                 description_parts.push(v.description.clone());
             }
             if let Some(n) = v.collapsed_children {
-                description_parts.push(format!(
-                    "closed menu with {n} items; not expanded: click it to open"
-                ));
+                description_parts.push(if tab_documents::is_tab_document(&v.role) {
+                    "background tab; contents skipped".to_owned()
+                } else {
+                    format!("closed menu with {n} items; not expanded: click it to open")
+                });
             }
             if let Some(note) = unlabelled_note {
                 description_parts.push(note);
@@ -2394,9 +2449,18 @@ fn render(visited: &[Visited<'_>], only_frame: Option<usize>) -> (String, Vec<At
                 object_ref: Some(v.object_ref.clone()),
             });
             idx += 1;
-        } else if emit && !v.name.is_empty() && v.showing {
+        } else if emit
+            && ((v.collapsed_children.is_some() && tab_documents::is_tab_document(&v.role))
+                || (!v.name.is_empty() && v.showing))
+        {
+            let skipped =
+                if v.collapsed_children.is_some() && tab_documents::is_tab_document(&v.role) {
+                    " (background tab; contents skipped)"
+                } else {
+                    ""
+                };
             md.push_str(&format!(
-                "{indent}- {role} = \"{name}\"{marker}
+                "{indent}- {role} = \"{name}\"{marker}{skipped}
 ",
                 role = v.role,
                 name = v.name,
