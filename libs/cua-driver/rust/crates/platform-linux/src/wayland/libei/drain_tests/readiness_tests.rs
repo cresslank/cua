@@ -42,7 +42,10 @@ fn ready_hook(tool: &str, args: &serde_json::Value) -> Result<(), String> {
             ready.sender.connect(interface, || {
                 ready.opens += 1;
                 Ok((
-                    ready.context.take().expect("opened more than once"),
+                    ready
+                        .context
+                        .take()
+                        .ok_or_else(|| anyhow::anyhow!("fixture portal unavailable"))?,
                     PortalKeepAlive::None,
                 ))
             })
@@ -199,7 +202,8 @@ fn cold_action_with_protocols(
     let result = runtime.block_on(registry(sender, tool, true).invoke(
         tool,
         serde_json::json!({
-            "pid": 937453, "window_id": 21, "strategy": {"kind": "existing_profile"}
+            "pid": 937453, "window_id": 21, "strategy": {"kind": "existing_profile"},
+            "delivery_mode": "foreground"
         }),
     ));
     assert_ne!(
@@ -253,6 +257,155 @@ fn cold_action_with_protocols(
     assert!(
         !readable(&fixture.peer, Duration::from_millis(50)),
         "unexpected replay"
+    );
+}
+
+#[test]
+fn gnome_background_admission_never_opens_or_waits_on_eis() {
+    isolated(
+        "gnome_background_admission_never_opens_or_waits_on_eis",
+        || {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (fixture, _context) = Fixture::disconnected();
+            *READINESS.lock().unwrap() = Some(Readiness {
+                session: InputReadinessSession::Gnome,
+                protocols: NativeInputProtocols {
+                    pointer: false,
+                    keyboard: false,
+                    wtype: false,
+                },
+                sender: fixture.sender.clone(),
+                context: None,
+                interfaces: vec![],
+                calls: 0,
+                opens: 0,
+            });
+            cua_driver_core::action_lease::install_raw_input_ready_hook(ready_hook);
+            // Exercise the real registry admission, not merely the route predicate.
+            // Any attempted open/wait hits a disconnected EIS fixture and fails.
+            for tool in [
+                "click",
+                "right_click",
+                "double_click",
+                "type_text",
+                "press_key",
+                "hotkey",
+                "scroll",
+                "drag",
+                "mouse_drag",
+                "parallel_mouse_drag",
+                "move_cursor",
+                "mouse_button_down",
+                "mouse_button_up",
+            ] {
+                for extra in [
+                    serde_json::json!({}),
+                    serde_json::json!({"delivery_mode":"background"}),
+                    serde_json::json!({"element_token":"snapshot:7"}),
+                    serde_json::json!({"x":10,"y":20,"modifier":["shift"],"count":2}),
+                    serde_json::json!({"scope":"desktop"}),
+                ] {
+                    let mut args = serde_json::json!({"pid":937453,"window_id":21});
+                    args.as_object_mut()
+                        .unwrap()
+                        .extend(extra.as_object().unwrap().clone());
+                    let result = runtime
+                        .block_on(registry(fixture.sender.clone(), tool, false).invoke(tool, args));
+                    assert_ne!(result.is_error, Some(true), "{tool}: {result:?}");
+                    runtime.block_on(assert_released());
+                }
+            }
+            let ready = READINESS.lock().unwrap().take().unwrap();
+            assert_eq!(ready.calls, 65);
+            assert_eq!(ready.opens, 0);
+            assert!(ready.interfaces.is_empty());
+            fixture.assert_disconnected();
+            assert!(
+                !readable(&fixture.peer, Duration::from_millis(50)),
+                "background input emitted"
+            );
+        },
+    );
+}
+
+#[test]
+fn gnome_foreground_and_native_background_preserve_readiness() {
+    isolated(
+        "gnome_foreground_and_native_background_preserve_readiness",
+        || {
+            for (tool, interfaces) in [
+                ("click", vec!["ei_pointer_absolute"]),
+                ("hotkey", vec!["ei_keyboard"]),
+                ("scroll", vec!["ei_pointer_absolute", "ei_scroll"]),
+            ] {
+                cold_action(tool, InputReadinessSession::Gnome, &interfaces);
+            }
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            let (fixture, _) = Fixture::disconnected();
+            for session in [
+                InputReadinessSession::Gnome,
+                InputReadinessSession::NativeWayland,
+            ] {
+                *READINESS.lock().unwrap() = Some(Readiness {
+                    session,
+                    protocols: NativeInputProtocols {
+                        pointer: false,
+                        keyboard: false,
+                        wtype: false,
+                    },
+                    sender: fixture.sender.clone(),
+                    context: None,
+                    interfaces: vec![],
+                    calls: 0,
+                    opens: 0,
+                });
+                cua_driver_core::action_lease::install_raw_input_ready_hook(ready_hook);
+                // No fixture context: readiness refuses at the external opener.
+                // Assert its exact protected refusal through registry admission.
+                let mut cases = vec![
+                    ("click", serde_json::json!({"delivery_mode":"foreground"})),
+                    (
+                        "bring_to_front",
+                        serde_json::json!({"delivery_mode":"background"}),
+                    ),
+                    ("set_window_frame", serde_json::json!({})),
+                    (
+                        "browser_prepare",
+                        serde_json::json!({"pid":937453,"strategy":{"kind":"existing_profile"}}),
+                    ),
+                ];
+                if matches!(session, InputReadinessSession::NativeWayland) {
+                    // Native activation/geometry need no EIS; only GNOME does.
+                    cases.retain(|(tool, _)| {
+                        !matches!(*tool, "bring_to_front" | "set_window_frame")
+                    });
+                    cases.push((
+                        "right_click",
+                        serde_json::json!({"delivery_mode":"background"}),
+                    ));
+                }
+                for mode in [
+                    serde_json::json!(null),
+                    serde_json::json!("BACKGROUND"),
+                    serde_json::json!("auto"),
+                ] {
+                    cases.push(("click", serde_json::json!({"delivery_mode":mode})));
+                }
+                for (tool, args) in cases {
+                    let result = runtime
+                        .block_on(registry(fixture.sender.clone(), tool, false).invoke(tool, args));
+                    assert_eq!(result.is_error, Some(true), "{tool}: {result:?}");
+                    assert_eq!(
+                        result.structured_content.unwrap()["refusal"]["code"],
+                        "input_unavailable",
+                        "{tool}"
+                    );
+                }
+                READINESS.lock().unwrap().take();
+            }
+            fixture.assert_disconnected();
+            assert!(!readable(&fixture.peer, Duration::from_millis(50)));
+        },
     );
 }
 

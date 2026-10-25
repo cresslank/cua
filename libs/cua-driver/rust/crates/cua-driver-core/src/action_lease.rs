@@ -50,15 +50,26 @@ pub struct ExactWindow {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LeaseResource {
     DesktopRaw,
-    BrowserProfile { key: String },
-    App { pid: i64 },
-    Window { pid: i64, window_id: u64 },
+    /// Exclusive transport teardown, never an action's delivery authority.
+    /// Conflicts with raw input and browser-profile operations that may retain
+    /// native setup cleanup across a human confirmation wait.
+    InputTransportRetirement,
+    BrowserProfile {
+        key: String,
+    },
+    App {
+        pid: i64,
+    },
+    Window {
+        pid: i64,
+        window_id: u64,
+    },
 }
 
 impl LeaseResource {
     fn rank(&self) -> u8 {
         match self {
-            Self::DesktopRaw => 0,
+            Self::DesktopRaw | Self::InputTransportRetirement => 0,
             Self::BrowserProfile { .. } => 1,
             Self::App { .. } => 2,
             Self::Window { .. } => 3,
@@ -524,6 +535,20 @@ impl ActionLeaseTable {
         }
     }
 
+    /// Atomically exclude raw input and every browser-profile action while an
+    /// idle native transport retires. Browser setup can retain native cleanup
+    /// beyond a human confirmation wait without holding DesktopRaw. Ordinary
+    /// browser actions keep their profile-scoped concurrency; only optional
+    /// retirement needs this wider, zero-wait fence.
+    pub fn try_acquire_input_transport_idle(self: &Arc<Self>) -> Result<ActionLease, LeaseError> {
+        let needed = [
+            LeaseResource::DesktopRaw,
+            LeaseResource::InputTransportRetirement,
+        ];
+        self.try_grant(&needed, None, self.reap_epoch(), false)?
+            .ok_or_else(|| busy_error(&needed))
+    }
+
     /// Sync acquire for platform workers that run outside the MCP task.
     pub fn acquire_blocking(
         self: &Arc<Self>,
@@ -693,6 +718,11 @@ impl ActionLeaseTable {
 fn resources_conflict(left: &LeaseResource, right: &LeaseResource) -> bool {
     match (left, right) {
         (LeaseResource::DesktopRaw, LeaseResource::DesktopRaw) => true,
+        (LeaseResource::InputTransportRetirement, LeaseResource::InputTransportRetirement)
+        | (LeaseResource::InputTransportRetirement, LeaseResource::DesktopRaw)
+        | (LeaseResource::DesktopRaw, LeaseResource::InputTransportRetirement)
+        | (LeaseResource::InputTransportRetirement, LeaseResource::BrowserProfile { .. })
+        | (LeaseResource::BrowserProfile { .. }, LeaseResource::InputTransportRetirement) => true,
         (
             LeaseResource::BrowserProfile { key: left },
             LeaseResource::BrowserProfile { key: right },

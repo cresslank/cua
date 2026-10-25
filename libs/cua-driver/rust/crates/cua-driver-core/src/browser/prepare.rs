@@ -224,6 +224,7 @@ fn with_prepare_side_effects(
 struct PendingExistingProfileSetup {
     platform: Arc<dyn super::platform::BrowserPlatform>,
     request: Option<ExistingProfileSetupRequest>,
+    ownership: crate::blocking::ActionLeaseScope,
 }
 
 impl PendingExistingProfileSetup {
@@ -234,6 +235,7 @@ impl PendingExistingProfileSetup {
         Self {
             platform,
             request: Some(request),
+            ownership: crate::blocking::ActionLeaseScope::capture(),
         }
     }
 
@@ -275,8 +277,13 @@ impl Drop for PendingExistingProfileSetup {
             "the existing-profile setup request ended before commit; rolling back its exact pending setup",
         );
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            // The original invocation can end before this task is polled. Keep
+            // its grant until abort finishes instead of exposing an overdue
+            // idle transport to retirement in that scheduling gap.
+            let ownership = self.ownership.clone();
             runtime.spawn(async move {
                 let _ = platform.abort_existing_profile_setup(request, error).await;
+                drop(ownership);
             });
         }
     }
@@ -1483,6 +1490,49 @@ impl BrowserEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_setup_drop_transfers_dispatch_ownership_to_abort_task() {
+        use crate::action_lease::{ActionLeaseTable, LeaseRequest};
+        let fixture = super::super::v2_tests::fixture().await;
+        let table = ActionLeaseTable::new();
+        let grant = table
+            .acquire_for_dispatch(LeaseRequest::browser_profile(
+                "pending-setup-owner",
+                Duration::ZERO,
+            ))
+            .await
+            .unwrap();
+        let weak = Arc::downgrade(&grant);
+        let pending = crate::tool::DISPATCH_ACTION_LEASE
+            .scope(Some(grant.clone()), async {
+                PendingExistingProfileSetup::new(
+                    fixture.engine.platform.clone(),
+                    ExistingProfileSetupRequest {
+                        pid: 1,
+                        window_id: 7,
+                        browser: super::super::types::BrowserProduct::GoogleChrome,
+                    },
+                )
+            })
+            .await;
+        drop(grant);
+        drop(pending);
+        // This current-thread executor has not polled the spawned abort yet:
+        // the original invocation is gone, but its cleanup must still pin it.
+        assert_eq!(
+            table.try_acquire_input_transport_idle().unwrap_err().code(),
+            "input_busy"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("abort task retained its ownership after completion");
+        drop(table.try_acquire_input_transport_idle().unwrap());
+    }
 
     #[tokio::test]
     async fn spawned_attestation_retries_absence_but_propagates_profile_errors() {

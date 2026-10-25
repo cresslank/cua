@@ -63,6 +63,41 @@ fn run_existing_profile_cleanup<T: Send + 'static>(
     )
 }
 
+/// Session-end and expired-grant cleanup are not fresh browser_prepare calls.
+/// Reopen a retired transport before taking the seat, then retain that seat
+/// through all native dismissal/preference restoration and its rollback. This
+/// uses the same readiness routing as acting existing-profile setup; no input
+/// command reconnects or replays inside a foreground transaction.
+pub(crate) fn with_existing_profile_cleanup_input<T>(
+    pid: u32,
+    window_id: u64,
+    cleanup: impl FnOnce() -> Result<T, BrowserRefusal>,
+) -> Result<T, BrowserRefusal> {
+    crate::wayland::ensure_raw_input_ready_for_tool(
+        "browser_prepare",
+        &serde_json::json!({"pid":pid,"window_id":window_id,
+            "strategy":{"kind":"existing_profile"},"delivery_mode":"foreground"}),
+    )
+    .map_err(|error| {
+        refusal(
+            BrowserRefusalCode::BrowserRouteUnavailable,
+            format!("browser cleanup input readiness failed: {error}"),
+        )
+    })?;
+    let _input = cua_driver_core::action_lease::global()
+        .acquire_blocking(cua_driver_core::action_lease::LeaseRequest::desktop_raw(
+            None,
+            Duration::from_secs(4),
+        ))
+        .map_err(|error| {
+            refusal(
+                BrowserRefusalCode::BrowserRouteUnavailable,
+                format!("browser cleanup input is unavailable: {}", error.message()),
+            )
+        })?;
+    cleanup()
+}
+
 async fn x11_native_window(pid: i64, window_id: u64) -> Option<(NativeWindowInfo, bool)> {
     let pid_u32 = u32::try_from(pid).ok()?;
     // X11 identity is checked before Wayland adapters. Admission stays on the
@@ -1279,11 +1314,13 @@ impl BrowserPlatform for LinuxBrowserPlatform {
             )
         })?;
         run_existing_profile_cleanup(move || {
-            let dismissed_before = crate::browser_consent_ui::dismiss(pid, window_id)?;
-            let closed_setup_page =
-                crate::browser_setup_ui::disable(pid, window_id, descriptor, &profile_path)?;
-            let dismissed_after = crate::browser_consent_ui::dismiss(pid, window_id)?;
-            Ok(dismissed_before || closed_setup_page || dismissed_after)
+            with_existing_profile_cleanup_input(pid, window_id, || {
+                let dismissed_before = crate::browser_consent_ui::dismiss(pid, window_id)?;
+                let closed_setup_page =
+                    crate::browser_setup_ui::disable(pid, window_id, descriptor, &profile_path)?;
+                let dismissed_after = crate::browser_consent_ui::dismiss(pid, window_id)?;
+                Ok(dismissed_before || closed_setup_page || dismissed_after)
+            })
         })?
     }
 
@@ -1295,8 +1332,21 @@ impl BrowserPlatform for LinuxBrowserPlatform {
         let Ok(pid) = u32::try_from(request.pid) else {
             return error;
         };
+        let fallback = error.clone();
         cua_driver_core::blocking::spawn(move || {
-            crate::browser_setup_ui::abort_pending(pid, request.window_id, error)
+            with_existing_profile_cleanup_input(pid, request.window_id, || {
+                Ok(crate::browser_setup_ui::abort_pending(
+                    pid,
+                    request.window_id,
+                    error,
+                ))
+            })
+            .unwrap_or_else(|cleanup_error| {
+                fallback.with_detail(serde_json::json!({
+                    "cleanup_error": cleanup_error.message,
+                    "cleanup_pending": true
+                }))
+            })
         })
         .await
         .unwrap_or_else(|join_error| {

@@ -33,6 +33,12 @@
 //! releases unstarted work's lease or joins active drain/discard before returning.
 //! GNOME foreground commands also share the helper transaction's earlier deadline.
 //!
+//! Portal-owned sessions retire after 20s without readiness/input work. Retirement
+//! runs on the same worker as commands, excludes readiness and admitted raw input,
+//! discards the EIS context before closing the Session/Connection/runtime, and
+//! leaves the worker available for lease-free readiness to reopen with the stored
+//! restore token. Direct `$LIBEI_SOCKET` connections are not idle-retired.
+//!
 //! Persistence: ashpd `PersistMode::ExplicitlyRevoked` keeps the user's consent
 //! until they revoke it in desktop settings. The restore token is stored at
 //! `~/.config/cua-driver/libei-persistent.token` and reused across daemon
@@ -193,6 +199,7 @@ impl Cmd {
 }
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
+const PORTAL_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 
 // A timeout must not return to a foreground guard while this command can still
 // emit input. The worker holds `cancelled` from admission through drain/discard
@@ -509,11 +516,12 @@ pub fn ensure_started() -> anyhow::Result<()> {
         let sender = CommandSender::new(tx);
         let live = sender.live.clone();
         let stopped = sender.stopped.clone();
+        let readiness = sender.readiness.clone();
         let thread = thread::Builder::new()
             .name("cua-libei-worker".into())
             .spawn(move || {
                 WORKER_STOP.with(|slot| *slot.borrow_mut() = Some(stopped));
-                if let Err(e) = worker(rx, live.clone()) {
+                if let Err(e) = worker(rx, live.clone(), readiness) {
                     tracing::warn!("cua-libei-worker exited with error: {e}");
                 }
                 live.store(false, Ordering::Release);
@@ -742,14 +750,14 @@ pub fn shutdown() {
 // both the EIS protocol and the inbound command channel.
 
 /// Owns the resources that must outlive a single libei call so the portal
-/// RemoteDesktop + EIS session stays alive for the whole worker-thread lifetime.
+/// RemoteDesktop + EIS session stays alive until idle retirement or shutdown.
 ///
 /// GNOME/Mutter (and KDE) tie the RemoteDesktop session — and therefore the
 /// handed-off EIS fd — to the D-Bus connection that created it. The previous
 /// code dropped the ashpd proxy/session (and the tokio runtime backing their
 /// zbus connection) at the end of `open_eis_context`, before the calloop loop
 /// even started, so the session died immediately on those compositors (#2105).
-/// Holding these for the worker's lifetime keeps the connection — and the
+/// Holding these until session retirement keeps the connection — and the
 /// session — open. The direct `$LIBEI_SOCKET` fast path has no portal
 /// session, so it carries `None`.
 enum PortalKeepAlive {
@@ -792,7 +800,11 @@ impl Drop for PortalKeepAlive {
     }
 }
 
-fn worker(rx: Receiver<WorkerRequest>, live: Arc<AtomicBool>) -> anyhow::Result<()> {
+fn worker(
+    rx: Receiver<WorkerRequest>,
+    live: Arc<AtomicBool>,
+    readiness: Arc<Mutex<()>>,
+) -> anyhow::Result<()> {
     while !worker_stopped() {
         let request = match rx.recv_timeout(Duration::from_millis(20)) {
             Ok(request) => request,
@@ -816,17 +828,16 @@ fn worker(rx: Receiver<WorkerRequest>, live: Arc<AtomicBool>) -> anyhow::Result<
                 execution.lease = Default::default();
                 queued.command.reply(Err(no_live_context()));
             }
-            WorkerRequest::Connect {
-                context,
-                keepalive: _portal_keepalive,
-            } => {
+            WorkerRequest::Connect { context, keepalive } => {
                 live.store(true, Ordering::Release);
-                let result = run_calloop(context, &rx);
+                let result = run_calloop(context, keepalive, &rx, &live, &readiness);
                 live.store(false, Ordering::Release);
-                if let Err(error) = result {
-                    tracing::warn!("libei connection ended: {error}; readiness must reconnect");
-                } else {
-                    break;
+                match result {
+                    Err(error) => {
+                        tracing::warn!("libei connection ended: {error}; readiness must reconnect");
+                    }
+                    Ok(ConnectionExit::Idle) => (),
+                    Ok(ConnectionExit::Shutdown) => break,
                 }
             }
         }
@@ -878,7 +889,7 @@ fn open_eis_context(stopped: &AtomicBool) -> anyhow::Result<(reis::ei::Context, 
 
     // A multi-threaded runtime (1 worker) so the zbus connection backing the
     // RemoteDesktop session keeps being driven after this fn returns. The
-    // session must stay live for the whole worker lifetime (#2105); a
+    // session must stay driven until retirement (#2105); a
     // current-thread runtime would freeze the connection the moment we stop
     // calling `block_on`, and GNOME/KDE would tear the session down.
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1019,15 +1030,35 @@ fn wait_writable(context: &reis::ei::Context, deadline: Instant) -> std::io::Res
     }
 }
 
-fn run_calloop(context: reis::ei::Context, rx: &Receiver<WorkerRequest>) -> anyhow::Result<()> {
+enum ConnectionExit {
+    Idle,
+    Shutdown,
+}
+
+fn run_calloop(
+    context: reis::ei::Context,
+    keepalive: PortalKeepAlive,
+    rx: &Receiver<WorkerRequest>,
+    live: &AtomicBool,
+    readiness: &Mutex<()>,
+) -> anyhow::Result<ConnectionExit> {
     use calloop::{generic::Generic, EventLoop, Interest, Mode};
 
+    // Own/discard the socket before any fallible loop setup, so even setup
+    // errors destroy EIS before the portal keepalive's parameter is dropped.
+    let mut state = EisState::default();
+    state.context = Some(context);
     let mut event_loop: EventLoop<EisState> = EventLoop::try_new()
         .map_err(|e| anyhow::anyhow!("calloop EventLoop::try_new failed: {e}"))?;
     // Register only a descriptor, not another owning Context. EisState owns the
     // output buffer, so discarding it destroys all unsent input before replying.
     let source = Generic::new(
-        context.as_fd().try_clone_to_owned()?,
+        state
+            .context
+            .as_ref()
+            .unwrap()
+            .as_fd()
+            .try_clone_to_owned()?,
         Interest::READ,
         Mode::Level,
     );
@@ -1037,9 +1068,8 @@ fn run_calloop(context: reis::ei::Context, rx: &Receiver<WorkerRequest>) -> anyh
             state.handle_eis_readable()
         })
         .map_err(|e| anyhow::anyhow!("calloop insert_source(eis) failed: {e}"))?;
-    let mut state = EisState::default();
-    state.context = Some(context);
     let mut pending = Vec::new();
+    let mut idle_since = Instant::now();
 
     loop {
         if worker_stopped() {
@@ -1089,6 +1119,9 @@ fn run_calloop(context: reis::ei::Context, rx: &Receiver<WorkerRequest>) -> anyh
                 }
                 execution.lease = Default::default();
                 drop(execution);
+                // Start a fresh idle interval only after command drain/discard,
+                // never at enqueue time or while a long action is still active.
+                idle_since = Instant::now();
                 if state.context.is_none() {
                     anyhow::bail!("libei EIS connection discarded");
                 }
@@ -1097,8 +1130,33 @@ fn run_calloop(context: reis::ei::Context, rx: &Receiver<WorkerRequest>) -> anyh
             }
         }
         pending = still;
+        if matches!(keepalive, PortalKeepAlive::Portal { .. })
+            && pending.is_empty()
+            && idle_since.elapsed() >= PORTAL_IDLE_TIMEOUT
+        {
+            // Lock order matches connect: readiness before a raw-input lease.
+            // Never wait for either: a consent/readiness caller or an admitted
+            // raw/browser action must win over optional idle cleanup. Browser
+            // setup retains native cleanup across trusted confirmation without
+            // holding DesktopRaw. The fence also protects the gap between
+            // readiness and the first queued input.
+            if let Ok(_ready) = readiness.try_lock() {
+                use cua_driver_core::action_lease::global;
+                if let Ok(_idle_lease) = global().try_acquire_input_transport_idle() {
+                    if rx.is_empty() {
+                        // A stale Context clone must not outlive retirement as
+                        // an input path. Keep both guards until portal teardown
+                        // completes, then publish offline before allowing reopen.
+                        state.discard_output();
+                        drop(keepalive);
+                        live.store(false, Ordering::Release);
+                        return Ok(ConnectionExit::Idle);
+                    }
+                }
+            }
+        }
     }
-    Ok(())
+    Ok(ConnectionExit::Shutdown)
 }
 
 #[derive(Default)]
