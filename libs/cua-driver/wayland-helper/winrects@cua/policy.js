@@ -1,9 +1,13 @@
 // Pure visibility/identity policy shared by the GNOME extension and Node tests.
-// Workspace indices are deliberately absent: visibility comes from Mutter's
-// actual painting decision, which already accounts for sticky windows, dynamic
-// workspace topology, monitor placement, and workspaces-only-on-primary.
+// showing_on_its_workspace() describes hypothetical visibility on that workspace,
+// not membership of the active stage. Keep workspace membership explicit without
+// depending on indices or the number of dynamic workspaces.
 export function targetIsPainted({ actorVisible, minimized, shellShowing }) {
     return Boolean(actorVisible) && !Boolean(minimized) && Boolean(shellShowing);
+}
+
+export function targetIsOnActiveStage({sticky, workspaceActive, ...painting}) {
+    return targetIsPainted(painting) && (Boolean(sticky) || Boolean(workspaceActive));
 }
 
 export function targetTokenMatches(epoch, targetId) {

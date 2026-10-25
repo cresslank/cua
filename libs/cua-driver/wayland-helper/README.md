@@ -9,7 +9,7 @@ normal Wayland client cannot do these things globally.
 
 It exposes `org.cua.WinRects` on the session bus:
 
-- `GetVersion() -> uint`: this fork's helper API version (v14, with the v8
+- `GetVersion() -> uint`: this fork's helper API version (v15, with the v8
   semantic cursor/session-badge API). The driver accepts it only after resolving
   the helper's immutable D-Bus owner and proving that owner is the current
   user's system-installed `gnome-shell` process.
@@ -107,6 +107,38 @@ capability gate. Atomic complete-runtime installation, the stage-only default,
 and refusal of malformed version metadata remain; automatic enablement and
 `--force` replacement are not adopted.
 
+## Workspace occlusion and reply compatibility (v15)
+
+A higher-stacked window blocks capture only when its actor is visible, it is not
+minimized, Mutter says it is showing on its workspace, and it is sticky or on the
+active workspace. `showing_on_its_workspace()` alone is hypothetical visibility:
+it can be true for a window on an inactive workspace. The same stage predicate
+controls target discovery, capture, and target-bound cursor/badge visibility.
+Activation does not require an already-painted actor, but remains restricted to
+the active workspace (or sticky windows). A target's own non-minimized modal
+child deliberately keeps the workspace-relative guard: activation must not
+bypass that modal during mapping/workspace transitions.
+
+The API bump identifies changed helper bytes; exact-target protocol 4 and
+`unoccluded-target-v1` are unchanged because this repairs their existing promise.
+The driver still accepts the v14 helper. v15 adds `target` and `transaction` to
+negative foreground replies for an existing transaction. A stale transaction has
+no target to echo. New drivers report correlated v14 BeginForeground reasons
+when `target` is absent, but never accept missing identity as success and always
+reject an explicitly different target/transaction. Legacy invalid validation
+replies lacking both fields are diagnostic refusals only; valid replies require
+both identities. Old drivers continue to accept v15 success replies and refuse
+unsafe validation.
+
+A row with `visible=true` and `capture_current=false` now yields
+`capture_occluded`, rather than claiming that the window is not painted. This row
+can also reflect an unsafe Shell context; the message does not assert overlap
+as the only possible cause. Non-painted rows retain `capture_foreground_required`.
+Neither code has a dedicated recovery-hint mapping or Rust E2E code assertion;
+MCP capture errors remain `tool_invocation_failed` with the specific reason in
+text. The downstream Hermes cua-jev plugin has no branch keyed on either code,
+so no compatibility follow-up is required there.
+
 ## Other compositors
 
 wlroots compositors such as Sway and labwc do not need this helper: cua-driver
@@ -118,7 +150,7 @@ because RemoteDesktop/libei input is global to the compositor focus.
 ## Versions and other apps that bundle the helper
 
 The UUID `winrects@cua` and session-bus name `org.cua.WinRects` are shared with
-other apps, including T3 Code. This bundle reports helper API 14 in both
+other apps, including T3 Code. This bundle reports helper API 15 in both
 `GetVersion()` and `metadata.json`. Exact-target authority is a separate
 protocol 4 capability contract: a larger API version alone never proves it.
 Legacy global capture/activation requests are refused, and clients must prove

@@ -17,13 +17,13 @@ import {
     rectanglesOverlap,
     rectanglesEqual,
     shellInputIsGrabbed,
-    targetIsPainted,
+    targetIsOnActiveStage,
     targetTokenMatches,
 } from './policy.js';
 
 Gio._promisify(Shell.Screenshot, 'composite_to_stream');
 
-const HELPER_API_VERSION = 14;
+const HELPER_API_VERSION = 15;
 const EXACT_TARGET_PROTOCOL_VERSION = 4;
 const FOREGROUND_TIMEOUT_MS = 30_000;
 const CURSOR_IDLE_TIMEOUT_US = 5 * 60 * 1_000_000;
@@ -998,14 +998,24 @@ export default class WinRectsExtension extends Extension {
         }
     }
 
+    _windowOnActiveWorkspace(window) {
+        try {
+            return window.is_on_all_workspaces()
+                || window.get_workspace() === global.workspace_manager.get_active_workspace();
+        } catch (_error) {
+            return false;
+        }
+    }
+
     _isTargetPainted(window) {
         if (!window)
             return false;
         const actor = this._actorFor(window);
-        return targetIsPainted({
+        return targetIsOnActiveStage({
             actorVisible: Boolean(actor?.visible),
             minimized: window.minimized,
             shellShowing: this._windowShowing(window),
+            workspaceActive: this._windowOnActiveWorkspace(window),
         });
     }
 
@@ -1018,7 +1028,8 @@ export default class WinRectsExtension extends Extension {
             targetResolved: Boolean(window),
             shellContextSafe: this._captureContextIsSafe(),
             minimized: window?.minimized,
-            shellShowing: window ? this._windowShowing(window) : false,
+            // Activation may raise a covered actor, but must not switch workspaces.
+            shellShowing: window ? this._windowOnActiveWorkspace(window) && this._windowShowing(window) : false,
             modalChildPresent: window ? Boolean(this._visibleModalChild(window)) : true,
         });
     }
@@ -1035,13 +1046,14 @@ export default class WinRectsExtension extends Extension {
         const targetRect = window.get_frame_rect();
         return !windows.slice(targetIndex + 1).some(candidate =>
             candidate !== window
-            && !candidate.minimized
-            && this._windowShowing(candidate)
+            && this._isTargetPainted(candidate)
             && rectanglesOverlap(targetRect, candidate.get_frame_rect())
         );
     }
 
     _visibleModalChild(target) {
+        // Deliberately workspace-relative: a target's own modal remains blocking
+        // during activation/workspace transitions, even before its actor paints.
         for (const actor of global.get_window_actors()) {
             const window = actor.meta_window;
             if (
@@ -1350,6 +1362,8 @@ export default class WinRectsExtension extends Extension {
                     state: 'terminal',
                     activated: false,
                     reason: 'stale_transaction',
+                    transaction,
+                    target: targetId,
                 })]));
                 return GLib.SOURCE_REMOVE;
             }
@@ -1369,6 +1383,7 @@ export default class WinRectsExtension extends Extension {
                     terminal: false,
                     state: 'reconciling',
                     transaction,
+                    target: targetId,
                     reason: 'child_modal_present',
                 })]));
                 return GLib.SOURCE_REMOVE;
@@ -1380,6 +1395,7 @@ export default class WinRectsExtension extends Extension {
                     terminal: false,
                     state: 'reconciling',
                     transaction,
+                    target: targetId,
                     reason: 'target_occluded',
                 })]));
                 return GLib.SOURCE_REMOVE;
@@ -1428,7 +1444,7 @@ export default class WinRectsExtension extends Extension {
     ValidateForeground(transaction) {
         const foreground = this._foreground;
         if (!foreground || foreground.transaction !== transaction)
-            return JSON.stringify({valid: false, reason: 'stale_transaction'});
+            return JSON.stringify({valid: false, transaction, reason: 'stale_transaction'});
         const currentTarget = this._resolveTarget(foreground.targetId);
         const modalChildPresent = Boolean(this._visibleModalChild(foreground.target));
         const targetUnoccluded = this._isTargetUnoccluded(foreground.target);
@@ -1451,7 +1467,10 @@ export default class WinRectsExtension extends Extension {
         else if (!targetSafe && !targetUnoccluded)
             reason = 'target_occluded';
         if (reason)
-            return JSON.stringify({valid: false, terminal: false, state: 'reconciling', reason});
+            return JSON.stringify({
+                valid: false, terminal: false, state: 'reconciling',
+                transaction, target: foreground.targetId, reason,
+            });
         return JSON.stringify({
             valid: true,
             target: foreground.targetId,

@@ -15,6 +15,7 @@ const {
     rectanglesOverlap,
     rectanglesEqual,
     shellInputIsGrabbed,
+    targetIsOnActiveStage,
     targetIsPainted,
     targetTokenMatches,
 } = await import(
@@ -50,6 +51,36 @@ test('hidden actors and minimized windows never expose a cursor or capture', () 
         minimized: true,
         shellShowing: true,
     }), false);
+});
+
+test('only painted active-workspace or sticky windows can occlude the stage', () => {
+    const painted = {actorVisible: true, minimized: false, shellShowing: true};
+    assert.equal(targetIsOnActiveStage({...painted, workspaceActive: false, sticky: false}), false);
+    assert.equal(targetIsOnActiveStage({...painted, workspaceActive: true, sticky: false}), true);
+    assert.equal(targetIsOnActiveStage({...painted, workspaceActive: false, sticky: true}), true);
+    for (const invalid of [
+        {actorVisible: false}, {minimized: true}, {shellShowing: false},
+    ]) {
+        assert.equal(targetIsOnActiveStage({...painted, ...invalid, workspaceActive: true}), false);
+        assert.equal(targetIsOnActiveStage({...painted, ...invalid, sticky: true}), false);
+    }
+});
+
+test('extension routes overlap and chrome through stage painting but retains own modal guards', async () => {
+    const source = await readFile(new URL('../winrects@cua/extension.js', import.meta.url), 'utf8');
+    const occlusion = source.slice(source.indexOf('    _isTargetUnoccluded(window) {'), source.indexOf('    _visibleModalChild(target) {'));
+    assert.match(occlusion, /this\._isTargetPainted\(candidate\)/);
+    const painting = source.slice(source.indexOf('    _isTargetPainted(window) {'), source.indexOf('    _isTargetVisible(window) {'));
+    assert.match(painting, /targetIsOnActiveStage\(/);
+    assert.match(painting, /workspaceActive: this\._windowOnActiveWorkspace\(window\)/);
+    const modal = source.slice(source.indexOf('    _visibleModalChild(target) {'), source.indexOf('    _windowAppId(window) {'));
+    assert.match(modal, /!this\._windowShowing\(window\)/);
+    assert.match(modal, /parent === target && \(attached \|\| modal\)/);
+    const begin = source.slice(source.indexOf('    BeginForegroundAsync('), source.indexOf('    _foregroundStatus('));
+    for (const reason of ['child_modal_present', 'target_occluded'])
+        assert.match(begin, new RegExp(`transaction,\\s*target: targetId,\\s*reason: '${reason}'`));
+    const validate = source.slice(source.indexOf('    ValidateForeground(transaction) {'), source.indexOf('    EndForegroundAsync('));
+    assert.match(validate, /transaction, target: foreground.targetId, reason/);
 });
 
 test('target tokens are bound to the helper epoch', () => {
