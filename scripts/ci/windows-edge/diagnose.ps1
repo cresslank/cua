@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory)][string]$CandidateDirectory,
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedSource,
+    [switch]$PolicyFirst,
     [switch]$IncludeLockTimeoutControl
 )
 Set-StrictMode -Version Latest
@@ -140,7 +141,7 @@ try {
         sfw_visibility = 'Unmodified artifact cannot expose internal driver SetForegroundWindow return values. Harness calls below are explicitly separate controls.'
     }
     $fixture = [EdgeForegroundDiagnostic.NativeForeground]::new((Join-Path $OutputDirectory 'native-timeline.jsonl'))
-    $variants = @('stock-flags', 'hklm-hide-first-run')
+    $variants = if ($PolicyFirst) { @('hklm-hide-first-run', 'stock-flags') } else { @('stock-flags', 'hklm-hide-first-run') }
     if ($IncludeLockTimeoutControl) { $variants += 'stock-flags-lock-timeout-zero' }
     foreach ($variant in $variants) {
         $directory = Join-Path $OutputDirectory $variant

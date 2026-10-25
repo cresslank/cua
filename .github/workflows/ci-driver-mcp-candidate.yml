@@ -16,6 +16,11 @@ on:
         type: string
         required: true
         default: "8871472ea121943ff2ce12ac81c6ab7fcab8d915"
+      policy_first:
+        description: "Run policy-on first on a fresh runner, then the original policy control"
+        type: boolean
+        required: true
+        default: false
       lock_timeout_control:
         description: "Also test temporary supported ForegroundLockTimeout=0 (restore/read back)"
         type: boolean
@@ -43,6 +48,7 @@ jobs:
       CANDIDATE_RUN: ${{ inputs.candidate_run }}
       CANDIDATE_SHA: ${{ inputs.candidate_sha }}
       LOCK_TIMEOUT_CONTROL: ${{ inputs.lock_timeout_control }}
+      POLICY_FIRST: ${{ inputs.policy_first }}
     steps:
       - name: Select disposable artifact/evidence paths
         run: |
@@ -113,6 +119,7 @@ jobs:
             -CandidateDirectory $env:CANDIDATE_ROOT `
             -OutputDirectory $env:DIAGNOSTIC_ROOT `
             -ExpectedSource $env:CANDIDATE_SHA `
+            -PolicyFirst:($env:POLICY_FIRST -eq 'true') `
             -IncludeLockTimeoutControl:($env:LOCK_TIMEOUT_CONTROL -eq 'true')
           exit $LASTEXITCODE
       - name: Mark setup/artifact blockers explicitly
