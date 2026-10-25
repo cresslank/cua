@@ -21,6 +21,11 @@
 use cua_driver_testkit::RawDriver;
 #[cfg(target_os = "windows")]
 use cua_driver_testkit::{Driver, McpDriver};
+#[cfg(target_os = "windows")]
+#[path = "support/windows_foreground_fixture.rs"]
+mod windows_foreground_fixture;
+#[path = "support/windows_foreground_policy.rs"]
+mod windows_foreground_policy;
 
 fn spawn_unrestricted() -> Option<RawDriver> {
     RawDriver::spawn_with_env(&[
@@ -138,12 +143,17 @@ fn launch_unknown_app_is_bounded_and_keeps_mcp_session_responsive() {
 #[cfg(target_os = "windows")]
 #[ignore = "requires an interactive Windows desktop with Microsoft Edge installed"]
 fn launch_edge_from_apps_folder_registration() {
+    // Do not borrow an arbitrary hosted-runner HWND. A stable, responsive
+    // owner also grants the exact daemon the foreground permission Windows
+    // requires; the stdio proxy is not the process restoring foreground.
+    let foreground = windows_foreground_fixture::ForegroundFixture::new();
     let Some(mut driver) = McpDriver::spawn_with_env(&[
         ("CUA_DRIVER_PERMISSION_MODE", "unrestricted"),
         ("CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS", "1"),
     ]) else {
         return;
     };
+    foreground.grant_to(driver.daemon_pid().expect("test-owned daemon PID"));
 
     let launch = driver.call(
         "launch_app",
@@ -164,6 +174,13 @@ fn launch_edge_from_apps_folder_registration() {
         "Edge AppsFolder launch returned no process id: {:?}",
         launch.raw
     );
+    eprintln!(
+        "Edge AppsFolder launched PID={}",
+        launch.structured()["pid"]
+    );
+    // Stronger than the old success/PID-only oracle: a superseded restore or
+    // an unobserved self-activation cannot silently satisfy this test.
+    foreground.assert_foreground();
 }
 
 #[test]

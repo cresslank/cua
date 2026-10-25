@@ -61,6 +61,13 @@ fn timeout_error_message(tool: &str, timeout: Duration) -> String {
 }
 
 impl McpDriver {
+    /// Process id of the daemon that owns platform UI state, when this
+    /// transport is daemon-backed. Desktop fixtures can grant native
+    /// foreground permission to this exact process, not the stdio proxy.
+    pub fn daemon_pid(&self) -> Option<u32> {
+        self._daemon.as_ref().map(|daemon| daemon.pid)
+    }
+
     /// Spawn the driver, start the stdout reader thread, and `initialize`.
     /// Returns `None` (with a skip message) if the binary isn't built — the
     /// caller's test should early-return so an un-built binary skips, not fails.
