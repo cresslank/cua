@@ -2238,7 +2238,6 @@ async fn restore_foreground_after_launch(
     use windows::Win32::System::Threading::{
         OpenProcess, WaitForInputIdle, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
-    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
     if spawned_pid == 0 {
         return Err("foreground_restore_unavailable: launch returned no stable spawned PID".into());
@@ -2257,34 +2256,53 @@ async fn restore_foreground_after_launch(
     })
     .await;
 
+    // Input-idle is not startup completion. Shell URL dispatch and browser
+    // startup can activate more than once, so a first successful restore is
+    // not the end of this bounded observation interval. A rejected request
+    // may also be transient; re-check identity and attribution before retrying.
+    use crate::launch_foreground::{settle_step, LaunchForeground, SettleStep};
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut attempts = 0;
     loop {
-        let current = unsafe { GetForegroundWindow() }.0 as usize as u64;
-        if current != prior.hwnd() {
-            if let Some(displaced) =
-                crate::win32::capture_foreground_target(current, Some(spawned_pid))
-            {
-                return match crate::win32::restore_foreground_target_if_still_displaced(
+        let current = crate::win32::capture_current_foreground_target();
+        let relation = match current {
+            Some(current) if current.hwnd() == prior.hwnd() && current.pid() == prior.pid() => {
+                LaunchForeground::Prior
+            }
+            Some(current) if current.pid() == spawned_pid => LaunchForeground::LaunchedApp,
+            Some(_) => LaunchForeground::Unrelated,
+            None => LaunchForeground::Unavailable,
+        };
+        let now = std::time::Instant::now();
+        match settle_step(
+            crate::win32::window_owner_pid(prior.hwnd()) == Some(prior.pid()),
+            relation,
+            now >= deadline,
+        ) {
+            SettleStep::Complete | SettleStep::Superseded => return Ok(()),
+            SettleStep::Failed => {
+                return Err(format!(
+                    "foreground_restore_failed: Windows did not confirm restoration of prior HWND {:#x} PID {} after pid {spawned_pid} activated; foreground={current:?}, attempts={attempts}",
+                    prior.hwnd(), prior.pid()
+                ));
+            }
+            SettleStep::Restore => {
+                let displaced = current.expect("LaunchedApp requires a stable foreground identity");
+                attempts += 1;
+                match crate::win32::restore_foreground_target_if_still_displaced(
                     prior,
                     displaced,
-                    std::time::Duration::from_millis(500),
+                    std::time::Duration::from_millis(500)
+                        .min(deadline.saturating_duration_since(now)),
                 ) {
+                    crate::win32::ForegroundRestoreOutcome::Superseded => return Ok(()),
+                    // Both results require a fresh observation. Never replay
+                    // restoration over an unrelated user focus transition.
                     crate::win32::ForegroundRestoreOutcome::Restored
-                    | crate::win32::ForegroundRestoreOutcome::Superseded => Ok(()),
-                    crate::win32::ForegroundRestoreOutcome::Failed => Err(format!(
-                        "foreground_restore_failed: Windows did not confirm restoration of prior HWND {:#x} after pid {spawned_pid} activated",
-                        prior.hwnd()
-                    )),
-                };
+                    | crate::win32::ForegroundRestoreOutcome::Failed => {}
+                }
             }
-            // A foreground not owned by the spawned process is a user or
-            // unrelated transition. It supersedes restoration.
-            if crate::win32::window_owner_pid(current).is_some() {
-                return Ok(());
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return Ok(());
+            SettleStep::Observe => {}
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
