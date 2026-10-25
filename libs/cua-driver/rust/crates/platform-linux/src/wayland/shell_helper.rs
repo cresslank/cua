@@ -448,6 +448,7 @@ struct CapturePayload {
 #[derive(Debug)]
 pub struct ForegroundTransaction {
     token: String,
+    target_id: String,
     // Installed just before BeginForeground and retained through every body
     // path (with_foreground_input, with_focused_window, and direct guards).
     _input_deadline: super::foreground_deadline::Scope,
@@ -480,13 +481,12 @@ impl ForegroundTransaction {
             Duration::from_secs(2),
         )
         .ok_or_else(|| anyhow::anyhow!("foreground_unavailable: validation timed out"))?;
-        let valid = extract_json_object(&raw)
+        let payload = extract_json_object(&raw)
             .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-            .and_then(|value| value.get("valid").and_then(serde_json::Value::as_bool))
-            .unwrap_or(false);
-        if !valid {
-            anyhow::bail!("stale_transaction: WinRects rejected foreground validation");
-        }
+            .ok_or_else(|| {
+                anyhow::anyhow!("stale_transaction: invalid WinRects validation response")
+            })?;
+        validate_foreground_reply(&self.token, &self.target_id, &payload)?;
         cua_driver_core::blocking::check_cancelled()?;
         Ok(())
     }
@@ -812,11 +812,7 @@ pub fn screenshot_window(window_id: u64) -> anyhow::Result<Vec<u8>> {
             "stale_target: GNOME window {window_id} belongs to another helper incarnation or no longer exists"
         )
     })?;
-    if !target.capture_current {
-        anyhow::bail!(
-            "capture_foreground_required: GNOME window {window_id} is not currently painted on the active stage"
-        );
-    }
+    require_capture_current(window_id, target.visible, target.capture_current)?;
     let raw = gdbus_call_with_timeout(
         "CaptureTarget",
         &[gvariant_string(&target.target_id)],
@@ -1143,8 +1139,72 @@ pub fn begin_foreground(window_id: u64) -> anyhow::Result<ForegroundTransaction>
     set_pending_foreground(None);
     Ok(ForegroundTransaction {
         token,
+        target_id: target.target_id,
         _input_deadline: input_deadline,
     })
+}
+
+fn require_capture_current(
+    window_id: u64,
+    visible: bool,
+    capture_current: bool,
+) -> anyhow::Result<()> {
+    if !capture_current {
+        if visible {
+            anyhow::bail!(
+                "capture_occluded: GNOME window {window_id} is painted but unavailable for exact capture (overlap or unsafe Shell context)"
+            );
+        }
+        anyhow::bail!(
+            "capture_foreground_required: GNOME window {window_id} is not currently painted on the active stage"
+        );
+    }
+    Ok(())
+}
+
+// Missing identity is tolerated only for negative legacy replies, never as
+// authority to send input. Explicitly conflicting identities always win over reason.
+fn check_foreground_reply_identity(
+    token: &str,
+    target_id: &str,
+    payload: &serde_json::Value,
+    require_transaction: bool,
+) -> anyhow::Result<()> {
+    match payload.get("transaction") {
+        Some(value) if value.as_str() == Some(token) => {}
+        None if !require_transaction => {}
+        _ => anyhow::bail!("WinRects returned a mismatched transaction ID"),
+    }
+    match payload.get("target") {
+        Some(value) if value.as_str() == Some(target_id) => {}
+        None if payload
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .is_some() => {}
+        _ => anyhow::bail!("WinRects returned a mismatched exact target"),
+    }
+    Ok(())
+}
+
+fn validate_foreground_reply(
+    token: &str,
+    target_id: &str,
+    payload: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let valid = payload.get("valid").and_then(serde_json::Value::as_bool) == Some(true);
+    check_foreground_reply_identity(token, target_id, payload, valid)?;
+    if !valid {
+        let reason = payload
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("validation_not_confirmed");
+        anyhow::bail!("stale_transaction: WinRects rejected foreground validation ({reason})");
+    }
+    // Even a malformed success carrying a reason cannot use legacy tolerance.
+    if payload.get("target").and_then(serde_json::Value::as_str) != Some(target_id) {
+        anyhow::bail!("WinRects returned a mismatched exact target");
+    }
+    Ok(())
 }
 
 fn wait_for_foreground_activation(
@@ -1154,16 +1214,11 @@ fn wait_for_foreground_activation(
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + Duration::from_millis(500);
     loop {
-        let returned_token = payload
-            .get("transaction")
-            .and_then(serde_json::Value::as_str)
-            .filter(|returned| !returned.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("missing WinRects transaction"))?;
-        if returned_token != token {
-            anyhow::bail!("WinRects returned a mismatched transaction ID");
-        }
-        if payload.get("target").and_then(serde_json::Value::as_str) != Some(target_id) {
-            anyhow::bail!("WinRects returned a mismatched exact target");
+        check_foreground_reply_identity(token, target_id, &payload, true)?;
+        // A correlated refusal must not be replaced by QueryForeground's cached
+        // activation flag: focus alone does not establish an unoccluded target.
+        if let Some(reason) = payload.get("reason").and_then(serde_json::Value::as_str) {
+            anyhow::bail!("WinRects refused foreground activation ({reason})");
         }
         if payload
             .get("activated")
@@ -1575,6 +1630,89 @@ mod tests {
     }
 
     #[test]
+    fn capture_readiness_distinguishes_covered_from_unpainted() {
+        assert!(require_capture_current(7, true, true).is_ok());
+        assert!(require_capture_current(7, true, false)
+            .unwrap_err()
+            .to_string()
+            .starts_with("capture_occluded:"));
+        assert!(require_capture_current(7, false, false)
+            .unwrap_err()
+            .to_string()
+            .starts_with("capture_foreground_required:"));
+    }
+
+    #[test]
+    fn foreground_activation_preserves_correlated_refusal_reasons_with_old_and_new_helpers() {
+        for reason in ["target_occluded", "child_modal_present"] {
+            for target in [None, Some("epoch:7")] {
+                let mut payload = serde_json::json!({"transaction": "token", "activated": false, "reason": reason});
+                if let Some(target) = target {
+                    payload["target"] = target.into();
+                }
+                let error = wait_for_foreground_activation("token", "epoch:7", payload)
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.contains(reason), "{error}");
+                assert!(!error.contains("mismatched"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn foreground_activation_never_accepts_missing_or_conflicting_identity() {
+        for payload in [
+            serde_json::json!({"transaction":"other", "target":"epoch:7", "reason":"target_occluded"}),
+            serde_json::json!({"transaction":"token", "target":"epoch:8", "reason":"target_occluded"}),
+            serde_json::json!({"transaction":"token", "activated":true}),
+            serde_json::json!({"target":"epoch:7", "activated":true}),
+            serde_json::json!({"transaction":"token", "target":null, "reason":"target_occluded"}),
+        ] {
+            assert!(wait_for_foreground_activation("token", "epoch:7", payload)
+                .unwrap_err()
+                .to_string()
+                .contains("mismatched"));
+        }
+        assert!(wait_for_foreground_activation(
+            "token",
+            "epoch:7",
+            serde_json::json!({"transaction":"token", "target":"epoch:7", "activated":true})
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn foreground_validation_reports_legacy_refusals_and_requires_identity_for_success() {
+        for payload in [
+            serde_json::json!({"valid":false, "reason":"target_occluded"}),
+            serde_json::json!({"valid":false, "transaction":"token", "reason":"target_occluded"}),
+            serde_json::json!({"valid":false, "transaction":"token", "target":"epoch:7", "reason":"target_occluded"}),
+        ] {
+            assert!(validate_foreground_reply("token", "epoch:7", &payload)
+                .unwrap_err()
+                .to_string()
+                .contains("target_occluded"));
+        }
+        for payload in [
+            serde_json::json!({"valid":true}),
+            serde_json::json!({"valid":true, "transaction":"token", "reason":"anything"}),
+            serde_json::json!({"valid":false, "transaction":"other", "reason":"target_occluded"}),
+            serde_json::json!({"valid":false, "transaction":"token", "target":"epoch:8", "reason":"target_occluded"}),
+        ] {
+            assert!(validate_foreground_reply("token", "epoch:7", &payload)
+                .unwrap_err()
+                .to_string()
+                .contains("mismatched"));
+        }
+        assert!(validate_foreground_reply(
+            "token",
+            "epoch:7",
+            &serde_json::json!({"valid":true, "transaction":"token", "target":"epoch:7"})
+        )
+        .is_ok());
+    }
+
+    #[test]
     fn overlay_dispatcher_runs_outside_the_callers_tokio_runtime() {
         let (observed_tx, observed_rx) = std::sync::mpsc::sync_channel(1);
         let sender = spawn_overlay_dispatcher(move |_request| {
@@ -1922,9 +2060,9 @@ mod tests {
     }
 
     #[test]
-    fn bundled_helper_v14_uses_v14_api_and_host_owned_modifier_badge_chips() {
+    fn bundled_helper_v15_preserves_host_owned_modifier_badge_chips() {
         assert!(EXTENSION_SOURCE.contains("GetVersion()"));
-        assert!(EXTENSION_SOURCE.contains("const HELPER_API_VERSION = 14;"));
+        assert!(EXTENSION_SOURCE.contains("const HELPER_API_VERSION = 15;"));
         assert!(EXTENSION_SOURCE.contains("return HELPER_API_VERSION;"));
         assert!(EXTENSION_SOURCE.contains("SetCursorState"));
         assert!(EXTENSION_SOURCE.contains("SetCursorColor"));
@@ -1951,7 +2089,7 @@ mod tests {
         assert!(!EXTENSION_SOURCE.contains("function drawModifiers"));
         let metadata: serde_json::Value =
             serde_json::from_str(EXTENSION_METADATA).expect("valid bundled helper metadata");
-        assert_eq!(metadata["version"], 14);
+        assert_eq!(metadata["version"], 15);
 
         for action in [
             "idle", "observe", "click", "drag", "scroll", "text", "key", "navigate", "app",
