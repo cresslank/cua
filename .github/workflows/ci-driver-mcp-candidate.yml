@@ -16,6 +16,11 @@ on:
         type: string
         required: true
         default: "8871472ea121943ff2ce12ac81c6ab7fcab8d915"
+      zero_first:
+        description: "Run timeout-zero control first, then restore original timeout for subsequent controls"
+        type: boolean
+        required: true
+        default: false
       policy_first:
         description: "Run policy-on first on a fresh runner, then the original policy control"
         type: boolean
@@ -49,6 +54,7 @@ jobs:
       CANDIDATE_SHA: ${{ inputs.candidate_sha }}
       LOCK_TIMEOUT_CONTROL: ${{ inputs.lock_timeout_control }}
       POLICY_FIRST: ${{ inputs.policy_first }}
+      ZERO_FIRST: ${{ inputs.zero_first }}
     steps:
       - name: Select disposable artifact/evidence paths
         run: |
@@ -120,6 +126,7 @@ jobs:
             -OutputDirectory $env:DIAGNOSTIC_ROOT `
             -ExpectedSource $env:CANDIDATE_SHA `
             -PolicyFirst:($env:POLICY_FIRST -eq 'true') `
+            -ZeroFirst:($env:ZERO_FIRST -eq 'true') `
             -IncludeLockTimeoutControl:($env:LOCK_TIMEOUT_CONTROL -eq 'true')
           exit $LASTEXITCODE
       - name: Mark setup/artifact blockers explicitly

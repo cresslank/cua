@@ -5,6 +5,7 @@ param(
     [Parameter(Mandatory)][string]$OutputDirectory,
     [Parameter(Mandatory)][ValidatePattern('^[0-9a-f]{40}$')][string]$ExpectedSource,
     [switch]$PolicyFirst,
+    [switch]$ZeroFirst,
     [switch]$IncludeLockTimeoutControl
 )
 Set-StrictMode -Version Latest
@@ -142,7 +143,10 @@ try {
     }
     $fixture = [EdgeForegroundDiagnostic.NativeForeground]::new((Join-Path $OutputDirectory 'native-timeline.jsonl'))
     $variants = if ($PolicyFirst) { @('hklm-hide-first-run', 'stock-flags') } else { @('stock-flags', 'hklm-hide-first-run') }
-    if ($IncludeLockTimeoutControl) { $variants += 'stock-flags-lock-timeout-zero' }
+    if ($IncludeLockTimeoutControl) {
+        if ($ZeroFirst) { $variants = @('stock-flags-lock-timeout-zero') + $variants }
+        else { $variants += 'stock-flags-lock-timeout-zero' }
+    }
     foreach ($variant in $variants) {
         $directory = Join-Path $OutputDirectory $variant
         New-Item -ItemType Directory -Path $directory | Out-Null
@@ -151,6 +155,12 @@ try {
         try {
             $fixture.Mark("$variant/setup")
             Stop-DisposableEdge
+            if ($variant -ne 'stock-flags-lock-timeout-zero' -and $timeoutTouched) {
+                $restore = $fixture.SetLockTimeout($timeoutOriginal)
+                Save-Json (Join-Path $OutputDirectory 'timeout-restoration.json') $restore
+                if (-not $restore.requested -or $restore.readback -ne $timeoutOriginal) { throw 'Between-control timeout restoration mismatch' }
+                $timeoutTouched = $false
+            }
             if ($variant -eq 'hklm-hide-first-run') {
                 $policyTouched = $true
                 Save-Json (Join-Path $directory 'policy.json') (Set-OnboardingPolicy)
