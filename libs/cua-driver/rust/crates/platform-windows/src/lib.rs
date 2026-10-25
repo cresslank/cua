@@ -41,6 +41,8 @@ pub mod virtualdesk;
 mod input_identity;
 #[cfg(any(target_os = "windows", test))]
 mod keycodes;
+#[cfg(any(target_os = "windows", test))]
+mod launch_foreground;
 
 // Cross-platform: pure math for packing `(x, y)` into the `LPARAM` payload
 // every `WM_MOUSE*` / `WM_*BUTTON*` message carries. Lives outside the
