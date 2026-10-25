@@ -11,23 +11,47 @@ use std::time::{Duration, Instant};
 const BOUND: Duration = Duration::from_secs(10);
 const PROBE_BOUND: Duration = Duration::from_secs(2);
 
-fn driver(home: &Path, args: &[&str]) -> Command {
+#[cfg(target_os = "linux")]
+#[path = "status_pid_file_cli_test/accessibility_fixture.rs"]
+mod accessibility_fixture;
+
+struct TestHome {
+    dir: tempfile::TempDir,
+    #[cfg(target_os = "linux")]
+    session: accessibility_fixture::Session,
+}
+impl TestHome {
+    fn new() -> Self {
+        Self {
+            dir: tempfile::tempdir().unwrap(),
+            #[cfg(target_os = "linux")]
+            session: accessibility_fixture::Session::new(),
+        }
+    }
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+fn driver(home: &TestHome, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_cua-driver"));
     command
         .args(args)
         .stdin(Stdio::null())
         .env("CUA_DRIVER_RS_TELEMETRY_ENABLED", "false")
-        .env("HOME", home)
-        .env("USERPROFILE", home)
-        .env("LOCALAPPDATA", home)
-        .env("XDG_STATE_HOME", home)
-        .env("CUA_DRIVER_HOME", home)
-        .env("CUA_DRIVER_LOCAL_HOME", home)
-        .env("CUA_DRIVER_RS_HOME", home);
+        .env("HOME", home.path())
+        .env("USERPROFILE", home.path())
+        .env("LOCALAPPDATA", home.path())
+        .env("XDG_STATE_HOME", home.path())
+        .env("CUA_DRIVER_HOME", home.path())
+        .env("CUA_DRIVER_LOCAL_HOME", home.path())
+        .env("CUA_DRIVER_RS_HOME", home.path());
+    #[cfg(target_os = "linux")]
+    home.session.apply(&mut command);
     command
 }
 
-fn run_status(home: &Path, args: &[&str], limit: Duration) -> Option<Output> {
+fn run_status(home: &TestHome, args: &[&str], limit: Duration) -> Option<Output> {
     let mut command = driver(home, args);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = spawn_in_job(&mut command).expect("spawn cua-driver status");
@@ -45,7 +69,7 @@ fn run_status(home: &Path, args: &[&str], limit: Duration) -> Option<Output> {
     }
 }
 
-fn status_pid(home: &Path, args: &[&str]) -> String {
+fn status_pid(home: &TestHome, args: &[&str]) -> String {
     let output = run_status(home, args, BOUND)
         .unwrap_or_else(|| panic!("status {args:?} did not finish within {BOUND:?}"));
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -63,7 +87,7 @@ fn status_pid(home: &Path, args: &[&str]) -> String {
 
 fn wait_until_ready(
     daemon: &mut Child,
-    home: &Path,
+    home: &TestHome,
     socket: &str,
     pid_file: &str,
 ) -> Result<String, String> {
@@ -93,8 +117,13 @@ fn wait_until_ready(
 
 #[test]
 fn status_reports_the_pid_stored_in_the_file_named_by_pid_file() {
-    let home = tempfile::tempdir().unwrap();
-    #[cfg(unix)]
+    let home = TestHome::new();
+    #[cfg(target_os = "linux")]
+    let endpoint_dir = tempfile::Builder::new()
+        .prefix("cua-status-")
+        .tempdir()
+        .unwrap();
+    #[cfg(all(unix, not(target_os = "linux")))]
     let endpoint_dir = tempfile::Builder::new()
         .prefix("cua-status-")
         .tempdir_in("/tmp")
@@ -108,7 +137,7 @@ fn status_reports_the_pid_stored_in_the_file_named_by_pid_file() {
     let other_pid_file = home.path().join("other.pid").display().to_string();
 
     let mut serve = driver(
-        home.path(),
+        &home,
         &[
             "serve",
             "--socket",
@@ -128,13 +157,13 @@ fn status_reports_the_pid_stored_in_the_file_named_by_pid_file() {
         });
     let mut reaper = ChildReaper::new();
     let mut daemon = spawn_in_job(&mut serve).expect("spawn source-built daemon");
-    let ready = wait_until_ready(&mut daemon, home.path(), &socket, &daemon_pid_file);
+    let ready = wait_until_ready(&mut daemon, &home, &socket, &daemon_pid_file);
     reaper.push(daemon);
     let daemon_pid = ready.unwrap_or_else(|error| panic!("{error}"));
 
     assert_eq!(
         status_pid(
-            home.path(),
+            &home,
             &[
                 "status",
                 "--socket",
@@ -147,7 +176,7 @@ fn status_reports_the_pid_stored_in_the_file_named_by_pid_file() {
     );
     assert_eq!(
         status_pid(
-            home.path(),
+            &home,
             &[
                 &format!("--pid-file={daemon_pid_file}"),
                 "status",
@@ -163,14 +192,14 @@ fn status_reports_the_pid_stored_in_the_file_named_by_pid_file() {
     std::fs::write(&other_pid_file, &this_process).unwrap();
     assert_eq!(
         status_pid(
-            home.path(),
+            &home,
             &["status", "--socket", &socket, "--pid-file", &other_pid_file],
         ),
         this_process,
     );
 
     assert_eq!(
-        status_pid(home.path(), &["status", "--socket", &socket]),
+        status_pid(&home, &["status", "--socket", &socket]),
         "unknown (no pid file)",
     );
 }
