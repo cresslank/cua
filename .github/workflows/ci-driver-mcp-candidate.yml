@@ -1,128 +1,135 @@
-name: "CI: Driver MCP candidate"
+# SCRATCH BRANCH ONLY. Reuse the registered workflow path so workflow_dispatch
+# works without adding a new workflow to the fork's default branch. Do not merge.
+name: "DIAGNOSTIC: Windows Edge foreground (artifact only)"
+run-name: "Edge foreground diagnostic / candidate ${{ inputs.candidate_run }}"
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/ci-driver-mcp-candidate.yml"
-      - "libs/cua-driver/rust/crates/cua-driver/src/mcp_envelope.rs"
-      - "libs/cua-driver/rust/crates/cua-driver/src/driver_service_http.rs"
-      - "libs/cua-driver/rust/crates/cua-driver/src/proxy.rs"
-      - "libs/cua-driver/rust/crates/cua-driver/src/serve.rs"
-      - "libs/cua-driver/rust/crates/cua-driver-sdk/src/remote_receiver*.rs"
-      - "libs/python/cua-sandbox/cua_sandbox/interfaces/_driver_mcp.py"
-      - "libs/python/cua-sandbox/cua_sandbox/interfaces/driver.py"
   workflow_dispatch:
+    inputs:
+      candidate_run:
+        description: "Successful CI Driver MCP candidate run in cresslank/cua"
+        type: string
+        required: true
+        default: "40173066492"
+      candidate_sha:
+        description: "Exact candidate source SHA (not this harness commit)"
+        type: string
+        required: true
+        default: "8871472ea121943ff2ce12ac81c6ab7fcab8d915"
+      lock_timeout_control:
+        description: "Also test temporary supported ForegroundLockTimeout=0 (restore/read back)"
+        type: boolean
+        required: true
+        default: false
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
-  group: driver-mcp-candidate-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  CARGO_NET_RETRY: "10"
-  CARGO_HTTP_TIMEOUT: "120"
-  CARGO_HTTP_MULTIPLEXING: "false"
+  group: windows-edge-diagnostic-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  candidate:
-    name: MCP candidate (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-24.04, windows-latest]
+  diagnostic:
+    if: github.repository == 'cresslank/cua' && startsWith(github.ref, 'refs/heads/scratch/windows-edge-')
+    name: "Windows / native foreground diagnostic (not qualification)"
+    runs-on: windows-latest
+    timeout-minutes: 8
     defaults:
       run:
-        shell: bash
+        shell: pwsh
     env:
-      EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-      CARGO_PROFILE_DEV_DEBUG: "0"
-      CUA_TELEMETRY_ENABLED: "false"
+      CANDIDATE_RUN: ${{ inputs.candidate_run }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      LOCK_TIMEOUT_CONTROL: ${{ inputs.lock_timeout_control }}
     steps:
+      - name: Select disposable artifact/evidence paths
+        run: |
+          "DIAGNOSTIC_ROOT=$(Join-Path $env:RUNNER_TEMP 'edge-foreground-diagnostic')" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "CANDIDATE_ROOT=$(Join-Path $env:RUNNER_TEMP 'edge-foreground-candidate')" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "ARTIFACT_ROOT=$(Join-Path $env:RUNNER_TEMP 'edge-foreground-artifact')" | Add-Content -LiteralPath $env:GITHUB_ENV
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Verify exact source
+      - name: Check harness parser, compiler, verdicts and stdio transport (not native qualification)
+        run: ./scripts/ci/windows-edge/test-contracts.ps1
+      - name: Download exact successful candidate (no build)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
-          test -z "$(git status --porcelain)"
-      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
-        with:
-          workspaces: "libs/cua-driver/rust -> target"
-          key: mcp-candidate
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
+          $ErrorActionPreference = 'Stop'
+          if ($env:CANDIDATE_RUN -notmatch '^[1-9][0-9]*$' -or $env:CANDIDATE_SHA -cnotmatch '^[0-9a-f]{40}$') { throw 'Invalid candidate identity' }
+          New-Item -ItemType Directory -Path $env:DIAGNOSTIC_ROOT, $env:ARTIFACT_ROOT | Out-Null
+          if ((git rev-parse HEAD) -cne $env:GITHUB_SHA -or (git status --porcelain)) { throw 'Harness checkout identity/cleanliness mismatch' }
+          $metadata = gh run view $env:CANDIDATE_RUN -R cresslank/cua --json status,conclusion,headSha,headBranch,workflowName,workflowDatabaseId,url
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate run lookup failed: diagnostic BLOCKED' }
+          $metadata | Set-Content -LiteralPath "$env:DIAGNOSTIC_ROOT/candidate-run.json" -Encoding utf8
+          $run = $metadata | ConvertFrom-Json
+          if ($run.status -ne 'completed' -or $run.conclusion -ne 'success' -or $run.headSha -cne $env:CANDIDATE_SHA -or $run.workflowDatabaseId -ne 384010651) { throw 'Candidate run identity/status mismatch: diagnostic BLOCKED' }
+          gh run download $env:CANDIDATE_RUN -R cresslank/cua --name "driver-mcp-candidate-Windows-$env:CANDIDATE_SHA" --dir $env:ARTIFACT_ROOT
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate artifact unavailable/expired: diagnostic BLOCKED (no rebuild or substitute)' }
+      - name: Verify archive provenance and all file hashes before execution
+        shell: python
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang pkg-config libdbus-1-dev libpipewire-0.3-dev libspa-0.2-dev \
-            libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev
-      - name: Run envelope receiver and service tests
-        working-directory: libs/cua-driver/rust
-        run: |
-          set -euo pipefail
-          cargo test -p cua-driver --bin cua-driver mcp_envelope --locked
-          cargo test -p cua-driver --bin cua-driver driver_service_http --locked
-          cargo test -p cua-driver-sdk remote_receiver::tests --locked
-      - name: Build disposable-test binaries
-        working-directory: libs/cua-driver/rust
-        run: |
-          set -euo pipefail
-          if [[ "$RUNNER_OS" == Linux ]]; then
-            cargo build --locked -p cua-driver -p cursor-theme-cli --features cua-driver/portal-input
-          else
-            cargo build --locked -p cua-driver -p cursor-theme-cli -p cua-driver-uia
-          fi
-      - name: Bundle exact binaries and provenance
-        run: |
-          python - <<'PY'
           import hashlib
           import json
           import os
           from pathlib import Path
-          import subprocess
+          import re
           import tarfile
 
-          source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-          assert source == os.environ["EXPECTED_SOURCE_SHA"]
-          assert not subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
-          windows = os.environ["RUNNER_OS"] == "Windows"
-          names = ["cua-driver", "cua-cursor-theme"] + (["cua-driver-uia"] if windows else [])
-          binaries = [Path("libs/cua-driver/rust/target/debug") / (name + (".exe" if windows else "")) for name in names]
-          assert all(path.is_file() and path.stat().st_size > 0 for path in binaries)
-          bundle = Path("mcp-candidate")
-          bundle.mkdir()
-          metadata = {
-              "source_sha": source,
-              "runner_os": os.environ["RUNNER_OS"],
-              "profile": "dev, debug=0",
-              "features": ["cua-driver/portal-input"] if not windows else [],
-              "rustc": subprocess.check_output(["rustc", "--version"], text=True).strip(),
-              "version": subprocess.check_output([str(binaries[0].resolve()), "--version"], text=True).strip(),
-              "files": {path.name: hashlib.file_digest(path.open("rb"), "sha256").hexdigest() for path in binaries},
-              "qualification": "Test-only unsigned candidate; not a release or image qualification.",
+          artifact = Path(os.environ["ARTIFACT_ROOT"])
+          output = Path(os.environ["CANDIDATE_ROOT"])
+          source = os.environ["CANDIDATE_SHA"]
+          assert re.fullmatch(r"[0-9a-f]{40}", source)
+          names = {"cua-driver.exe", "cua-cursor-theme.exe", "cua-driver-uia.exe"}
+          provenance_bytes = (artifact / "provenance.json").read_bytes()
+          provenance = json.loads(provenance_bytes)
+          assert provenance["source_sha"] == source and provenance["runner_os"] == "Windows"
+          assert set(provenance["files"]) == names
+          assert all(re.fullmatch(r"[0-9a-f]{64}", value) for value in provenance["files"].values())
+          output.mkdir(exist_ok=False)
+          with tarfile.open(artifact / "candidate.tar.gz", "r:gz") as archive:
+              members = archive.getmembers()
+              assert len(members) == 4 and {item.name for item in members} == names | {"provenance.json"}
+              assert all(item.isfile() and 0 < item.size < 512 * 1024 * 1024 for item in members)
+              # Fixed basename inventory, no extraction of links/path traversal/extra executable content.
+              payloads = {item.name: archive.extractfile(item).read() for item in members}
+          assert payloads["provenance.json"] == provenance_bytes
+          for name in sorted(names):
+              actual = hashlib.sha256(payloads[name]).hexdigest()
+              assert actual == provenance["files"][name], f"Hash mismatch: {name}"
+          for name, data in payloads.items():
+              (output / name).write_bytes(data)
+          receipt = {"verified_source": source, "files": provenance["files"],
+                     "archive_sha256": hashlib.sha256((artifact / "candidate.tar.gz").read_bytes()).hexdigest()}
+          (Path(os.environ["DIAGNOSTIC_ROOT"]) / "artifact-verification.json").write_text(json.dumps(receipt, indent=2) + "\n")
+          print(json.dumps(receipt, indent=2))
+      - name: Run native foreground variants (preserve failures)
+        run: |
+          & ./scripts/ci/windows-edge/diagnose.ps1 `
+            -CandidateDirectory $env:CANDIDATE_ROOT `
+            -OutputDirectory $env:DIAGNOSTIC_ROOT `
+            -ExpectedSource $env:CANDIDATE_SHA `
+            -IncludeLockTimeoutControl:($env:LOCK_TIMEOUT_CONTROL -eq 'true')
+          exit $LASTEXITCODE
+      - name: Mark setup/artifact blockers explicitly
+        if: always()
+        run: |
+          if (-not (Test-Path -LiteralPath "$env:DIAGNOSTIC_ROOT/summary.json")) {
+            New-Item -ItemType Directory -Path $env:DIAGNOSTIC_ROOT -Force | Out-Null
+            @{ status = 'BLOCKED'; qualification = $false; reason = 'No completed native harness summary. Inspect setup/artifact/compile step; no driver success is claimed.' } |
+              ConvertTo-Json | Set-Content -LiteralPath "$env:DIAGNOSTIC_ROOT/summary.json" -Encoding utf8
+            '## BLOCKED: no native harness summary; not qualification' | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY
+            exit 1
           }
-          provenance = bundle / "provenance.json"
-          provenance.write_text(json.dumps(metadata, indent=2) + "\n")
-          with tarfile.open(bundle / "candidate.tar.gz", "w:gz") as archive:
-              for path in binaries:
-                  archive.add(path, arcname=path.name)
-              archive.add(provenance, arcname=provenance.name)
-          print(json.dumps(metadata, indent=2))
-          PY
-      - name: Upload candidate for separately authorized tests
+      - name: Upload raw evidence even after driver/oracle failure
+        if: always()
         uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08 # v4
         with:
-          name: driver-mcp-candidate-${{ runner.os }}-${{ github.event.pull_request.head.sha || github.sha }}
+          name: edge-foreground-diagnostic-${{ github.run_id }}
+          path: ${{ env.DIAGNOSTIC_ROOT }}
           if-no-files-found: error
           retention-days: 7
-          path: |
-            mcp-candidate/candidate.tar.gz
-            mcp-candidate/provenance.json
