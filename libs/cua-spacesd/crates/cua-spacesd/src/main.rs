@@ -591,20 +591,34 @@ fn build_info() -> serde_json::Value {
 
 /// The cua-driver tool registry for this platform.
 pub(crate) fn platform_tools() -> Option<Arc<dyn cua_driver_core::server::ToolProvider>> {
-    #[cfg(target_os = "linux")]
-    let registry = platform_linux::register_tools();
-    #[cfg(target_os = "macos")]
-    let registry = platform_macos::register_tools();
-    #[cfg(target_os = "windows")]
-    let registry = platform_windows::register_tools();
-    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-    return None;
-    #[allow(unreachable_code)]
+    // The core-only fallback must construct its snapshot stores under the same
+    // authorization runtime used by ToolRegistry dispatch, just like the full
+    // desktop provider. Otherwise every fresh snapshot is already NotCurrent.
+    let scope = match cua_driver_core::session_authorization::configured_registry()
+        .and_then(|registry| registry.legacy_context())
     {
-        let registry = Arc::new(registry);
-        registry.init_self_weak();
-        Some(registry)
-    }
+        Ok(context) => context.runtime_scope_key(),
+        Err(error) => {
+            tracing::warn!(%error, "driver tools unavailable: no authorization runtime");
+            return None;
+        }
+    };
+    cua_driver_core::tool::with_runtime_scope(scope, || {
+        #[cfg(target_os = "linux")]
+        let registry = platform_linux::register_tools();
+        #[cfg(target_os = "macos")]
+        let registry = platform_macos::register_tools();
+        #[cfg(target_os = "windows")]
+        let registry = platform_windows::register_tools();
+        #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+        return None;
+        #[allow(unreachable_code)]
+        {
+            let registry = Arc::new(registry);
+            registry.init_self_weak();
+            Some(registry as Arc<dyn cua_driver_core::server::ToolProvider>)
+        }
+    })
 }
 
 async fn serve(args: ServeArgs, join: Option<JoinArgs>) -> Result<Exit, BoxError> {
@@ -1157,6 +1171,62 @@ mod tests {
             .unwrap()
             .iter()
             .any(|c| c == "openh264"));
+    }
+
+    /// Use the real fallback registry and its real native snapshot store, but
+    /// never connect to a display, a session bus, or the user's configuration.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn core_only_registry_snapshots_use_dispatch_runtime() {
+        const CHILD: &str = "CUA_SPACESD_SCOPE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let home = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::core_only_registry_snapshots_use_dispatch_runtime",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", home.path())
+                .env("TMPDIR", home.path())
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+        use cua_driver_core::element_token::RegistryError;
+        use cua_driver_core::snapshot_store::current_runtime_store;
+        use cua_driver_core::tool::with_runtime_scope;
+        use platform_linux::atspi::snapshot::AtspiSnapshot;
+
+        let context = cua_driver_core::session_authorization::configured_registry()
+            .unwrap()
+            .legacy_context()
+            .unwrap();
+        let _tools = platform_tools().unwrap();
+        let store = with_runtime_scope(context.runtime_scope_key(), || {
+            let store = current_runtime_store::<AtspiSnapshot>()
+                .expect("fallback snapshot store must belong to the dispatch runtime");
+            store
+                .try_publish(std::process::id() as i32, 7, AtspiSnapshot::from_nodes(&[]))
+                .expect("a fresh fallback snapshot must be publishable");
+            store
+        });
+        // Scoping construction must not weaken cross-runtime admission.
+        with_runtime_scope("another-runtime".into(), || {
+            assert_eq!(
+                store.try_publish(std::process::id() as i32, 7, AtspiSnapshot::from_nodes(&[])),
+                Err(RegistryError::NotCurrent),
+            );
+        });
     }
 
     #[test]
