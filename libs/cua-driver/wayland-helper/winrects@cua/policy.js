@@ -33,9 +33,13 @@ export function rectanglesOverlap(a, b) {
         && a.y + a.height > b.y;
 }
 
+export function captureDimensionsAreSafe(width, height) {
+    return [width, height].every(value => Number.isFinite(value) && value >= 1);
+}
+
 export function captureAreaIsSafe({displayWidth, displayHeight, stageWidth, stageHeight}) {
-    return [displayWidth, displayHeight, stageWidth, stageHeight]
-        .every(value => Number.isFinite(value) && value >= 1);
+    return captureDimensionsAreSafe(displayWidth, displayHeight)
+        && captureDimensionsAreSafe(stageWidth, stageHeight);
 }
 
 export function captureRectangleIsSafe(rect, {displayWidth, displayHeight}) {

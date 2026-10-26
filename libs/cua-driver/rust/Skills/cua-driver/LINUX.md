@@ -270,8 +270,21 @@ driver selects a backend from compositor capabilities:
 - Hyprland has separate discovery and capture adapters. Its optional plugin
   defaults to discovery-only; the opt-in input v3 source candidate has the
   qualification and validation limits below. Do not inherit Sway coverage.
-- GNOME/Mutter uses the bundled WinRects Shell helper for target geometry and
-  activation, plus portal/libei for foreground raw input.
+- GNOME/Mutter uses the bundled WinRects Shell helper for target geometry,
+  exact-window capture and activation, plus portal/libei for foreground raw input.
+  Whole-screen capture (`get_desktop_state`, including `app="screen"` clients)
+  returns `capture_scope_unsupported` with `effect:"refused"`: this helper only
+  exports exact-target pixels. It never falls back to grim, a screenshot portal,
+  ext-image-copy-capture or an XWayland root capture on GNOME. Window capture
+  requires WinRects (`helper_unavailable` if absent, `helper_protocol_mismatch`
+  if incompatible or if it lacks `capture-geometry-safety-v1`). The screenshot
+  guards are independent of `CUA_DRIVER_RS_ENABLE_WAYLAND`; opting out cannot
+  enable a GNOME fallback. A staged helper becomes active after logout/login;
+  an older loaded helper still supports metadata/input but capture refuses.
+  Invalid, zero or nonfinite screenshot dimensions return
+  `capture_geometry_invalid` before a screenshot request (an invalid Shell
+  stage/display returns `capture_not_ready`); retry once the display and target
+  are painted with valid geometry, not through another backend.
 - KDE/KWin uses AT-SPI and portal facilities where available. Target-specific
   foreground activation remains experimental, so unsafe raw input refuses.
 - The optional `cua-compositor` is a separate nested session enabled

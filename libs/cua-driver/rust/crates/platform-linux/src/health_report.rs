@@ -169,6 +169,14 @@ async fn check_ax_capability() -> CheckEntry {
 }
 
 async fn check_screen_capture_capability() -> CheckEntry {
+    #[cfg(target_os = "linux")]
+    if crate::capture_safety::gnome_session() {
+        return CheckEntry::fail(
+            NAME_SCREEN_CAPTURE_CAPABILITY,
+            "capture_scope_unsupported: GNOME whole-screen capture is disabled; no grim or portal fallback.",
+            "Use get_window_state with an exact pid and window_id and a compatible WinRects helper.",
+        );
+    }
     // Native Wayland: capture flows through a cascade — wlroots screencopy
     // (sway / labwc / kwin 5.27+ / hyprland) → ext-image-copy-capture-v1
     // (sway 1.10+ / labwc 0.8+ / niri / KDE 6.2+ / GNOME 47+) →

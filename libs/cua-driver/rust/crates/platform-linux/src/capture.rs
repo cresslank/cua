@@ -39,6 +39,7 @@ const XSHM_INIT_RETRY_BACKOFF: Duration = Duration::from_secs(30);
 
 /// Capture a window by X11 XID. Returns raw PNG bytes.
 pub fn screenshot_window_bytes(xid: u64) -> Result<Vec<u8>> {
+    crate::capture_safety::refuse_gnome_display()?;
     capture_window_with_backends(
         xid,
         capture_via_xshm,
@@ -101,6 +102,10 @@ fn capture_via_import(xid: u64) -> Result<Vec<u8>> {
     if !crate::x11::window_exists(xid) {
         bail!("window {xid} no longer exists");
     }
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    let (conn, _) = x11rb::rust_connection::RustConnection::connect(None)?;
+    let geometry = conn.get_geometry(xid_to_window(xid)?)?.reply()?;
+    crate::capture_safety::dimensions(f64::from(geometry.width), f64::from(geometry.height))?;
     let mut child = Command::new("import")
         .args(["-window", &xid.to_string(), "png:-"])
         .stdin(std::process::Stdio::null())
@@ -937,9 +942,9 @@ pub fn png_dimensions_pub(data: &[u8]) -> Result<(u32, u32)> {
 /// Dispatch:
 /// - Native Wayland (`CUA_DRIVER_RS_ENABLE_WAYLAND=1` + Wayland session):
 ///   routes through [`crate::wayland::screenshot_display_dispatch`] which
-///   owns the complete GNOME helper → wlroots screencopy →
-///   ext-image-copy-capture-v1 → portal Screenshot → X11 cascade. An
-///   available GNOME helper's capture failure is terminal.
+///   owns the non-GNOME wlroots screencopy → ext-image-copy-capture-v1 →
+///   portal Screenshot → X11 cascade. GNOME whole-screen scope is refused
+///   before any backend is opened; WinRects only exports exact-target pixels.
 /// - X11 / Wayland-disabled: ImageMagick `import` → x11rb `XGetImage`.
 pub fn screenshot_display_bytes() -> Result<Vec<u8>> {
     screenshot_display_bytes_with_dispatch(
@@ -966,6 +971,16 @@ fn screenshot_display_bytes_with_dispatch(
 /// fallback without re-entering [`screenshot_display_bytes`] (which would
 /// loop forever once we're on Wayland).
 pub(crate) fn screenshot_display_bytes_x11() -> Result<Vec<u8>> {
+    crate::capture_safety::refuse_gnome_display()?;
+    use x11rb::protocol::xproto::*;
+    use x11rb::rust_connection::RustConnection;
+    let (conn, screen_num) = RustConnection::connect(None)
+        .map_err(|e| anyhow::anyhow!("{e}{}", crate::no_display_hint()))?;
+    let root = conn.setup().roots[screen_num].root;
+    let geom = conn.get_geometry(root)?.reply()?;
+    let w = geom.width as u32;
+    let h = geom.height as u32;
+    crate::capture_safety::dimensions(f64::from(w), f64::from(h))?;
     // Try `import -window root png:-` (ImageMagick).
     let out = Command::new("import")
         .args(["-window", "root", "png:-"])
@@ -975,28 +990,7 @@ pub(crate) fn screenshot_display_bytes_x11() -> Result<Vec<u8>> {
             return Ok(o.stdout);
         }
     }
-    // Fallback: x11rb XGetImage on the root window.
-    use x11rb::connection::Connection;
-    use x11rb::protocol::xproto::*;
-    use x11rb::rust_connection::RustConnection;
-    let (conn, screen_num) = RustConnection::connect(None)
-        .map_err(|e| anyhow::anyhow!("{e}{}", crate::no_display_hint()))?;
-    let root = conn.setup().roots[screen_num].root;
-    // Get root geometry.
-    let geom = conn.get_geometry(root)?.reply()?;
-    let w = geom.width as u32;
-    let h = geom.height as u32;
-    // WSLg / headless XWayland quirk: the X server connects but the root
-    // window reports a 0-px geometry until a real output is attached.
-    // `get_image` with w/h == 0 yields an empty buffer that later decodes
-    // to null/zero dimensions downstream. Fail with an actionable, typed
-    // error instead of emitting a 0-px image. See issue #2005.
-    if w == 0 || h == 0 {
-        anyhow::bail!(
-            "X11 root window reports a 0x0 geometry — no usable display to capture.{}",
-            crate::no_display_hint()
-        );
-    }
+    // Fallback: x11rb XGetImage on the already-validated root window.
     let img = conn
         .get_image(ImageFormat::Z_PIXMAP, root, 0, 0, w as u16, h as u16, !0u32)?
         .reply()?;
@@ -1018,6 +1012,8 @@ pub(crate) fn screenshot_display_bytes_x11() -> Result<Vec<u8>> {
 /// for a window whose own drawable would hide the menu or dialog open over
 /// it. The rectangle is clipped to the screen.
 pub fn screenshot_root_region_png(x: i32, y: i32, width: u32, height: u32) -> Result<Vec<u8>> {
+    crate::capture_safety::refuse_gnome_display()?;
+    crate::capture_safety::dimensions(f64::from(width), f64::from(height))?;
     use x11rb::connection::Connection;
     use x11rb::protocol::xproto::*;
     use x11rb::rust_connection::RustConnection;

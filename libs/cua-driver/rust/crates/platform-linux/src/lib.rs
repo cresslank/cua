@@ -20,6 +20,9 @@
 
 use cua_driver_core::tool::ToolRegistry;
 
+#[cfg(target_os = "linux")]
+mod capture_safety;
+
 pub mod health_report;
 pub mod overlay;
 pub mod overlay_capture;

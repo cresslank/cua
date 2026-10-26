@@ -263,6 +263,26 @@ export async function run() {
         capture.rect.width === top.w && capture.rect.height === top.h,
         'capture rectangle drifted'
     );
+    // Exercise the real producer boundary with a private compositor actor
+    // temporarily at zero size, not a mocked screenshot implementation.
+    const captureActor = windowActor(topWindow);
+    const [savedActorWidth, savedActorHeight] = captureActor.get_size();
+    try {
+        captureActor.set_size(0, 0);
+        assert(captureActor.width === 0 && captureActor.height === 0,
+            'fixture did not create an empty native actor');
+        await expectRefusal('CaptureTarget', new GLib.Variant('(s)', [top.target_id]),
+            'capture_geometry_invalid');
+        await expectRefusal('CaptureTargetPreview', new GLib.Variant('(su)', [top.target_id, 128]),
+            'capture_geometry_invalid');
+    } finally {
+        captureActor.set_size(savedActorWidth, savedActorHeight);
+    }
+    const [restoredCapture] = await call('CaptureTarget', new GLib.Variant('(s)', [top.target_id]));
+    assert(decodePng(JSON.parse(restoredCapture).png_base64).width >= top.w,
+        'capture did not recover after restoring native actor dimensions');
+    print('Zero-size actor: full and preview refused; restored capture PASS');
+
     const pixbuf = decodePng(capture.png_base64);
     assert(pixbuf.width >= top.w && pixbuf.height >= top.h, 'target PNG is undersized');
     assert(pixbuf.width <= top.w * 8 && pixbuf.height <= top.h * 8, 'target PNG is broad');
