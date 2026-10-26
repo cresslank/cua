@@ -30,6 +30,7 @@ pub(super) fn cursor_call(destination: &str, method: &str, args: &[String]) -> O
         args,
         Duration::from_secs(25),
     )
+    .ok()
 }
 
 /// Retire the current transport generation without initializing a cold one.
@@ -46,6 +47,18 @@ pub(super) fn call(
     args: &[String],
     timeout: Duration,
 ) -> Option<String> {
+    call_result(destination, path, method, args, timeout).ok()
+}
+
+/// Required operations retain the actual peer refusal; best-effort discovery
+/// and cursor callers may deliberately discard it through `call`.
+pub(super) fn call_result(
+    destination: &str,
+    path: &str,
+    method: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<String, Failure> {
     call_on(owner(), destination, path, method, args, timeout)
 }
 
@@ -56,71 +69,100 @@ fn call_on(
     method: &str,
     args: &[String],
     timeout: Duration,
-) -> Option<String> {
+) -> Result<String, Failure> {
     let destination = destination.to_owned();
     let path = path.to_owned();
     let method = method.to_owned();
     let args = args.to_vec();
     let action_lease = cua_driver_core::blocking::ActionLeaseScope::capture();
     let (tx, rx) = mpsc::sync_channel(1);
-    owner.spawn(move |generation| async move {
-        let mut used = None;
-        let result = tokio::time::timeout(timeout, async {
-            let connection = {
-                let mut shared = generation.connection.lock().await;
-                if shared.is_none() {
-                    *shared = Some(
-                        generation.session(
-                            Connection::session()
-                                .await
-                                .map_err(|_| Failure::Transport)?,
-                        ),
-                    );
+    owner
+        .spawn(move |generation| async move {
+            let mut used = None;
+            let result = tokio::time::timeout(timeout, async {
+                let connection = {
+                    let mut shared = generation.connection.lock().await;
+                    if shared.is_none() {
+                        *shared = Some(
+                            generation.session(Connection::session().await.map_err(classify)?),
+                        );
+                    }
+                    shared.as_ref().ok_or(Failure::Unavailable)?.clone()
+                };
+                used = Some(connection.clone());
+                // A connection wait may outlive the native caller. Do not begin a
+                // new focus mutation after cancellation; terminal reconciliation
+                // methods must remain available for unconditional restoration.
+                if method.ends_with("BeginForeground") {
+                    action_lease
+                        .run(cua_driver_core::blocking::check_cancelled)
+                        .map_err(|_| Failure::Cancelled)?;
                 }
-                shared.as_ref().ok_or(Failure::Transport)?.clone()
-            };
-            used = Some(connection.clone());
-            // A connection wait may outlive the native caller. Do not begin a
-            // new focus mutation after cancellation; terminal reconciliation
-            // methods must remain available for unconditional restoration.
-            if method.ends_with("BeginForeground") {
-                action_lease
-                    .run(cua_driver_core::blocking::check_cancelled)
-                    .map_err(|_| Failure::Reply)?;
+                invoke(&connection.connection, &destination, &path, &method, &args).await
+            })
+            .await
+            .unwrap_or(Err(Failure::Timeout));
+            // Never replay a possibly applied mutation. Retire only the connection
+            // this request used: an older failure cannot evict its replacement.
+            // Its last user schedules a bounded close without interrupting peers.
+            if matches!(result, Err(Failure::Transport(_) | Failure::Timeout)) {
+                if let Some(connection) = used.as_ref() {
+                    generation.retire(connection).await;
+                }
             }
-            invoke(&connection.connection, &destination, &path, &method, &args).await
+            drop(used);
+            let _ = tx.send(result);
         })
-        .await
-        .unwrap_or(Err(Failure::Transport));
-        // Never replay a possibly applied mutation. Retire only the connection
-        // this request used: an older failure cannot evict its replacement.
-        // Its last user schedules a bounded close without interrupting peers.
-        if matches!(result, Err(Failure::Transport)) {
-            if let Some(connection) = used.as_ref() {
-                generation.retire(connection).await;
-            }
-        }
-        drop(used);
-        let _ = tx.send(result.ok());
-    })?;
+        .ok_or(Failure::Unavailable)?;
     rx.recv_timeout(timeout + Duration::from_millis(100))
-        .ok()
-        .flatten()
+        .map_err(|error| match error {
+            mpsc::RecvTimeoutError::Timeout => Failure::Timeout,
+            mpsc::RecvTimeoutError::Disconnected => Failure::Unavailable,
+        })?
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum Failure {
-    /// The peer answered with an error, or the call or reply had an
-    /// unexpected shape. The connection is healthy.
+pub(super) enum Failure {
     Reply,
-    /// The connection failed or the call timed out.
-    Transport,
+    /// A peer refusal is not a timeout and does not retire a healthy connection.
+    Remote {
+        name: String,
+        message: String,
+    },
+    Transport(String),
+    Timeout,
+    Cancelled,
+    Unavailable,
 }
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Reply => write!(f, "invalid WinRects call or reply shape"),
+            Self::Remote { name, message } => write!(f, "D-Bus {name}: {message}"),
+            Self::Transport(message) => write!(f, "D-Bus transport failed: {message}"),
+            Self::Timeout => write!(f, "D-Bus call timed out"),
+            Self::Cancelled => write!(f, "D-Bus call cancelled before dispatch"),
+            Self::Unavailable => write!(f, "WinRects transport unavailable or shut down"),
+        }
+    }
+}
+
+impl std::error::Error for Failure {}
 
 fn classify(error: zbus::Error) -> Failure {
     match error {
-        zbus::Error::MethodError(..) | zbus::Error::FDO(_) => Failure::Reply,
-        _ => Failure::Transport,
+        zbus::Error::MethodError(name, message, _) => Failure::Remote {
+            name: name.to_string(),
+            message: message.unwrap_or_default(),
+        },
+        zbus::Error::FDO(error) => Failure::Remote {
+            name: zbus::DBusError::name(error.as_ref()).to_string(),
+            message: zbus::DBusError::description(error.as_ref())
+                .unwrap_or_default()
+                .to_owned(),
+        },
+        error => Failure::Transport(error.to_string()),
     }
 }
 
@@ -231,6 +273,12 @@ mod tests {
     // backslash, a newline and non-ASCII. A typed reply carries them intact.
     const RECTS: &str = r#"[{"id":3,"pid":41,"title":"Tomorrow's \"plan\" C:\\ 1\n2 飞书","x":0,"y":0,"w":10,"h":10},{"id":7,"pid":42,"title":"Target","x":14,"y":12,"w":800,"h":600}]"#;
 
+    #[derive(Debug, zbus::DBusError)]
+    #[zbus(prefix = "org.cua.WinRects")]
+    enum Refusal {
+        TargetNotActivatable(String),
+    }
+
     struct Helper;
     #[zbus::interface(name = "org.cua.WinRects")]
     impl Helper {
@@ -255,8 +303,20 @@ mod tests {
             }
             self.capture_target(target)
         }
-        fn begin_foreground(&self, transaction: &str, target: &str) -> String {
-            format!("{transaction}:{target}")
+        async fn begin_foreground(
+            &self,
+            transaction: &str,
+            target: &str,
+        ) -> Result<String, Refusal> {
+            if target == "blocked" {
+                return Err(Refusal::TargetNotActivatable(
+                    "target_not_activatable: reason=shell_key_focus; user's Shell UI 飞书".into(),
+                ));
+            }
+            if target == "stall" {
+                return std::future::pending().await;
+            }
+            Ok(format!("{transaction}:{target}"))
         }
         fn query_foreground(&self, transaction: &str) -> String {
             transaction.into()
@@ -333,6 +393,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn peer_refusal_survives_worker_and_tool_error_without_becoming_timeout() {
+        let Some((_dir, _bus, address)) = private_bus() else {
+            return;
+        };
+        let service = zbus::connection::Builder::address(address.trim())
+            .unwrap()
+            .name("org.cua.WinRects")
+            .unwrap()
+            .serve_at("/org/cua/WinRects", Helper)
+            .unwrap()
+            .build()
+            .await
+            .unwrap();
+        let owner = std::sync::Arc::new(runtime::Owner::default());
+        let name = install_private_connection(&owner, address);
+        for (method, args, code, expected) in [
+            ("BeginForeground", vec!["transaction".into(), "blocked".into()], "foreground_unavailable",
+             "D-Bus org.cua.WinRects.TargetNotActivatable: target_not_activatable: reason=shell_key_focus; user's Shell UI 飞书"),
+            ("CaptureTarget", vec!["stale:7".into()], "tool_invocation_failed",
+             "D-Bus org.freedesktop.DBus.Error.Failed: stale_target"),
+        ] {
+            let caller = owner.clone();
+            let error = tokio::task::spawn_blocking(move || call_on(
+                &caller, "org.cua.WinRects", "/org/cua/WinRects",
+                &format!("org.cua.WinRects.{method}"), &args, Duration::from_secs(2),
+            )).await.unwrap().unwrap_err();
+            let refusal = super::super::required_call_error(code, method, &error).to_string();
+            assert_eq!(refusal, format!("{code}: GNOME {method} failed: {expected}"));
+            assert!(!refusal.contains("timed out"));
+        }
+        // A method refusal must keep the same live connection, not retire it.
+        let (tx, rx) = mpsc::sync_channel(1);
+        owner
+            .spawn(move |generation| async move {
+                let current = generation.connection.lock().await;
+                tx.send(
+                    current
+                        .as_ref()
+                        .unwrap()
+                        .connection
+                        .unique_name()
+                        .unwrap()
+                        .to_string(),
+                )
+                .unwrap();
+            })
+            .unwrap();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), name);
+        let caller = owner.clone();
+        let error = tokio::task::spawn_blocking(move || {
+            call_on(
+                &caller,
+                "org.cua.WinRects",
+                "/org/cua/WinRects",
+                "org.cua.WinRects.BeginForeground",
+                &["transaction".into(), "stall".into()],
+                Duration::from_millis(100),
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error, Failure::Timeout);
+        assert_eq!(error.to_string(), "D-Bus call timed out");
+        assert_name_gone(&service, &name).await;
+        owner.shutdown();
+        service.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn teardown_closes_private_connection_and_reopens() {
         let Some((_dir, _bus, address)) = private_bus() else {
             return;
@@ -365,7 +495,7 @@ mod tests {
                 .await
                 .unwrap()
                 .as_deref(),
-                Some("(uint32 14,)")
+                Ok("(uint32 14,)")
             );
             // Exercise shutdown inside a different, current-thread Tokio runtime.
             owner.shutdown();
@@ -420,7 +550,7 @@ mod tests {
         let start = std::time::Instant::now();
         owner.shutdown();
         assert!(start.elapsed() < Duration::from_secs(2));
-        assert_eq!(request.await.unwrap(), None);
+        assert_eq!(request.await.unwrap(), Err(Failure::Unavailable));
         assert_name_gone(&service, &name).await;
         service.close().await.unwrap();
     }
@@ -548,7 +678,10 @@ mod tests {
         }
         assert_eq!(
             call("CaptureTarget", vec!["stale:7".into()]).await,
-            Err(Failure::Reply)
+            Err(Failure::Remote {
+                name: "org.freedesktop.DBus.Error.Failed".into(),
+                message: "stale_target".into(),
+            })
         );
         for method in [
             "Capture",

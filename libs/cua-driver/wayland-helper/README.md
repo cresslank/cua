@@ -164,6 +164,32 @@ never qualify it. XWayland keeps its genuine Screen extents. New helper files
 still require the normal logout/login boundary; this change does not reload the
 live Shell or grant background native input.
 
+## Exact refusal diagnostics
+
+The additive `refusal-reasons-v1` capability advertises exact diagnostic reasons,
+not new input authority. `TargetNotActivatable` retains its D-Bus name and
+`target_not_activatable` prefix; its message now includes `reason=...`.
+`GetRects.capture_refusal_reason` and capture D-Bus errors distinguish
+`overview_visible`, `session_locked`, `shell_modal_grab`, `shell_key_focus`,
+`minimized`, `off_workspace`, and `modal_child`. Other visibility failures use
+`not_showing`, `not_painted`, or `overlapped`. When several guards apply, Shell
+context precedes window state. Reasons never dismiss Shell UI or move focus.
+
+Required foreground and capture RPCs preserve the peer's exact D-Bus error name
+and message through the driver refusal. A real deadline says `D-Bus call timed
+out`; a method refusal no longer masquerades as a timeout or retires a healthy
+connection. Refusal codes and existing reconciliation remain unchanged. Older
+API15/API16 helpers remain usable; their missing diagnostic field is optional.
+Updated helper bytes still require the approved helper activation boundary.
+
+Foreground native right/double clicks remain refused. Mutter 50's EIS sync
+acknowledges input-thread work, not necessarily final Clutter event routing;
+closing a session does not join all already-enqueued virtual-input work. A safe
+route needs a compositor-dispatch fence, exact transaction/batch correlation,
+and a quarantine lease owner that survives driver loss and helper retirement.
+End/Abort/watchdog restoration and transport close are not that proof. No new
+input capability or native-terminal retirement hook is advertised here.
+
 ## Other compositors
 
 wlroots compositors such as Sway and labwc do not need this helper: cua-driver
