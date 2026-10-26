@@ -28,10 +28,11 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 mkdir -p "$work/extension"
+python3 "$HELPER/package.py" "$work/winrects@cua"
 gnome-extensions pack -f \
   -o "$work/extension" \
-  --extra-source=policy.js \
-  "$HELPER/winrects@cua"
+  --extra-source=impl --extra-source=selected.json \
+  "$work/winrects@cua"
 
 GDK_BACKEND=wayland \
 GIO_USE_VFS=local \

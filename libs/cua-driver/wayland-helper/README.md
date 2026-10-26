@@ -75,11 +75,19 @@ capture; covered or off-stage targets remain refused. Legacy `Capture` and
 gnome-extensions info winrects@cua   # -> State: ACTIVE
 ```
 
-When producing a distributable bundle, include the pure policy module:
+For a distributable zip, first materialize its content-addressed closure:
 
 ```bash
-gnome-extensions pack --extra-source=policy.js winrects@cua
+python3 package.py /owned/staging/winrects@cua
+gnome-extensions pack --extra-source=impl --extra-source=selected.json /owned/staging/winrects@cua
 ```
+
+The first cached-monolith → stable-bootstrap deployment still needs one
+logout/login. Routine implementation updates then use the bounded loader API,
+not an extension toggle or Shell's private reload API. See
+[loader ABI, closure format, retirement and installer transaction](HOT-RELOAD.md).
+`install.sh` deliberately preserves an already-installed bootstrap and rollback
+closures; the separately reviewed managed transaction owns routine selection.
 
 cua-driver auto-detects it at runtime (`wayland::shell_helper`). AX operations
 still work when it is absent. With an incompatible installed helper, exact
@@ -160,9 +168,10 @@ offscreen controls and shadows can extend beyond a screenshot at 1x.
 The coordinate correction needs v16 metadata. Older helpers remain accepted for
 existing exact-target operations, but cannot attest this native reconstruction;
 missing/unknown client types, wrong PID/window pairs, and duplicate identities
-never qualify it. XWayland keeps its genuine Screen extents. New helper files
-still require the normal logout/login boundary; this change does not reload the
-live Shell or grant background native input.
+never qualify it. XWayland keeps its genuine Screen extents. The initial stable
+bootstrap still requires one logout/login; subsequent implementation-only
+updates follow [the hot-reload transaction](HOT-RELOAD.md). Neither grants
+background native input.
 
 ## Exact refusal diagnostics
 
@@ -208,7 +217,9 @@ Legacy global capture/activation requests are refused, and clients must prove
 the helper incarnation and exact target before requesting pixels or input.
 
 The driver installers only bundle helper files for a later explicit rollout.
-`install.sh` stages the complete runtime atomically, refuses malformed installed
+`install.sh` stages the first bootstrap atomically, refuses malformed installed
 version metadata, never downgrades a newer helper, and enables only with
-`--enable`. Activation of changed helper bytes requires the normal logout/login
-boundary. No installer or updater implicitly installs or reloads the helper.
+`--enable`. It never replaces an existing stable bootstrap or retained closure.
+Bootstrap-byte changes require logout/login; implementation-only activation
+uses the explicit transaction and bounded API in [HOT-RELOAD.md](HOT-RELOAD.md).
+No binary installer/updater implicitly installs or reloads the helper.
