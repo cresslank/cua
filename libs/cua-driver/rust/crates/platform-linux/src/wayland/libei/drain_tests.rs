@@ -14,6 +14,7 @@ use std::os::unix::net::UnixStream;
 static LEASE_TEST: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const TEXT_LEN: usize = 32_768;
 
+mod idle_tests;
 mod readiness_tests;
 
 fn readable(fd: &impl AsRawFd, timeout: Duration) -> bool {
@@ -59,7 +60,8 @@ impl Fixture {
         let (tx, rx) = bounded(64);
         let sender = CommandSender::new(tx);
         let live = sender.live.clone();
-        let worker = thread::spawn(move || worker(rx, live));
+        let readiness = sender.readiness.clone();
+        let worker = thread::spawn(move || worker(rx, live, readiness));
         (
             Self {
                 sender,

@@ -185,6 +185,20 @@ fn ensure_input_ready_with(
     if matches!(session, InputReadinessSession::Bypass) {
         return Ok(());
     }
+    // GNOME background dispatch never reaches compositor input: addressed
+    // click/text/scroll use AT-SPI or refuse; keys and gestures refuse; stateful
+    // pointer input has no GNOME backend; move_cursor is overlay-only. Desktop
+    // forms also refuse exact_target_required before any libei call. Keep the
+    // ordinary dispatch/refusal path and its lease, but do not open a privacy-
+    // sensitive RemoteDesktop session (or wait for consent) to reach it.
+    // This is not an AccessibilityOnly grant: its stricter retained-token
+    // dispatch validation remains unchanged. Unknown tools/malformed delivery
+    // modes, foreground input and activation/geometry retain existing readiness.
+    if matches!(session, InputReadinessSession::Gnome)
+        && gnome_background_without_compositor_input(tool, args)
+    {
+        return Ok(());
+    }
     let tool = readiness_route(tool, args);
     let (keyboard, pointer, scroll) = match tool {
         "browser_prepare" => (true, true, false),
@@ -234,6 +248,31 @@ fn ensure_input_ready_with(
         reconnect("ei_scroll")?;
     }
     Ok(())
+}
+
+fn gnome_background_without_compositor_input(tool: &str, args: &serde_json::Value) -> bool {
+    let background = match args.get("delivery_mode") {
+        None => true,
+        Some(serde_json::Value::String(mode)) => mode == "background",
+        _ => false,
+    };
+    background
+        && matches!(
+            tool,
+            "click"
+                | "double_click"
+                | "right_click"
+                | "type_text"
+                | "press_key"
+                | "hotkey"
+                | "scroll"
+                | "drag"
+                | "mouse_drag"
+                | "parallel_mouse_drag"
+                | "move_cursor"
+                | "mouse_button_down"
+                | "mouse_button_up"
+        )
 }
 
 /// The route production dispatch takes for these arguments. PressKeyTool sends
