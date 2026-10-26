@@ -34,6 +34,7 @@ import shutil
 import stat
 import sys
 import tempfile
+import runpy
 
 
 source = Path(sys.argv[1])
@@ -72,16 +73,21 @@ if destination.exists():
     if installed_version > bundled_version:
         print(f"Keeping the installed winrects@cua v{installed_version}: newer than bundle v{bundled_version}.")
         raise SystemExit(0)
+    if os.path.lexists(destination / "selected.json"):
+        print("Keeping the installed stable bootstrap and closures; use the reviewed selector transaction for updates.")
+        raise SystemExit(0)
 
 stage = Path(tempfile.mkdtemp(prefix=f".{destination.name}.new-", dir=parent))
 published = False
 try:
-    for child in source.iterdir():
-        staged_child = stage / child.name
-        if child.is_dir():
-            shutil.copytree(str(child), str(staged_child), symlinks=True)
-        else:
-            shutil.copy2(str(child), str(staged_child), follow_symlinks=False)
+    # Packaging materializes literal content-addressed import URIs. The source
+    # checkout contains readable impl/main.js, not a mutable runtime URI.
+    stage.rmdir()
+    digest = runpy.run_path(str(source.parent / "package.py"))["package"](source, stage)
+    manifest = json.loads((stage / "impl" / digest / "manifest.json").read_text())
+    source_files = {Path("extension.js"), Path("metadata.json"), Path("selected.json"),
+                    Path("impl") / digest / "manifest.json"}
+    source_files.update(Path("impl") / digest / entry["path"] for entry in manifest["files"])
     staged_files = set()
     for path in stage.rglob("*"):
         mode = path.lstat().st_mode

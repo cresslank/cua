@@ -3,7 +3,7 @@ import {readFile} from 'node:fs/promises';
 import test from 'node:test';
 
 const policySource = await readFile(
-    new URL('../winrects@cua/policy.js', import.meta.url),
+    new URL('../winrects@cua/impl/policy.js', import.meta.url),
     'utf8',
 );
 const {
@@ -78,7 +78,7 @@ test('only painted active-workspace or sticky windows can occlude the stage', ()
 });
 
 test('extension routes overlap and chrome through stage painting but retains own modal guards', async () => {
-    const source = await readFile(new URL('../winrects@cua/extension.js', import.meta.url), 'utf8');
+    const source = await readFile(new URL('../winrects@cua/impl/main.js', import.meta.url), 'utf8');
     const occlusion = source.slice(source.indexOf('    _isTargetUnoccluded(window) {'), source.indexOf('    _visibleModalChild(target) {'));
     assert.match(occlusion, /this\._isTargetPainted\(candidate\)/);
     const painting = source.slice(source.indexOf('    _isTargetPainted(window) {'), source.indexOf('    _isTargetVisible(window) {'));
@@ -167,7 +167,7 @@ test('atomic capture rejects geometry drift after pixels are produced', () => {
 
 test('extension uses an explicit positive area and never implicit stage capture', async () => {
     const extensionSource = await readFile(
-        new URL('../winrects@cua/extension.js', import.meta.url),
+        new URL('../winrects@cua/impl/main.js', import.meta.url),
         'utf8',
     );
     assert.match(
@@ -262,7 +262,7 @@ test('exact targets may activate from behind another window but not from unsafe 
 
 test('extension advertises and implements transaction revalidation', async () => {
     const extensionSource = await readFile(
-        new URL('../winrects@cua/extension.js', import.meta.url),
+        new URL('../winrects@cua/impl/main.js', import.meta.url),
         'utf8',
     );
     assert.match(extensionSource, /foreground-revalidate-v1/);
@@ -290,7 +290,7 @@ test('extension advertises and implements transaction revalidation', async () =>
 
 test('cursor ownership is connection-derived with disconnect and bounded-idle cleanup', async () => {
     const extensionSource = await readFile(
-        new URL('../winrects@cua/extension.js', import.meta.url),
+        new URL('../winrects@cua/impl/main.js', import.meta.url),
         'utf8',
     );
     assert.match(extensionSource, /connection-owned-cursors-v1/);
@@ -306,7 +306,7 @@ test('cursor ownership is connection-derived with disconnect and bounded-idle cl
 
 test('capture protocol exposes one exact target and one atomic result', async () => {
     const extensionSource = await readFile(
-        new URL('../winrects@cua/extension.js', import.meta.url),
+        new URL('../winrects@cua/impl/main.js', import.meta.url),
         'utf8',
     );
     assert.match(

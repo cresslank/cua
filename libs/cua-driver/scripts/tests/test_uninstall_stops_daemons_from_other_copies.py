@@ -354,16 +354,24 @@ def test_installer_survivor_note_names_the_pid(machine: Machine) -> None:
     assert f"(pid: {stray})" in result.stdout
 
 
-def test_a_short_lived_stop_helper_process_is_not_reported_as_a_survivor(machine: Machine) -> None:
-    """`cua-driver --expected-pid N stop` re-executes itself; it is not a daemon left behind."""
+def test_installer_survivor_note_preserves_a_helper_until_it_drains(machine: Machine) -> None:
+    """The installer reports preserved live workers; it does not wait for or stop them.
+
+    Keep the process alive through observation, then let it drain independently.
+    Scheduling its exit before the note races the diagnostic and incorrectly
+    assumes the installer's old stop-and-wait policy.
+    """
     old = machine.bundle("tmp/CuaDriver.app")
-    helper = machine.spawn(old)  # exits by itself in ~1s, like the stop helper chain
-    machine.spawn_exit_after(helper, 1)
+    helper = machine.spawn(old)
     machine._write(machine.bin / "uname", "echo Darwin")
 
     result = machine.common_shell("show_cua_driver_daemon_survivors", CUA_DRIVER_STOP_TIMEOUT="4")
 
-    assert result.stdout == ""
+    assert result.returncode == 0
+    assert f"(pid: {helper})" in result.stdout
+    assert "intentionally left running" in result.stdout
+    assert alive(helper), "the diagnostic must not stop a preserved worker"
+    machine.spawn_exit_after(helper, 1)
     assert machine.wait_dead(helper)
 
 

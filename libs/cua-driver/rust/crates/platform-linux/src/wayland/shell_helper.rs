@@ -1684,7 +1684,7 @@ mod tests {
     }
 
     const EXTENSION_SOURCE: &str =
-        include_str!("../../../../../wayland-helper/winrects@cua/extension.js");
+        include_str!("../../../../../wayland-helper/winrects@cua/impl/main.js");
     const EXTENSION_METADATA: &str =
         include_str!("../../../../../wayland-helper/winrects@cua/metadata.json");
 

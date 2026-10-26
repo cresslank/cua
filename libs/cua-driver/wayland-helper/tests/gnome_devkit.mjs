@@ -88,6 +88,11 @@ function windowRect(window) {
 }
 
 export async function run() {
+    await waitUntil(() => Gio.DBus.session.call_sync(
+        'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+        'NameHasOwner', new GLib.Variant('(s)', [BUS]),
+        new GLib.VariantType('(b)'), Gio.DBusCallFlags.NONE, 1000, null
+    ).deepUnpack()[0], 'stable loader did not publish the helper');
     await closeOverview('GNOME dev-kit overview did not close');
 
     const existingIds = new Set(global.get_window_actors()

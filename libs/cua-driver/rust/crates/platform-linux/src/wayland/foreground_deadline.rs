@@ -5,7 +5,7 @@ use std::marker::PhantomData;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-// Keep in sync with wayland-helper/winrects@cua/extension.js FOREGROUND_TIMEOUT_MS.
+// Keep in sync with wayland-helper/winrects@cua/impl/main.js FOREGROUND_TIMEOUT_MS.
 // Stop writing five seconds before the helper can independently restore focus.
 const HELPER_FOREGROUND_TIMEOUT: Duration = Duration::from_secs(30);
 const FOREGROUND_SAFETY_MARGIN: Duration = Duration::from_secs(5);
@@ -53,7 +53,7 @@ mod tests {
 
     #[test]
     fn helper_foreground_timeout_matches_rust_budget() {
-        let source = include_str!("../../../../../wayland-helper/winrects@cua/extension.js");
+        let source = include_str!("../../../../../wayland-helper/winrects@cua/impl/main.js");
         let value = source
             .split("const FOREGROUND_TIMEOUT_MS = ")
             .nth(1)
