@@ -21,6 +21,61 @@ use std::sync::{Arc, RwLock};
 use crate::atspi::Snapshots;
 use cursor_overlay::CursorRegistry;
 
+/// Delivered image pixels per accessibility coordinate unit. GNOME's native
+/// actor capture includes compositor resource scale, independently of resizing.
+fn element_screenshot_scale(
+    delivered_width: u32,
+    original_png_width: Option<u32>,
+    logical_frame_width: Option<u32>,
+) -> f64 {
+    logical_frame_width
+        .filter(|width| *width > 0)
+        .or(original_png_width.filter(|width| *width > 0))
+        .map_or(1.0, |width| f64::from(delivered_width) / f64::from(width))
+}
+
+#[cfg(test)]
+mod element_screenshot_scale_tests {
+    use super::element_screenshot_scale;
+    use serde_json::json;
+
+    #[test]
+    fn native_and_downsized_hidpi_gnome_frames_index_the_delivered_image() {
+        let element = json!({"frame": {"x": 280, "y": 175, "w": 720, "h": 34}});
+        for (delivered, original, logical, expected) in [
+            (720, None, Some(720), json!({"x":0,"y":37,"w":720,"h":34})),
+            (1440, None, Some(720), json!({"x":0,"y":74,"w":1440,"h":68})),
+            (
+                720,
+                Some(1440),
+                Some(720),
+                json!({"x":0,"y":37,"w":720,"h":34}),
+            ),
+            (
+                360,
+                Some(1440),
+                Some(720),
+                json!({"x":0,"y":19,"w":360,"h":17}),
+            ),
+        ] {
+            let projected = cua_driver_core::element_frame::with_screenshot_frames(
+                vec![element.clone()],
+                (280.0, 138.0),
+                element_screenshot_scale(delivered, original, logical),
+            );
+            assert_eq!(projected[0]["screenshot_frame"], expected);
+            assert_eq!(projected[0]["frame"], element["frame"]);
+        }
+    }
+
+    #[test]
+    fn other_backends_keep_the_original_resize_only_transform() {
+        assert_eq!(element_screenshot_scale(720, None, None), 1.0);
+        assert_eq!(element_screenshot_scale(360, Some(720), None), 0.5);
+        assert_eq!(element_screenshot_scale(360, Some(720), Some(0)), 0.5);
+    }
+}
+
 fn coordinate_frame_schema() -> Value {
     json!({"type":"string","enum":["window","desktop"],"default":"window","description":"Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter."})
 }
@@ -2264,8 +2319,15 @@ impl Tool for GetWindowStateTool {
             Ok(Ok((tree_opt, shot_opt, bounds, screenshot_error, overlays, binds_window))) => {
                 let mut content = Vec::new();
                 let mut structured = json!({ "window_id": xid, "pid": pid });
+                let gnome_frame_origin = crate::wayland::is_wayland()
+                    .then(|| crate::wayland::shell_helper::native_window_origins(pid, xid))
+                    .flatten()
+                    .map(|(_, frame)| frame);
+                let logical_frame_width = gnome_frame_origin
+                    .and_then(|_| window_meta.as_ref())
+                    .map(|window| window.width);
                 let screenshot_scale = shot_opt.as_ref().map(|(_, _, w, _, original_w, _)| {
-                    original_w.map_or(1.0, |ow| ow as f64 / *w as f64)
+                    element_screenshot_scale(*w, *original_w, logical_frame_width).recip()
                 });
                 let mut published_snapshot = None;
                 let mut refreshed_context = None;
@@ -2384,6 +2446,7 @@ impl Tool for GetWindowStateTool {
                     let local_origin = (!crate::wayland::is_wayland())
                         .then(|| crate::atspi::native::x11_window_origin(xid))
                         .flatten()
+                        .or(gnome_frame_origin)
                         .or_else(|| popup_meta.as_ref().map(|popup| (popup.x, popup.y)));
                     let bounds_by_idx: HashMap<usize, (i32, i32, u32, u32)> = bounds
                         .into_iter()
@@ -2410,7 +2473,11 @@ impl Tool for GetWindowStateTool {
                     // drawable (screen pixels), downsized by delivered/native.
                     let elements = match (local_origin, shot_opt.as_ref()) {
                         (Some((ox, oy)), Some((_, _, w, _, orig_w, _))) => {
-                            let scale = orig_w.map_or(1.0, |ow| *w as f64 / ow as f64);
+                            // GNOME frame/AT-SPI units are logical, while the
+                            // actor capture includes resource scale AND resize.
+                            // Use the same logical action frame as capture input,
+                            // not merely delivered/original PNG (resize-only).
+                            let scale = element_screenshot_scale(*w, *orig_w, logical_frame_width);
                             cua_driver_core::element_frame::with_screenshot_frames(
                                 elements,
                                 (f64::from(ox), f64::from(oy)),
@@ -2631,6 +2698,10 @@ impl Tool for GetWindowStateTool {
                     structured["screenshot_width"] = json!(w);
                     structured["screenshot_height"] = json!(h);
                     structured["screenshot_frame_valid"] = json!(true);
+                    // State the actual capture ratio even at 1x. Consumers must
+                    // not infer image scaling from element extents: offscreen
+                    // controls and CSD buffer margins are not image dimensions.
+                    structured["frame_scale"] = json!(1.0);
                     if let Some(ow) = orig_w {
                         if ow > 0 {
                             structured["frame_scale"] = json!(w as f64 / ow as f64);
@@ -2689,9 +2760,11 @@ impl Tool for GetWindowStateTool {
                 structured["frame_note"] = json!(
                     "x/y for click / double_click / right_click / drag / scroll on this \
                      window are pixels of THIS screenshot (window-local, 0..screenshot_width \
-                     x 0..screenshot_height), as are the element frames; the screenshot is \
-                     kept at or below 1.15 megapixels so the image you read is the image these \
-                     pixels index (frame_scale < 1 says the window was downsized to it). \
+                     x 0..screenshot_height), as are the element screenshot_frame values. \
+                     Element frame values are screen coordinates, not screenshot pixels. \
+                     The screenshot is kept at or below 1.15 megapixels so the image you read \
+                     is the image these pixels index (frame_scale < 1 says the window was \
+                     downsized to it). \
                      window_bounds is where it sits on the screen. Pass scope:\"desktop\" only \
                      for get_desktop_state pixels."
                 );

@@ -23,7 +23,7 @@ import {
 
 Gio._promisify(Shell.Screenshot, 'composite_to_stream');
 
-const HELPER_API_VERSION = 15;
+const HELPER_API_VERSION = 16;
 const EXACT_TARGET_PROTOCOL_VERSION = 4;
 const FOREGROUND_TIMEOUT_MS = 30_000;
 const CURSOR_IDLE_TIMEOUT_US = 5 * 60 * 1_000_000;
@@ -1163,6 +1163,10 @@ export default class WinRectsExtension extends Extension {
                 h: r.height,
                 buffer_x: buffer.x,
                 buffer_y: buffer.y,
+                // Screen extents from native Wayland toolkits can actually be
+                // surface-local. Let clients distinguish them from XWayland's
+                // genuine screen coordinates without guessing from the PID.
+                client_type: w.get_client_type() === Meta.WindowClientType.WAYLAND ? 'wayland' : 'x11',
                 focused: focusedWindow === w,
                 minimized,
                 visible: paintedVisible,

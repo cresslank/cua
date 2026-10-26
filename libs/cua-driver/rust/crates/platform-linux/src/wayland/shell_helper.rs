@@ -406,6 +406,7 @@ struct ShellWindow {
     y: i32,
     buffer_x: i32,
     buffer_y: i32,
+    native_wayland: bool,
     width: u32,
     height: u32,
     visible: bool,
@@ -983,6 +984,29 @@ pub fn window_origin(pid: u32, window_id: u64) -> Option<(i32, i32)> {
     select_window_origin(&read_shell_windows()?, pid, window_id)
 }
 
+/// Authoritative origins for an exact native Wayland client: (buffer, frame).
+/// Missing/old client-type metadata does not attest native coordinates. In
+/// particular, never apply this reconstruction to XWayland Screen extents.
+pub fn native_window_origins(pid: u32, window_id: u64) -> Option<((i32, i32), (i32, i32))> {
+    select_native_window_origins(&read_shell_windows()?, pid, window_id)
+}
+
+fn select_native_window_origins(
+    windows: &[ShellWindow],
+    pid: u32,
+    window_id: u64,
+) -> Option<((i32, i32), (i32, i32))> {
+    if window_id == 0 {
+        return None;
+    }
+    let mut matches = windows.iter().filter(|window| {
+        window.pid == pid && (window.public_id == window_id || window.native_id == window_id)
+    });
+    let window = matches.next()?;
+    (matches.next().is_none() && window.native_wayland)
+        .then_some(((window.buffer_x, window.buffer_y), (window.x, window.y)))
+}
+
 fn select_window_origin(windows: &[ShellWindow], pid: u32, window_id: u64) -> Option<(i32, i32)> {
     let mut matches = windows.iter().filter(|window| {
         window.pid == pid
@@ -1458,6 +1482,20 @@ fn parse_shell_windows(raw: &str) -> Option<Vec<ShellWindow>> {
             y,
             buffer_x,
             buffer_y,
+            native_wayland: window
+                .get("client_type")
+                .and_then(serde_json::Value::as_str)
+                == Some("wayland")
+                && window
+                    .get("buffer_x")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .is_some()
+                && window
+                    .get("buffer_y")
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(|value| i32::try_from(value).ok())
+                    .is_some(),
             width,
             height,
             visible: window
@@ -1943,6 +1981,82 @@ mod tests {
     }
 
     #[test]
+    fn native_csd_geometry_requires_exact_native_client_metadata() {
+        let row = serde_json::json!({
+            "id": 46, "target_id": "epoch-a:46", "helper_epoch": "epoch-a",
+            "protocol_version": 4, "pid": 6079, "title": "GTK",
+            "x": 280, "y": 138, "buffer_x": 254, "buffer_y": 115,
+            "w": 720, "h": 557, "client_type": "wayland"
+        });
+        let parse = |rows: Vec<serde_json::Value>| {
+            parse_shell_windows(&serde_json::to_string(&rows).unwrap()).unwrap()
+        };
+        let windows = parse(vec![row.clone()]);
+        let id = windows[0].public_id;
+        assert_eq!(
+            select_native_window_origins(&windows, 6079, id),
+            Some(((254, 115), (280, 138)))
+        );
+        assert_eq!(
+            select_native_window_origins(&windows, 6079, 46),
+            Some(((254, 115), (280, 138)))
+        );
+        assert_eq!(select_native_window_origins(&windows, 6079, 0), None);
+        assert_eq!(select_native_window_origins(&windows, 6080, id), None);
+        assert_eq!(select_native_window_origins(&windows, 6079, 47), None);
+        assert_eq!(
+            select_native_window_origins(&parse(vec![row.clone(), row.clone()]), 6079, id),
+            None
+        );
+        for client in [
+            serde_json::Value::Null,
+            serde_json::json!("x11"),
+            serde_json::json!("unknown"),
+        ] {
+            let mut other = row.clone();
+            other["client_type"] = client;
+            assert_eq!(
+                select_native_window_origins(&parse(vec![other]), 6079, id),
+                None
+            );
+        }
+        let mut old = row.clone();
+        old.as_object_mut().unwrap().remove("client_type");
+        assert_eq!(
+            select_native_window_origins(&parse(vec![old]), 6079, id),
+            None
+        );
+        for field in ["buffer_x", "buffer_y"] {
+            for value in [
+                serde_json::Value::Null,
+                serde_json::json!("254"),
+                serde_json::json!(i64::MAX),
+            ] {
+                let mut malformed = row.clone();
+                malformed[field] = value;
+                assert_eq!(
+                    select_native_window_origins(&parse(vec![malformed]), 6079, id),
+                    None
+                );
+            }
+            let mut missing = row.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert_eq!(
+                select_native_window_origins(&parse(vec![missing]), 6079, id),
+                None
+            );
+        }
+        // Tiling/maximizing removes the CSD shadow inset, not the screen origin.
+        let mut tiled = row;
+        tiled["buffer_x"] = serde_json::json!(280);
+        tiled["buffer_y"] = serde_json::json!(138);
+        assert_eq!(
+            select_native_window_origins(&parse(vec![tiled]), 6079, id),
+            Some(((280, 138), (280, 138)))
+        );
+    }
+
+    #[test]
     fn helper_epoch_changes_public_window_identity() {
         assert_ne!(
             public_window_id("epoch-a:46"),
@@ -2062,7 +2176,7 @@ mod tests {
     #[test]
     fn bundled_helper_v15_preserves_host_owned_modifier_badge_chips() {
         assert!(EXTENSION_SOURCE.contains("GetVersion()"));
-        assert!(EXTENSION_SOURCE.contains("const HELPER_API_VERSION = 15;"));
+        assert!(EXTENSION_SOURCE.contains("const HELPER_API_VERSION = 16;"));
         assert!(EXTENSION_SOURCE.contains("return HELPER_API_VERSION;"));
         assert!(EXTENSION_SOURCE.contains("SetCursorState"));
         assert!(EXTENSION_SOURCE.contains("SetCursorColor"));
@@ -2089,7 +2203,7 @@ mod tests {
         assert!(!EXTENSION_SOURCE.contains("function drawModifiers"));
         let metadata: serde_json::Value =
             serde_json::from_str(EXTENSION_METADATA).expect("valid bundled helper metadata");
-        assert_eq!(metadata["version"], 15);
+        assert_eq!(metadata["version"], 16);
 
         for action in [
             "idle", "observe", "click", "drag", "scroll", "text", "key", "navigate", "app",
