@@ -9,7 +9,7 @@ normal Wayland client cannot do these things globally.
 
 It exposes `org.cua.WinRects` on the session bus:
 
-- `GetVersion() -> uint`: this fork's helper API version (v15, with the v8
+- `GetVersion() -> uint`: this fork's helper API version (v16, with the v8
   semantic cursor/session-badge API). The driver accepts it only after resolving
   the helper's immutable D-Bus owner and proving that owner is the current
   user's system-installed `gnome-shell` process.
@@ -139,6 +139,31 @@ MCP capture errors remain `tool_invocation_failed` with the specific reason in
 text. The downstream Hermes cua-jev plugin has no branch keyed on either code,
 so no compatibility follow-up is required there.
 
+## Native element coordinates (v16)
+
+`GetRects.client_type` explicitly distinguishes native Wayland from XWayland.
+For an exact native target, the driver uses `CoordType::Window` plus the buffer
+origin even when GTK3 labels its surface-local coordinates as `Screen`. GTK4
+instead reports widget-root Window coordinates: its attested application toolkit
+metadata selects the frame origin rather than adding the surface shadow twice.
+The same origin is used for snapshot, retained-object, and point-action bounds.
+Public `elements[].frame` remains in screen coordinates; `screenshot_frame` subtracts
+Mutter's frame origin and applies delivered pixels per logical frame unit,
+including compositor resource scale and image resizing. For a floating GTK CSD
+window this starts from `window_xy + buffer_origin - frame_origin` for GTK3.
+The actual current origins are used in every window state: maximization can
+remove the inset, while some GTK3 half-tiled surfaces retain a smaller buffer
+margin. Equal origins naturally produce zero correction. The driver reports `frame_scale: 1`
+when no image resize occurred. Element extents are not a scale measurement:
+offscreen controls and shadows can extend beyond a screenshot at 1x.
+
+The coordinate correction needs v16 metadata. Older helpers remain accepted for
+existing exact-target operations, but cannot attest this native reconstruction;
+missing/unknown client types, wrong PID/window pairs, and duplicate identities
+never qualify it. XWayland keeps its genuine Screen extents. New helper files
+still require the normal logout/login boundary; this change does not reload the
+live Shell or grant background native input.
+
 ## Other compositors
 
 wlroots compositors such as Sway and labwc do not need this helper: cua-driver
@@ -150,7 +175,7 @@ because RemoteDesktop/libei input is global to the compositor focus.
 ## Versions and other apps that bundle the helper
 
 The UUID `winrects@cua` and session-bus name `org.cua.WinRects` are shared with
-other apps, including T3 Code. This bundle reports helper API 15 in both
+other apps, including T3 Code. This bundle reports helper API 16 in both
 `GetVersion()` and `metadata.json`. Exact-target authority is a separate
 protocol 4 capability contract: a larger API version alone never proves it.
 Legacy global capture/activation requests are refused, and clients must prove

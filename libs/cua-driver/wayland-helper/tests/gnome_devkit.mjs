@@ -1,6 +1,7 @@
 import GdkPixbuf from 'gi://GdkPixbuf';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import Meta from 'gi://Meta';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Scripting from 'resource:///org/gnome/shell/ui/scripting.js';
@@ -226,6 +227,15 @@ export async function run() {
         .map(id => byNativeId.get(id))
         .filter(Boolean);
     assert(fixtureRecords.length === 2, 'helper did not publish exact test-window identities');
+    for (const record of fixtureRecords) {
+        const window = fixtureWindows.get(record.id);
+        const buffer = window.get_buffer_rect();
+        const frame = window.get_frame_rect();
+        const clientType = window.get_client_type() === Meta.WindowClientType.WAYLAND ? 'wayland' : 'x11';
+        assert(record.client_type === clientType, 'helper misidentified native versus XWayland coordinates');
+        assert(record.buffer_x === buffer.x && record.buffer_y === buffer.y, 'helper changed the surface buffer origin');
+        assert(record.x === frame.x && record.y === frame.y, 'helper replaced the capture frame with the buffer');
+    }
     const currentRecords = fixtureRecords.filter(record => record.capture_current);
     assert(
         currentRecords.length === 1,

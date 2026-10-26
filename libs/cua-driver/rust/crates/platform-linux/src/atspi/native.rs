@@ -5393,6 +5393,11 @@ pub fn perform_action_at_screen_point(
             let offset = bounded_blocking(move || window_to_screen_offset(pid, xid, None))
                 .await
                 .flatten();
+            let offset = if let Some(node) = visited.first() {
+                refine_gnome_toolkit_origin(conn.connection(), &node.acc, pid, xid, offset).await
+            } else {
+                offset
+            };
             let coord = if offset.is_some() {
                 CoordType::Window
             } else {
@@ -5948,9 +5953,17 @@ pub fn get_verified_element_bounds_by_key(
                 .component()
                 .await
                 .map_err(|error| anyhow!("Component unavailable: {error}"))?;
-            match bounded_blocking(move || window_to_screen_offset(pid, window_id, None))
+            let offset = bounded_blocking(move || window_to_screen_offset(pid, window_id, None))
                 .await
-                .flatten()
+                .flatten();
+            match refine_gnome_toolkit_origin(
+                conn.connection(),
+                &target.acc,
+                pid,
+                window_id,
+                offset,
+            )
+            .await
             {
                 Some((offset_x, offset_y)) => {
                     let (x, y, width, height) = component
@@ -6032,16 +6045,78 @@ fn screen_answer_overrides_window(
     !native_origin_attested && screen_extents_trusted(raw, display)
 }
 
-/// True only when the Hyprland compositor identifies this exact client
-/// (nonzero address `xid` AND `pid`) as native Wayland, not XWayland. Missing,
-/// mismatched, or unreported clients fail closed, so `Screen` extents keep
-/// winning, which is correct for XWayland GTK and LibreOffice. Performs
-/// blocking compositor IPC: async callers must use `bounded_blocking`.
+/// True only when compositor-owned metadata identifies this exact client
+/// (nonzero `xid` AND `pid`) as native Wayland, not XWayland. GNOME additionally
+/// publishes buffer and frame origins to account for floating CSD shadows.
+/// Missing, mismatched, or unreported clients are not attested, so true XWayland
+/// Screen extents keep winning. Async callers must use `bounded_blocking`.
 fn native_wayland_origin_attested(pid: u32, xid: u64) -> bool {
     xid != 0
         && crate::wayland::is_wayland()
-        && crate::wayland::hyprland::is_session()
-        && crate::wayland::hyprland::native_client_attested(xid, pid)
+        && (if crate::wayland::hyprland::is_session() {
+            crate::wayland::hyprland::native_client_attested(xid, pid)
+        } else {
+            crate::wayland::shell_helper::native_window_origins(pid, xid).is_some()
+        })
+}
+
+async fn refine_gnome_toolkit_origin(
+    conn: &atspi::zbus::Connection,
+    acc: &AccessibleProxy<'_>,
+    pid: u32,
+    xid: u64,
+    offset: Option<(i32, i32)>,
+) -> Option<(i32, i32)> {
+    if xid == 0 || !crate::wayland::is_wayland() {
+        return offset;
+    }
+    let Some((_, frame_origin)) =
+        bounded_blocking(move || crate::wayland::shell_helper::native_window_origins(pid, xid))
+            .await
+            .flatten()
+    else {
+        return offset;
+    };
+    // GTK3 Window coordinates include the CSD surface shadow; GTK4 Window
+    // coordinates are widget-root coordinates and exclude that surface inset.
+    // Query the actual application's toolkit, never infer it from a PID/title.
+    let Some(Ok(application)) = call(acc.get_application()).await else {
+        return offset;
+    };
+    let Some(destination) = application.name() else {
+        return offset;
+    };
+    if destination.as_str() != acc.inner().destination().as_str() {
+        return offset;
+    }
+    if !sandbox_gate_allows(conn, destination.as_str()).await {
+        return offset;
+    }
+    let Ok(builder) = atspi::proxy::application::ApplicationProxy::builder(conn)
+        .destination(destination.as_str())
+        .and_then(|builder| builder.path(application.path().as_str()))
+    else {
+        return offset;
+    };
+    let Ok(proxy) = builder
+        .cache_properties(atspi::zbus::proxy::CacheProperties::No)
+        .build()
+        .await
+    else {
+        return offset;
+    };
+    let toolkit = call(proxy.toolkit_name()).await.and_then(Result::ok);
+    let version = call(proxy.version()).await.and_then(Result::ok);
+    if gtk4_uses_frame_origin(toolkit.as_deref(), version.as_deref()) {
+        Some(frame_origin)
+    } else {
+        offset
+    }
+}
+
+fn gtk4_uses_frame_origin(toolkit: Option<&str>, version: Option<&str>) -> bool {
+    toolkit.is_some_and(|name| name.eq_ignore_ascii_case("gtk"))
+        && version.is_some_and(|version| version.starts_with("4."))
 }
 
 pub(crate) fn x11_window_origin(xid: u64) -> Option<(i32, i32)> {
@@ -6774,6 +6849,12 @@ async fn element_bounds_for_visited_with_completeness(
         bounded_blocking(move || window_to_screen_offset(pid, xid, window_title_owned.as_deref()))
             .await
             .flatten();
+    let offset = if let Some(node) = visited.first() {
+        refine_gnome_toolkit_origin(node.acc.inner().connection(), &node.acc, pid, xid, offset)
+            .await
+    } else {
+        offset
+    };
     if crate::wayland::is_wayland()
         && crate::wayland::hyprland::is_session()
         && (offset.is_none() || scoped_frame.is_none())
@@ -7031,6 +7112,20 @@ mod screen_extents_tests {
 #[cfg(test)]
 mod screen_override_tests {
     use super::{project_screen_extents, screen_answer_overrides_window};
+
+    #[test]
+    fn gtk4_root_coordinates_exclude_the_gtk3_surface_shadow() {
+        assert!(super::gtk4_uses_frame_origin(Some("GTK"), Some("4.22.5")));
+        for (toolkit, version) in [
+            (Some("gtk"), Some("3.24.52")),
+            (Some("WebKitGTK"), Some("4.1")),
+            (Some("gtk"), Some("40.0")),
+            (Some("gtk"), None),
+            (None, Some("4.22")),
+        ] {
+            assert!(!super::gtk4_uses_frame_origin(toolkit, version));
+        }
+    }
 
     #[test]
     fn attested_origin_rejects_window_local_screen_answer() {
@@ -8628,6 +8723,8 @@ pub fn element_bounds_ref(
         async {
             let conn = shared_connection().await?;
             let (acc, _) = live_accessible(&conn, object_ref).await?;
+            let offset =
+                refine_gnome_toolkit_origin(conn.connection(), &acc, pid, xid, offset).await;
             let proxies = match call(acc.proxies()).await {
                 Some(Ok(proxies)) => proxies,
                 Some(Err(e)) => return Err(anyhow!("interface proxies unavailable: {e}")),
