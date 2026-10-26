@@ -36,6 +36,8 @@ pub fn screenshot_via_portal() -> anyhow::Result<Vec<u8>> {
 }
 
 fn screenshot_via_portal_blocking() -> anyhow::Result<Vec<u8>> {
+    crate::capture_safety::refuse_gnome_display()?;
+    super::checked_capture_output_dimensions()?;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

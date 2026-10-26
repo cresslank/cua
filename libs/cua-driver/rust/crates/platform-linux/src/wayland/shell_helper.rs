@@ -818,14 +818,24 @@ fn gdbus_call_target(
     transport::call(dest, path, method, args, timeout)
 }
 
+fn require_safe_capture_helper() -> anyhow::Result<()> {
+    if !available()
+        || !capabilities().is_some_and(|reply| {
+            reply
+                .capabilities
+                .iter()
+                .any(|capability| capability == "capture-geometry-safety-v1")
+        })
+    {
+        anyhow::bail!("helper_protocol_mismatch: GNOME capture requires capture-geometry-safety-v1; stage the updated WinRects helper and log out/in; no fallback capture was requested");
+    }
+    Ok(())
+}
+
 /// Capture one exact GNOME target using the rectangle and logical display
 /// dimensions returned by the same Shell transaction as the target-only pixels.
 pub fn screenshot_window(window_id: u64) -> anyhow::Result<Vec<u8>> {
-    if !available() {
-        anyhow::bail!(
-            "helper_protocol_mismatch: exact-target capture requires protocol 4 and API 14"
-        );
-    }
+    require_safe_capture_helper()?;
     let target = resolve_target(window_id).ok_or_else(|| {
         anyhow::anyhow!(
             "stale_target: GNOME window {window_id} belongs to another helper incarnation or no longer exists"
@@ -837,6 +847,7 @@ pub fn screenshot_window(window_id: u64) -> anyhow::Result<Vec<u8>> {
         target.capture_current,
         target.capture_refusal_reason.as_deref(),
     )?;
+    crate::capture_safety::dimensions(f64::from(target.width), f64::from(target.height))?;
     let raw = required_call(
         "CaptureTarget",
         &[gvariant_string(&target.target_id)],
@@ -853,11 +864,15 @@ pub fn screenshot_window_preview(
     pid: u32,
     max_dimension: u32,
 ) -> Option<(Vec<u8>, u32, u32)> {
-    if !(1..=4096).contains(&max_dimension) || !available() {
+    if !(1..=4096).contains(&max_dimension) || require_safe_capture_helper().is_err() {
         return None;
     }
     let target = resolve_target(window_id)?;
-    if target.pid != pid || !target.capture_current {
+    if target.pid != pid
+        || !target.capture_current
+        || crate::capture_safety::dimensions(f64::from(target.width), f64::from(target.height))
+            .is_err()
+    {
         return None;
     }
     let raw = gdbus_call_with_timeout(

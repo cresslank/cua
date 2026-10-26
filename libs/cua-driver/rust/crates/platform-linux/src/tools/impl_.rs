@@ -2224,7 +2224,7 @@ impl Tool for GetWindowStateTool {
             // over this window: listed for the caller, and when one overlaps
             // the window the screenshot is taken from the screen, since the
             // window's own drawable never shows them.
-            let overlays = if crate::wayland::is_wayland() {
+            let overlays = if crate::wayland::is_wayland() || crate::capture_safety::gnome_session() {
                 WindowOverlays::default()
             } else {
                 window_overlays(pid, xid)
@@ -12680,7 +12680,17 @@ impl Tool for GetDesktopStateTool {
                     action_record: None,
                 }
             }
-            Ok(Err(e)) => ToolResult::error(format!("Capture error: {e}")),
+            Ok(Err(e)) => {
+                let text = e.to_string();
+                let mut result = ToolResult::error(format!("Capture error: {text}"));
+                if let Some(code) = ["capture_scope_unsupported", "capture_geometry_invalid"]
+                    .into_iter()
+                    .find(|code| text.starts_with(&format!("{code}:")))
+                {
+                    result = result.with_structured(json!({"code": code, "effect": "refused"}));
+                }
+                result
+            }
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }

@@ -67,6 +67,8 @@ struct CapState {
 /// doesn't expose the protocol — surface a typed anyhow::Error so the
 /// cascade in `screenshot_display_dispatch` can branch.
 pub fn screenshot_via_ext_copy() -> anyhow::Result<Vec<u8>> {
+    crate::capture_safety::refuse_gnome_display()?;
+    super::checked_capture_output_dimensions()?;
     let conn = Connection::connect_to_env()?;
     let mut queue = conn.new_event_queue::<CapState>();
     let qh = queue.handle();

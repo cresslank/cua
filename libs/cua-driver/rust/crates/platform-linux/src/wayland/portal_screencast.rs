@@ -83,6 +83,7 @@ pub fn screenshot_window_via_portal() -> anyhow::Result<Vec<u8>> {
 }
 
 fn screenshot_window_blocking() -> anyhow::Result<Vec<u8>> {
+    crate::capture_safety::refuse_gnome_display()?;
     anyhow::ensure!(
         ENABLED.load(Ordering::Acquire),
         "portal ScreenCast owner is shutting down"

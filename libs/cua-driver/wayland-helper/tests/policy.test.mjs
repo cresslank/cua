@@ -11,6 +11,7 @@ const {
     captureContextIsSafe,
     captureContextRefusalReason,
     captureRectangleIsSafe,
+    captureDimensionsAreSafe,
     foregroundTargetCanActivate,
     foregroundTargetIsSafe,
     rectanglesOverlap,
@@ -23,6 +24,15 @@ const {
     `data:text/javascript;base64,${Buffer.from(policySource).toString('base64')}`
 );
 
+
+test('screenshot dimensions reject zero, subpixel and nonfinite geometry on either axis', () => {
+    for (const [width, height] of [[1, 1], [1920, 1080], [3840, 2160]])
+        assert.equal(captureDimensionsAreSafe(width, height), true);
+    for (const invalid of [0, -1, 0.5, NaN, Infinity, -Infinity, undefined, null]) {
+        assert.equal(captureDimensionsAreSafe(invalid, 1080), false);
+        assert.equal(captureDimensionsAreSafe(1920, invalid), false);
+    }
+});
 
 test('visibility follows Mutter painting, not workspace index or count', () => {
     for (const workspaceIndex of [0, 1, 6, 11, 37]) {

@@ -13,6 +13,7 @@ import {
     captureContextIsSafe,
     captureContextRefusalReason,
     captureRectangleIsSafe,
+    captureDimensionsAreSafe,
     foregroundTargetCanActivate,
     foregroundTargetIsSafe,
     rectanglesOverlap,
@@ -1137,6 +1138,7 @@ export default class WinRectsExtension extends Extension {
                 'workspace-metadata',
                 'target-stage-capture',
                 'atomic-target-capture-v1',
+                'capture-geometry-safety-v1',
                 'keyed-target-cursors',
                 'connection-owned-cursors-v1',
                 'foreground-transaction',
@@ -1275,6 +1277,11 @@ export default class WinRectsExtension extends Extension {
             if (!actor) throw new Error('stale_target: no actor for exact target');
             const buffer = target.get_buffer_rect();
             const scale = actor.get_resource_scale();
+            const [actorWidth, actorHeight] = actor.get_size();
+            if (!captureDimensionsAreSafe(buffer.width, buffer.height)
+                || !captureDimensionsAreSafe(actorWidth, actorHeight)
+                || !Number.isFinite(scale) || scale <= 0)
+                throw new Error('capture_geometry_invalid: window buffer, actor or scale is invalid');
             const content = actor.paint_to_content(null);
             const texture = content?.get_texture();
             if (!texture || !Number.isFinite(scale) || scale <= 0)
@@ -1283,9 +1290,10 @@ export default class WinRectsExtension extends Extension {
             const y = Math.round((frame.y - buffer.y) * scale);
             const pixelWidth = Math.round(frame.width * scale);
             const pixelHeight = Math.round(frame.height * scale);
-            if (x < 0 || y < 0 || pixelWidth <= 0 || pixelHeight <= 0 ||
-                x + pixelWidth > texture.get_width() || y + pixelHeight > texture.get_height())
-              throw new Error('Window content does not match its frame');
+            if (!captureRectangleIsSafe(
+                {x, y, width: pixelWidth, height: pixelHeight},
+                {displayWidth: texture.get_width(), displayHeight: texture.get_height()}))
+              throw new Error('capture_geometry_invalid: window content does not match its frame');
             stream = Gio.MemoryOutputStream.new_resizable();
             let captureTexture = texture;
             let captureX = x, captureY = y, captureWidth = pixelWidth, captureHeight = pixelHeight;
@@ -1308,6 +1316,8 @@ export default class WinRectsExtension extends Extension {
               captureX = 0;
               captureY = 0;
             }
+            if (!captureDimensionsAreSafe(captureWidth, captureHeight))
+                throw new Error('capture_geometry_invalid: refusing empty composite screenshot');
             await Shell.Screenshot.composite_to_stream(
               captureTexture, captureX, captureY, captureWidth, captureHeight, 1, null, 0, 0, 1, stream);
             if (this._resolveTarget(targetId) !== target)

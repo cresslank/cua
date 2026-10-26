@@ -1212,6 +1212,7 @@ fn correlated_toplevel_windows(
 /// screencopy manager or `wl_shm` is unavailable so users on lighter wlroots
 /// builds stay supported.
 pub fn screenshot_bytes() -> anyhow::Result<Vec<u8>> {
+    crate::capture_safety::refuse_gnome_display()?;
     match capture_via_screencopy() {
         Ok(bytes) => return Ok(bytes),
         Err(e) => tracing::warn!("native screencopy failed, falling back to grim: {e}"),
@@ -1222,6 +1223,8 @@ pub fn screenshot_bytes() -> anyhow::Result<Vec<u8>> {
 /// Shell out to `grim -t png -` — the wlroots reference screenshot tool. Kept
 /// as the last-resort fallback for compositors that hide screencopy.
 fn capture_via_grim() -> anyhow::Result<Vec<u8>> {
+    crate::capture_safety::refuse_gnome_display()?;
+    checked_capture_output_dimensions()?;
     let out = std::process::Command::new("grim")
         .args(["-t", "png", "-"])
         .output()?;
@@ -1260,6 +1263,7 @@ fn capture_via_screencopy() -> anyhow::Result<Vec<u8>> {
         .clone()
         .ok_or_else(|| anyhow::anyhow!("compositor exposed no wl_output to capture"))?;
 
+    crate::capture_safety::dimensions(f64::from(state.output_w), f64::from(state.output_h))?;
     let frame = manager.capture_output(0, &output, &qh, ());
     // Drain Buffer / Flags events; spin until Ready or Failed (or timeout).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -1278,11 +1282,15 @@ fn capture_via_screencopy() -> anyhow::Result<Vec<u8>> {
             break;
         }
         // Once we know the buffer params, allocate + send copy exactly once.
-        if let Some(fmt_raw) = state
-            .capture
-            .format
-            .filter(|_| buffer.is_none() && state.capture.stride > 0 && state.capture.height > 0)
-        {
+        if let Some(fmt_raw) = state.capture.format.filter(|_| buffer.is_none()) {
+            crate::capture_safety::dimensions(
+                f64::from(state.capture.width),
+                f64::from(state.capture.height),
+            )?;
+            anyhow::ensure!(
+                state.capture.stride > 0,
+                "capture_geometry_invalid: zero screencopy stride"
+            );
             let size = (state.capture.stride as usize)
                 .checked_mul(state.capture.height as usize)
                 .ok_or_else(|| anyhow::anyhow!("screencopy buffer size overflow"))?;
@@ -1570,7 +1578,7 @@ pub fn screenshot_dispatch_with_pid(xid: u64, pid: u32) -> anyhow::Result<Vec<u8
 }
 
 fn screenshot_dispatch_for_pid(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec<u8>> {
-    if !is_wayland() {
+    if !is_wayland() && !crate::capture_safety::gnome_session() {
         return crate::capture::screenshot_window_bytes(xid);
     }
 
@@ -1612,6 +1620,9 @@ fn screenshot_dispatch_for_pid(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec
         return shell_helper::screenshot_window(xid);
     }
 
+    if crate::capture_safety::gnome_session() {
+        anyhow::bail!("helper_unavailable: GNOME window capture requires a compatible WinRects helper; output, grim, portal and XWayland fallbacks are disabled");
+    }
     screenshot_window_bytes_with_dispatch(
         true,
         xid,
@@ -1737,14 +1748,12 @@ fn physical_crop_geometry(
     )
 }
 
-/// Display-level capture dispatcher. Cascade:
-/// 1. Native Wayland on wlroots: zwlr_screencopy_manager_v1 (fast, zero
-///    consent).
-/// 2. Wayland but no wlroots screencopy globals (GNOME/KDE/COSMIC):
-///    xdg-desktop-portal Screenshot via ashpd. Triggers consent prompt
-///    on first use per session.
-/// 3. X11: existing root-window path.
+/// Display-level capture dispatcher. GNOME refuses whole-screen scope before
+/// opening any capture backend: WinRects only qualifies exact-window pixels.
+/// Other Wayland compositors keep native screencopy → grim → ext-copy → portal
+/// → X11 recovery; X11 keeps its existing root-window path.
 pub fn screenshot_display_dispatch() -> anyhow::Result<Vec<u8>> {
+    crate::capture_safety::refuse_gnome_display()?;
     if is_wayland() && hyprland::is_session() {
         // The desktop action frame spans every powered output. The cascade
         // below copies only the first output, so a multi-monitor layout is
@@ -2734,6 +2743,20 @@ pub fn with_target_foreground<T>(
         "foreground_unavailable: no trusted Wayland compositor adapter can confirm exact \
          target window {window_id} for pid {pid}; no global keyboard input was sent"
     )
+}
+
+pub(super) fn checked_capture_output_dimensions() -> anyhow::Result<(u32, u32)> {
+    let conn = Connection::connect_to_env()?;
+    let mut queue = conn.new_event_queue::<State>();
+    let qh = queue.handle();
+    conn.display().get_registry(&qh, ());
+    let mut state = State::default();
+    queue.roundtrip(&mut state)?;
+    for _ in 0..4 {
+        queue.roundtrip(&mut state)?;
+    }
+    crate::capture_safety::dimensions(f64::from(state.output_w), f64::from(state.output_h))?;
+    Ok((state.output_w, state.output_h))
 }
 
 /// Query the first `wl_output`'s pixel dimensions via a short Wayland
