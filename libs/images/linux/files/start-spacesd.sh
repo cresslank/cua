@@ -36,7 +36,8 @@
 # CUA_SPACESD_BIN/_ARGS fall back to the older CUA_GUESTD_* and
 # CUA_ENV_DRIVER_* spellings.
 set -euo pipefail
-. /opt/cua/bin/env-token-mode.sh
+# shellcheck source=env-token-mode.sh
+. "$(dirname "$0")/env-token-mode.sh"
 BIN="${CUA_SPACESD_BIN:-${CUA_GUESTD_BIN:-${CUA_ENV_DRIVER_BIN:-/usr/local/bin/cua-spacesd}}}"
 CUA_SPACESD_ARGS="${CUA_SPACESD_ARGS:-${CUA_GUESTD_ARGS:-${CUA_ENV_DRIVER_ARGS:-}}}"
 if [ -z "$CUA_SPACESD_ARGS" ] && [ -n "${CUA_ENV_RELAY_URL:-${CUA_SPACESD_RELAY_URL:-}}" ]; then
@@ -82,11 +83,35 @@ else
 fi
 
 ENV_FILE="${CUA_DESKTOP_RUNTIME_DIR:-/run/cua-desktop}/desktop.env"
-for _ in $(seq 1 60); do
-    [ -r "$ENV_FILE" ] && break
+# Docker can retain desktop.env and even a dead bus socket across restarts.
+# Require a reply from the session bus named by the file, not just its presence,
+# before constructing desktop services. A failed startup is retried by init;
+# launching anyway can strand spacesd in core-only mode for the whole boot.
+desktop_ready() {
+    [ -r "$ENV_FILE" ] || return 1
+    (
+        unset DBUS_SESSION_BUS_ADDRESS
+        # shellcheck disable=SC1090
+        . "$ENV_FILE"
+        [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || exit 1
+        # reply-timeout alone does not bound D-Bus connection/authentication.
+        timeout 2s dbus-send --bus="$DBUS_SESSION_BUS_ADDRESS" \
+            --type=method_call --print-reply --reply-timeout=1000 \
+            --dest=org.freedesktop.DBus / org.freedesktop.DBus.GetId >/dev/null 2>&1
+    )
+}
+deadline=$((SECONDS + 60))
+until desktop_ready; do
+    if [ "$SECONDS" -ge "$deadline" ]; then
+        echo "[$(date -Iseconds)] desktop session not ready after 60s; refusing to start"
+        exit 1
+    fi
     sleep 1
 done
-if [ -r "$ENV_FILE" ]; then set -a; . "$ENV_FILE"; set +a; else export DISPLAY="${CUA_DISPLAY:-:1}"; fi
+set -a
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+set +a
 
 echo "[$(date -Iseconds)] starting $BIN on 0.0.0.0:$CUA_ENV_PORT (DISPLAY=$DISPLAY, $token_desc)"
 # shellcheck disable=SC2086  # CUA_SPACESD_ARGS is a flag list
