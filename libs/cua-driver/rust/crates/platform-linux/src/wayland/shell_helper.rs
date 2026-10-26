@@ -411,6 +411,7 @@ struct ShellWindow {
     height: u32,
     visible: bool,
     capture_current: bool,
+    capture_refusal_reason: Option<String>,
     minimized: bool,
     z_index: Option<usize>,
     workspace_index: Option<i32>,
@@ -476,12 +477,12 @@ pub struct ForegroundTerminalOutcome {
 impl ForegroundTransaction {
     pub fn validate(&self) -> anyhow::Result<()> {
         cua_driver_core::blocking::check_cancelled()?;
-        let raw = gdbus_call_with_timeout(
+        let raw = required_call(
             "ValidateForeground",
             &[gvariant_string(&self.token)],
             Duration::from_secs(2),
-        )
-        .ok_or_else(|| anyhow::anyhow!("foreground_unavailable: validation timed out"))?;
+            "foreground_unavailable",
+        )?;
         let payload = extract_json_object(&raw)
             .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
             .ok_or_else(|| {
@@ -503,12 +504,12 @@ impl ForegroundTransaction {
     pub fn commit(mut self) -> anyhow::Result<()> {
         let token = std::mem::take(&mut self.token);
         set_pending_foreground(Some(token.clone()));
-        let raw = gdbus_call_with_timeout(
+        let raw = required_call(
             "CommitForeground",
             &[gvariant_string(&token)],
             Duration::from_secs(2),
-        )
-        .ok_or_else(|| anyhow::anyhow!("foreground_unavailable: commit timed out"))?;
+            "foreground_unavailable",
+        )?;
         let committed = extract_json_object(&raw)
             .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
             .and_then(|value| value.get("committed").and_then(serde_json::Value::as_bool))
@@ -647,6 +648,23 @@ fn gdbus_call(method: &str, args: &[String]) -> Option<String> {
 fn gdbus_call_with_timeout(method: &str, args: &[String], timeout: Duration) -> Option<String> {
     let owner = shell_owner(false)?;
     gdbus_call_target(&owner, PATH, &format!("{IFACE}.{method}"), args, timeout)
+}
+
+fn required_call(
+    method: &str,
+    args: &[String],
+    timeout: Duration,
+    refusal_code: &str,
+) -> anyhow::Result<String> {
+    let owner = shell_owner(false).ok_or_else(|| {
+        anyhow::anyhow!("{refusal_code}: GNOME {method} unavailable: no trusted WinRects owner")
+    })?;
+    transport::call_result(&owner, PATH, &format!("{IFACE}.{method}"), args, timeout)
+        .map_err(|error| required_call_error(refusal_code, method, &error))
+}
+
+fn required_call_error(code: &str, method: &str, error: &transport::Failure) -> anyhow::Error {
+    anyhow::anyhow!("{code}: GNOME {method} failed: {error}")
 }
 
 /// Resolve the helper's immutable unique bus name and prove that it is hosted
@@ -813,13 +831,18 @@ pub fn screenshot_window(window_id: u64) -> anyhow::Result<Vec<u8>> {
             "stale_target: GNOME window {window_id} belongs to another helper incarnation or no longer exists"
         )
     })?;
-    require_capture_current(window_id, target.visible, target.capture_current)?;
-    let raw = gdbus_call_with_timeout(
+    require_capture_current(
+        window_id,
+        target.visible,
+        target.capture_current,
+        target.capture_refusal_reason.as_deref(),
+    )?;
+    let raw = required_call(
         "CaptureTarget",
         &[gvariant_string(&target.target_id)],
         Duration::from_secs(5),
-    )
-    .ok_or_else(|| anyhow::anyhow!("GNOME exact-target capture failed for window {window_id}"))?;
+        "tool_invocation_failed",
+    )?;
     decode_capture_payload(&raw, &target.target_id)
 }
 
@@ -1122,24 +1145,27 @@ pub fn begin_foreground(window_id: u64) -> anyhow::Result<ForegroundTransaction>
     let token = new_foreground_token();
     set_pending_foreground(Some(token.clone()));
     let input_deadline = super::foreground_deadline::Scope::begin(Instant::now());
-    let raw = gdbus_call_with_timeout(
+    let raw = required_call(
         "BeginForeground",
         &[gvariant_string(&token), gvariant_string(&target.target_id)],
         Duration::from_secs(2),
+        "foreground_unavailable",
     );
-    let Some(raw) = raw else {
-        let recovery = terminalize_foreground("AbortForeground", &token);
-        if recovery.is_ok() {
-            set_pending_foreground(None);
-        }
-        anyhow::bail!(
-            "foreground_unavailable: GNOME BeginForeground timed out for exact window {window_id}; reconciliation {}",
+    let raw = match raw {
+        Ok(raw) => raw,
+        Err(error) => {
+            let recovery = terminalize_foreground("AbortForeground", &token);
             if recovery.is_ok() {
-                "reached a terminal state"
-            } else {
-                "remains required"
+                set_pending_foreground(None);
             }
-        );
+            anyhow::bail!(
+                "{error}; exact window {window_id}; reconciliation {}",
+                match recovery {
+                    Ok(_) => "reached a terminal state".to_owned(),
+                    Err(error) => format!("remains required ({error})"),
+                }
+            );
+        }
     };
     let payload = extract_json_object(&raw)
         .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
@@ -1172,15 +1198,19 @@ fn require_capture_current(
     window_id: u64,
     visible: bool,
     capture_current: bool,
+    reason: Option<&str>,
 ) -> anyhow::Result<()> {
     if !capture_current {
+        let diagnostic = reason
+            .map(|reason| format!("; reason={reason}"))
+            .unwrap_or_default();
         if visible {
             anyhow::bail!(
-                "capture_occluded: GNOME window {window_id} is painted but unavailable for exact capture (overlap or unsafe Shell context)"
+                "capture_occluded: GNOME window {window_id} is painted but unavailable for exact capture (overlap or unsafe Shell context){diagnostic}"
             );
         }
         anyhow::bail!(
-            "capture_foreground_required: GNOME window {window_id} is not currently painted on the active stage"
+            "capture_foreground_required: GNOME window {window_id} is not currently painted on the active stage{diagnostic}"
         );
     }
     Ok(())
@@ -1266,12 +1296,12 @@ fn wait_for_foreground_activation(
         if remaining.is_zero() {
             anyhow::bail!("bounded focus confirmation timed out ({reason})");
         }
-        let raw = gdbus_call_with_timeout(
+        let raw = required_call(
             "QueryForeground",
             &[gvariant_string(token)],
             remaining.min(Duration::from_millis(100)),
-        )
-        .ok_or_else(|| anyhow::anyhow!("QueryForeground timed out"))?;
+            "foreground_unavailable",
+        )?;
         payload = extract_json_object(&raw)
             .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
             .ok_or_else(|| anyhow::anyhow!("invalid QueryForeground response"))?;
@@ -1312,8 +1342,12 @@ fn terminalize_foreground(method: &str, token: &str) -> anyhow::Result<Foregroun
     if token.is_empty() {
         anyhow::bail!("foreground_recovery_required: missing transaction ID");
     }
-    let raw = gdbus_call_with_timeout(method, &[gvariant_string(token)], Duration::from_secs(2))
-        .ok_or_else(|| anyhow::anyhow!("foreground_recovery_required: {method} timed out"))?;
+    let raw = required_call(
+        method,
+        &[gvariant_string(token)],
+        Duration::from_secs(2),
+        "foreground_recovery_required",
+    )?;
     parse_foreground_outcome(&raw)
 }
 
@@ -1322,12 +1356,12 @@ pub fn reconcile_orphaned_foreground() -> anyhow::Result<()> {
         .lock()
         .ok()
         .and_then(|pending| pending.clone());
-    let raw = gdbus_call_with_timeout(
+    let raw = required_call(
         "QueryForeground",
         &[gvariant_string(local_pending.as_deref().unwrap_or(""))],
         Duration::from_secs(2),
-    )
-    .ok_or_else(|| anyhow::anyhow!("foreground_recovery_required: QueryForeground timed out"))?;
+        "foreground_recovery_required",
+    )?;
     let payload = extract_json_object(&raw)
         .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
         .ok_or_else(|| {
@@ -1506,6 +1540,10 @@ fn parse_shell_windows(raw: &str) -> Option<Vec<ShellWindow>> {
                 .get("capture_current")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false),
+            capture_refusal_reason: window
+                .get("capture_refusal_reason")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned),
             minimized: window
                 .get("minimized")
                 .and_then(serde_json::Value::as_bool)
@@ -1669,15 +1707,41 @@ mod tests {
 
     #[test]
     fn capture_readiness_distinguishes_covered_from_unpainted() {
-        assert!(require_capture_current(7, true, true).is_ok());
-        assert!(require_capture_current(7, true, false)
+        assert!(require_capture_current(7, true, true, None).is_ok());
+        assert!(require_capture_current(7, true, false, None)
             .unwrap_err()
             .to_string()
             .starts_with("capture_occluded:"));
-        assert!(require_capture_current(7, false, false)
+        assert!(require_capture_current(7, false, false, None)
             .unwrap_err()
             .to_string()
             .starts_with("capture_foreground_required:"));
+        for reason in [
+            "overview_visible",
+            "session_locked",
+            "shell_modal_grab",
+            "shell_key_focus",
+            "minimized",
+            "off_workspace",
+            "modal_child",
+        ] {
+            for (visible, code) in [
+                (true, "capture_occluded"),
+                (false, "capture_foreground_required"),
+            ] {
+                let error = require_capture_current(7, visible, false, Some(reason))
+                    .unwrap_err()
+                    .to_string();
+                assert!(error.starts_with(&format!("{code}:")), "{error}");
+                assert!(error.ends_with(&format!("; reason={reason}")), "{error}");
+            }
+        }
+        let raw = r#"[{"protocol_version":4,"id":7,"helper_epoch":"epoch","target_id":"epoch:7","pid":41,"x":0,"y":0,"w":200,"h":100,"capture_refusal_reason":"shell_key_focus"}]"#;
+        let row = parse_shell_windows(raw).unwrap().remove(0);
+        assert_eq!(
+            row.capture_refusal_reason.as_deref(),
+            Some("shell_key_focus")
+        );
     }
 
     #[test]

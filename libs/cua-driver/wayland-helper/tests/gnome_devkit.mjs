@@ -2,6 +2,7 @@ import GdkPixbuf from 'gi://GdkPixbuf';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import Meta from 'gi://Meta';
+import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Scripting from 'resource:///org/gnome/shell/ui/scripting.js';
@@ -212,6 +213,7 @@ export async function run() {
         'atomic-target-capture-v1',
         'connection-owned-cursors-v1',
         'foreground-reconcile-v1',
+        'refusal-reasons-v1',
     ]) {
         assert(capabilities.capabilities.includes(capability), `missing ${capability}`);
     }
@@ -276,6 +278,65 @@ export async function run() {
         'stale_target'
     );
     print('Milestone A: exact target capture and occlusion proof PASS');
+
+    async function expectBlockedContext(reason) {
+        const focus = global.display.focus_window;
+        const keyFocus = global.stage.get_key_focus();
+        await expectRefusal('BeginForeground', new GLib.Variant('(ss)', [
+            `cua-fg-reason-${reason}-0001`, top.target_id,
+        ]), `org.cua.WinRects.TargetNotActivatable: target_not_activatable: reason=${reason}`);
+        await expectRefusal('CaptureTarget', new GLib.Variant('(s)', [top.target_id]), `reason=${reason}`);
+        const [rows] = await call('GetRects', null);
+        const row = JSON.parse(rows).find(record => record.target_id === top.target_id);
+        assert(row.capture_current === false && row.capture_refusal_reason === reason,
+            `discovery lost exact refusal reason ${reason}: ${JSON.stringify(row)}`);
+        const [query] = await call('QueryForeground', new GLib.Variant('(s)', ['']));
+        assert(JSON.parse(query).terminal === true, 'refusal created a foreground transaction');
+        assert(global.display.focus_window === focus && global.stage.get_key_focus() === keyFocus,
+            'refusal dismissed Shell UI or moved focus');
+        print(`REFUSAL-REASON ${reason} PASS`);
+    }
+
+    // Real Shell actor and grab seams on this disposable compositor. No helper
+    // internals are replaced, and the helper must leave the blocking UI alone.
+    const shellUi = new St.Widget({reactive: true, can_focus: true, width: 120, height: 80});
+    Main.uiGroup.add_child(shellUi);
+    let modalGrab = null;
+    try {
+        global.stage.set_key_focus(shellUi);
+        await expectBlockedContext('shell_key_focus');
+        modalGrab = Main.pushModal(shellUi);
+        assert(Main.modalCount > 0, 'fixture did not acquire a real Shell modal grab');
+        await expectBlockedContext('shell_modal_grab');
+    } finally {
+        if (modalGrab)
+            Main.popModal(modalGrab);
+        shellUi.destroy();
+        global.stage.set_key_focus(null);
+    }
+    Main.overview.show();
+    await waitUntil(() => Main.overview.visible, 'fixture overview did not open');
+    try {
+        await expectBlockedContext('overview_visible');
+    } finally {
+        await closeOverview('fixture overview did not retire');
+    }
+    topWindow.minimize();
+    await waitUntil(
+        () => topWindow.minimized && global.display.focus_window !== topWindow
+            && global.stage.get_key_focus() === null,
+        'fixture target did not finish its minimize/focus transition'
+    );
+    try {
+        await expectBlockedContext('minimized');
+    } finally {
+        topWindow.unminimize();
+        windowActor(topWindow).show();
+        topWindow.activate(global.get_current_time());
+        await waitUntil(() => global.display.focus_window === topWindow,
+            'fixture target did not recover after minimizing');
+    }
+    print('Milestone A2: exact native Shell refusal reasons PASS');
 
     const firstTransaction = 'cua-fg-devkit-first-0001';
     const [beginJson] = await call(
@@ -371,6 +432,7 @@ export async function run() {
         new GLib.Variant('(s)', [top.target_id]),
         'capture_foreground_required'
     );
+    await expectBlockedContext('off_workspace');
     print('Milestone C: target-bound cursor and inactive-workspace refusal PASS');
 
     await Scripting.destroyTestWindows();

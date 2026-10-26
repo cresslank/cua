@@ -57,6 +57,20 @@ export function rectanglesEqual(a, b) {
         && a.height === b.height;
 }
 
+// Deterministic diagnostic precedence when several Shell guards are active.
+// The existing boolean policy remains the authority to allow or refuse.
+export function captureContextRefusalReason({overviewVisible, sessionLocked, modalCount, keyFocusInShellUi}) {
+    if (overviewVisible)
+        return 'overview_visible';
+    if (sessionLocked)
+        return 'session_locked';
+    if (Number(modalCount || 0) > 0)
+        return 'shell_modal_grab';
+    if (keyFocusInShellUi)
+        return 'shell_key_focus';
+    return null;
+}
+
 export function captureContextIsSafe({overviewVisible, sessionLocked, shellInputGrabbed}) {
     return !Boolean(overviewVisible)
         && !Boolean(sessionLocked)

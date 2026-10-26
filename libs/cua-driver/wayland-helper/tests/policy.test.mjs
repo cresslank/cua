@@ -9,6 +9,7 @@ const policySource = await readFile(
 const {
     captureAreaIsSafe,
     captureContextIsSafe,
+    captureContextRefusalReason,
     captureRectangleIsSafe,
     foregroundTargetCanActivate,
     foregroundTargetIsSafe,
@@ -173,6 +174,16 @@ test('extension uses an explicit positive area and never implicit stage capture'
 });
 
 test('overview and lock screen make the capture context fail closed', () => {
+    const clear = {overviewVisible: false, sessionLocked: false, modalCount: 0, keyFocusInShellUi: false};
+    assert.equal(captureContextRefusalReason(clear), null);
+    for (const [field, value, reason] of [
+        ['overviewVisible', true, 'overview_visible'],
+        ['sessionLocked', true, 'session_locked'],
+        ['modalCount', 1, 'shell_modal_grab'],
+        ['keyFocusInShellUi', true, 'shell_key_focus'],
+    ])
+        assert.equal(captureContextRefusalReason({...clear, [field]: value}), reason);
+    assert.equal(captureContextRefusalReason({overviewVisible: true, sessionLocked: true, modalCount: 1, keyFocusInShellUi: true}), 'overview_visible');
     assert.equal(captureContextIsSafe({
         overviewVisible: false,
         sessionLocked: false,

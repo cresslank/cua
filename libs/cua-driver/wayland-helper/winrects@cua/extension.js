@@ -11,6 +11,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {
     captureAreaIsSafe,
     captureContextIsSafe,
+    captureContextRefusalReason,
     captureRectangleIsSafe,
     foregroundTargetCanActivate,
     foregroundTargetIsSafe,
@@ -977,6 +978,45 @@ export default class WinRectsExtension extends Extension {
         return false;
     }
 
+    // Diagnostics only: these reasons never authorize activation, dismiss Shell
+    // UI, or replace the compositor-local safety predicates below.
+    _captureContextRefusalReason() {
+        return captureContextRefusalReason({
+            overviewVisible: Main.overview?.visible,
+            sessionLocked: Main.sessionMode?.isLocked,
+            modalCount: Main.modalCount,
+            keyFocusInShellUi: this._keyFocusInShellUi(),
+        });
+    }
+
+    _targetActivationRefusalReason(window) {
+        const contextReason = this._captureContextRefusalReason();
+        if (contextReason)
+            return contextReason;
+        if (!window)
+            return 'stale_target';
+        if (window.minimized)
+            return 'minimized';
+        if (!this._windowOnActiveWorkspace(window))
+            return 'off_workspace';
+        if (!this._windowShowing(window))
+            return 'not_showing';
+        if (this._visibleModalChild(window))
+            return 'modal_child';
+        return null;
+    }
+
+    _targetCaptureRefusalReason(window) {
+        const reason = this._targetActivationRefusalReason(window);
+        if (reason)
+            return reason;
+        if (!this._isTargetPainted(window))
+            return 'not_painted';
+        if (!this._isTargetUnoccluded(window))
+            return 'overlapped';
+        return null;
+    }
+
     _captureContextIsSafe() {
         return captureContextIsSafe({
             overviewVisible: Main.overview?.visible,
@@ -1107,6 +1147,7 @@ export default class WinRectsExtension extends Extension {
                 'trusted-cursor-overlay-v1',
                 'exact-target-activation-v1',
                 'shell-grab-classification-v1',
+                'refusal-reasons-v1',
             ],
         });
     }
@@ -1171,6 +1212,7 @@ export default class WinRectsExtension extends Extension {
                 minimized,
                 visible: paintedVisible,
                 capture_current: captureCurrent,
+                capture_refusal_reason: captureCurrent ? null : this._targetCaptureRefusalReason(w),
                 workspace_index: workspaceIndex,
                 workspace_active: sticky || workspace === activeWorkspace,
                 workspace_count: global.workspace_manager.n_workspaces,
@@ -1206,9 +1248,11 @@ export default class WinRectsExtension extends Extension {
             if (!target)
                 throw new Error('stale_target: target belongs to another helper incarnation or no longer exists');
             if (!this._isTargetVisible(target))
-                throw new Error('capture_foreground_required: target is not currently painted on the GNOME stage');
+                throw new Error('capture_foreground_required: target is not currently painted on the GNOME stage; '
+                    + `reason=${this._targetCaptureRefusalReason(target) ?? 'not_painted'}`);
             if (!this._isTargetUnoccluded(target))
-                throw new Error('capture_occluded: target is overlapped by a higher-stacked window');
+                throw new Error('capture_occluded: target is overlapped by a higher-stacked window; '
+                    + `reason=${this._targetCaptureRefusalReason(target) ?? 'overlapped'}`);
             const [displayWidth, displayHeight] = global.display.get_size();
             const [stageWidth, stageHeight] = global.stage.get_size();
             if (!captureAreaIsSafe({displayWidth, displayHeight, stageWidth, stageHeight}))
@@ -1282,11 +1326,11 @@ export default class WinRectsExtension extends Extension {
             if (!rectanglesEqual(captureRect, currentRect))
                 throw new Error('target_geometry_changed_during_capture');
             if (!this._isTargetVisible(target))
-                throw new Error('capture_context_changed');
+                throw new Error(`capture_context_changed: reason=${this._targetCaptureRefusalReason(target) ?? 'not_painted'}`);
             if (this._visibleModalChild(target))
-                throw new Error('child_modal_appeared_during_capture');
+                throw new Error('child_modal_appeared_during_capture: reason=modal_child');
             if (!this._isTargetUnoccluded(target))
-                throw new Error('target_occluded_during_capture');
+                throw new Error(`target_occluded_during_capture: reason=${this._targetCaptureRefusalReason(target) ?? 'overlapped'}`);
             if (stream.get_data_size() > 32 * 1024 * 1024)
                 throw new Error('Window capture is too large');
             stream.close(null);
@@ -1339,7 +1383,7 @@ export default class WinRectsExtension extends Extension {
         if (!this._canActivateTarget(target)) {
             invocation.return_dbus_error(
                 'org.cua.WinRects.TargetNotActivatable',
-                'target_not_activatable: target is minimized, off-workspace, modal-blocked, or Shell context is unsafe'
+                `target_not_activatable: reason=${this._targetActivationRefusalReason(target) ?? 'activation_unavailable'}`
             );
             return;
         }
