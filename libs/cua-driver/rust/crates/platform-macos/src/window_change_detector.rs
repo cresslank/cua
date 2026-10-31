@@ -81,10 +81,19 @@ pub struct Snapshot {
 pub struct Changes {
     pub new_windows: Vec<WindowEvent>,
     pub foreground_changed: bool,
+    /// Windows the previous action opened after its result had returned.
+    pub earlier_new_windows: Vec<WindowEvent>,
+    /// The previous action made another app frontmost after it returned.
+    pub earlier_foreground_changed: bool,
     /// Whether the post-action window poll ran. `false` when the host bound
     /// skipped it or the poll task was lost: an empty `new_windows` then means
     /// nothing was watched, not that nothing opened.
     pub polled: bool,
+    /// The caller passed `post_action_wait: "none"`: the result did not wait
+    /// for a change, and the watch runs detached (see
+    /// [`cua_driver_core::post_action_wait`]). The result says so instead of
+    /// reporting "no change".
+    pub deferred: bool,
 }
 
 impl Changes {
@@ -92,14 +101,34 @@ impl Changes {
         Self {
             new_windows: Vec::new(),
             foreground_changed: false,
+            earlier_new_windows: Vec::new(),
+            earlier_foreground_changed: false,
             polled: true,
+            deferred: false,
         }
+    }
+
+    fn with_earlier(mut self, earlier: Option<Late>) -> Self {
+        if let Some(late) = earlier {
+            self.earlier_new_windows = late.new_windows;
+            self.earlier_foreground_changed = late.foreground_changed;
+        }
+        self
     }
 
     pub fn not_polled() -> Self {
         Self {
             polled: false,
             ..Self::no_change()
+        }
+    }
+
+    /// The result returned without waiting for a change; the watch went on
+    /// detached.
+    pub fn deferred() -> Self {
+        Self {
+            deferred: true,
+            ..Self::not_polled()
         }
     }
 
@@ -117,40 +146,65 @@ impl Changes {
     /// **verbatim** so MCP callers that key off the suffix wording
     /// don't need a per-binary special case.
     pub fn result_suffix(&self) -> String {
+        let mut suffix = String::new();
+        if !self.earlier_new_windows.is_empty() {
+            suffix.push_str(&format!(
+                "\n\n🪟 After the previous action returned, it opened new window(s): {}.",
+                window_summaries(&self.earlier_new_windows)
+            ));
+        } else if self.earlier_foreground_changed {
+            suffix.push_str(
+                "\n\n🔀 After the previous action returned, a different app became frontmost.",
+            );
+        }
+        if self.deferred {
+            suffix.push_str(DEFERRED_NOTE);
+            return suffix;
+        }
         if !self.needs_restore() {
-            return String::new();
+            return suffix;
         }
 
         if !self.new_windows.is_empty() {
-            // Group by app name (stable order), join titles per app.
-            let mut by_app: std::collections::BTreeMap<&str, Vec<&str>> =
-                std::collections::BTreeMap::new();
-            for w in &self.new_windows {
-                by_app.entry(&w.app_name).or_default().push(&w.title);
-            }
-            let summaries: Vec<String> = by_app
-                .into_iter()
-                .map(|(app, titles)| {
-                    let titles: Vec<String> = titles
-                        .into_iter()
-                        .filter(|t| !t.is_empty())
-                        .map(|t| format!("\"{t}\""))
-                        .collect();
-                    if titles.is_empty() {
-                        app.to_string()
-                    } else {
-                        format!("{app} ({})", titles.join(", "))
-                    }
-                })
-                .collect();
-            format!(
+            suffix.push_str(&format!(
                 "\n\n🪟 Action opened new window(s): {}.",
-                summaries.join("; ")
-            )
+                window_summaries(&self.new_windows)
+            ));
         } else {
-            "\n\n🔀 Action caused a different app to become frontmost.".to_string()
+            suffix.push_str("\n\n🔀 Action caused a different app to become frontmost.");
         }
+        suffix
     }
+}
+
+/// Result suffix for an action whose caller skipped the window-change wait.
+pub(crate) const DEFERRED_NOTE: &str =
+    "\n\n⏭️ Window changes not observed: post_action_wait \"none\" \
+     returned without waiting. A new window or foreground change seen afterwards is reported \
+     on the next action's result.";
+
+/// `App ("Title", …); Other` for a result suffix, grouped by app name.
+fn window_summaries(windows: &[WindowEvent]) -> String {
+    let mut by_app: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    for w in windows {
+        by_app.entry(&w.app_name).or_default().push(&w.title);
+    }
+    by_app
+        .into_iter()
+        .map(|(app, titles)| {
+            let titles: Vec<String> = titles
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .map(|t| format!("\"{t}\""))
+                .collect();
+            if titles.is_empty() {
+                app.to_string()
+            } else {
+                format!("{app} ({})", titles.join(", "))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Returns true when a window belongs to this cua-driver process, including
@@ -398,6 +452,12 @@ impl Snapshot {
             drop(self);
             return Changes::not_polled();
         }
+        if report_window.is_zero() {
+            // Only the async finish path can hand off a skipped watch.
+            // Do not read or claim a deferred watch from this direct poll.
+            drop(self);
+            return Changes::not_polled();
+        }
         self.detect_with(report_window.min(bounds.timeout), bounds.poll, observe)
     }
 
@@ -415,8 +475,13 @@ impl Snapshot {
         let started = Instant::now();
         // Read pacing on this task: a blocking worker does not inherit the
         // batch marker. A batched step returns after the shorter window.
-        let report_window = cua_driver_core::step_pacing::report_window(REPORT_WINDOW);
-        let mut changes = self
+        let report_window = match cua_driver_core::post_action_wait::current() {
+            cua_driver_core::post_action_wait::PostActionWait::None => Duration::ZERO,
+            cua_driver_core::post_action_wait::PostActionWait::Default => {
+                cua_driver_core::step_pacing::report_window(REPORT_WINDOW)
+            }
+        };
+        let changes = self
             .finish_with(
                 bounds,
                 background,
@@ -434,7 +499,13 @@ impl Snapshot {
                     std::thread::sleep(bounds.poll);
                 },
                 move |lease, deadline, generation| {
+                    let mut reported = false;
                     crate::post_action::hold_observation(lease, deadline, generation, move || {
+                        if reported {
+                            // A skipped watch retains its lease for the whole
+                            // deadline after recording its one late report.
+                            return false;
+                        }
                         authority
                             .try_run_cleanup(|| {
                                 let (current, current_front) = observe_host();
@@ -449,26 +520,15 @@ impl Snapshot {
                                     new_windows,
                                     foreground_changed,
                                 });
-                                true
+                                reported = true;
+                                !report_window.is_zero()
                             })
                             .unwrap_or(false)
                     })
                 },
             )
             .await;
-        if let Some(earlier) = earlier {
-            for window in earlier.new_windows {
-                if !changes
-                    .new_windows
-                    .iter()
-                    .any(|w| w.window_id == window.window_id)
-                {
-                    changes.new_windows.push(window);
-                }
-            }
-            changes.foreground_changed |= earlier.foreground_changed;
-        }
-        changes
+        changes.with_earlier(earlier)
     }
 
     async fn finish_with(
@@ -477,7 +537,7 @@ impl Snapshot {
         background: bool,
         report_window: Duration,
         mut observe: impl FnMut() -> (Vec<WindowInfo>, Option<i32>) + Send + 'static,
-        hold: impl FnOnce(SuppressionLease, Instant, u64) -> Result<(), SuppressionLease>
+        hold: impl FnOnce(Option<SuppressionLease>, Instant, u64) -> Result<(), Option<SuppressionLease>>
             + Send
             + 'static,
     ) -> Changes {
@@ -487,6 +547,19 @@ impl Snapshot {
         }
         let generation = crate::post_action::generation();
         cua_driver_core::blocking::spawn(move || {
+            if report_window.is_zero() {
+                // No native observation before return. Keep both a real
+                // suppression lease and a lease-less watch on the same
+                // bounded reaper, including in finite-host mode.
+                let deadline = Instant::now() + bounds.timeout;
+                if let Err(_lease) = hold(self._lease.take(), deadline, generation) {
+                    // Saturation keeps protection on this admitted worker.
+                    // No watch was queued, so do not promise a late report.
+                    std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                    return Changes::not_polled();
+                }
+                return Changes::deferred();
+            }
             if !background {
                 return self.detect_bounded_reporting(bounds, report_window, observe);
             }
@@ -496,10 +569,11 @@ impl Snapshot {
                 new_windows,
                 foreground_changed: matches!((self.front_pid, current_front), (Some(a), Some(b)) if a != b),
                 polled: true,
+                ..Changes::no_change()
             };
             let deadline = Instant::now() + bounds.timeout;
             if let Some(lease) = self._lease.take() {
-                if let Err(_lease) = hold(lease, deadline, generation) {
+                if let Err(_lease) = hold(Some(lease), deadline, generation) {
                     // Queue saturation preserves protection synchronously on
                     // this existing blocking worker, without another thread.
                     std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
@@ -537,6 +611,7 @@ impl Snapshot {
                     new_windows,
                     foreground_changed,
                     polled: true,
+                    ..Changes::no_change()
                 };
             }
             if Instant::now() >= deadline {
@@ -640,7 +715,7 @@ mod tests {
                     },
                     move |lease, deadline, _| {
                         assert!(deadline >= started + Duration::from_millis(2000));
-                        *receiver.lock().unwrap() = Some(lease);
+                        *receiver.lock().unwrap() = lease;
                         Ok(())
                     },
                 )
@@ -757,6 +832,7 @@ mod tests {
                 title: "New Tab".into(),
             }],
             foreground_changed: false,
+            ..Changes::no_change()
         };
         assert!(c.needs_restore());
         assert_eq!(
@@ -790,6 +866,7 @@ mod tests {
                 },
             ],
             foreground_changed: true,
+            ..Changes::no_change()
         };
         let suffix = c.result_suffix();
         // BTreeMap sort order is alphabetical by app name → Chrome before Mail.
@@ -805,6 +882,7 @@ mod tests {
             polled: true,
             new_windows: vec![],
             foreground_changed: true,
+            ..Changes::no_change()
         };
         assert!(c.needs_restore());
         assert_eq!(
@@ -824,6 +902,7 @@ mod tests {
                 title: "".into(),
             }],
             foreground_changed: false,
+            ..Changes::no_change()
         };
         // No title → just the app name, no parentheses.
         assert_eq!(
@@ -997,6 +1076,154 @@ mod tests {
             elapsed < REPORT_WINDOW,
             "a batched step waited as long as a direct call: {elapsed:?}"
         );
+    }
+
+    /// The shorter window still reports a window that opens inside it.
+    #[test]
+    fn a_batched_poll_still_reports_a_window_that_opens_quickly() {
+        use cua_driver_core::step_pacing::BATCH_REPORT_WINDOW;
+        let started = Instant::now();
+        let snap = WindowChangeDetector::capture_from(HashSet::from([1]), Some(7), false, None);
+        let changes = snap.detect_bounded_reporting(
+            observation_bounds_from(Some("3000"), Some("10")),
+            BATCH_REPORT_WINDOW,
+            move || {
+                if started.elapsed() > Duration::from_millis(40) {
+                    (
+                        vec![win(1, 7, "App", "Main"), win(2, 7, "App", "Menu")],
+                        Some(7),
+                    )
+                } else {
+                    (vec![win(1, 7, "App", "Main")], Some(7))
+                }
+            },
+        );
+        assert_eq!(changes.new_windows.len(), 1);
+    }
+
+    /// A skipped wait performs no native read and hands protection to the
+    /// bounded holder even for finite hosts and snapshots without suppression.
+    #[tokio::test]
+    async fn a_skipped_wait_returns_without_observing_and_hands_off_the_lease() {
+        for background in [false, true] {
+            for suppress in [false, true] {
+                let (lease, active) = SuppressionLease::isolated_for_test();
+                let snap = Snapshot {
+                    window_ids: HashSet::new(),
+                    front_pid: Some(7),
+                    // Consume the isolated lease in both branches; otherwise
+                    // the unsuppressed case retains the local until loop end.
+                    _lease: suppress.then_some(lease),
+                };
+                let held = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let receiver = held.clone();
+                let queued = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mark_queued = queued.clone();
+                let started = Instant::now();
+                let changes = snap
+                    .finish_with(
+                        observation_bounds_from(Some("2000"), None),
+                        background,
+                        Duration::ZERO,
+                        || panic!("skipped wait must not observe before return"),
+                        move |lease, deadline, _| {
+                            assert!(deadline >= started + Duration::from_millis(2000));
+                            assert_eq!(lease.is_some(), suppress);
+                            *receiver.lock().unwrap() = lease;
+                            mark_queued.store(true, std::sync::atomic::Ordering::SeqCst);
+                            Ok(())
+                        },
+                    )
+                    .await;
+                assert!(started.elapsed() < Duration::from_millis(500));
+                assert!(changes.deferred && !changes.polled);
+                assert!(!changes.needs_restore());
+                assert_eq!(changes.result_suffix(), DEFERRED_NOTE);
+                assert!(queued.load(std::sync::atomic::Ordering::SeqCst));
+                assert_eq!(active(), suppress);
+                held.lock().unwrap().take();
+                assert!(!active());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_saturated_skipped_watch_retains_protection_without_claiming_a_late_report() {
+        let (lease, active) = SuppressionLease::isolated_for_test();
+        let snap = Snapshot {
+            window_ids: HashSet::new(),
+            front_pid: Some(7),
+            _lease: Some(lease),
+        };
+        let started = Instant::now();
+        let changes = snap
+            .finish_with(
+                observation_bounds_from(Some("20"), None),
+                true,
+                Duration::ZERO,
+                || panic!("skipped wait must not observe"),
+                |lease, _, _| Err(lease),
+            )
+            .await;
+        assert!(started.elapsed() >= Duration::from_millis(20));
+        assert!(!changes.polled && !changes.deferred);
+        assert!(!active());
+        assert_eq!(changes.result_suffix(), "");
+    }
+
+    #[test]
+    fn a_deferred_result_keeps_prior_changes_separate() {
+        let changes = Changes::deferred().with_earlier(Some(Late {
+            at: Instant::now(),
+            new_windows: vec![WindowEvent {
+                window_id: 2,
+                pid: 7,
+                app_name: "App".into(),
+                title: "Save".into(),
+            }],
+            foreground_changed: false,
+        }));
+        assert!(changes.new_windows.is_empty());
+        assert!(!changes.needs_restore());
+        assert_eq!(
+            changes.result_suffix(),
+            format!(
+                "\n\n🪟 After the previous action returned, it opened new window(s): App (\"Save\").{DEFERRED_NOTE}"
+            )
+        );
+        assert_eq!(
+            Changes::not_polled()
+                .with_earlier(Some(Late {
+                    at: Instant::now(),
+                    new_windows: vec![],
+                    foreground_changed: true,
+                }))
+                .result_suffix(),
+            "\n\n🔀 After the previous action returned, a different app became frontmost."
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_host_timeout_overrides_a_skipped_wait() {
+        for background in [false, true] {
+            let (lease, active) = SuppressionLease::isolated_for_test();
+            let snap = Snapshot {
+                window_ids: HashSet::new(),
+                front_pid: None,
+                _lease: Some(lease),
+            };
+            let changes = snap
+                .finish_with(
+                    observation_bounds_from(Some("0"), None),
+                    background,
+                    Duration::ZERO,
+                    || panic!("zero timeout must not observe"),
+                    |_, _, _| panic!("zero timeout must not queue a watch"),
+                )
+                .await;
+            assert!(!changes.polled && !changes.deferred);
+            assert!(!active());
+        }
     }
 
     /// A deadline inside the report window behaves as before: the poll stops

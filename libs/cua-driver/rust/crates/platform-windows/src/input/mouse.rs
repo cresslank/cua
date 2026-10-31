@@ -690,7 +690,16 @@ pub fn send_click_synthesized_mods(
     button: &str,
     modifiers: &[&str],
 ) -> Result<()> {
-    send_click_synthesized_mods_impl(target, None, sx, sy, count, button, modifiers, false)
+    send_click_synthesized_mods_impl(
+        target,
+        None,
+        sx,
+        sy,
+        count,
+        button,
+        modifiers,
+        ClickMode::NonActivating,
+    )
 }
 
 pub fn send_click_synthesized_mods_for_pid(
@@ -710,7 +719,7 @@ pub fn send_click_synthesized_mods_for_pid(
         count,
         button,
         modifiers,
-        false,
+        ClickMode::NonActivating,
     )
 }
 
@@ -739,7 +748,65 @@ pub fn send_click_synthesized_active_mods_for_pid(
     button: &str,
     modifiers: &[&str],
 ) -> Result<()> {
-    send_click_synthesized_mods_impl(target, expected_pid, sx, sy, count, button, modifiers, true)
+    send_click_synthesized_mods_impl(
+        target,
+        expected_pid,
+        sx,
+        sy,
+        count,
+        button,
+        modifiers,
+        ClickMode::Window,
+    )
+}
+
+/// Explicit desktop clicks leave the hardware cursor at the requested point.
+pub fn send_click_synthesized_desktop_mods(
+    target: u64,
+    sx: i32,
+    sy: i32,
+    count: usize,
+    button: &str,
+    modifiers: &[&str],
+) -> Result<()> {
+    send_click_synthesized_mods_impl(
+        target,
+        None,
+        sx,
+        sy,
+        count,
+        button,
+        modifiers,
+        ClickMode::Desktop,
+    )
+}
+
+pub fn send_click_synthesized_desktop_mods_for_pid(
+    target: u64,
+    expected_pid: u32,
+    sx: i32,
+    sy: i32,
+    count: usize,
+    button: &str,
+    modifiers: &[&str],
+) -> Result<()> {
+    send_click_synthesized_mods_impl(
+        target,
+        Some(expected_pid),
+        sx,
+        sy,
+        count,
+        button,
+        modifiers,
+        ClickMode::Desktop,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ClickMode {
+    NonActivating,
+    Window,
+    Desktop,
 }
 
 fn send_click_synthesized_mods_impl(
@@ -750,8 +817,9 @@ fn send_click_synthesized_mods_impl(
     count: usize,
     button: &str,
     modifiers: &[&str],
-    activate: bool,
+    mode: ClickMode,
 ) -> Result<()> {
+    let activate = mode != ClickMode::NonActivating;
     let target = HWND(target as *mut _);
     if target.0.is_null() {
         bail!("invalid target hwnd");
@@ -845,7 +913,7 @@ fn send_click_synthesized_mods_impl(
                 )
             }
         };
-        let target_before = if activate {
+        let target_before = {
             Some(
                 crate::win32::capture_foreground_target(target.0 as usize as u64, expected_pid)
                     .ok_or_else(|| {
@@ -855,10 +923,8 @@ fn send_click_synthesized_mods_impl(
                         )
                     })?,
             )
-        } else {
-            None
         };
-        let cursor_target = if expected_pid.is_some() {
+        let cursor_target = if expected_pid.is_some() && mode != ClickMode::Desktop {
             Some(crate::win32::capture_current_cursor_target().ok_or_else(|| {
                 anyhow::anyhow!(
                     "cursor_restore_unavailable: stable prior cursor recipient could not be captured; no mouse input was sent"
@@ -868,9 +934,7 @@ fn send_click_synthesized_mods_impl(
             None
         };
         let mut prev_cursor = POINT::default();
-        if cursor_target.is_none() {
-            let _ = GetCursorPos(&mut prev_cursor);
-        }
+        let prev_cursor_valid = GetCursorPos(&mut prev_cursor).is_ok();
 
         if activate
             && !match expected_pid {
@@ -1132,8 +1196,26 @@ fn send_click_synthesized_mods_impl(
         let cursor_restored = if !activate {
             if let Some(cursor_target) = cursor_target {
                 crate::win32::restore_cursor_target(cursor_target)
-            } else {
+            } else if prev_cursor_valid {
                 SetCursorPos(prev_cursor.x, prev_cursor.y).is_ok()
+            } else {
+                true
+            }
+        } else if mode == ClickMode::Window {
+            // Restore our injected movement, but leave a later user/app move alone.
+            let mut current_cursor = POINT::default();
+            if GetCursorPos(&mut current_cursor).is_err() {
+                false
+            } else if cursor_still_at_injected_click(current_cursor.x, current_cursor.y, sx, sy) {
+                if let Some(cursor_target) = cursor_target {
+                    crate::win32::restore_cursor_target(cursor_target)
+                } else if prev_cursor_valid {
+                    SetCursorPos(prev_cursor.x, prev_cursor.y).is_ok()
+                } else {
+                    true
+                }
+            } else {
+                true
             }
         } else {
             true
@@ -1190,10 +1272,12 @@ fn send_click_synthesized_mods_impl(
                 Err(error) => anyhow::anyhow!("{error}; cleanup failure: {restore_error}"),
             });
         }
-        if let Some(previous) = prev_fg_target {
+        if let (Some(previous), Some(displaced)) =
+            (prev_fg_target, foreground_target.or(target_before))
+        {
             let restored = crate::win32::restore_foreground_target_if_still_displaced(
                 previous,
-                foreground_target.expect("foreground target captured before restoration"),
+                displaced,
                 Duration::from_millis(500),
             );
             if restored == crate::win32::ForegroundRestoreOutcome::Failed {
@@ -1212,6 +1296,10 @@ fn send_click_synthesized_mods_impl(
     Ok(())
 }
 
+fn cursor_still_at_injected_click(x: i32, y: i32, click_x: i32, click_y: i32) -> bool {
+    x.abs_diff(click_x) <= 2 && y.abs_diff(click_y) <= 2
+}
+
 /// Press-hold-move-release drag via `SendInput`, used by the `drag` tool's
 /// `scope:"desktop"` path, which intentionally acts on whatever is visible at
 /// the screen coordinates.
@@ -1226,6 +1314,11 @@ fn send_click_synthesized_mods_impl(
 /// input queue and DOES update GetKeyState, so a WPF Slider thumb actually
 /// tracks the drag.
 ///
+/// `modifiers` (ctrl/shift/alt/win) are held through the system input queue
+/// from before the press until after the release, so targets that read live
+/// key state (WPF `Keyboard.Modifiers`, Excel's Ctrl-drag copy) see a
+/// modified drag.
+///
 /// Same UIAccess constraints as [`send_click_synthesized`] — the
 /// `SetForegroundWindow` swap is rejected from non-UIAccess processes
 /// when foreground-lock is active; route through `cua-driver-uia.exe`
@@ -1234,6 +1327,7 @@ fn send_click_synthesized_mods_impl(
 /// Desktop scope raises z-order without stealing focus. When `expected_pid`
 /// is known, the press is still refused unless that exact window owns the
 /// start point.
+#[allow(clippy::too_many_arguments)]
 pub fn send_drag_synthesized(
     target: u64,
     expected_pid: Option<u32>,
@@ -1244,6 +1338,7 @@ pub fn send_drag_synthesized(
     duration_ms: u64,
     steps: usize,
     button: &str,
+    modifiers: &[&str],
 ) -> Result<()> {
     send_drag_synthesized_impl(
         target,
@@ -1255,6 +1350,7 @@ pub fn send_drag_synthesized(
         duration_ms,
         steps,
         button,
+        modifiers,
         false,
     )
 }
@@ -1273,6 +1369,8 @@ pub fn send_drag_synthesized(
 /// Activation and restore use PID-attributed foreground identity so a hosted
 /// UWP app is not confused with the shared `ApplicationFrameHost` PID. The
 /// caller does not also poll-restore; this function confirms restoration.
+/// `modifiers` are held as in [`send_drag_synthesized`].
+#[allow(clippy::too_many_arguments)]
 pub fn send_drag_synthesized_active(
     target: u64,
     expected_pid: Option<u32>,
@@ -1283,6 +1381,7 @@ pub fn send_drag_synthesized_active(
     duration_ms: u64,
     steps: usize,
     button: &str,
+    modifiers: &[&str],
 ) -> Result<()> {
     send_drag_synthesized_impl(
         target,
@@ -1294,6 +1393,7 @@ pub fn send_drag_synthesized_active(
         duration_ms,
         steps,
         button,
+        modifiers,
         true,
     )
 }
@@ -1314,6 +1414,7 @@ fn send_drag_synthesized_impl(
     duration_ms: u64,
     steps: usize,
     button: &str,
+    modifiers: &[&str],
     activate: bool,
 ) -> Result<()> {
     let target = HWND(target as *mut _);
@@ -1329,6 +1430,7 @@ fn send_drag_synthesized_impl(
         "middle" => (MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP),
         _ => (MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP),
     };
+    let (mod_downs, mod_ups) = crate::input::keyboard::modifier_hold_inputs(modifiers);
 
     let (vd_x, vd_y, vd_w, vd_h) = unsafe {
         (
@@ -1532,22 +1634,120 @@ fn send_drag_synthesized_impl(
             );
         }
 
+        // Release the held modifiers, retrying once like the click path so a
+        // partially inserted release does not leave system key state held.
+        let release_modifiers = |inserted: usize| {
+            let ups = &mod_ups[mod_ups.len() - inserted.min(mod_ups.len())..];
+            let authorized = || {
+                crate::win32::capture_foreground_target(target_addr, approved_pid).is_some()
+                    && (!activate
+                        || target_before.is_some_and(|approved| {
+                            crate::win32::foreground_matches_target_or_owned_window(
+                                approved,
+                                GetForegroundWindow().0 as usize as u64,
+                            )
+                        }))
+            };
+            let size = std::mem::size_of::<INPUT>() as i32;
+            ups.is_empty()
+                || (authorized() && SendInput(ups, size) as usize == ups.len())
+                || (authorized() && SendInput(ups, size) as usize == ups.len())
+        };
+
+        let prepare_input = || {
+            cua_driver_core::blocking::check_cancelled()
+            .map_err(anyhow::Error::from)
+            .and_then(|()| {
+                if !point_owned_by_target(sx_from, sy_from)
+                    || (activate && !target_before.is_some_and(|approved| {
+                        crate::win32::foreground_matches_target_or_owned_window(
+                            approved,
+                            GetForegroundWindow().0 as usize as u64,
+                        )
+                    }))
+                {
+                    bail!("foreground_unavailable: exact drag recipient was lost before button-down; no mouse input was sent");
+                }
+                Ok(())
+            })
+        };
+
+        // Do not introduce modifier downs after cancellation; restoration is
+        // still required because foreground/z-order preparation already ran.
+        if let Err(error) = prepare_input() {
+            restore_z_order(true);
+            let restored = restore_foreground();
+            drop(noactivate);
+            return Err(
+                if restored == crate::win32::ForegroundRestoreOutcome::Failed {
+                    anyhow!("{error}; cleanup failure: foreground restoration was not confirmed")
+                } else {
+                    error.into()
+                },
+            );
+        }
+
+        // 0. Hold the modifiers before the press.
+        let mut inserted_modifier_downs = 0usize;
+        if !mod_downs.is_empty() {
+            let sent = SendInput(&mod_downs, std::mem::size_of::<INPUT>() as i32);
+            inserted_modifier_downs = (sent as usize).min(mod_downs.len());
+            if sent as usize != mod_downs.len() {
+                let modifiers_released = release_modifiers(inserted_modifier_downs);
+                restore_z_order(true);
+                let foreground_restore = restore_foreground();
+                drop(noactivate);
+                bail!(
+                    "SendInput inserted {sent}/{} modifier key presses; no mouse input was sent{}{}",
+                    mod_downs.len(),
+                    if modifiers_released { "" } else { "; cleanup failure: modifier keys may still be held" },
+                    if foreground_restore == crate::win32::ForegroundRestoreOutcome::Failed {
+                        "; cleanup failure: foreground restoration was not confirmed"
+                    } else { "" }
+                );
+            }
+            sleep(Duration::from_millis(5));
+        }
+
         // 1. Move + press at the start of the drag.
+        let prelude_error = prepare_input().err();
         let (nfx, nfy) = norm(sx_from, sy_from);
-        let _ = SetCursorPos(sx_from, sy_from);
+        if prelude_error.is_none() {
+            let _ = SetCursorPos(sx_from, sy_from);
+        }
         let prelude = [
             make_input(nfx, nfy, MOUSEEVENTF_MOVE),
             make_input(nfx, nfy, down_flag),
         ];
-        let sent = SendInput(&prelude, std::mem::size_of::<INPUT>() as i32);
+        let sent = if prelude_error.is_none() {
+            SendInput(&prelude, std::mem::size_of::<INPUT>() as i32)
+        } else {
+            0
+        };
         if sent as usize != prelude.len() {
             // Records insert in order, so a short prelude never pressed the button.
+            let modifiers_released = release_modifiers(inserted_modifier_downs);
             restore_z_order(true);
-            let _ = restore_foreground();
+            let foreground_restore = restore_foreground();
             drop(noactivate);
+            let primary = prelude_error.unwrap_or_else(|| {
+                anyhow!(
+                    "SendInput drag-prelude inserted {sent}/{} events",
+                    prelude.len()
+                )
+            });
             bail!(
-                "SendInput drag-prelude inserted {sent}/{} events",
-                prelude.len()
+                "{primary}{}{}",
+                if modifiers_released {
+                    ""
+                } else {
+                    "; cleanup failure: modifier keys may still be held"
+                },
+                if foreground_restore == crate::win32::ForegroundRestoreOutcome::Failed {
+                    "; cleanup failure: foreground restoration was not confirmed"
+                } else {
+                    ""
+                }
             );
         }
 
@@ -1595,7 +1795,12 @@ fn send_drag_synthesized_impl(
         let released = SendInput(&release, std::mem::size_of::<INPUT>() as i32) == 1
             || SendInput(&release, std::mem::size_of::<INPUT>() as i32) == 1;
 
+        // Brief settle, so a target that samples live key state while handling
+        // the button release still sees the modifiers held. Then release them
+        // and restore z-order (demote target, restack user's window — no
+        // activation) and the cursor.
         sleep(Duration::from_millis(40));
+        let modifiers_released = release_modifiers(inserted_modifier_downs);
         restore_z_order(released);
         let foreground_restore = restore_foreground();
         drop(noactivate);
@@ -1606,6 +1811,16 @@ fn send_drag_synthesized_impl(
                 "SendInput did not insert the drag's button release after a retry; the \
                  button may still be held at screen ({cx},{cy}), so the cursor was left there."
             );
+        }
+        if !modifiers_released {
+            let cleanup_error = anyhow!(
+                "SendInput did not insert the drag's modifier key releases after a retry; \
+                 modifier keys may still be held."
+            );
+            move_error = Some(match move_error {
+                Some(error) => anyhow!("{error}; cleanup failure: {cleanup_error}"),
+                None => cleanup_error,
+            });
         }
         if foreground_restore == crate::win32::ForegroundRestoreOutcome::Failed {
             let restore_error = anyhow!(
@@ -1859,6 +2074,20 @@ mod nc_hit_tests {
         assert_eq!(classify_nc_move_resize_hit(3), None); // HTSYSMENU (click, not drag-move)
         assert_eq!(classify_nc_move_resize_hit(-1), None); // HTERROR
         assert_eq!(classify_nc_move_resize_hit(18), None); // HTBORDER (non-resizable edge)
+    }
+}
+
+#[cfg(test)]
+mod cursor_restore_tests {
+    use super::cursor_still_at_injected_click;
+
+    #[test]
+    fn restore_only_while_the_cursor_remains_at_the_injected_point() {
+        assert!(cursor_still_at_injected_click(-100, 200, -100, 200));
+        assert!(cursor_still_at_injected_click(-98, 198, -100, 200));
+        assert!(!cursor_still_at_injected_click(-97, 200, -100, 200));
+        assert!(!cursor_still_at_injected_click(-100, 203, -100, 200));
+        assert!(!cursor_still_at_injected_click(i32::MIN, 0, i32::MAX, 0));
     }
 }
 

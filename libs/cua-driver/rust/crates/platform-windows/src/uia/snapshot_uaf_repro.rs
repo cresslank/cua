@@ -125,6 +125,7 @@ fn snapshot_with(ptrs: Vec<usize>) -> UiaSnapshot {
                 center: (0, 0),
                 rect: None,
                 msaa_role: None,
+                read_while_minimized: false,
             })
             .collect(),
     }
@@ -339,6 +340,7 @@ fn exact_snapshot_retains_matching_identity_and_geometry() {
     payload.elements[0].center = (31, 47);
     payload.elements[0].rect = Some((11, 27, 51, 67));
     payload.elements[0].msaa_role = Some(0x38);
+    let payload = payload.with_read_while_minimized(true);
     let first = cache.publish(pid(), HWND, payload);
     let guard = acquire(&cache, first, 0).unwrap();
     let second = cache.publish(pid(), HWND, snapshot_with(vec![make_fake(hits, false)]));
@@ -356,7 +358,10 @@ fn exact_snapshot_retains_matching_identity_and_geometry() {
         "element is an MSAA element, not a UIA element"
     );
     assert_eq!(guard.element_has_keyboard_focus(), None);
-    assert_eq!(acquire(&cache, second, 0).unwrap().center, (0, 0));
+    assert!(guard.read_while_minimized);
+    let replacement = acquire(&cache, second, 0).unwrap();
+    assert_eq!(replacement.center, (0, 0));
+    assert!(!replacement.read_while_minimized);
     let wrong_window = cache
         .resolve(
             pid(),
@@ -368,6 +373,7 @@ fn exact_snapshot_retains_matching_identity_and_geometry() {
         "conflicting_element_target"
     );
     let cloned = guard.clone();
+    assert!(cloned.read_while_minimized);
     drop(guard);
     unsafe { touch_vtable(cloned.as_ptr()) };
     drop(cloned);
@@ -583,6 +589,7 @@ fn unpublished_payload_releases_its_walker_retain() {
         center: (0, 0),
         rect: None,
         msaa_role: None,
+        read_while_minimized: false,
     });
     drop(payload);
     assert_eq!(

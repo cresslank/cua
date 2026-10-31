@@ -331,19 +331,19 @@ pub fn revive_cursor(key: CursorKey) {
     }
 }
 
+/// Read the render map, treating a poisoned or uninitialised map as absent.
+fn read_render<T>(f: impl FnOnce(&RenderMap) -> T) -> Option<T> {
+    RENDER.lock().ok()?.as_ref().map(f)
+}
+
 /// Returns true if the cursor for `key` is currently enabled/visible. A session
 /// with no own cursor yet falls back to the seeded `"default"` cursor.
 pub fn is_enabled(key: &str) -> bool {
-    RENDER
-        .lock()
-        .ok()
-        .and_then(|g| {
-            g.as_ref().and_then(|m| {
-                m.cursor_or_default(key)
-                    .map(|rs| rs.core.cfg.enabled && rs.core.visible)
-            })
-        })
-        .unwrap_or(false)
+    read_render(|map| {
+        map.cursor_or_default(key)
+            .is_some_and(|rs| rs.core.is_enabled())
+    })
+    .unwrap_or(false)
 }
 
 /// Truthful render acknowledgement for lifecycle inspection. Unlike
@@ -365,11 +365,7 @@ pub fn is_visible_for_session(key: &str) -> bool {
 /// Snapshot the current motion config for `key`, or its configured default
 /// when that key has no own entry yet.
 pub fn current_motion(key: &str) -> MotionConfig {
-    RENDER
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|m| m.motion_for_key(key)))
-        .unwrap_or_default()
+    read_render(|map| map.motion_for_key(key)).unwrap_or_default()
 }
 
 /// Update config defaults without overriding explicit per-session motion.
@@ -379,30 +375,13 @@ pub fn set_default_glide_duration(session: Option<&str>, value: f64) {
     }
 }
 
-pub fn current_theme_state(
-    key: &str,
-) -> Option<(
-    String,
-    String,
-    String,
-    Option<String>,
-    cursor_overlay::CursorVisualState,
-)> {
-    let guard = RENDER.lock().ok()?;
-    let map = guard.as_ref()?;
-    let state = map.cursor_or_default(key)?;
-    let (id, version, profile, fallback) = state.core.active_theme_metadata();
-    Some((id, version, profile, fallback, state.core.visual.clone()))
+pub fn current_theme_state(key: &str) -> Option<cursor_overlay::CursorThemeState> {
+    read_render(|map| map.theme_state(key)).flatten()
 }
 
 /// Current screen position, or `None` for an absent or unplaced cursor.
 pub fn current_position(key: &str) -> Option<(f64, f64)> {
-    RENDER.lock().ok().and_then(|g| {
-        g.as_ref()
-            .and_then(|m| m.cursors.get(key))
-            .filter(|rs| rs.core.placed)
-            .map(|rs| rs.core.pos)
-    })
+    read_render(|map| map.placed_position(key)).flatten()
 }
 
 /// Seed a brand-new (sentinel-positioned) cursor at an on-screen start point
@@ -1847,11 +1826,14 @@ mod tests {
     }
 
     // Before the shared predicate, a landed Windows cursor dropped to the IDLE
-    // cadence for the whole idle-hide delay and its resting bob froze.
+    // cadence for the whole idle-hide delay and its resting bob froze. The bob
+    // is `cursor.float`, on by default.
     #[test]
     fn resting_cursor_keeps_the_active_cadence_for_its_bob() {
         let mut map = empty_map();
         map.seed_start_if_unplaced("sessA", 60.0, 60.0, map.platform.frame());
+        map.cursors.get_mut("sessA").unwrap().core.options_override =
+            Some(cursor_overlay::CursorOptions::default());
         apply_msg(&mut map, move_msg("sessA", 10.0, 10.0));
         settle(&mut map);
         let rs = &map.cursors["sessA"];

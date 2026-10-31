@@ -100,13 +100,15 @@ desktop_ready() {
             --dest=org.freedesktop.DBus / org.freedesktop.DBus.GetId >/dev/null 2>&1
     )
 }
+# Up to 60 s, checked every 0.1 s: the desktop writes it about a second
+# after start, and every Space create waits for this daemon.
 deadline=$((SECONDS + 60))
 until desktop_ready; do
     if [ "$SECONDS" -ge "$deadline" ]; then
         echo "[$(date -Iseconds)] desktop session not ready after 60s; refusing to start"
         exit 1
     fi
-    sleep 1
+    sleep 0.1
 done
 set -a
 # shellcheck disable=SC1090

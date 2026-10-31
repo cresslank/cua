@@ -36,8 +36,6 @@ impl RuntimeLease {
             crate::wayland::shell_helper::restart();
             #[cfg(feature = "portal-input")]
             crate::wayland::libei::restart();
-            #[cfg(feature = "portal-capture")]
-            crate::wayland::portal_screencast::restart();
         }
         *owners += 1;
         Ok(Self { _private: () })
@@ -63,8 +61,6 @@ impl Drop for RuntimeLease {
             tracing::warn!(%error, "AT-SPI teardown incomplete; continuing shutdown");
         }
         crate::wayland::shell_helper::shutdown();
-        #[cfg(feature = "portal-capture")]
-        crate::wayland::portal_screencast::shutdown();
         #[cfg(feature = "portal-input")]
         crate::wayland::libei::shutdown();
         cua_driver_core::element_token::release_global();

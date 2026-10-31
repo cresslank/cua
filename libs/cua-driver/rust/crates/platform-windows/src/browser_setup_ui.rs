@@ -33,10 +33,6 @@ use crate::uia::UiaNode;
 // same rule: its native URL and web-control topology are contracts; its
 // localized document, heading, and checkbox names are not.
 
-fn refusal(code: BrowserRefusalCode, message: impl Into<String>) -> BrowserRefusal {
-    BrowserRefusal::new(code, message)
-}
-
 fn release_nodes(nodes: &[UiaNode]) {
     for node in nodes.iter().filter(|node| node.element_ptr != 0) {
         unsafe { drop(IUIAutomationElement::from_raw(node.element_ptr as *mut _)) };
@@ -64,7 +60,7 @@ fn native_nodes(hwnd: u64) -> Result<Vec<UiaNode>, BrowserRefusal> {
         }
     };
     walked.map_err(|error| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "the approved browser window's native accessibility tree was unavailable: {error}"
@@ -92,7 +88,7 @@ fn unique_web_actionable(
     match matches.len() {
         0 => Ok(None),
         1 => Ok(matches.into_iter().next()),
-        _ => Err(refusal(
+        _ => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "multiple web {control_type} controls expose the exact {action} action on the setup page"
@@ -148,7 +144,7 @@ fn unique_native_actionable_with_focus(
                 .collect::<Vec<_>>();
             match focused.as_slice() {
                 [element] => Ok(Some(*element)),
-                _ => Err(refusal(
+                _ => Err(BrowserRefusal::new(
                     BrowserRefusalCode::BrowserWrongTargetRefused,
                     format!(
                         "multiple native {control_type} controls expose the exact {action} action, \
@@ -199,7 +195,7 @@ fn exact_native_new_tab_button(nodes: &[UiaNode]) -> Result<Option<usize>, Brows
         || !successor.actions.iter().any(|action| action == "invoke")
         || !vertically_overlaps_tab_row
     {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             "the native tab strip did not expose one exact structural new-tab action",
         ));
@@ -225,7 +221,7 @@ fn stable_native_tab_count(hwnd: u64, initial_count: usize) -> Result<usize, Bro
         }
         previous = current;
         if Instant::now() >= deadline {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "the approved Chromium window did not expose a stable native tab topology",
             ));
@@ -286,7 +282,7 @@ unsafe fn invoke(
     })();
     std::mem::forget(element);
     result.map_err(|error| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!("the exact {description} UIA Invoke action failed: {error}"),
         )
@@ -295,7 +291,7 @@ unsafe fn invoke(
 
 fn prove_window_owner(hwnd: u64, expected_pid: u32, operation: &str) -> Result<(), BrowserRefusal> {
     if crate::win32::window_owner_pid(hwnd) != Some(expected_pid) {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingStale,
             format!(
                 "the approved browser window changed ownership immediately before {operation}; no UIA mutation was attempted"
@@ -321,7 +317,7 @@ unsafe fn set_value(
     })();
     std::mem::forget(element);
     result.map_err(|error| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!("the exact UIA Value action failed: {error}"),
         )
@@ -347,7 +343,7 @@ fn confirm_setup_navigation(
     let target = HWND(hwnd as *mut _);
     let displaced_target = crate::win32::capture_foreground_target(hwnd, Some(expected_pid))
         .ok_or_else(|| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "the approved browser HWND changed ownership before setup navigation; no window or input mutation was attempted",
             )
@@ -356,7 +352,7 @@ fn confirm_setup_navigation(
         Some(prior) if prior.hwnd() != hwnd => Some(prior),
         Some(_) => None,
         None => {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "a stable prior foreground identity could not be captured before setup navigation",
             ));
@@ -366,7 +362,7 @@ fn confirm_setup_navigation(
         let (fronted, injected) = force_setup_foreground(target, expected_pid);
         *injected_global_input |= injected;
         if !fronted {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "Windows refused the bounded foreground assist for the exact browser window",
             ));
@@ -381,7 +377,7 @@ fn confirm_setup_navigation(
                     .and_then(|_| element.CurrentHasKeyboardFocus()),
                 Err(error) => {
                     std::mem::forget(element);
-                    return Err(refusal(
+                    return Err(BrowserRefusal::new(
                         BrowserRefusalCode::BrowserWrongTargetRefused,
                         format!(
                             "could not revalidate the exact address field before focus: {error}"
@@ -394,13 +390,13 @@ fn confirm_setup_navigation(
         match focused {
             Ok(value) if value.as_bool() => *focused_setup_address_field = true,
             Ok(_) => {
-                return Err(refusal(
+                return Err(BrowserRefusal::new(
                     BrowserRefusalCode::BrowserWrongTargetRefused,
                     "the exact address-and-search field did not acquire keyboard focus",
                 ));
             }
             Err(error) => {
-                return Err(refusal(
+                return Err(BrowserRefusal::new(
                     BrowserRefusalCode::BrowserWrongTargetRefused,
                     format!("could not focus the exact address-and-search field: {error}"),
                 ));
@@ -416,7 +412,7 @@ fn confirm_setup_navigation(
             || Ok(()),
         )
         .map_err(|error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!("could not confirm the bounded setup navigation: {error}"),
             )
@@ -431,7 +427,7 @@ fn confirm_setup_navigation(
         ) == crate::win32::ForegroundRestoreOutcome::Failed
     });
     if restoration_failed {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             "the setup navigation completed, but Windows refused to restore the prior foreground window",
         ));
@@ -455,11 +451,11 @@ unsafe fn checkbox_state(element_ptr: usize) -> Result<CheckboxState, BrowserRef
     match result {
         Ok(state) if state == ToggleState_Off => Ok(CheckboxState::Off),
         Ok(state) if state == ToggleState_On => Ok(CheckboxState::On),
-        Ok(_) => Err(refusal(
+        Ok(_) => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             "the exact remote-debugging checkbox had an indeterminate state",
         )),
-        Err(error) => Err(refusal(
+        Err(error) => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!("could not read the exact remote-debugging checkbox: {error}"),
         )),
@@ -481,7 +477,7 @@ unsafe fn toggle(
     })();
     std::mem::forget(element);
     result.map_err(|error| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!("the exact UIA Toggle action failed: {error}"),
         )
@@ -510,14 +506,14 @@ fn profile_key(file: &File) -> Result<ProfileResourceKey, BrowserRefusal> {
     let mut information = BY_HANDLE_FILE_INFORMATION::default();
     unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &mut information) }.map_err(
         |error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 format!("could not query stable browser profile identity: {error}"),
             )
         },
     )?;
     if information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingStale,
             "browser profile is not a direct non-reparse directory",
         ));
@@ -536,7 +532,7 @@ impl SetupReservation {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(&profile_path)
             .map_err(|error| {
-                refusal(
+                BrowserRefusal::new(
                     BrowserRefusalCode::BrowserBindingStale,
                     format!("could not securely open browser profile: {error}"),
                 )
@@ -551,7 +547,7 @@ impl SetupReservation {
             .create_new(true)
             .open(&marker_path)
             .map_err(|error| {
-                refusal(
+                BrowserRefusal::new(
                     if error.kind() == std::io::ErrorKind::AlreadyExists {
                         BrowserRefusalCode::BrowserBindingAmbiguous
                     } else {
@@ -564,7 +560,7 @@ impl SetupReservation {
             .write_all(b"active\n")
             .and_then(|_| marker.sync_all())
             .map_err(|error| {
-                refusal(
+                BrowserRefusal::new(
                     BrowserRefusalCode::BrowserRouteUnavailable,
                     format!("could not persist browser setup poison: {error}"),
                 )
@@ -576,13 +572,13 @@ impl SetupReservation {
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(&profile_path)
             .map_err(|error| {
-                refusal(
+                BrowserRefusal::new(
                     BrowserRefusalCode::BrowserBindingStale,
                     format!("browser profile moved while reserving it: {error}"),
                 )
             })?;
         if profile_key(&reproved)? != key {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 "browser profile identity changed while reserving setup",
             ));
@@ -728,7 +724,7 @@ impl SetupUiHandle {
             proven
         });
         if !proven {
-            let error = refusal(
+            let error = BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "the temporary setup page was no longer exact before cleanup",
             );
@@ -741,7 +737,7 @@ impl SetupUiHandle {
             &["ctrl"],
             || Ok(()),
         ) {
-            let error = refusal(
+            let error = BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!("could not close the exact temporary setup tab: {error}"),
             );
@@ -802,7 +798,7 @@ pub fn retain_pending(hwnd: u64, handle: SetupUiHandle) -> Result<(), BrowserRef
     let mut pending = pending_setups().lock().unwrap();
     if pending.contains_key(&hwnd) {
         drop(pending);
-        return Err(handle.abort(refusal(
+        return Err(handle.abort(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingAmbiguous,
             "another approved browser setup is already pending for this exact window",
         )));
@@ -817,7 +813,7 @@ pub fn commit_pending(hwnd: u64) -> Result<bool, BrowserRefusal> {
         .unwrap()
         .remove(&hwnd)
         .ok_or_else(|| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 "the exact pending browser setup cleanup handle is missing",
             )
@@ -897,7 +893,7 @@ fn set_remote_debugging(
                 Ok(Some(element)) => element,
                 Ok(None) => {
                     release_nodes(&tab_tree);
-                    return Err(handle.abort(refusal(
+                    return Err(handle.abort(BrowserRefusal::new(
                         BrowserRefusalCode::BrowserWrongTargetRefused,
                         format!(
                             "the exact {} window has no structural native new-tab action",
@@ -936,7 +932,7 @@ fn set_remote_debugging(
                 }
                 release_nodes(&tree);
                 if Instant::now() >= deadline {
-                    return Err(handle.abort(refusal(
+                    return Err(handle.abort(BrowserRefusal::new(
                         BrowserRefusalCode::BrowserWrongTargetRefused,
                         format!(
                             "{} did not expose exactly one newly created tab",
@@ -950,7 +946,7 @@ fn set_remote_debugging(
                 Ok(Some(element)) => element,
                 Ok(None) => {
                     release_nodes(&created);
-                    return Err(handle.abort(refusal(
+                    return Err(handle.abort(BrowserRefusal::new(
                         BrowserRefusalCode::BrowserWrongTargetRefused,
                         format!(
                             "the approved {} window has no unique native editable address field",
@@ -988,7 +984,7 @@ fn set_remote_debugging(
                 }
                 Ok(_) => {
                     release_nodes(&created);
-                    return Err(handle.abort(refusal(
+                    return Err(handle.abort(BrowserRefusal::new(
                         BrowserRefusalCode::BrowserWrongTargetRefused,
                         "the unique native address field did not retain the exact setup URL",
                     )));
@@ -1064,7 +1060,7 @@ fn set_remote_debugging(
             }
         }
         if Instant::now() >= deadline {
-            return Err(handle.abort(refusal(
+            return Err(handle.abort(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!(
                     "the exact {} remote-debugging setup page did not become ready",

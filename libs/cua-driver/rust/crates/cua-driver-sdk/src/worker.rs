@@ -3116,7 +3116,7 @@ impl PrivateWorkerClient {
                 }
             })?;
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "musl")))]
         let trusted_accessibility_bus = Some(
             crate::runtime::prepare_private_worker_accessibility_route(startup_deadline).map_err(
                 |error| DriverError::Worker {
@@ -3124,7 +3124,9 @@ impl PrivateWorkerClient {
                 },
             )?,
         );
-        #[cfg(not(target_os = "linux"))]
+        // A musl build is the static headless guest daemon: no desktop
+        // platform, so no accessibility route to prepare.
+        #[cfg(not(all(target_os = "linux", not(target_env = "musl"))))]
         let trusted_accessibility_bus: Option<String> = None;
         ensure_startup_deadline(startup_deadline)?;
         let worker_environment = private_worker_environment(

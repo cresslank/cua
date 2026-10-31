@@ -20,10 +20,6 @@ use cua_driver_core::browser::{
 
 use crate::atspi::AtspiNode;
 
-fn refusal(code: BrowserRefusalCode, message: impl Into<String>) -> BrowserRefusal {
-    BrowserRefusal::new(code, message)
-}
-
 fn field_equals(node: &AtspiNode, expected: &str) -> bool {
     [
         node.name.as_deref(),
@@ -127,7 +123,7 @@ fn exact_setup_checkbox<'a>(
     match matches.as_slice() {
         [] => Ok(None),
         [node] => Ok(Some(*node)),
-        _ => Err(refusal(
+        _ => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             "multiple exact remote-debugging checkboxes were exposed",
         )),
@@ -160,7 +156,7 @@ fn exact_setup_navigation<'a>(
     match matches.as_slice() {
         [] => Ok(None),
         [node] => Ok(Some(*node)),
-        _ => Err(refusal(
+        _ => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             "multiple exact remote-debugging navigation controls were exposed",
         )),
@@ -210,7 +206,7 @@ fn exact_omnibox<'a>(
     match matches.as_slice() {
         [] => Ok(None),
         [node] => Ok(Some(*node)),
-        _ => Err(refusal(
+        _ => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "{} exposed multiple exact address-and-search fields",
@@ -406,14 +402,14 @@ fn window_scoped_tree(
 ) -> Result<crate::atspi::AtspiTreeResult, BrowserRefusal> {
     let tree = crate::atspi::walk_tree_bounded(pid, window_id, None, None, None);
     if !tree.trusted {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserRouteUnavailable,
             "no trusted AT-SPI tree for the approved browser window; \
              the accessibility bus must be reachable to prove which window a control belongs to",
         ));
     }
     if !tree.window_scoped {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingAmbiguous,
             format!(
                 "could not prove which of pid {pid}'s accessibility top-levels renders window \
@@ -438,13 +434,13 @@ struct SetupResourceKey {
 impl SetupResourceKey {
     fn for_profile(profile_path: &Path) -> Result<Self, BrowserRefusal> {
         let metadata = std::fs::metadata(profile_path).map_err(|error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 format!("could not identify the approved browser profile resource: {error}"),
             )
         })?;
         if !metadata.is_dir() {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 "the approved browser profile resource is not a directory",
             ));
@@ -489,13 +485,13 @@ impl SetupReservation {
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(&lock_path)
             .map_err(|error| {
-                refusal(
+                BrowserRefusal::new(
                     BrowserRefusalCode::BrowserRouteUnavailable,
                     format!("could not open the browser setup reservation: {error}"),
                 )
             })?;
         let metadata = lock_file.metadata().map_err(|error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!("could not inspect the browser setup reservation: {error}"),
             )
@@ -508,7 +504,7 @@ impl SetupReservation {
             || metadata.nlink() != 1
             || metadata.permissions().mode() & 0o077 != 0
         {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 "refusing an unsafe browser setup reservation file",
             ));
@@ -520,7 +516,7 @@ impl SetupReservation {
             let busy = error
                 .raw_os_error()
                 .is_some_and(|code| code == libc::EWOULDBLOCK || code == libc::EAGAIN);
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 if busy {
                     BrowserRefusalCode::BrowserBindingAmbiguous
                 } else {
@@ -537,7 +533,7 @@ impl SetupReservation {
 
         let state_path = lock_dir.join(key.state_name());
         if !reservation_marker_is_clean(&state_path)? {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 "a prior browser setup did not prove terminal cleanup; the profile remains reserved fail-closed",
             ));
@@ -545,7 +541,7 @@ impl SetupReservation {
         // Persist the active marker atomically before the first browser read or
         // mutation. A failed write leaves the previous state intact.
         write_reservation_marker(&state_path, b"active\n").map_err(|error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!("could not arm the browser setup reservation: {error}"),
             )
@@ -563,7 +559,7 @@ impl SetupReservation {
         ensure_secure_reservation_dir(&lock_dir)?;
         let lock_path = lock_dir.join(key.lock_name());
         if !lock_path.try_exists().map_err(|error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!("could not inspect the browser setup reservation path: {error}"),
             )
@@ -576,13 +572,13 @@ impl SetupReservation {
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(&lock_path)
             .map_err(|error| {
-                refusal(
+                BrowserRefusal::new(
                     BrowserRefusalCode::BrowserRouteUnavailable,
                     format!("could not open the browser setup reservation: {error}"),
                 )
             })?;
         let metadata = lock_file.metadata().map_err(|error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!("could not inspect the browser setup reservation: {error}"),
             )
@@ -593,14 +589,14 @@ impl SetupReservation {
             || metadata.nlink() != 1
             || metadata.permissions().mode() & 0o077 != 0
         {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 "refusing an unsafe browser setup reservation file",
             ));
         }
         let locked = unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if locked != 0 {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingAmbiguous,
                 "browser endpoint discovery is blocked by an active setup for this profile",
             ));
@@ -608,7 +604,7 @@ impl SetupReservation {
         if reservation_marker_is_clean(&lock_dir.join(key.state_name()))? {
             Ok(())
         } else {
-            Err(refusal(
+            Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 "browser endpoint discovery is blocked because prior setup cleanup is unproven",
             ))
@@ -640,7 +636,7 @@ fn reservation_marker_is_clean(path: &Path) -> Result<bool, BrowserRefusal> {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
         Err(error) => {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!("could not inspect the browser setup state marker: {error}"),
             ));
@@ -652,7 +648,7 @@ fn reservation_marker_is_clean(path: &Path) -> Result<bool, BrowserRefusal> {
         || metadata.nlink() != 1
         || metadata.permissions().mode() & 0o077 != 0
     {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserRouteUnavailable,
             "refusing an unsafe browser setup state marker",
         ));
@@ -660,7 +656,7 @@ fn reservation_marker_is_clean(path: &Path) -> Result<bool, BrowserRefusal> {
     std::fs::read(path)
         .map(|marker| marker == b"clean\n")
         .map_err(|error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!("could not read the browser setup state marker: {error}"),
             )
@@ -707,14 +703,14 @@ fn ensure_secure_reservation_dir(path: &Path) -> Result<(), BrowserRefusal> {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!("could not create the browser setup reservation directory: {error}"),
             ));
         }
     }
     let metadata = std::fs::symlink_metadata(path).map_err(|error| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserRouteUnavailable,
             format!("could not inspect the browser setup reservation directory: {error}"),
         )
@@ -724,7 +720,7 @@ fn ensure_secure_reservation_dir(path: &Path) -> Result<(), BrowserRefusal> {
         || metadata.uid() != effective_uid
         || metadata.permissions().mode() & 0o077 != 0
     {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserRouteUnavailable,
             "refusing an unsafe browser setup reservation directory",
         ));
@@ -842,7 +838,7 @@ impl SetupUiHandle {
             return Ok(None);
         }
         if let Err(error) = self.validate() {
-            let error = refusal(
+            let error = BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!("the immutable setup target became stale before cleanup: {error}"),
             );
@@ -853,14 +849,14 @@ impl SetupUiHandle {
             Err(error) => return Err(self.abort(error)),
         };
         if !setup_page_proven(&tree.nodes, self.descriptor, self.trusted_setup_navigation) {
-            let error = refusal(
+            let error = BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "the temporary setup page was no longer exact before cleanup",
             );
             return Err(self.abort(error));
         }
         if let Err(error) = close_tab(&self.target, self.window_id) {
-            let error = refusal(
+            let error = BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!("could not close the exact temporary setup tab: {error}"),
             );
@@ -943,7 +939,7 @@ pub fn retain_pending(
     handle: SetupUiHandle,
 ) -> Result<(), BrowserRefusal> {
     if (handle.pid, handle.window_id) != (pid, window_id) {
-        return Err(handle.abort(refusal(
+        return Err(handle.abort(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingStale,
             "the browser setup reservation does not match the retained window",
         )));
@@ -951,7 +947,7 @@ pub fn retain_pending(
     let mut pending = pending_setups().lock().unwrap();
     if pending.contains_key(&pid) {
         drop(pending);
-        return Err(handle.abort(refusal(
+        return Err(handle.abort(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingAmbiguous,
             "another approved browser setup is already pending for this browser profile",
         )));
@@ -966,13 +962,13 @@ pub fn commit_pending(pid: u32, window_id: u64) -> Result<bool, BrowserRefusal> 
         .unwrap()
         .remove(&pid)
         .ok_or_else(|| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 "the exact pending browser setup cleanup handle is missing",
             )
         })?;
     if handle.window_id != window_id {
-        return Err(handle.abort(refusal(
+        return Err(handle.abort(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingStale,
             "the pending browser setup belongs to a different approved window",
         )));
@@ -983,7 +979,7 @@ pub fn commit_pending(pid: u32, window_id: u64) -> Result<bool, BrowserRefusal> 
 pub fn abort_pending(pid: u32, window_id: u64, error: BrowserRefusal) -> BrowserRefusal {
     match pending_setups().lock().unwrap().remove(&pid) {
         Some(handle) if handle.window_id == window_id => handle.abort(error),
-        Some(handle) => handle.abort(refusal(
+        Some(handle) => handle.abort(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingStale,
             "the pending browser setup belongs to a different approved window",
         )),
@@ -1001,7 +997,7 @@ fn set_remote_debugging(
     desired_enabled: bool,
 ) -> Result<SetupUiHandle, BrowserRefusal> {
     let target = crate::wayland::establish_exact_target(pid, window_id).map_err(|error| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!("could not establish the immutable browser setup target: {error}"),
         )
@@ -1049,7 +1045,7 @@ fn set_remote_debugging(
         if let Err(error) = crate::wayland::validate_exact_target(&target)
             .and_then(|_| trusted_setup_navigation(pid, window_id, &target, descriptor))
         {
-            return Err(handle.abort(refusal(
+            return Err(handle.abort(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!(
                     "could not navigate the exact {} window to its fixed setup page: {error}",
@@ -1063,7 +1059,7 @@ fn set_remote_debugging(
     let deadline = Instant::now() + EXISTING_PROFILE_SETUP_READY_TIMEOUT;
     loop {
         if let Err(error) = handle.validate() {
-            return Err(handle.abort(refusal(
+            return Err(handle.abort(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!("the immutable browser setup target became stale: {error}"),
             )));
@@ -1085,7 +1081,7 @@ fn set_remote_debugging(
                 Some(state) if state != desired_enabled && !handle.enable_attempted => {
                     let element_key = node.element_key;
                     if let Err(error) = validate_single_exact_native_window(&handle.target) {
-                        return Err(handle.abort(refusal(
+                        return Err(handle.abort(BrowserRefusal::new(
                             BrowserRefusalCode::BrowserWrongTargetRefused,
                             format!("the immutable browser setup target became stale: {error}"),
                         )));
@@ -1106,7 +1102,7 @@ fn set_remote_debugging(
                             current_checkbox
                         }
                         Ok(_) => {
-                            return Err(handle.abort(refusal(
+                            return Err(handle.abort(BrowserRefusal::new(
                                 BrowserRefusalCode::BrowserWrongTargetRefused,
                                 "the exact checkbox changed before its trusted action",
                             )));
@@ -1129,7 +1125,7 @@ fn set_remote_debugging(
                             )
                         },
                     ) {
-                        return Err(handle.abort(refusal(
+                        return Err(handle.abort(BrowserRefusal::new(
                             BrowserRefusalCode::BrowserWrongTargetRefused,
                             format!("the exact checkbox action failed: {error}"),
                         )));
@@ -1234,7 +1230,7 @@ fn set_remote_debugging(
                             handle.used_bounded_pixel_fallback |= injected;
                         }
                         Err(error) => {
-                            return Err(handle.abort(refusal(
+                            return Err(handle.abort(BrowserRefusal::new(
                                 BrowserRefusalCode::BrowserWrongTargetRefused,
                                 format!(
                                     "could not toggle the exact Microsoft Edge remote-debugging checkbox: {error}"
@@ -1245,7 +1241,7 @@ fn set_remote_debugging(
                 }
                 Some(_) => {}
                 None => {
-                    return Err(handle.abort(refusal(
+                    return Err(handle.abort(BrowserRefusal::new(
                         BrowserRefusalCode::BrowserWrongTargetRefused,
                         "AT-SPI did not expose the exact checkbox checked state",
                     )));
@@ -1255,7 +1251,7 @@ fn set_remote_debugging(
             Err(error) => return Err(handle.abort(error)),
         }
         if Instant::now() >= deadline {
-            return Err(handle.abort(refusal(
+            return Err(handle.abort(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 setup_not_ready_message(descriptor),
             )));
