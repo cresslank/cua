@@ -20,10 +20,6 @@ use crate::ax::tree::{
     walk_native_chrome_bounded, walk_tree, AXNode, TreeWalkResult, DEFAULT_MAX_ELEMENTS,
 };
 
-fn refusal(code: BrowserRefusalCode, message: impl Into<String>) -> BrowserRefusal {
-    BrowserRefusal::new(code, message)
-}
-
 fn field_equals(node: &AXNode, expected: &str) -> bool {
     [
         node.title.as_deref(),
@@ -142,7 +138,7 @@ fn unique_actionable(
     match matches.as_slice() {
         [] => Ok(None),
         [(_, node)] => Ok(Some(node.element_ptr)),
-        _ => Err(refusal(
+        _ => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!("multiple exact {role} controls matched {label:?}"),
         )),
@@ -253,7 +249,7 @@ fn exact_setup_checkbox(
     descriptor: &BrowserSetupDescriptor,
 ) -> Result<Option<usize>, BrowserRefusal> {
     if tree.truncated {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "{}'s setup accessibility proof was truncated",
@@ -273,7 +269,7 @@ fn unique_omnibox(
     descriptor: &BrowserSetupDescriptor,
 ) -> Result<usize, BrowserRefusal> {
     unique_actionable(nodes, "AXTextField", "Address and search bar", "AXPress")?.ok_or_else(|| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "the approved {} window has no exact address-and-search field",
@@ -323,7 +319,7 @@ fn exact_omnibox_suggestion(
         0 => return Ok(None),
         1 => {}
         _ => {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!(
                     "{} exposed multiple exact address fields containing the setup URL",
@@ -343,7 +339,7 @@ fn exact_omnibox_suggestion(
         [] => return Ok(None),
         [(index, popup)] => (*index, *popup),
         _ => {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!(
                     "{} exposed multiple exact omnibox suggestion popups",
@@ -372,7 +368,7 @@ fn exact_omnibox_suggestion(
     match matches.as_slice() {
         [] => Ok(None),
         [(_, node)] => Ok(Some(node.element_ptr)),
-        _ => Err(refusal(
+        _ => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "{} exposed multiple exact setup URL suggestions",
@@ -387,7 +383,7 @@ fn new_tab_button(
     descriptor: &BrowserSetupDescriptor,
 ) -> Result<usize, BrowserRefusal> {
     unique_actionable(nodes, "AXButton", "New Tab", "AXPress")?.ok_or_else(|| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "the approved {} window has no exact New Tab button",
@@ -426,7 +422,7 @@ fn select_new_tab_close_button(
         [(index, tab)] => (*index, *tab),
         [] => return Ok(None),
         _ => {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!(
                     "{} exposed multiple new tab candidates",
@@ -457,14 +453,14 @@ fn select_new_tab_close_button(
     );
     match close_buttons.as_slice() {
         [(_, node)] => Ok(Some(node.element_ptr)),
-        [] => Err(refusal(
+        [] => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "the newly created {} tab has no exact Close button",
                 descriptor.product_name
             ),
         )),
-        _ => Err(refusal(
+        _ => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "the newly created {} tab has multiple Close buttons",
@@ -622,7 +618,7 @@ fn unique_pixel_checkbox(
     let [(center_x, center_y, state)] = matches else {
         return match matches.len() {
             0 => Ok(None),
-            _ => Err(refusal(
+            _ => Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!(
                     "{}'s exact setup page exposed multiple checkbox-shaped controls in the bounded trusted region",
@@ -819,7 +815,7 @@ fn exact_pixel_setup_checkbox(
         return Ok(None);
     }
     if tree.truncated {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "{}'s setup accessibility proof was truncated",
@@ -842,7 +838,7 @@ fn exact_pixel_setup_checkbox(
     .filter_map(|(_, node)| node.frame)
     .collect::<Vec<_>>();
     let [window_frame] = window_frames.as_slice() else {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "{}'s exact setup tab did not expose one native window frame",
@@ -866,7 +862,7 @@ fn exact_pixel_setup_checkbox(
     .filter_map(|(_, node)| node.frame)
     .collect::<Vec<_>>();
     let [omnibox_frame] = omnibox_frames.as_slice() else {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "{}'s exact setup tab did not expose one address-field frame",
@@ -875,7 +871,7 @@ fn exact_pixel_setup_checkbox(
         ));
     };
     let capture_bounds = crate::windows::window_bounds_by_id(window_id).ok_or_else(|| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "{}'s exact setup window disappeared before capture",
@@ -890,7 +886,7 @@ fn exact_pixel_setup_checkbox(
         capture_bounds.height,
     ];
     if !frames_agree(*window_frame, capture_frame, 1.0) {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "{}'s native and captured setup-window bounds disagree",
@@ -899,7 +895,7 @@ fn exact_pixel_setup_checkbox(
         ));
     }
     let png = crate::capture::screenshot_window_bytes(window_id).map_err(|error| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserRouteUnavailable,
             format!(
                 "could not capture {}'s exact setup window: {error}",
@@ -909,7 +905,7 @@ fn exact_pixel_setup_checkbox(
     })?;
     let screenshot = image::load_from_memory(&png)
         .map_err(|error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!(
                     "could not decode {}'s exact setup window: {error}",
@@ -924,7 +920,7 @@ fn exact_pixel_setup_checkbox(
         (screenshot.width(), screenshot.height()),
     )
     .map_err(|cause| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!(
                 "{}'s setup screenshot geometry was refused: {cause}",
@@ -1015,7 +1011,7 @@ fn checkbox_state(value: Option<bool>) -> Result<CheckboxState, BrowserRefusal> 
     match value {
         Some(false) => Ok(CheckboxState::Off),
         Some(true) => Ok(CheckboxState::On),
-        None => Err(refusal(
+        None => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             "the exact remote-debugging checkbox had an unknown checked state",
         )),
@@ -1034,7 +1030,7 @@ struct SetupReservation {
 impl SetupReservation {
     fn acquire(key: PendingSetupKey) -> Result<Self, BrowserRefusal> {
         if !setup_reservations().lock().unwrap().insert(key) {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingAmbiguous,
                 "another approved browser setup is already preparing this browser profile",
             ));
@@ -1281,7 +1277,7 @@ impl SetupUiHandle {
         Err(self.abort(
             pid,
             window_id,
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!(
                     "{}'s exact temporary-tab Close action became stale before AXPress",
@@ -1335,7 +1331,7 @@ fn setup_reservations() -> &'static Mutex<HashSet<PendingSetupKey>> {
 
 pub fn ensure_profile_discoverable(pid: i32) -> Result<(), BrowserRefusal> {
     if setup_reservations().lock().unwrap().contains(&pid) {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingAmbiguous,
             "browser endpoint discovery is blocked by a pending or poisoned setup for this profile",
         ));
@@ -1352,7 +1348,7 @@ pub fn retain_pending(
         return Err(handle.abort(
             pid,
             window_id,
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 "the browser setup reservation does not match the retained window",
             ),
@@ -1364,7 +1360,7 @@ pub fn retain_pending(
         return Err(handle.abort(
             pid,
             window_id,
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingAmbiguous,
                 "another approved browser setup is already pending for this browser profile",
             ),
@@ -1380,7 +1376,7 @@ pub fn commit_pending(pid: i32, window_id: u32) -> Result<bool, BrowserRefusal> 
         .unwrap()
         .remove(&pid)
         .ok_or_else(|| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 "the exact pending browser setup cleanup handle is missing",
             )
@@ -1389,7 +1385,7 @@ pub fn commit_pending(pid: i32, window_id: u32) -> Result<bool, BrowserRefusal> 
         return Err(handle.abort(
             pid,
             window_id,
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 "the pending browser setup belongs to a different approved window",
             ),
@@ -1404,7 +1400,7 @@ pub fn abort_pending(pid: i32, window_id: u32, error: BrowserRefusal) -> Browser
         Some(handle) => handle.abort(
             pid,
             window_id,
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 "the pending browser setup belongs to a different approved window",
             ),
@@ -1459,7 +1455,7 @@ fn set_remote_debugging(
             let pressed = unsafe { perform_action(new_tab as AXUIElementRef, "AXPress") };
             if pressed != kAXErrorSuccess {
                 release_actionable_nodes(&initial.nodes);
-                return Err(refusal(
+                return Err(BrowserRefusal::new(
                     BrowserRefusalCode::BrowserWrongTargetRefused,
                     format!(
                         "{}'s exact New Tab action became stale before AXPress",
@@ -1485,7 +1481,7 @@ fn set_remote_debugging(
                     Ok(None) => {
                         release_actionable_nodes(&initial.nodes);
                         release_actionable_nodes(&created.nodes);
-                        return Err(refusal(
+                        return Err(BrowserRefusal::new(
                             BrowserRefusalCode::BrowserWrongTargetRefused,
                             format!(
                                 "{} did not expose exactly one newly created tab",
@@ -1549,7 +1545,7 @@ fn set_remote_debugging(
                 return Err(handle.abort(
                     pid,
                     window_id,
-                    refusal(
+                    BrowserRefusal::new(
                         BrowserRefusalCode::BrowserWrongTargetRefused,
                         format!(
                             "{}'s exact address field became stale before AXPress",
@@ -1567,7 +1563,7 @@ fn set_remote_debugging(
                 return Err(handle.abort(
                     pid,
                     window_id,
-                    refusal(
+                    BrowserRefusal::new(
                         BrowserRefusalCode::BrowserWrongTargetRefused,
                         format!(
                             "{}'s exact address field rejected the fixed setup URL",
@@ -1592,7 +1588,7 @@ fn set_remote_debugging(
                 return Err(handle.abort(
                     pid,
                     window_id,
-                    refusal(
+                    BrowserRefusal::new(
                         BrowserRefusalCode::BrowserWrongTargetRefused,
                         format!(
                             "{}'s exact address field did not retain the fixed setup URL",
@@ -1633,7 +1629,7 @@ fn set_remote_debugging(
                             return Err(handle.abort(
                                 pid,
                                 window_id,
-                                refusal(
+                                BrowserRefusal::new(
                                     BrowserRefusalCode::BrowserWrongTargetRefused,
                                     format!(
                                         "{}'s exact fixed-URL suggestion became stale before AXPress",
@@ -1731,7 +1727,7 @@ fn set_remote_debugging(
                             return Err(handle.abort(
                                 pid,
                                 window_id,
-                                refusal(
+                                BrowserRefusal::new(
                                     BrowserRefusalCode::BrowserWrongTargetRefused,
                                     format!(
                                         "could not navigate the exact approved {} setup tab: {error}",
@@ -1789,7 +1785,7 @@ fn set_remote_debugging(
                                 unsafe { perform_action(element as AXUIElementRef, "AXPress") };
                             release_actionable_nodes(&tree.nodes);
                             if pressed != kAXErrorSuccess {
-                                return Err(handle.abort(pid, window_id, refusal(
+                                return Err(handle.abort(pid, window_id, BrowserRefusal::new(
                                     BrowserRefusalCode::BrowserWrongTargetRefused,
                                     "the exact remote-debugging checkbox became stale before AXPress",
                                 )));
@@ -1808,7 +1804,7 @@ fn set_remote_debugging(
                                 return Err(handle.abort(
                                     pid,
                                     window_id,
-                                    refusal(
+                                    BrowserRefusal::new(
                                         BrowserRefusalCode::BrowserWrongTargetRefused,
                                         "the exact remote-debugging checkbox had no stable screen center",
                                     ),
@@ -1844,7 +1840,7 @@ fn set_remote_debugging(
                                 return Err(handle.abort(
                                     pid,
                                     window_id,
-                                    refusal(
+                                    BrowserRefusal::new(
                                         BrowserRefusalCode::BrowserWrongTargetRefused,
                                         format!(
                                             "could not toggle the exact Microsoft Edge remote-debugging checkbox: {error}"
@@ -1880,7 +1876,7 @@ fn set_remote_debugging(
                         return Err(handle.abort(
                             pid,
                             window_id,
-                            refusal(
+                            BrowserRefusal::new(
                                 BrowserRefusalCode::BrowserWrongTargetRefused,
                                 format!(
                                     "the exact {} remote-debugging checkbox changed identity after the setup click",
@@ -1927,7 +1923,7 @@ fn set_remote_debugging(
                             return Err(handle.abort(
                                 pid,
                                 window_id,
-                                refusal(
+                                BrowserRefusal::new(
                                     BrowserRefusalCode::BrowserWrongTargetRefused,
                                     format!(
                                         "could not toggle the exact {} remote-debugging checkbox: {error}",
@@ -1954,7 +1950,7 @@ fn set_remote_debugging(
             return Err(handle.abort(
                 pid,
                 window_id,
-                refusal(
+                BrowserRefusal::new(
                     BrowserRefusalCode::BrowserWrongTargetRefused,
                     format!(
                         "the exact {} remote-debugging setup page did not become ready",

@@ -30,6 +30,7 @@ pub use keyboard::{
 pub use mouse::{
     has_chromium_descendant, is_chromium_target_window, post_click_screen, send_click_synthesized,
     send_click_synthesized_active_mods, send_click_synthesized_active_mods_for_pid,
+    send_click_synthesized_desktop_mods, send_click_synthesized_desktop_mods_for_pid,
     send_click_synthesized_mods, send_click_synthesized_mods_for_pid, send_wheel_synthesized,
     send_wheel_synthesized_for_target,
 };

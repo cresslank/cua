@@ -189,7 +189,7 @@ where
         let mut error = cleanup_error
             .or_else(|| dismiss_error.clone())
             .unwrap_or_else(|| {
-                refusal(
+                BrowserRefusal::new(
                     BrowserRefusalCode::BrowserWrongTargetRefused,
                     "remote-debugging cleanup retained browser consent UI",
                 )
@@ -244,7 +244,7 @@ impl MacOsBrowserPlatform {
                 continue;
             };
             if discovered.is_some() {
-                return Err(refusal(
+                return Err(BrowserRefusal::new(
                     BrowserRefusalCode::BrowserBindingAmbiguous,
                     "multiple browser-level DevTools endpoints are owned by the approved process",
                 ));
@@ -286,10 +286,6 @@ fn restore_front_app_if_browser_front(previous_pid: i64, browser_pid: i64) -> bo
         return false;
     }
     crate::apps::activate_pid(previous)
-}
-
-fn refusal(code: BrowserRefusalCode, message: impl Into<String>) -> BrowserRefusal {
-    BrowserRefusal::new(code, message)
 }
 
 fn is_chromium(name: &str, bundle_id: &str) -> bool {
@@ -431,7 +427,7 @@ fn default_user_data_dir(product: BrowserProduct) -> Option<PathBuf> {
 
 fn process_arguments(pid: i64) -> Result<Vec<Vec<u8>>, BrowserRefusal> {
     let pid = libc::pid_t::try_from(pid).map_err(|_| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             "browser pid is outside the macOS process-id range",
         )
@@ -449,7 +445,7 @@ fn process_arguments(pid: i64) -> Result<Vec<Vec<u8>>, BrowserRefusal> {
         )
     };
     if size_result != 0 || size < std::mem::size_of::<libc::c_int>() {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingStale,
             format!("browser process {pid} arguments are unavailable"),
         ));
@@ -466,7 +462,7 @@ fn process_arguments(pid: i64) -> Result<Vec<Vec<u8>>, BrowserRefusal> {
         )
     };
     if read_result != 0 {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingStale,
             format!("browser process {pid} arguments changed during inspection"),
         ));
@@ -528,11 +524,11 @@ fn user_data_dir_from_arguments_with_relative_fallback(
         [] => Ok(default),
         [path] if path.is_absolute() => Ok(Some(path.clone())),
         [_] if allow_relative_fallback => Ok(None),
-        [_] => Err(refusal(
+        [_] => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserRouteUnavailable,
             "the browser uses a relative --user-data-dir that cannot be attested without its launch working directory",
         )),
-        _ => Err(refusal(
+        _ => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingAmbiguous,
             "browser process has multiple distinct --user-data-dir arguments",
         )),
@@ -554,7 +550,7 @@ async fn user_data_dir_for_pid(
     })
     .await
     .map_err(|error| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserRouteUnavailable,
             format!("browser argument inspection task failed: {error}"),
         )
@@ -593,14 +589,14 @@ async fn process_details(pid: i64) -> Result<(String, String), BrowserRefusal> {
             )
         })?;
     if !output.status.success() {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingStale,
             format!("browser process {pid} is no longer available"),
         ));
     }
     let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     if text.is_empty() {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingStale,
             format!("browser process {pid} has no process identity"),
         ));
@@ -685,14 +681,14 @@ async fn active_port_endpoint_with_relative_fallback(
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!("could not read the browser's DevToolsActivePort file: {error}"),
             ))
         }
     };
     let Some((port, path)) = parse_devtools_active_port(&text) else {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserEndpointOwnerMismatch,
             "the browser's DevToolsActivePort file did not contain one exact browser endpoint",
         ));
@@ -718,7 +714,7 @@ async fn active_port_endpoint_with_relative_fallback(
 
 fn ensure_profile_discoverable(pid: i64) -> Result<(), BrowserRefusal> {
     let pid = i32::try_from(pid).map_err(|_| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             "browser pid is outside the macOS process-id range",
         )
@@ -785,7 +781,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 return Ok(executable);
             }
         }
-        Err(refusal(
+        Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserRouteUnavailable,
             "no vendor-signed system Chromium executable is available for isolated launch",
         ))
@@ -980,7 +976,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         window_id: u64,
     ) -> Result<NativeWindowInfo, BrowserRefusal> {
         let window_id_u32 = u32::try_from(window_id).map_err(|_| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!("window_id {window_id} is outside the macOS window-id range"),
             )
@@ -994,13 +990,13 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         .ok()
         .flatten()
         .ok_or_else(|| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 format!("macOS window {window_id} is no longer available"),
             )
         })?;
         if i64::from(window.pid) != pid {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!("window {window_id} is not owned by pid {pid}"),
             ));
@@ -1034,7 +1030,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         })
         .await
         .map_err(|error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!("could not enumerate macOS browser windows: {error}"),
             )
@@ -1065,7 +1061,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
         ensure_profile_discoverable(pid)?;
         let Some(port) = loopback_websocket_port(expected_ws_url) else {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserEndpointOwnerMismatch,
                 "the approved existing-profile endpoint is not loopback-only",
             ));
@@ -1076,7 +1072,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         let classification = self.classify_browser(pid).await?;
         if let Some(endpoint) = active_port_endpoint(pid, classification.product_kind).await? {
             if endpoint.ws_url != expected_ws_url {
-                return Err(refusal(
+                return Err(BrowserRefusal::new(
                     BrowserRefusalCode::BrowserEndpointOwnerMismatch,
                     "the browser's exact DevTools endpoint changed after approval",
                 ));
@@ -1101,7 +1097,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         request: ExistingProfileSetupRequest,
     ) -> Result<ExistingProfileSetupOutcome, BrowserRefusal> {
         let descriptor = existing_profile_setup_descriptor(request.browser).ok_or_else(|| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!(
                     "approved existing-profile setup is not implemented for {:?}",
@@ -1110,13 +1106,13 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             )
         })?;
         let pid = i32::try_from(request.pid).map_err(|_| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "the approved browser pid is outside the macOS process-id range",
             )
         })?;
         let window_id = u32::try_from(request.window_id).map_err(|_| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "the approved browser window is outside the macOS window-id range",
             )
@@ -1131,7 +1127,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 })
                 .await
                 .map_err(|error| {
-                    refusal(
+                    BrowserRefusal::new(
                         BrowserRefusalCode::BrowserRouteUnavailable,
                         format!(
                             "could not inspect {}'s remote-debugging setup UI: {error}",
@@ -1179,7 +1175,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                         "new PID-owned listener correlated with exact approved setup",
                     ));
                 } else if correlated.len() > 1 {
-                    break Err(refusal(
+                    break Err(BrowserRefusal::new(
                         BrowserRefusalCode::BrowserBindingAmbiguous,
                         format!(
                             "{} exposed multiple newly correlated PID-owned listeners",
@@ -1206,7 +1202,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 [] => {
-                    break Err(refusal(
+                    break Err(BrowserRefusal::new(
                         BrowserRefusalCode::BrowserRequiresSetup,
                         format!(
                             "{} did not expose a uniquely PID-owned loopback endpoint after the exact setup action",
@@ -1215,7 +1211,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                     ))
                 }
                 _ => {
-                    break Err(refusal(
+                    break Err(BrowserRefusal::new(
                         BrowserRefusalCode::BrowserBindingAmbiguous,
                         format!(
                             "{} exposed multiple PID-owned endpoint candidates after the exact setup action",
@@ -1232,7 +1228,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                     cua_driver_core::blocking::spawn(move || handle.abort(pid, window_id, error))
                         .await
                         .map_err(|join_error| {
-                            refusal(
+                            BrowserRefusal::new(
                                 BrowserRefusalCode::BrowserRouteUnavailable,
                                 format!("could not roll back browser setup: {join_error}"),
                             )
@@ -1259,13 +1255,13 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         request: ExistingProfileSetupRequest,
     ) -> Result<bool, BrowserRefusal> {
         let pid = i32::try_from(request.pid).map_err(|_| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "the approved browser pid is outside the macOS process-id range",
             )
         })?;
         let window_id = u32::try_from(request.window_id).map_err(|_| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "the approved browser window is outside the macOS window-id range",
             )
@@ -1273,7 +1269,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         cua_driver_core::blocking::spawn(move || super::setup_ui::commit_pending(pid, window_id))
             .await
             .map_err(|error| {
-                refusal(
+                BrowserRefusal::new(
                     BrowserRefusalCode::BrowserRouteUnavailable,
                     format!("could not commit exact browser setup cleanup: {error}"),
                 )
@@ -1285,7 +1281,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         request: ExistingProfileSetupRequest,
     ) -> Result<bool, BrowserRefusal> {
         let descriptor = existing_profile_setup_descriptor(request.browser).ok_or_else(|| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!(
                     "existing-profile cleanup is not implemented for {:?}",
@@ -1294,13 +1290,13 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             )
         })?;
         let pid = i32::try_from(request.pid).map_err(|_| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "the approved browser pid is outside the macOS process-id range",
             )
         })?;
         let window_id = u32::try_from(request.window_id).map_err(|_| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "the approved browser window is outside the macOS window-id range",
             )
@@ -1344,7 +1340,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         })
         .await
         .unwrap_or_else(|join_error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRouteUnavailable,
                 format!("could not roll back exact browser setup: {join_error}"),
             )
@@ -1372,7 +1368,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         request: PrepareRequest,
     ) -> Result<PrepareOutcome, BrowserRefusal> {
         let Some(pid) = request.pid else {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserRequiresSetup,
                 "pid-free isolated launch is handled by shared core",
             ));
@@ -1387,7 +1383,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 attachment: None,
             });
         }
-        Err(refusal(
+        Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserRequiresSetup,
             "No owned endpoint is available. Acting setup is handled by shared core only for a verified driver-owned isolated profile.",
         ))
@@ -1436,7 +1432,7 @@ mod tests {
         ]
         .into_iter();
         let error = run_failed_prepare_consent_cleanup(
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "prepare failed",
             ),
@@ -1471,13 +1467,13 @@ mod tests {
     fn failed_prepare_cleanup_returns_bounded_evidence_for_retained_surfaces() {
         let mut rollback_calls = 0;
         let error = run_failed_prepare_consent_cleanup(
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "prepare failed",
             ),
             3,
             || {
-                Err(refusal(
+                Err(BrowserRefusal::new(
                     BrowserRefusalCode::BrowserWrongTargetRefused,
                     "ambiguous cancel actions",
                 ))
@@ -1570,7 +1566,7 @@ mod tests {
         let error = run_committed_consent_cleanup(
             1,
             || {
-                Err(refusal(
+                Err(BrowserRefusal::new(
                     BrowserRefusalCode::BrowserWrongTargetRefused,
                     "truncated scan",
                 ))
@@ -1588,13 +1584,13 @@ mod tests {
         );
         let mut rolled_back = false;
         let error = run_failed_prepare_consent_cleanup(
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserConsentRevoked,
                 "original prepare failure",
             ),
             1,
             || {
-                Err(refusal(
+                Err(BrowserRefusal::new(
                     BrowserRefusalCode::BrowserWrongTargetRefused,
                     "truncated scan",
                 ))

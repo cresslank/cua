@@ -9,10 +9,6 @@ use cua_driver_core::browser::{
 
 use crate::atspi::AtspiNode;
 
-fn refusal(code: BrowserRefusalCode, message: impl Into<String>) -> BrowserRefusal {
-    BrowserRefusal::new(code, message)
-}
-
 fn normalized_text(node: &AtspiNode) -> String {
     [
         node.name.as_deref(),
@@ -154,7 +150,7 @@ fn exact_prompt_button(
     match matches.as_slice() {
         [] => Ok(None),
         [node] => Ok(Some(allow_action(node))),
-        _ => Err(refusal(
+        _ => Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             format!("multiple exact {label} actions matched the browser consent prompt"),
         )
@@ -244,7 +240,7 @@ fn trusted_allow_click(target: &crate::wayland::ExactTargetProof) -> anyhow::Res
 
 pub fn dismiss(pid: u32, window_id: u64) -> Result<bool, BrowserRefusal> {
     let target = crate::wayland::establish_exact_target(pid, window_id).map_err(|error| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserBindingStale,
             format!("the approved browser window is not exact: {error}"),
         )
@@ -253,7 +249,7 @@ pub fn dismiss(pid: u32, window_id: u64) -> Result<bool, BrowserRefusal> {
     let mut dismissed = false;
     loop {
         crate::wayland::validate_exact_target(&target).map_err(|error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 format!("the approved browser window changed before cleanup: {error}"),
             )
@@ -264,7 +260,7 @@ pub fn dismiss(pid: u32, window_id: u64) -> Result<bool, BrowserRefusal> {
             return Ok(dismissed);
         }
         let cancel = exact_cancel_button(&tree.nodes, &tree.bounds)?.ok_or_else(|| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "the exact remote-debugging consent prompt exposed no semantic cancel action",
             )
@@ -280,20 +276,20 @@ pub fn dismiss(pid: u32, window_id: u64) -> Result<bool, BrowserRefusal> {
             &cancel.action,
         )
         .map_err(|error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 format!("the exact browser consent cancel action failed: {error}"),
             )
         })?;
         if result.0 != expected_action || result.1 {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "the exact browser consent cancel action was not explicitly acknowledged",
             ));
         }
         dismissed = true;
         if Instant::now() >= deadline {
-            return Err(refusal(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "the remote-debugging consent prompt remained after its exact cancel action",
             ));
@@ -304,7 +300,7 @@ pub fn dismiss(pid: u32, window_id: u64) -> Result<bool, BrowserRefusal> {
 
 fn check_deadline(deadline: Instant) -> Result<(), BrowserRefusal> {
     if Instant::now() >= deadline {
-        return Err(refusal(
+        return Err(BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             "Chromium remote-debugging consent did not settle within its bounded attempt",
         ));
@@ -323,7 +319,7 @@ async fn consent_action<T: Send + 'static>(
         cua_driver_core::blocking::spawn(move || {
             check_deadline(deadline)?;
             operation().map_err(|error| {
-                refusal(
+                BrowserRefusal::new(
                     BrowserRefusalCode::BrowserWrongTargetRefused,
                     format!("the exact browser consent action failed: {error}"),
                 )
@@ -331,7 +327,7 @@ async fn consent_action<T: Send + 'static>(
         })
     });
     let result = worker.await.map_err(|error| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserRouteUnavailable,
             format!("could not dispatch the exact browser consent action: {error}"),
         )
@@ -345,14 +341,14 @@ pub async fn handle(
     request: BrowserConsentRequest,
 ) -> Result<BrowserConsentOutcome, BrowserRefusal> {
     let pid = u32::try_from(request.pid).map_err(|_| {
-        refusal(
+        BrowserRefusal::new(
             BrowserRefusalCode::BrowserWrongTargetRefused,
             "the approved browser pid is outside the Linux process-id range",
         )
     })?;
     let target =
         crate::wayland::establish_exact_target(pid, request.window_id).map_err(|error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 format!("the approved browser window is not exact: {error}"),
             )
@@ -364,7 +360,7 @@ pub async fn handle(
     loop {
         check_deadline(deadline)?;
         crate::wayland::validate_exact_target(&target).map_err(|error| {
-            refusal(
+            BrowserRefusal::new(
                 BrowserRefusalCode::BrowserBindingStale,
                 format!("the approved browser window changed before consent: {error}"),
             )
@@ -374,7 +370,7 @@ pub async fn handle(
             cua_driver_core::blocking::spawn(move || crate::atspi::walk_tree(pid, window_id, None))
                 .await
                 .map_err(|error| {
-                    refusal(
+                    BrowserRefusal::new(
                         BrowserRefusalCode::BrowserRouteUnavailable,
                         format!("could not inspect the browser consent UI: {error}"),
                     )
@@ -401,7 +397,7 @@ pub async fn handle(
                 })
                 .await?;
                 if result.0 != expected_action || result.1 {
-                    return Err(refusal(
+                    return Err(BrowserRefusal::new(
                         BrowserRefusalCode::BrowserWrongTargetRefused,
                         "the exact browser consent action was not explicitly acknowledged",
                     ));
@@ -430,7 +426,7 @@ pub async fn handle(
                 if accessibility_action_at.is_some() {
                     return Ok(BrowserConsentOutcome::Accepted);
                 }
-                return Err(refusal(
+                return Err(BrowserRefusal::new(
                     BrowserRefusalCode::BrowserConsentRevoked,
                     "the browser consent prompt disappeared without an explicitly acknowledged Allow action",
                 ));

@@ -46,6 +46,10 @@ windows = { version = "0.58", features = [
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+# A musl Linux build is the static headless guest daemon (cua-spacesd in any
+# OCI image): no desktop platform, so none of the X11/AT-SPI C libraries.
+[target.'cfg(all(target_os = "linux", not(target_env = "musl")))'.dependencies]
 platform-linux = { path = "../platform-linux" }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

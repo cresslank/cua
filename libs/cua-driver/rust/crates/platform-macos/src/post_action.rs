@@ -11,7 +11,8 @@ use crate::focus_steal::SuppressionLease;
 
 const MAX_HELD: usize = 256;
 static BACKGROUND: OnceLock<bool> = OnceLock::new();
-static HOLDER: OnceLock<Holder<SuppressionLease>> = OnceLock::new();
+// Lease-less observation and focus protection share one process-wide bound.
+static HOLDER: OnceLock<Holder<Option<SuppressionLease>>> = OnceLock::new();
 
 /// Pin finite in-process commands to synchronous mode, before SDK creation.
 pub fn keep_synchronous() {
@@ -22,26 +23,27 @@ pub fn keep_synchronous() {
 /// The immutable process choice prevents one runtime changing another's mode.
 pub fn enable_background() {
     if *BACKGROUND.get_or_init(|| true) {
-        HOLDER.get_or_init(|| {
-            let holder = Holder::new();
-            // Normal return and process::exit both run atexit callbacks. The
-            // reaper is independent of Tokio, which may already be torn down.
-            //
-            // Exit waits for the fixed set of guards already handed off, i.e.
-            // actions that had returned before exit began; synchronous mode
-            // finished those guards before returning, so none is shortened.
-            // An action still running when exit begins loses its guard at
-            // termination, exactly as the synchronous wait did. Exit must not
-            // wait for running actions: their futures may need the executor
-            // thread that called exit (current-thread hosts), which deadlocks.
-            extern "C" fn drain_before_exit() {
-                drain();
-            }
-            assert_eq!(unsafe { libc::atexit(drain_before_exit) }, 0);
-            holder
-        });
-        cua_driver_core::action_boundary::install_before_mutation_hook(cancel);
+        holder();
     }
+}
+
+/// An explicit skip can defer observation even in a finite host. Initialize its
+/// cancellation/exit ownership without changing that host's BACKGROUND choice.
+fn holder() -> &'static Holder<Option<SuppressionLease>> {
+    let holder = HOLDER.get_or_init(|| {
+        let holder = Holder::new();
+        // Normal return and process::exit both run atexit callbacks. The
+        // reaper is independent of Tokio, which may already be torn down.
+        // Exit waits only for the fixed set already handed off. Waiting for
+        // running actions could deadlock the executor thread calling exit.
+        extern "C" fn drain_before_exit() {
+            drain();
+        }
+        assert_eq!(unsafe { libc::atexit(drain_before_exit) }, 0);
+        holder
+    });
+    cua_driver_core::action_boundary::install_before_mutation_hook(cancel);
+    holder
 }
 
 pub(crate) fn background() -> bool {
@@ -49,7 +51,9 @@ pub(crate) fn background() -> bool {
 }
 
 pub(crate) fn generation() -> u64 {
-    HOLDER.get().map_or(0, Holder::generation)
+    // Install cancellation before capturing the epoch. A first finite-host
+    // skip must not resurrect a watch after an intervening intentional action.
+    holder().generation()
 }
 
 /// Cancel only deferred leases, never the guards of a currently running action.
@@ -73,30 +77,23 @@ pub(crate) fn hold(
     generation: u64,
 ) -> Result<(), SuppressionLease> {
     match HOLDER.get().filter(|_| background()) {
-        Some(holder) => holder.hold(lease, deadline, generation),
+        Some(holder) => holder
+            .hold(Some(lease), deadline, generation)
+            .map_err(|lease| lease.expect("a refused hold preserves its lease")),
         None => Err(lease),
     }
 }
 
 /// Poll deferred observation on the same bounded reaper that owns the lease.
-/// A saturated holder returns the original lease for synchronous protection.
+/// An explicit finite-host skip may queue a lease-less watch too. Saturation
+/// returns ownership unchanged so the caller can protect its deadline locally.
 pub(crate) fn hold_observation(
-    lease: SuppressionLease,
+    lease: Option<SuppressionLease>,
     deadline: Instant,
     generation: u64,
     poll: impl FnMut() -> bool + Send + 'static,
-) -> Result<(), SuppressionLease> {
-    let Some(holder) = HOLDER.get().filter(|_| background()) else {
-        return Err(lease);
-    };
-    let mut state = holder.state.0.lock().unwrap();
-    let previous = state.last_id;
-    state.hold(lease, deadline, generation, Instant::now())?;
-    if state.last_id != previous {
-        state.leases.last_mut().unwrap().poll = Some(Box::new(poll));
-    }
-    holder.state.1.notify_all();
-    Ok(())
+) -> Result<(), Option<SuppressionLease>> {
+    holder().hold_observation(lease, deadline, generation, poll)
 }
 
 struct State<T> {
@@ -232,6 +229,23 @@ impl<T: Send + 'static> Holder<T> {
         result
     }
 
+    fn hold_observation(
+        &self,
+        lease: T,
+        deadline: Instant,
+        generation: u64,
+        poll: impl FnMut() -> bool + Send + 'static,
+    ) -> Result<(), T> {
+        let mut state = self.state.0.lock().unwrap();
+        let previous = state.last_id;
+        state.hold(lease, deadline, generation, Instant::now())?;
+        if state.last_id != previous {
+            state.leases.last_mut().unwrap().poll = Some(Box::new(poll));
+        }
+        self.state.1.notify_all();
+        Ok(())
+    }
+
     fn cancel(&self) -> u64 {
         let mut state = self.state.0.lock().unwrap();
         state.generation = state.generation.wrapping_add(1);
@@ -343,6 +357,72 @@ mod tests {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[test]
+    fn finite_observation_initializes_cancellation_without_pinning_background() {
+        let choice = BACKGROUND.get().copied();
+        let generation = generation();
+        assert!(HOLDER.get().is_some());
+        assert_eq!(BACKGROUND.get().copied(), choice);
+        // An intentional action between capture and handoff invalidates even
+        // the first lease-less watch; its callback must never run.
+        cancel();
+        assert!(hold_observation(
+            None,
+            Instant::now() + Duration::from_secs(1),
+            generation,
+            || panic!("stale finite-host observation ran"),
+        )
+        .is_ok());
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(hold_observation(
+            None,
+            Instant::now() + Duration::from_secs(1),
+            self::generation(),
+            move || {
+                tx.send(()).unwrap();
+                true
+            },
+        )
+        .is_ok());
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drain();
+        assert_eq!(BACKGROUND.get().copied(), choice);
+    }
+
+    #[test]
+    fn lease_less_watches_share_the_bound_and_preserve_overflow_ownership() {
+        let holder = Holder::<Option<Lease>>::new();
+        let drops = Arc::new(AtomicUsize::new(0));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let generation = holder.generation();
+        for _ in 0..MAX_HELD {
+            assert!(holder
+                .hold_observation(None, deadline, generation, || false)
+                .is_ok());
+        }
+        assert!(matches!(
+            holder.hold_observation(None, deadline, generation, || false),
+            Err(None)
+        ));
+        let overflow =
+            holder.hold_observation(Some(Lease(drops.clone())), deadline, generation, || {
+                panic!("refused observation ran")
+            });
+        assert!(matches!(overflow, Err(Some(_))));
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        holder.cancel();
+        assert!(holder.state.0.lock().unwrap().leases.is_empty());
+        drop(overflow);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        // Late admission after cancellation drops a real lease immediately.
+        assert!(holder
+            .hold_observation(Some(Lease(drops.clone())), deadline, generation, || {
+                panic!("cancelled observation ran")
+            })
+            .is_ok());
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     #[test]

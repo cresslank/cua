@@ -55,9 +55,15 @@ pub(crate) struct RuntimeOptions {
     pub host_owns_permission_ux: bool,
     pub host_bundle_id: Option<String>,
     pub compatibility_mode: bool,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(target_os = "linux", not(target_env = "musl"))),
+        allow(dead_code)
+    )]
     pub prepare_desktop_environment: bool,
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(
+        not(all(target_os = "linux", not(target_env = "musl"))),
+        allow(dead_code)
+    )]
     pub require_atspi_listener: bool,
     pub register_host_tools: Option<fn(&mut ToolRegistry)>,
     pub authorization_ceiling: Option<SessionModeCeiling>,
@@ -171,7 +177,7 @@ pub(crate) struct DriverRuntime {
     /// previously admitted operation is still executing.
     lifecycle: tokio::sync::RwLock<()>,
     lifecycle_maintenance: Mutex<Option<LifecycleMaintenance>>,
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     platform_lease: Mutex<Option<platform_linux::lifecycle::RuntimeLease>>,
     #[cfg(target_os = "linux")]
     shutdown_signal: tokio::sync::watch::Sender<bool>,
@@ -206,7 +212,7 @@ impl DriverRuntime {
                 .legacy_context()
                 .map_err(RuntimeCreateError::Authorization)?,
         };
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "musl")))]
         let platform_lease = platform_linux::lifecycle::RuntimeLease::acquire()
             .map_err(|error| RuntimeCreateError::Unavailable(error.to_string()))?;
         let registry = Arc::new(cua_driver_core::tool::with_runtime_scope(
@@ -224,7 +230,7 @@ impl DriverRuntime {
             last_activity: AtomicU64::new(now_unix_secs()),
             lifecycle: tokio::sync::RwLock::new(()),
             lifecycle_maintenance: Mutex::new(None),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", not(target_env = "musl")))]
             platform_lease: Mutex::new(Some(platform_lease)),
             #[cfg(target_os = "linux")]
             shutdown_signal: tokio::sync::watch::channel(false).0,
@@ -308,7 +314,7 @@ impl DriverRuntime {
         }
         #[cfg(not(target_os = "linux"))]
         let _ = stop_recording.await;
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "musl")))]
         {
             let lease = self.platform_lease.lock().unwrap().take();
             if let Some(lease) = lease {
@@ -566,7 +572,7 @@ impl Drop for DriverRuntime {
             let recording = self.registry.recording.clone();
             let _ = recording.stop_owner(None);
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", not(target_env = "musl")))]
         self.platform_lease.get_mut().unwrap().take();
     }
 }
@@ -663,7 +669,7 @@ pub(crate) fn tool_inventory(mut options: RuntimeOptions) -> Value {
 /// This uses the same preparation lock, bus discovery, listener admission and
 /// native hooks as the embedded runtime. Errors must abort native admission.
 /// Metadata-only and headless hosts should not call this constructor.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 pub fn build_linux_host_registry(cursor: CursorConfig) -> Result<ToolRegistry, String> {
     // The Rust-only registry seam is an owner too, even without DriverRuntime.
     // Retain it through the registry's existing drop-cleanup mechanism so an
@@ -677,7 +683,7 @@ pub fn build_linux_host_registry(cursor: CursorConfig) -> Result<ToolRegistry, S
     Ok(registry)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn build_linux_registry(options: &RuntimeOptions) -> Result<ToolRegistry, RuntimeCreateError> {
     configure_linux_runtime(
         options.prepare_desktop_environment,
@@ -713,10 +719,14 @@ fn build_registry(options: &RuntimeOptions) -> Result<ToolRegistry, RuntimeCreat
         )
     };
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     let mut registry = build_linux_registry(options)?;
 
-    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "windows",
+        all(target_os = "linux", not(target_env = "musl"))
+    )))]
     let mut registry = {
         let _ = options;
         ToolRegistry::new()
@@ -799,14 +809,14 @@ fn configure_windows_runtime() {
     ));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn acquire_linux_desktop_preparation_lock() -> Result<std::fs::File, String> {
     let effective_uid = unsafe { libc::geteuid() };
     let path = linux_desktop_preparation_lock_path(effective_uid);
     acquire_linux_desktop_preparation_lock_at(&path, effective_uid)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn acquire_linux_desktop_preparation_lock_until(
     deadline: std::time::Instant,
 ) -> Result<std::fs::File, String> {
@@ -815,7 +825,7 @@ fn acquire_linux_desktop_preparation_lock_until(
     acquire_linux_desktop_preparation_lock_at_until(&path, effective_uid, deadline)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn linux_desktop_preparation_lock_path(effective_uid: u32) -> std::path::PathBuf {
     // Derive one host-wide location from the effective UID, never from ambient
     // XDG_RUNTIME_DIR or TMPDIR. Services, private workers, and manually
@@ -831,7 +841,7 @@ fn linux_desktop_preparation_lock_path(effective_uid: u32) -> std::path::PathBuf
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn acquire_linux_desktop_preparation_lock_at(
     path: &std::path::Path,
     effective_uid: u32,
@@ -843,7 +853,7 @@ fn acquire_linux_desktop_preparation_lock_at(
     )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn acquire_linux_desktop_preparation_lock_at_until(
     path: &std::path::Path,
     effective_uid: u32,
@@ -899,7 +909,7 @@ fn acquire_linux_desktop_preparation_lock_at_until(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn trusted_private_worker_accessibility_bus_from_current_process(
 ) -> Result<Option<String>, RuntimeCreateError> {
     const PRIVATE_ATSPI_ROUTE: &str = "CUA_DRIVER_PRIVATE_AT_SPI_BUS_ADDRESS";
@@ -922,7 +932,7 @@ fn trusted_private_worker_accessibility_bus_from_current_process(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 pub(crate) fn prepare_private_worker_accessibility_route(
     deadline: std::time::Instant,
 ) -> Result<String, RuntimeCreateError> {
@@ -991,7 +1001,7 @@ pub(crate) fn prepare_private_worker_accessibility_route(
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn configure_linux_runtime(
     prepare_desktop_environment: bool,
     require_atspi_listener: bool,
@@ -1037,7 +1047,7 @@ fn configure_linux_runtime(
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn linux_preparation_lock_for_admission<T>(
     require_atspi_listener: bool,
     lock: Result<T, String>,
@@ -1055,7 +1065,7 @@ fn linux_preparation_lock_for_admission<T>(
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
 fn finish_linux_accessibility_admission(
     require_atspi_listener: bool,
     preparation: Result<(), String>,
@@ -1130,7 +1140,7 @@ mod tests {
         options
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     #[test]
     fn strict_linux_admission_rejects_accessibility_preparation_failure() {
         let listener_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1149,7 +1159,7 @@ mod tests {
         assert!(!listener_called.load(Ordering::SeqCst));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     #[test]
     fn desktop_preparation_lock_contention_obeys_linux_admission_policy() {
         assert!(matches!(
@@ -1193,7 +1203,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     #[test]
     fn best_effort_linux_admission_degrades_on_accessibility_preparation_failure() {
         finish_linux_accessibility_admission(
@@ -1204,7 +1214,7 @@ mod tests {
         .expect("best-effort admission should preserve direct MCP transport");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     #[test]
     fn listener_failure_obeys_linux_admission_policy() {
         let strict = finish_linux_accessibility_admission(true, Ok(()), || {
@@ -1246,7 +1256,7 @@ mod tests {
         assert!(violations.is_empty(), "{violations:#?}");
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(target_env = "musl")))]
     #[test]
     fn metadata_schema_validation_does_not_reopen_a_retired_native_owner() {
         let exact = concat!(
