@@ -40,6 +40,7 @@
 //! its fallback and reports that it could not exclude the overlay.
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+pub use cua_driver_core::image_utils::{CapturedImage, RgbaFrame};
 use objc2::rc::autoreleasepool;
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -217,10 +218,10 @@ fn capture_window_with_backends<N, F>(
     window_id: u32,
     native: N,
     fallback: F,
-) -> anyhow::Result<Vec<u8>>
+) -> anyhow::Result<CapturedImage>
 where
-    N: FnOnce(u32) -> anyhow::Result<Vec<u8>>,
-    F: FnOnce(u32) -> anyhow::Result<Vec<u8>>,
+    N: FnOnce(u32) -> anyhow::Result<CapturedImage>,
+    F: FnOnce(u32) -> anyhow::Result<CapturedImage>,
 {
     match native(window_id) {
         Ok(bytes) if !bytes.is_empty() => Ok(bytes),
@@ -548,17 +549,20 @@ fn window_capture_config(
         .with_shows_cursor(false)
 }
 
-/// Single-frame capture + RGBA/PNG encode from an existing plan.
+/// Single-frame capture from an existing plan, kept as raw RGBA pixels.
 ///
 /// https://developer.apple.com/documentation/screencapturekit/scscreenshotmanager
-fn capture_window_from_plan(window_id: u32, plan: &WindowCapturePlan) -> anyhow::Result<Vec<u8>> {
+fn capture_window_from_plan(
+    window_id: u32,
+    plan: &WindowCapturePlan,
+) -> anyhow::Result<CapturedImage> {
     use screencapturekit::screenshot_manager::SCScreenshotManager;
 
     let image = SCScreenshotManager::capture_image(&plan.filter, &plan.config).map_err(|e| {
         anyhow::anyhow!("SCScreenshotManager::capture_image failed for window {window_id}: {e}")
     })?;
 
-    cgimage_to_png(&image, &format!("window {window_id}"))
+    cgimage_to_rgba(&image, &format!("window {window_id}")).map(CapturedImage::Rgba)
 }
 
 /// Encode a ScreenCaptureKit `CGImage` as PNG after checking its geometry.
@@ -566,6 +570,15 @@ fn cgimage_to_png(
     image: &screencapturekit::screenshot_manager::CGImage,
     label: &str,
 ) -> anyhow::Result<Vec<u8>> {
+    let frame = cgimage_to_rgba(image, label)?;
+    cua_driver_core::image_utils::encode_rgba_to_png(&frame.rgba, frame.width, frame.height)
+}
+
+/// Read a ScreenCaptureKit `CGImage`'s RGBA pixels after checking its geometry.
+fn cgimage_to_rgba(
+    image: &screencapturekit::screenshot_manager::CGImage,
+    label: &str,
+) -> anyhow::Result<RgbaFrame> {
     use screencapturekit::screenshot_manager::CGImageExt;
 
     let w = checked_image_dim(image.width(), "CGImage width")?;
@@ -586,11 +599,15 @@ fn cgimage_to_png(
         );
     }
 
-    cua_driver_core::image_utils::encode_rgba_to_png(&rgba, w, h)
+    Ok(RgbaFrame {
+        width: w,
+        height: h,
+        rgba,
+    })
 }
 
 enum CaptureIdentityValidation {
-    Matched(Vec<u8>),
+    Matched(CapturedImage),
     Changed(WindowCaptureIdentity),
 }
 
@@ -603,7 +620,7 @@ fn capture_then_validate_identity<C, I>(
     current_identity: I,
 ) -> anyhow::Result<CaptureIdentityValidation>
 where
-    C: FnOnce() -> anyhow::Result<Vec<u8>>,
+    C: FnOnce() -> anyhow::Result<CapturedImage>,
     I: FnOnce() -> anyhow::Result<WindowCaptureIdentity>,
 {
     let bytes = capture()?;
@@ -638,7 +655,7 @@ fn retry_after_identity_change(
     window_id: u32,
     stale_plan: &std::sync::Arc<WindowCapturePlan>,
     actual_identity: WindowCaptureIdentity,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<CapturedImage> {
     evict_window_capture_plan(window_id, stale_plan);
     let rebuilt = build_window_capture_plan(window_id, actual_identity)?;
     {
@@ -666,7 +683,7 @@ fn retry_after_identity_change(
 /// Uses a desktop-independent window filter and `SCScreenshotManager` —
 /// see module docs for Apple + crate source URLs. No subprocess/temp/base64.
 /// Warm hits reuse a bounded two-second filter/config plan cache.
-fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<Vec<u8>> {
+fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<CapturedImage> {
     let identity = current_window_capture_identity(window_id)?;
     let cached = {
         let mut cache = lock_window_plan_cache();
@@ -747,7 +764,7 @@ fn screenshot_window_bytes_sck_inner(window_id: u32) -> anyhow::Result<Vec<u8>> 
 /// Bound the dependency's synchronous callback wrappers without permitting an
 /// unbounded number of detached workers. Ownership of the gate permit and all
 /// ScreenCaptureKit/CF objects stays on the worker until it really returns.
-fn screenshot_window_bytes_sck(window_id: u32) -> anyhow::Result<Vec<u8>> {
+fn screenshot_window_bytes_sck(window_id: u32) -> anyhow::Result<CapturedImage> {
     run_native_capture_worker(
         native_capture_gate(),
         WINDOW_CAPTURE_NATIVE_TIMEOUT,
@@ -764,7 +781,7 @@ fn screenshot_window_bytes_sck(window_id: u32) -> anyhow::Result<Vec<u8>> {
 /// A capture and its qualification at the native route selection boundary.
 #[derive(Debug)]
 pub struct WindowCapture {
-    pub bytes: Vec<u8>,
+    pub image: CapturedImage,
     /// Only the current-Space public route can ground actions. Backing-store
     /// pixels remain observations even when their dimensions look correct.
     pub actionable: bool,
@@ -776,7 +793,7 @@ impl WindowCapture {
             self.actionable,
             "window capture is observation-only: unqualified Space or backing-store route"
         );
-        Ok(self.bytes)
+        self.image.into_png()
     }
 }
 
@@ -785,7 +802,8 @@ pub fn screenshot_window_bytes(window_id: u32) -> anyhow::Result<Vec<u8>> {
     screenshot_window_capture(window_id)?.into_actionable_bytes()
 }
 
-/// Capture PNG bytes together with native-route qualification.
+/// Capture raw pixels (or a backend PNG) with native-route qualification.
+/// The caller can resize and encode once with [`CapturedImage::encode`].
 pub fn screenshot_window_capture(window_id: u32) -> anyhow::Result<WindowCapture> {
     refuse_without_direct_capture_consent()?;
     // Unknown Space is not proof of the current Space. Route it as off-space
@@ -795,11 +813,9 @@ pub fn screenshot_window_capture(window_id: u32) -> anyhow::Result<WindowCapture
         window_id,
         off_space,
         |id| {
-            capture_window_with_backends(
-                id,
-                screenshot_window_bytes_sck,
-                screenshot_window_bytes_shell,
-            )
+            capture_window_with_backends(id, screenshot_window_bytes_sck, |id| {
+                screenshot_window_bytes_shell(id).map(CapturedImage::Png)
+            })
         },
         screenshot_window_bytes_skylight,
     )?;
@@ -820,14 +836,14 @@ fn capture_window_with_space_route<P, S>(
     skylight: S,
 ) -> anyhow::Result<WindowCapture>
 where
-    P: FnOnce(u32) -> anyhow::Result<Vec<u8>>,
-    S: FnOnce(u32) -> anyhow::Result<Vec<u8>>,
+    P: FnOnce(u32) -> anyhow::Result<CapturedImage>,
+    S: FnOnce(u32) -> anyhow::Result<CapturedImage>,
 {
     if off_space {
         let skylight_err = match skylight(window_id) {
             Ok(bytes) if !bytes.is_empty() => {
                 return Ok(WindowCapture {
-                    bytes,
+                    image: bytes,
                     actionable: false,
                 })
             }
@@ -836,7 +852,7 @@ where
         };
         return public(window_id)
             .map(|bytes| WindowCapture {
-                bytes,
+                image: bytes,
                 actionable: false,
             })
             .map_err(|public_err| {
@@ -848,12 +864,12 @@ where
     }
     match public(window_id) {
         Ok(bytes) => Ok(WindowCapture {
-            bytes,
+            image: bytes,
             actionable: true,
         }),
         Err(public_err) => match skylight(window_id) {
             Ok(bytes) if !bytes.is_empty() => Ok(WindowCapture {
-                bytes,
+                image: bytes,
                 actionable: false,
             }),
             Ok(_) => Err(anyhow::anyhow!(
@@ -867,20 +883,20 @@ where
 }
 
 /// Off-Space capture through `SLSHWCaptureWindowList` (see module docs).
-fn screenshot_window_bytes_skylight(window_id: u32) -> anyhow::Result<Vec<u8>> {
+fn screenshot_window_bytes_skylight(window_id: u32) -> anyhow::Result<CapturedImage> {
     let image = crate::input::skylight::hw_capture_window(window_id).ok_or_else(|| {
         anyhow::anyhow!("SLSHWCaptureWindowList returned no image for window {window_id}")
     })?;
-    core_cgimage_to_png(&image, &format!("window {window_id}"))
+    core_cgimage_to_rgba(&image, &format!("window {window_id}")).map(CapturedImage::Rgba)
 }
 
-/// Encode a CoreGraphics image of any pixel layout as an RGBA PNG by drawing
-/// it into an RGBA8 bitmap. Fails on a fully transparent image, which is what
-/// WindowServer hands back for a window with no backing store.
-fn core_cgimage_to_png(
+/// Read a CoreGraphics image of any pixel layout as straight-alpha RGBA8 by
+/// drawing it into an RGBA8 bitmap. Fails on a fully transparent image, which
+/// is what WindowServer hands back for a window with no backing store.
+fn core_cgimage_to_rgba(
     image: &core_graphics::image::CGImage,
     label: &str,
-) -> anyhow::Result<Vec<u8>> {
+) -> anyhow::Result<RgbaFrame> {
     use core_graphics::base::{kCGBitmapByteOrder32Big, kCGImageAlphaPremultipliedLast};
     use core_graphics::color_space::CGColorSpace;
     use core_graphics::context::CGContext;
@@ -912,7 +928,11 @@ fn core_cgimage_to_png(
     if !unpremultiply_rgba(&mut rgba) {
         anyhow::bail!("capture of {label} is fully transparent (no window content)");
     }
-    cua_driver_core::image_utils::encode_rgba_to_png(&rgba, w, h)
+    Ok(RgbaFrame {
+        width: w,
+        height: h,
+        rgba,
+    })
 }
 
 /// Convert premultiplied RGBA8 to straight alpha in place. Returns whether
@@ -1201,6 +1221,10 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
 
+    fn png(bytes: Vec<u8>) -> CapturedImage {
+        CapturedImage::Png(bytes)
+    }
+
     /// Regression for trycua/cua#5476: with the pointer outside the window,
     /// a pointer-showing window capture came back scaled and offset while
     /// still sized like the window, so clicks aimed from it missed by ~37 px.
@@ -1221,10 +1245,10 @@ mod tests {
                 public_calls.set(public_calls.get() + 1);
                 anyhow::bail!("public backends must not run when SkyLight succeeds off-Space")
             },
-            |window_id| Ok(format!("sky-{window_id}").into_bytes()),
+            |window_id| Ok(png(format!("sky-{window_id}").into_bytes())),
         )
         .expect("off-Space SkyLight capture should succeed");
-        assert_eq!(got.bytes, b"sky-7");
+        assert_eq!(got.image, png(b"sky-7".to_vec()));
         assert!(!got.actionable);
         assert_eq!(public_calls.get(), 0);
     }
@@ -1234,21 +1258,21 @@ mod tests {
         let got = capture_window_with_space_route(
             7,
             true,
-            |_| Ok(b"public".to_vec()),
+            |_| Ok(png(b"public".to_vec())),
             |_| anyhow::bail!("SPI missing"),
         )
         .expect("public fallback should run");
-        assert_eq!(got.bytes, b"public");
+        assert_eq!(got.image, png(b"public".to_vec()));
         assert!(!got.actionable);
 
         let got = capture_window_with_space_route(
             7,
             true,
-            |_| Ok(b"public".to_vec()),
-            |_| Ok(Vec::new()),
+            |_| Ok(png(b"public".to_vec())),
+            |_| Ok(png(Vec::new())),
         )
         .expect("empty SkyLight bytes fall back");
-        assert_eq!(got.bytes, b"public");
+        assert_eq!(got.image, png(b"public".to_vec()));
         assert!(!got.actionable);
     }
 
@@ -1258,14 +1282,14 @@ mod tests {
         let got = capture_window_with_space_route(
             7,
             false,
-            |_| Ok(b"public".to_vec()),
+            |_| Ok(png(b"public".to_vec())),
             |_| {
                 sky_calls.set(sky_calls.get() + 1);
-                Ok(b"sky".to_vec())
+                Ok(png(b"sky".to_vec()))
             },
         )
         .expect("public capture should succeed");
-        assert_eq!(got.bytes, b"public");
+        assert_eq!(got.image, png(b"public".to_vec()));
         assert!(got.actionable);
         assert_eq!(
             sky_calls.get(),
@@ -1277,11 +1301,50 @@ mod tests {
             7,
             false,
             |_| anyhow::bail!("sck and shell failed"),
-            |_| Ok(b"sky".to_vec()),
+            |_| Ok(png(b"sky".to_vec())),
         )
         .expect("SkyLight is the last resort");
-        assert_eq!(got.bytes, b"sky");
+        assert_eq!(got.image, png(b"sky".to_vec()));
         assert!(!got.actionable);
+    }
+
+    #[test]
+    fn raw_route_preserves_pixels_and_byte_consumers_require_qualification() {
+        let image = CapturedImage::Rgba(RgbaFrame {
+            width: 2,
+            height: 1,
+            rgba: vec![11, 22, 33, 255, 44, 55, 66, 255],
+        });
+        for off_space in [false, true] {
+            let capture = capture_window_with_space_route(
+                7,
+                off_space,
+                |_| Ok(image.clone()),
+                |_| Ok(image.clone()),
+            )
+            .unwrap();
+            assert_eq!(capture.image, image);
+            assert_eq!(capture.actionable, !off_space);
+            if off_space {
+                assert_eq!(
+                    capture.into_actionable_bytes().unwrap_err().to_string(),
+                    "window capture is observation-only: unqualified Space or backing-store route"
+                );
+            } else {
+                let expected = image.clone().into_png().unwrap();
+                assert_eq!(capture.into_actionable_bytes().unwrap(), expected);
+            }
+        }
+        let fallback = capture_window_with_space_route(
+            7,
+            false,
+            |_| anyhow::bail!("public capture unavailable"),
+            |_| Ok(image.clone()),
+        )
+        .unwrap();
+        assert_eq!(fallback.image, image);
+        assert!(!fallback.actionable);
+        assert!(fallback.into_actionable_bytes().is_err());
     }
 
     #[test]
@@ -1331,7 +1394,7 @@ mod tests {
     }
 
     #[test]
-    fn core_cgimage_to_png_round_trips_pixels() {
+    fn core_cgimage_to_rgba_reads_pixels() {
         use core_graphics::base::{kCGBitmapByteOrder32Big, kCGImageAlphaPremultipliedLast};
         use core_graphics::color_space::CGColorSpace;
         use core_graphics::context::CGContext;
@@ -1347,8 +1410,9 @@ mod tests {
         );
         ctx.data().copy_from_slice(&[255u8, 0, 0, 255].repeat(6));
         let image = ctx.create_image().expect("image from bitmap");
-        let png = core_cgimage_to_png(&image, "test").expect("encode");
-        assert_eq!(png_dimensions(&png).expect("dims"), (3, 2));
+        let frame = core_cgimage_to_rgba(&image, "test").expect("read");
+        assert_eq!((frame.width, frame.height), (3, 2));
+        assert_eq!(frame.rgba, [255u8, 0, 0, 255].repeat(6));
 
         let mut clear = CGContext::create_bitmap_context(
             None,
@@ -1361,7 +1425,7 @@ mod tests {
         );
         clear.data().fill(0);
         let image = clear.create_image().expect("image from bitmap");
-        let err = core_cgimage_to_png(&image, "test").expect_err("blank image fails");
+        let err = core_cgimage_to_rgba(&image, "test").expect_err("blank image fails");
         assert!(err.to_string().contains("fully transparent"), "{err}");
     }
 
@@ -1385,7 +1449,7 @@ mod tests {
             move |window_id| {
                 native_calls_n.set(native_calls_n.get() + 1);
                 native_window_id_n.set(Some(window_id));
-                Ok(png_n)
+                Ok(CapturedImage::Png(png_n))
             },
             move |_window_id| {
                 fallback_calls_f.set(fallback_calls_f.get() + 1);
@@ -1401,19 +1465,23 @@ mod tests {
             "native backend receives window id 42"
         );
         assert_eq!(fallback_calls.get(), 0, "shell fallback must not run");
-        assert_eq!(got, png, "helper returns native PNG bytes verbatim");
+        assert_eq!(
+            got,
+            CapturedImage::Png(png),
+            "helper returns native PNG bytes verbatim"
+        );
     }
 
     #[test]
     fn empty_native_capture_uses_shell_fallback() {
         let got = capture_window_with_backends(
             42,
-            |_| Ok(Vec::new()),
-            |window_id| Ok(format!("fallback-{window_id}").into_bytes()),
+            |_| Ok(png(Vec::new())),
+            |window_id| Ok(png(format!("fallback-{window_id}").into_bytes())),
         )
         .expect("empty native capture should fall back");
 
-        assert_eq!(got, b"fallback-42");
+        assert_eq!(got, png(b"fallback-42".to_vec()));
     }
 
     #[test]
@@ -1517,8 +1585,9 @@ mod tests {
         let before = WindowCaptureIdentity::new(10, 0, 1.0, 2.0, 800.0, 600.0);
         let after = WindowCaptureIdentity::new(10, 0, 5.0, 2.0, 800.0, 600.0);
 
-        let outcome = capture_then_validate_identity(before, || Ok(vec![1, 2, 3]), || Ok(after))
-            .expect("capture and identity read succeed");
+        let outcome =
+            capture_then_validate_identity(before, || Ok(png(vec![1, 2, 3])), || Ok(after))
+                .expect("capture and identity read succeed");
 
         assert!(matches!(
             outcome,
@@ -1532,14 +1601,15 @@ mod tests {
         let second = WindowCaptureIdentity::new(10, 0, 5.0, 2.0, 800.0, 600.0);
         let third = WindowCaptureIdentity::new(10, 0, 5.0, 2.0, 900.0, 600.0);
 
-        let first_attempt = capture_then_validate_identity(first, || Ok(vec![1]), || Ok(second))
-            .expect("first attempt completes");
+        let first_attempt =
+            capture_then_validate_identity(first, || Ok(png(vec![1])), || Ok(second))
+                .expect("first attempt completes");
         assert!(matches!(
             first_attempt,
             CaptureIdentityValidation::Changed(identity) if identity == second
         ));
 
-        let retry = capture_then_validate_identity(second, || Ok(vec![2]), || Ok(third))
+        let retry = capture_then_validate_identity(second, || Ok(png(vec![2])), || Ok(third))
             .expect("retry completes");
         assert!(matches!(
             retry,

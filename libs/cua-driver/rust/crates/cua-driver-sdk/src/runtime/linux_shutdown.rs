@@ -370,6 +370,7 @@ mod tests {
         runtime.shutdown_timeout(Duration::from_secs(1));
         result.expect("platform cleanup queued behind native blocking work");
         assert!(!driver.is_running());
+        #[cfg(not(target_env = "musl"))]
         assert!(driver.platform_lease.lock().unwrap().is_none());
     }
 

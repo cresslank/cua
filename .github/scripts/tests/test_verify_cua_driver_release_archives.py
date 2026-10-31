@@ -25,16 +25,25 @@ from verify_cua_driver_release_archives import (
 
 VERSION = "9.8.7"
 CURRENT_HELPER_MEMBERS = (
+    "wayland-helper/HOT-RELOAD.md",
     "wayland-helper/README.md",
     "wayland-helper/install.sh",
+    "wayland-helper/package.py",
     "wayland-helper/tests/gnome_devkit.mjs",
     "wayland-helper/tests/gnome_no_x11.sh",
     "wayland-helper/tests/gnome_session_bus.conf",
+    "wayland-helper/tests/hotreload_README.md",
+    "wayland-helper/tests/hotreload_harness_test.py",
+    "wayland-helper/tests/hotreload_observer.js",
+    "wayland-helper/tests/hotreload_private_lab.py",
+    "wayland-helper/tests/hotreload_receiver.py",
+    "wayland-helper/tests/hotreload_verify.py",
     "wayland-helper/tests/policy.test.mjs",
     "wayland-helper/tests/run_gnome_devkit.sh",
     "wayland-helper/winrects@cua/extension.js",
+    "wayland-helper/winrects@cua/impl/main.js",
+    "wayland-helper/winrects@cua/impl/policy.js",
     "wayland-helper/winrects@cua/metadata.json",
-    "wayland-helper/winrects@cua/policy.js",
 )
 HISTORICAL_0_14_HELPER_MEMBERS = (
     "wayland-helper/README.md",
@@ -357,7 +366,8 @@ def test_missing_cursor_theme_fails_with_archive_and_member(
         "wayland-helper/install.sh",
         "wayland-helper/winrects@cua/extension.js",
         "wayland-helper/winrects@cua/metadata.json",
-        "wayland-helper/winrects@cua/policy.js",
+        "wayland-helper/winrects@cua/impl/main.js",
+        "wayland-helper/winrects@cua/impl/policy.js",
     ),
 )
 def test_missing_linux_wayland_helper_fails_with_archive_and_member(

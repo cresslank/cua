@@ -1290,6 +1290,7 @@ dependencies = [
  "hmac",
  "image",
  "jsonschema",
+ "keyring",
  "libc",
  "regex",
  "regorus",
@@ -1420,7 +1421,7 @@ dependencies = [
 
 [[package]]
 name = "cua-telemetry"
-version = "0.7.0"
+version = "0.9.0"
 dependencies = [
  "hex",
  "rand 0.9.5",
@@ -3544,9 +3545,7 @@ dependencies = [
  "enumflags2",
  "evdev",
  "futures-util",
- "getrandom 0.4.2",
  "image",
- "keyring",
  "libc",
  "libspa",
  "memmap2",
@@ -3575,7 +3574,6 @@ dependencies = [
  "x11rb",
  "xkbcommon",
  "zbus",
- "zeroize",
 ]
 
 [[package]]
@@ -3631,7 +3629,6 @@ dependencies = [
  "cursor-overlay",
  "getrandom 0.4.2",
  "image",
- "keyring",
  "pip-preview",
  "serde",
  "serde_json",

@@ -55,7 +55,18 @@ fn def() -> &'static ToolDef {
                 },
                 "screenshot_out_file": {
                     "type": "string",
-                    "description": "When set, write the PNG to this file path (~ expanded) instead of embedding base64 in the response. The structured output will contain screenshot_file_path instead."
+                    "description": "When set, write the screenshot (PNG, or JPEG with screenshot_format:\"jpeg\") to this file path (~ expanded) instead of embedding base64 in the response. The structured output will contain screenshot_file_path instead."
+                },
+                "screenshot_format": {
+                    "type": "string",
+                    "enum": ["png", "jpeg"],
+                    "description": "Encoding of the returned screenshot. Default \"png\". \"jpeg\" is smaller, drops alpha, and mints no capture_id (capture_id-bound tools need a PNG read); pixel coordinates are unchanged."
+                },
+                "screenshot_quality": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 95,
+                    "description": "JPEG quality, 1-95, with screenshot_format:\"jpeg\" only. Default 85."
                 },
                 "max_elements": {
                     "type": "integer",
@@ -124,66 +135,52 @@ fn prefetch_capture<T: Send + 'static>(
     (should_capture && want_tree).then(|| cua_driver_core::blocking::spawn(capture))
 }
 
-fn choose_qualified_capture(
+/// Validate the selected capture without losing its native-route qualification.
+/// A stale prefetch is retried once. A fresh invalid frame is returned inside
+/// the qualification envelope, so publication still becomes observation-only.
+fn verified_capture(
     window_id: u32,
     prefetched: Option<anyhow::Result<crate::capture::WindowCapture>>,
     bounds: &crate::windows::WindowBounds,
     capture: impl FnOnce() -> anyhow::Result<crate::capture::WindowCapture>,
-) -> Result<crate::capture::WindowCapture, super::px_frame::PxFrameError> {
+) -> Result<
+    (
+        bool,
+        Result<(crate::capture::CapturedImage, u32, u32, f64), super::px_frame::PxFrameError>,
+    ),
+    super::px_frame::PxFrameError,
+> {
     use super::px_frame::{validate_capture_frame, PxFrameError};
-    let usable = |bytes: &[u8]| -> Result<(), PxFrameError> {
-        let (w, h) = crate::capture::png_dimensions(bytes).map_err(|e| {
-            PxFrameError::CaptureUnavailable {
-                window_id,
-                reason: e.to_string(),
-            }
-        })?;
-        validate_capture_frame(window_id, bounds, w, h)?;
-        Ok(())
+    let validate = |capture: crate::capture::WindowCapture| {
+        let actionable = capture.actionable;
+        let frame = (|| {
+            let (w, h) =
+                capture
+                    .image
+                    .dimensions()
+                    .map_err(|e| PxFrameError::CaptureUnavailable {
+                        window_id,
+                        reason: e.to_string(),
+                    })?;
+            let scale = validate_capture_frame(window_id, bounds, w, h)?;
+            Ok((capture.image, w, h, scale))
+        })();
+        (actionable, frame)
     };
-    if let Some(raw) = prefetched {
-        if let Ok(capture) = raw {
-            match usable(&capture.bytes) {
-                Ok(()) => return Ok(capture),
-                Err(e @ PxFrameError::WindowNotFound { .. }) => return Err(e),
-                Err(_) => {}
-            }
-        }
-    }
-    capture().map_err(|e| PxFrameError::CaptureUnavailable {
-        window_id,
-        reason: e.to_string(),
-    })
-}
-
-fn verified_capture(
-    window_id: u32,
-    prefetched: Option<anyhow::Result<Vec<u8>>>,
-    bounds: &crate::windows::WindowBounds,
-    capture: impl FnOnce() -> anyhow::Result<Vec<u8>>,
-) -> Result<(Vec<u8>, u32, u32, f64), super::px_frame::PxFrameError> {
-    use super::px_frame::{validate_capture_frame, PxFrameError};
-    let validate = |raw: anyhow::Result<Vec<u8>>| {
-        let (raw, w, h) = (|| -> anyhow::Result<_> {
-            let raw = raw?;
-            let (w, h) = crate::capture::png_dimensions(&raw)?;
-            Ok((raw, w, h))
-        })()
-        .map_err(|e| PxFrameError::CaptureUnavailable {
-            window_id,
-            reason: e.to_string(),
-        })?;
-        let scale = validate_capture_frame(window_id, bounds, w, h)?;
-        Ok((raw, w, h, scale))
-    };
-    if let Some(raw) = prefetched {
-        match validate(raw) {
-            Ok(frame) => return Ok(frame),
-            Err(e @ PxFrameError::WindowNotFound { .. }) => return Err(e),
+    if let Some(Ok(raw)) = prefetched {
+        let (actionable, frame) = validate(raw);
+        match frame {
+            Ok(frame) => return Ok((actionable, Ok(frame))),
+            Err(e @ PxFrameError::WindowNotFound { .. }) => return Ok((actionable, Err(e))),
             Err(_) => {}
         }
     }
-    validate(capture())
+    capture()
+        .map(validate)
+        .map_err(|e| PxFrameError::CaptureUnavailable {
+            window_id,
+            reason: e.to_string(),
+        })
 }
 
 /// Chromium stops painting and stops updating its accessibility tree while its
@@ -341,6 +338,24 @@ impl Tool for GetWindowStateTool {
             .get("max_image_dimension")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
+        let encoding = match cua_driver_core::image_utils::ScreenshotEncoding::from_args(
+            "screenshot_format",
+            args.get("screenshot_format"),
+            "screenshot_quality",
+            args.get("screenshot_quality"),
+        ) {
+            Ok(encoding) => encoding,
+            Err(detail) => {
+                return ToolResult::error(format!("get_window_state: {detail}")).with_structured(
+                    serde_json::json!({
+                        "code": "invalid_arguments",
+                        "tool": "get_window_state",
+                        "detail": detail,
+                    }),
+                );
+            }
+        };
+        let jpeg = encoding != cua_driver_core::image_utils::ScreenshotEncoding::Png;
         // Internal direct-tool mode used by verify_state. Registry ingress
         // strips underscore-prefixed arguments before public dispatch; only
         // a trusted direct in-process invocation can enable this mode.
@@ -474,7 +489,7 @@ impl Tool for GetWindowStateTool {
             max_image_dimension,
         }
         .resolve();
-        // Returns the exact delivered PNG bytes, optional file path, delivered
+        // Returns the exact delivered image bytes, optional file path, delivered
         // and native dimensions, the WindowServer bounds it was validated
         // against, and the raw capture's backing scale.
         let mut screenshot_frame_error = None;
@@ -501,31 +516,18 @@ impl Tool for GetWindowStateTool {
                 let bounds = crate::windows::window_bounds_by_id(window_id)
                     .filter(|b| b.width > 0.0 && b.height > 0.0)
                     .ok_or(super::px_frame::PxFrameError::WindowNotFound { window_id })?;
-                let capture = choose_qualified_capture(
+                let (capture_actionable, raw) = verified_capture(
                     window_id,
                     prefetched_raw,
                     &bounds,
                     || crate::capture::screenshot_window_capture(window_id),
                 )?;
-                let capture_actionable = capture.actionable;
-                let raw = capture.bytes;
-                // Carry qualification even if validation, resizing or file output fails.
+                // Carry qualification even if validation, encoding or file output fails.
                 let frame = (|| {
-                let (orig_w, orig_h) = crate::capture::png_dimensions(&raw).map_err(|e| {
-                    super::px_frame::PxFrameError::CaptureUnavailable {
-                        window_id,
-                        reason: e.to_string(),
-                    }
-                })?;
-                let scale =
-                    super::px_frame::validate_capture_frame(window_id, &bounds, orig_w, orig_h)?;
-                let png = crate::capture::resize_png_if_needed(&raw, max_dim).map_err(|e| {
-                    super::px_frame::PxFrameError::CaptureUnavailable {
-                        window_id,
-                        reason: e.to_string(),
-                    }
-                })?;
-                let (w, h) = crate::capture::png_dimensions(&png).map_err(|e| {
+                let (raw, orig_w, orig_h, scale) = raw?;
+                // Resize and encode once from the raw pixels; the PNG bytes
+                // are identical to the former encode-decode-resize round trip.
+                let (png, w, h) = raw.encode(max_dim, encoding).map_err(|e| {
                     super::px_frame::PxFrameError::CaptureUnavailable {
                         window_id,
                         reason: e.to_string(),
@@ -618,7 +620,11 @@ impl Tool for GetWindowStateTool {
         if let Some((png, ref file_path, w, h, _, _, _, _)) = screenshot.as_ref() {
             if file_path.is_none() {
                 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-                content.push(Content::image_png(BASE64.encode(png)));
+                content.push(if jpeg {
+                    Content::image_jpeg(BASE64.encode(png))
+                } else {
+                    Content::image_png(BASE64.encode(png))
+                });
             }
 
             // Summary text line (matching Swift reference format).
@@ -722,7 +728,8 @@ impl Tool for GetWindowStateTool {
             Err(error) => return ToolResult::error(format!("snapshot publication failed: {error}"))
                 .with_structured(serde_json::json!({"status":"refused","refusal":{"code":"snapshot_publication_failed","message":error.to_string()}})),
         };
-        let capture_id = match (snapshot_id, screenshot.as_ref()) {
+        // The capture registry holds PNG captures only; a JPEG read mints none.
+        let capture_id = match (snapshot_id, screenshot.as_ref().filter(|_| !jpeg)) {
             (
                 Some(snapshot_id),
                 Some((png, _, width, height, native_width, native_height, _, _)),
@@ -989,7 +996,7 @@ impl Tool for GetWindowStateTool {
             // know what they're holding. `Content::image_png` already carries
             // `mimeType` on the protocol image part — this mirrors it onto
             // the structured side. Additive: keeps every existing field.
-            structured["screenshot_mime_type"] = serde_json::json!("image/png");
+            structured["screenshot_mime_type"] = serde_json::json!(encoding.mime_type());
         }
         if let Some((bounds, scale)) = screenshot_frame {
             structured["window_bounds"] = serde_json::json!({
@@ -1660,6 +1667,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn verified_capture_keeps_unqualified_status_on_invalid_frames() {
+        let bounds = crate::windows::WindowBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 4.0,
+            height: 4.0,
+        };
+        for image in [
+            crate::capture::CapturedImage::Png(vec![0]),
+            crate::capture::CapturedImage::Rgba(cua_driver_core::image_utils::RgbaFrame {
+                width: 3,
+                height: 4,
+                rgba: vec![0; 3 * 4 * 4],
+            }),
+        ] {
+            let (actionable, frame) = verified_capture(7, None, &bounds, || {
+                Ok(crate::capture::WindowCapture {
+                    image,
+                    actionable: false,
+                })
+            })
+            .unwrap();
+            assert!(!actionable);
+            assert!(frame.is_err());
+        }
+    }
+
+    #[test]
     fn verified_capture_reuses_or_recovers_prefetch() {
         use super::super::px_frame::PxFrameError;
         use std::{cell::Cell, io::Cursor};
@@ -1677,23 +1712,77 @@ mod tests {
             width: 4.0,
             height: 4.0,
         };
-        let valid = png(4, 4);
+        use crate::capture::CapturedImage;
+        let qualified = |image| crate::capture::WindowCapture {
+            image,
+            actionable: true,
+        };
+        let valid = CapturedImage::Png(png(4, 4));
         for (prefetched, expected_calls) in [
-            (Some(Ok(valid.clone())), 0),
+            (Some(Ok(qualified(valid.clone()))), 0),
             (Some(Err(anyhow::anyhow!("prefetch failed"))), 1),
-            (Some(Ok(png(3, 4))), 1),
-            (Some(Ok(vec![0])), 1),
+            (Some(Ok(qualified(CapturedImage::Png(png(3, 4))))), 1),
+            (Some(Ok(qualified(CapturedImage::Png(vec![0])))), 1),
             (None, 1),
         ] {
             let calls = Cell::new(0);
-            let frame = verified_capture(7, prefetched, &bounds, || {
+            let (actionable, frame) = verified_capture(7, prefetched, &bounds, || {
                 calls.set(calls.get() + 1);
-                Ok(valid.clone())
+                Ok(qualified(valid.clone()))
             })
             .unwrap();
-            assert_eq!(frame, (valid.clone(), 4, 4, 1.0));
+            assert!(actionable);
+            assert_eq!(frame.unwrap(), (valid.clone(), 4, 4, 1.0));
             assert_eq!(calls.get(), expected_calls);
         }
+        let raw = |w: u32, h: u32| {
+            CapturedImage::Rgba(cua_driver_core::image_utils::RgbaFrame {
+                width: w,
+                height: h,
+                rgba: vec![0; (w * h * 4) as usize],
+            })
+        };
+        let calls = Cell::new(0);
+        let (actionable, frame) =
+            verified_capture(7, Some(Ok(qualified(raw(4, 4)))), &bounds, || {
+                calls.set(calls.get() + 1);
+                Ok(qualified(valid.clone()))
+            })
+            .unwrap();
+        assert!(actionable);
+        assert_eq!(frame.unwrap(), (raw(4, 4), 4, 4, 1.0));
+        assert_eq!(calls.get(), 0);
+        let calls = Cell::new(0);
+        let (actionable, frame) =
+            verified_capture(7, Some(Ok(qualified(raw(3, 4)))), &bounds, || {
+                calls.set(calls.get() + 1);
+                Ok(qualified(valid.clone()))
+            })
+            .unwrap();
+        assert!(actionable);
+        assert_eq!(frame.unwrap(), (valid.clone(), 4, 4, 1.0));
+        assert_eq!(calls.get(), 1);
+        let calls = Cell::new(0);
+        let error = verified_capture(7, Some(Ok(qualified(raw(3, 4)))), &bounds, || {
+            calls.set(calls.get() + 1);
+            Ok(qualified(raw(3, 4)))
+        })
+        .unwrap()
+        .1
+        .unwrap_err();
+        assert_eq!(
+            error,
+            PxFrameError::FrameMismatch {
+                window_id: 7,
+                bounds_width: 4.0,
+                bounds_height: 4.0,
+                capture_width: 3,
+                capture_height: 4,
+                scale_x: 0.75,
+                scale_y: 1.0,
+            }
+        );
+        assert_eq!(calls.get(), 1);
         for prefetched in [Some(Err(anyhow::anyhow!("old error"))), None] {
             let calls = Cell::new(0);
             let error = verified_capture(7, prefetched, &bounds, || {
