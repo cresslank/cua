@@ -84,14 +84,14 @@ A window-scoped drag (pid + window_id) runs in the background by default: the ge
 </Tab>
 <Tab value="Linux">
 
-Press-drag-release gesture from (from_x, from_y) to (to_x, to_y) in window-local screenshot pixels. Background delivery on X11 is one real held gesture on the session's virtual master pointer (path mpx_pointer: press, interpolated motion, release); it lands on GTK/VCL/Qt/Chromium; a point covered by another application's window is refused (target_occluded), one covered by this app's own dialog is retargeted to it. Headless servers fall back to XSendEvent. duration_ms (default 500), steps (default 20). No focus steal. Limits and fallbacks: `get_guide({topic:"drag"})`.
+Press-drag-release gesture from (from_x, from_y) to (to_x, to_y) in window-local screenshot pixels via XSendEvent (ButtonPress + MotionNotify × steps + ButtonRelease). duration_ms (default 500), steps (default 20). No focus steal. Limits and fallbacks: `get_guide({topic:"drag"})`.
 
 **Linux parameters**
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | <span id="drag--linux--button"></span>`button` | `"left" \| "right" \| "middle"` |  | Mouse button. Default "left". |
-| <span id="drag--linux--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` |  | Frame of x/y (and from_x/from_y/to_x/to_y). Default "window": window-local screenshot pixels as returned by get_window_state. "desktop": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:"desktop" together with pid/window_id means the same thing. |
+| <span id="drag--linux--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` | `"window"` | Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter. |
 | <span id="drag--linux--cursor_id"></span>`cursor_id` | `string` |  | Optional multi-cursor instance id. Default: 'default'. |
 | <span id="drag--linux--delivery_mode"></span>`delivery_mode` | `"background" \| "foreground"` | `"background"` | Input delivery mode. 'background' (default) never activates or raises the target window. On X11 it injects via XTEST / the XInput2 master pointer (no focus steal). On Wayland it goes through libei + xdg-desktop-portal, which injects to the compositor's input focus: Wayland's security model has no per-window background targeting, so a specific non-focused window cannot be aimed at; when no libei backend is available the tool returns a structured background_unavailable error. 'foreground' is the explicit escalation: activate the target (X11 _NET_ACTIVE_WINDOW; Wayland compositor activate), inject, then restore the prior active window; a brief focus swap unless the target was already active. Matches the macOS / Windows delivery_mode surface. |
 | <span id="drag--linux--duration_ms"></span>`duration_ms` | `integer` |  | Total drag duration. Default: 500. Range: 0 to 10000. |
@@ -187,7 +187,7 @@ Scroll the target pid's focused region via XSendEvent Button4/5. direction requi
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | <span id="scroll--linux--amount"></span>`amount` | `integer` |  | Number of scroll steps. Default: 3. Range: 1 to 50. |
-| <span id="scroll--linux--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` |  | Frame of x/y (and from_x/from_y/to_x/to_y). Default "window": window-local screenshot pixels as returned by get_window_state. "desktop": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:"desktop" together with pid/window_id means the same thing. |
+| <span id="scroll--linux--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` | `"window"` | Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter. |
 | <span id="scroll--linux--cursor_id"></span>`cursor_id` | `string` |  | Optional multi-cursor instance id. Default: 'default'. |
 | <span id="scroll--linux--delivery_mode"></span>`delivery_mode` | `"background" \| "foreground"` | `"background"` | Input delivery mode. 'background' (default) never activates or raises the target window. On X11 it injects via XTEST / the XInput2 master pointer (no focus steal). On Wayland it goes through libei + xdg-desktop-portal, which injects to the compositor's input focus: Wayland's security model has no per-window background targeting, so a specific non-focused window cannot be aimed at; when no libei backend is available the tool returns a structured background_unavailable error. 'foreground' is the explicit escalation: activate the target (X11 _NET_ACTIVE_WINDOW; Wayland compositor activate), inject, then restore the prior active window; a brief focus swap unless the target was already active. Matches the macOS / Windows delivery_mode surface. |
 | <span id="scroll--linux--pid"></span>`pid` | `integer` |  | Target process ID. Required unless scope is "desktop" or element_token is supplied (the token carries the pid). |
@@ -269,8 +269,10 @@ Move the synthetic agent cursor without changing the user's pointer. Only an exp
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
+| <span id="move_cursor--linux--pid"></span>`pid` | `integer` |  | Window scope: process ID of the target window. Supply with window_id; required on GNOME Wayland and in Wayland inject mode. Minimum: 1. |
 | <span id="move_cursor--linux--scope"></span>`scope` | `"window" \| "desktop"` | `"window"` | "window" (default) moves only the agent cursor overlay; "desktop" moves the real OS pointer. |
-| <span id="move_cursor--linux--x"></span>`x` | `number` | required | Destination X. Window scope: screen coordinates of the agent cursor overlay. Desktop scope: get_desktop_state screenshot pixels. |
+| <span id="move_cursor--linux--window_id"></span>`window_id` | `integer` |  | Window scope: target window id, supplied with pid. Makes x and y window-local. Minimum: 1. |
+| <span id="move_cursor--linux--x"></span>`x` | `number` | required | Destination X. Window scope: window-local pixels of window_id when pid and window_id are given, otherwise screen coordinates of the agent cursor overlay. Desktop scope: get_desktop_state screenshot pixels. |
 
 </Tab>
 <Tab value="Windows">
@@ -315,7 +317,7 @@ Effect: destructive. Platforms: Linux.
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | <span id="mouse_button_down--button"></span>`button` | `"left" \| "right" \| "middle"` |  | Mouse button. Default "left". |
-| <span id="mouse_button_down--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` |  | Frame of x/y (and from_x/from_y/to_x/to_y). Default "window": window-local screenshot pixels as returned by get_window_state. "desktop": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:"desktop" together with pid/window_id means the same thing. |
+| <span id="mouse_button_down--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` | `"window"` | Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter. |
 | <span id="mouse_button_down--cursor_id"></span>`cursor_id` | `string` |  | Optional multi-cursor instance id. Default: 'default'. |
 | <span id="mouse_button_down--from_zoom"></span>`from_zoom` | `boolean` |  | Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space. |
 | <span id="mouse_button_down--pid"></span>`pid` | `integer` | required | Target process ID. |
@@ -338,7 +340,7 @@ Effect: destructive. Platforms: Linux.
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| <span id="mouse_button_up--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` |  | Frame of x/y (and from_x/from_y/to_x/to_y). Default "window": window-local screenshot pixels as returned by get_window_state. "desktop": full-screen pixels as returned by get_desktop_state, translated to the target window. Passing scope:"desktop" together with pid/window_id means the same thing. |
+| <span id="mouse_button_up--coordinate_frame"></span>`coordinate_frame` | `"window" \| "desktop"` | `"window"` | Window screenshot pixels. Explicit desktop-to-window translation is unavailable in the exact-target adapter. |
 | <span id="mouse_button_up--cursor_id"></span>`cursor_id` | `string` |  | Optional multi-cursor instance id. Default: 'default'. |
 | <span id="mouse_button_up--from_zoom"></span>`from_zoom` | `boolean` |  | Set true after a zoom call to auto-translate zoom-image pixel coordinates back to full-window space. |
 | <span id="mouse_button_up--pid"></span>`pid` | `integer` |  | Optional process ID; must match the held button's target. |
@@ -411,9 +413,45 @@ Effect: mutating, idempotent. Platforms: macOS, Linux, Windows.
 
 ### `set_agent_cursor_motion`
 
+Effect: mutating, idempotent. Platforms: macOS, Linux, Windows.
+
+<Tabs items={['macOS', 'Linux', 'Windows']} groupId="platform" persist>
+<Tab value="macOS">
+
 Configure the movement style, timing, effects and visibility timing for a session cursor.
 
-Effect: mutating, idempotent. Platforms: macOS, Linux, Windows.
+**macOS parameters**
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| <span id="set_agent_cursor_motion--macos--glide_duration_ms"></span>`glide_duration_ms` | `number` |  | Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A nonzero value with `native` or the default `steady` timing also fixes the duration. Explicit zero uses speed-based motion unless a timing preset was selected. Clamped to 0..5000. |
+
+</Tab>
+<Tab value="Linux">
+
+Configure the movement style, timing, effects and visibility timing for a session cursor.
+
+**Linux parameters**
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| <span id="set_agent_cursor_motion--linux--glide_duration_ms"></span>`glide_duration_ms` | `number` |  | Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A nonzero value with `native` or the default `steady` timing also fixes the duration. Explicit zero uses speed-based motion unless a timing preset was selected. Clamped to 0..5000. |
+
+</Tab>
+<Tab value="Windows">
+
+Configure the movement style, timing, effects and visibility timing for a session cursor.
+
+**Windows parameters**
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| <span id="set_agent_cursor_motion--windows--glide_duration_ms"></span>`glide_duration_ms` | `number` |  | Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A nonzero value with `native` or the default `steady` timing also fixes the duration. Clamped to 0..5000. |
+
+</Tab>
+</Tabs>
+
+**Parameters on every platform**
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -427,7 +465,6 @@ Effect: mutating, idempotent. Platforms: macOS, Linux, Windows.
 | <span id="set_agent_cursor_motion--effects-squish"></span>`effects.squish` | `"on" \| "off" \| "default"` |  | Brief scale-down of the cursor on click. |
 | <span id="set_agent_cursor_motion--effects-trail"></span>`effects.trail` | `"on" \| "off" \| "default"` |  | Short fading trail behind the cursor. |
 | <span id="set_agent_cursor_motion--end_handle"></span>`end_handle` | `number` |  | Arc control-point offset from the end, as a fraction of the distance, for `signature_arc`, `spring_settle` and `comet_swoop`. Clamped to 0..1 (default 0.3). |
-| <span id="set_agent_cursor_motion--glide_duration_ms"></span>`glide_duration_ms` | `number` |  | Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A nonzero value with `native` or the default `steady` timing also fixes the duration. Clamped to 0..5000. |
 | <span id="set_agent_cursor_motion--idle_hide_ms"></span>`idle_hide_ms` | `number` |  | Hide the cursor after this many idle milliseconds; 0 never hides it. Clamped to 0..60000 (default 15000). |
 | <span id="set_agent_cursor_motion--session"></span>`session` | `string` | required | Public label of the session that owns the cursor. Omitted or null motion fields keep their current value. |
 | <span id="set_agent_cursor_motion--spring"></span>`spring` | `number` |  | Arrival spring damping for `classic`: 1 is critically damped, 0.3 is bouncy. Clamped to 0.3..1 (default 0.72). |
@@ -538,14 +575,49 @@ Effect: read-only, idempotent. Platforms: macOS, Linux, Windows.
 
 ### `browser_prepare`
 
+Effect: destructive. Platforms: macOS, Linux, Windows.
+
+<Tabs items={['macOS', 'Linux', 'Windows']} groupId="platform" persist>
+<Tab value="macOS">
+
 Attach the browser tools to a browser. For a page in the user's running Chrome, Edge or Brave, call it once with pid, window_id, session and strategy &#123;"kind":"existing_profile"&#125; when get_browser_state refuses with browser_consent_required or browser_requires_setup; then call get_browser_state again and act with browser_click, browser_type or browser_pointer. It attaches, or refuses with nothing changed and says why. Explicitly prepare an owned DevTools endpoint for a browser. pid is required for an existing process or existing-profile attachment, and optional only for allow_launch=true with an isolated profile. Existing endpoints are detected without side effects. Acting setup for an isolated profile follows the runtime permission mode and optional capability manifest. It requires allow_launch=true, launches a separate browser, and never copies, modifies, or terminates the requested user profile. Without pid, only a platform-attested system Chrome/Edge installation (or a root-owned package payload on Linux) is eligible; redirects and user-controlled locations fail closed. Existing-profile attachment is explicit and follows the runtime's immutable permission mode: standard requires an explicit --grant existing-profile launch grant or an embedding authorization host, bounded requires a launch-approved exact resource manifest, and unrestricted requires explicit trusted startup risk acceptance. Ordinary MCP transport approval never proves profile authorization. On proven platforms, an authorized request also permits one bounded exact-window setup: open the recognized browser product's fixed remote-debugging page, toggle its uniquely matched per-instance checkbox, prove the PID-owned loopback endpoint, and close the temporary tab. Every visible effect is reported; ambiguity is refused. Where attaching would bring the browser in front of the user's app (macOS Chrome shows its own remote-debugging prompt in front whenever the driver opens a new browser connection; sessions for the same browser share one approved connection, kept for up to 30 minutes idle and 8 hours in total, so later sessions do not prompt again), existing-profile attachment refuses with background_unavailable unless delivery_mode is "foreground" (the app that was in front is brought back afterwards) or the browser window is on another Space than the user's, where it attaches in the background while the driver reverts the browser's own brief activations. A driver-owned isolated launch result carries an advisory lifecycle object: the browser process ends with the calling session after idle_expires_in_seconds without session activity, an isolated_named profile persists after the session and an isolated_new profile does not, and explicit end, disconnect, revocation or shutdown end it earlier. Setup and recovery: `get_guide({topic:"browser"})`.
 
-Effect: destructive. Platforms: macOS, Linux, Windows.
+**macOS parameters**
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| <span id="browser_prepare--macos--delivery_mode"></span>`delivery_mode` | `"background" \| "foreground"` | `"background"` | Existing-profile attachment only. background (default) refuses with background_unavailable, before any visible effect, where attaching would bring the browser in front of the user's app. foreground accepts that, for a screen nobody else is using or when the user agreed; the app that was in front is brought back afterwards. |
+
+</Tab>
+<Tab value="Linux">
+
+Attach the browser tools to a browser. For a page in the user's running Chrome, Edge or Brave, call it once with pid, window_id, session and strategy &#123;"kind":"existing_profile"&#125; when get_browser_state refuses with browser_consent_required or browser_requires_setup; then call get_browser_state again and act with browser_click, browser_type or browser_pointer. It attaches, or refuses with nothing changed and says why. Explicitly prepare an owned DevTools endpoint for a browser. pid is required for an existing process or existing-profile attachment, and optional only for allow_launch=true with an isolated profile. Existing endpoints are detected without side effects. Acting setup for an isolated profile follows the runtime permission mode and optional capability manifest. It requires allow_launch=true, launches a separate browser, and never copies, modifies, or terminates the requested user profile. Without pid, only a platform-attested system Chrome/Edge installation (or a root-owned package payload on Linux) is eligible; redirects and user-controlled locations fail closed. Existing-profile attachment is explicit and follows the runtime's immutable permission mode: standard requires an explicit --grant existing-profile launch grant or an embedding authorization host, bounded requires a launch-approved exact resource manifest, and unrestricted requires explicit trusted startup risk acceptance. Ordinary MCP transport approval never proves profile authorization. On proven platforms, an authorized request also permits one bounded exact-window setup: open the recognized browser product's fixed remote-debugging page, toggle its uniquely matched per-instance checkbox, prove the PID-owned loopback endpoint, and close the temporary tab. Every visible effect is reported; ambiguity is refused. Where attaching would bring the browser in front of the user's app (macOS Chrome shows its own remote-debugging prompt in front whenever the driver opens a new browser connection; sessions for the same browser share one approved connection, kept for up to 30 minutes idle and 8 hours in total, so later sessions do not prompt again), existing-profile attachment refuses with background_unavailable unless delivery_mode is "foreground" (the app that was in front is brought back afterwards) or the browser window is on another Space than the user's, where it attaches in the background while the driver reverts the browser's own brief activations. A driver-owned isolated launch result carries an advisory lifecycle object: the browser process ends with the calling session after idle_expires_in_seconds without session activity, an isolated_named profile persists after the session and an isolated_new profile does not, and explicit end, disconnect, revocation or shutdown end it earlier. Setup and recovery: `get_guide({topic:"browser"})`.
+
+**Linux parameters**
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| <span id="browser_prepare--linux--delivery_mode"></span>`delivery_mode` | `"background" \| "foreground"` | `"background"` | Existing-profile attachment only. background (default) refuses with background_unavailable, before any visible effect, where attaching would bring the browser in front of the user's app. foreground accepts that, for a screen nobody else is using or when the user agreed; the app that was in front is brought back afterwards. |
+
+</Tab>
+<Tab value="Windows">
+
+Attach the browser tools to a browser. For a page in the user's running Chrome, Edge or Brave, call it once with pid, window_id, session and strategy &#123;"kind":"existing_profile"&#125; when get_browser_state refuses with browser_consent_required or browser_requires_setup; then call get_browser_state again and act with browser_click, browser_type or browser_pointer. It attaches, or refuses with nothing changed and says why. Explicitly prepare an owned DevTools endpoint for a browser. pid is required for an existing process or existing-profile attachment, and optional only for allow_launch=true with an isolated profile. Existing endpoints are detected without side effects. Acting setup for an isolated profile follows the runtime permission mode and optional capability manifest. It requires allow_launch=true, launches a separate browser, and never copies, modifies, or terminates the requested user profile. Without pid, only a platform-attested system Chrome/Edge installation (or a root-owned package payload on Linux) is eligible; redirects and user-controlled locations fail closed. Existing-profile attachment is explicit and follows the runtime's immutable permission mode: standard requires an explicit --grant existing-profile launch grant or an embedding authorization host, bounded requires a launch-approved exact resource manifest, and unrestricted requires explicit trusted startup risk acceptance. Ordinary MCP transport approval never proves profile authorization. On proven platforms, an authorized request also permits one bounded exact-window setup: open the recognized browser product's fixed remote-debugging page, toggle its uniquely matched per-instance checkbox, prove the PID-owned loopback endpoint, and close the temporary tab. Every visible effect is reported; ambiguity is refused. Where attaching would bring the browser in front of the user's app (macOS Chrome shows its own remote-debugging prompt in front whenever the driver opens a new browser connection; sessions for the same browser share one approved connection, kept for up to 30 minutes idle and 8 hours in total, so later sessions do not prompt again), existing-profile attachment refuses with background_unavailable unless delivery_mode is "foreground" (the app that was in front is brought back afterwards) or the browser window is on another Space than the user's, where it attaches in the background while the driver reverts the browser's own brief activations. A driver-owned isolated launch result carries an advisory lifecycle object: the browser process ends with the calling session after idle_expires_in_seconds without session activity, an isolated_named profile persists after the session and an isolated_new profile does not, and explicit end, disconnect, revocation or shutdown end it earlier. Setup and recovery: `get_guide({topic:"browser"})`.
+
+**Windows parameters**
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| <span id="browser_prepare--windows--delivery_mode"></span>`delivery_mode` | `"background" \| "foreground"` | `"background"` | Existing-profile attachment only. background (default) attaches in the background when the browser window is on another Space than the user's, and otherwise refuses with background_unavailable, before any visible effect, where attaching would bring the browser in front of the user's app. foreground accepts that, for a screen nobody else is using or when the user agreed; the app that was in front is brought back afterwards. |
+
+</Tab>
+</Tabs>
+
+**Parameters on every platform**
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | <span id="browser_prepare--allow_launch"></span>`allow_launch` | `boolean` |  | Allow a separate driver-owned isolated Chromium process to be launched (default false). |
-| <span id="browser_prepare--delivery_mode"></span>`delivery_mode` | `"background" \| "foreground"` | `"background"` | Existing-profile attachment only. background (default) attaches in the background when the browser window is on another Space than the user's, and otherwise refuses with background_unavailable, before any visible effect, where attaching would bring the browser in front of the user's app. foreground accepts that, for a screen nobody else is using or when the user agreed; the app that was in front is brought back afterwards. |
 | <span id="browser_prepare--pid"></span>`pid` | `integer` |  | Browser process id to prepare. Required except for a driver-owned isolated_new/isolated_named launch with allow_launch=true. |
 | <span id="browser_prepare--profile"></span>`profile` | `object` |  | Driver-owned isolated Chromium profile to launch with allow_launch=true. mode=isolated_new creates a fresh throwaway profile; mode=isolated_named reuses the named driver-owned profile. Never an existing user profile. |
 | <span id="browser_prepare--profile-mode"></span>`profile.mode` | `"isolated_new" \| "isolated_named"` |  |  |

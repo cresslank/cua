@@ -93,7 +93,11 @@ fn call_on(
                 // A connection wait may outlive the native caller. Do not begin a
                 // new focus mutation after cancellation; terminal reconciliation
                 // methods must remain available for unconditional restoration.
-                if method.ends_with("BeginForeground") {
+                if method.ends_with("BeginForeground")
+                    || method.ends_with("SwitchToTarget")
+                    || method.ends_with("FocusSwitchSearch")
+                    || method.ends_with("DeliverSwitchSearch")
+                {
                     action_lease
                         .run(cua_driver_core::blocking::check_cancelled)
                         .map_err(|_| Failure::Cancelled)?;
@@ -191,6 +195,8 @@ async fn invoke(
             | "GetConnectionUnixProcessID"
             | "GetConnectionUnixUser"
             | "CaptureTarget"
+            | "FocusSwitchSearch"
+            | "CancelSwitchSearch"
             | "QueryForeground"
             | "AbortForeground"
             | "ValidateForeground"
@@ -198,8 +204,10 @@ async fn invoke(
             | "CommitForeground",
             [value],
         ) => send!((value.as_str(),)),
-        ("GetRects" | "GetVersion" | "GetCapabilities", []) => send!(()),
-        ("BeginForeground", [transaction, target]) => {
+        ("GetRects" | "GetVersion" | "GetCapabilities" | "GetSwitchState" | "GetActive", []) => {
+            send!(())
+        }
+        ("BeginForeground" | "SwitchToTarget" | "DeliverSwitchSearch", [transaction, target]) => {
             send!((transaction.as_str(), target.as_str()))
         }
         ("CaptureTargetPreview", [target, max]) => send!((target.as_str(), parse_u32(max)?)),
@@ -233,6 +241,10 @@ async fn invoke(
     };
     let body = reply.body();
     let decoded = match member {
+        "GetActive" => body
+            .deserialize::<bool>()
+            .ok()
+            .map(|value| value.to_string()),
         "MoveCursorFor" | "ClickPulseFor" | "SetCursorColorFor" | "SetCursorStateFor"
         | "SetSessionLabelFor" | "HideCursorFor" | "RemoveCursor" => {
             body.deserialize::<()>().ok().map(|()| String::new())

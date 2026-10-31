@@ -209,6 +209,11 @@ fn observe_exact_window(pid: i32, window_id: u32) -> ExactWindowObservation {
     }
 }
 
+/// Read-only reuse of bring_to_front's independent exact-window oracle.
+pub(crate) fn exact_window_is_focused(pid: i32, window_id: u32) -> bool {
+    observe_exact_window(pid, window_id).exact_postcondition(pid, window_id)
+}
+
 fn wait_for_exact_window(pid: i32, window_id: u32) -> ExactWindowObservation {
     let deadline = Instant::now() + VERIFY_TIMEOUT;
     let mut stable_since = None;
@@ -239,29 +244,41 @@ fn wait_for_exact_window(pid: i32, window_id: u32) -> ExactWindowObservation {
 /// make the app active for AppKit, so a window the typing opens (Chrome's
 /// omnibox suggestions) hands the front back to the previous app mid-string.
 pub(crate) fn activate_exact_window_blocking(pid: i32, window_id: u32) -> bool {
+    activate_exact_window_with_guard(pid, window_id, || {
+        cua_driver_core::blocking::check_cancelled().is_ok()
+    })
+}
+
+/// The switch-window caller additionally rechecks the session lock after each
+/// blocking native read and before every persistent activation request.
+pub(crate) fn activate_exact_window_with_guard(
+    pid: i32,
+    window_id: u32,
+    ready: impl Fn() -> bool,
+) -> bool {
     let Some(app) = (unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) })
     else {
         return false;
     };
-    if cua_driver_core::blocking::check_cancelled().is_err() {
+    if !ready() {
         return false;
     }
     crate::input::skylight::set_front_process_persistently(pid, window_id);
-    if cua_driver_core::blocking::check_cancelled().is_err() {
+    if !ready() {
         return false;
     }
     crate::input::skylight::make_exact_window_key(pid, window_id);
-    if cua_driver_core::blocking::check_cancelled().is_err() {
+    if !ready() {
         return false;
     }
     unsafe {
         app.activateWithOptions(NSApplicationActivationOptions::NSApplicationActivateAllWindows)
     };
-    if cua_driver_core::blocking::check_cancelled().is_err() {
+    if !ready() {
         return false;
     }
     crate::post_action::cancel();
-    raise_exact_window_of_pid(pid, window_id);
+    crate::ax::bindings::raise_exact_window_with_guard(pid, window_id, &ready);
     wait_for_exact_window(pid, window_id).exact_postcondition(pid, window_id)
 }
 

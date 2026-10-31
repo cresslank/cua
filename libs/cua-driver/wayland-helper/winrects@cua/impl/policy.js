@@ -1,3 +1,38 @@
+// Mutter's default 'Super' binding is the left overlay key; an explicit
+// Super_L is equivalent. Disabled/remapped/right-side bindings do not authorize
+// the driver's fixed KEY_LEFTMETA dispatch.
+export function overlayKeyUsesLeftSuper(binding) {
+    return binding === 'Super' || binding === 'Super_L';
+}
+
+// Persistent switching is deliberately separate from temporary foreground input:
+// overview, minimization and workspace changes are permitted only for this action.
+export function persistentSwitchRefusal({sessionLocked, userSession, targetResolved, busy, modalChildPresent}) {
+    if (sessionLocked !== false || userSession !== true) return 'session_locked';
+    if (targetResolved !== true) return 'window_not_found';
+    if (busy !== false || modalChildPresent !== false) return 'shell_not_ready';
+    return null;
+}
+
+export function persistentSwitchFocused({sessionLocked, targetResolved, focusMatches, workspaceActive,
+    minimized, overviewVisible, keyFocusInShellUi, modalCount}) {
+    return sessionLocked === false && targetResolved === true && focusMatches === true
+        && workspaceActive === true && minimized === false && overviewVisible === false
+        && keyFocusInShellUi === false && modalCount === 0;
+}
+
+// Positive proof only; focus_window can remain an application while overview owns keys.
+export function shellSearchCanRequestFocus({overviewVisible, sessionLocked, busy, entryAvailable, modalCount}) {
+    return overviewVisible === true && sessionLocked === false && busy === false
+        && entryAvailable === true && Number.isInteger(modalCount) && modalCount >= 0 && modalCount <= 1;
+}
+
+export function shellSearchHasFocus({overviewVisible, sessionLocked, searchEntryHasKeyFocus, keyFocusInShellUi, modalCount}) {
+    return overviewVisible === true && sessionLocked === false
+        && searchEntryHasKeyFocus === true && keyFocusInShellUi === true
+        && Number.isInteger(modalCount) && modalCount >= 0 && modalCount <= 1;
+}
+
 // Pure visibility/identity policy shared by the GNOME extension and Node tests.
 // showing_on_its_workspace() describes hypothetical visibility on that workspace,
 // not membership of the active stage. Keep workspace membership explicit without

@@ -847,7 +847,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "list_apps" => &["app.list"],
         "kill_app" => &["app.kill"],
         "list_windows" => &["window.list"],
-        "bring_to_front" => &["window.activate"],
+        "bring_to_front" | "switch_window" => &["window.activate"],
         "set_window_frame" => &["window.frame.set"],
         "debug_window_info" => &["window.debug_info"],
 
@@ -2820,7 +2820,7 @@ impl ToolRegistry {
             // checked against its approved manifest.
             return Ok(());
         }
-        let delivery_mode = if tool_name == "bring_to_front" {
+        let delivery_mode = if matches!(tool_name, "bring_to_front" | "switch_window") {
             "foreground"
         } else {
             args.get("delivery_mode")
@@ -7236,6 +7236,7 @@ mod capability_tests {
         "kill_app",
         "list_windows",
         "bring_to_front",
+        "switch_window",
         "set_window_frame",
         "debug_window_info",
         // permissions / config

@@ -75,6 +75,16 @@ pub fn active_window() -> Option<u64> {
     (id != 0).then_some(u64::from(id))
 }
 
+/// Mapping an iconic client requests NormalState (unminimize). A checked map
+/// precedes EWMH activation; only later keyboard-focus readback proves success.
+pub(crate) fn unminimize_for_switch(xid: u64) -> Result<()> {
+    let xid = u32::try_from(xid)?;
+    let (conn, _) = RustConnection::connect(None)?;
+    conn.map_window(xid)?.check()?;
+    conn.flush()?;
+    Ok(())
+}
+
 /// List top-level windows, optionally filtered by pid.
 pub fn list_windows(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     list_windows_inner(filter_pid).unwrap_or_default()

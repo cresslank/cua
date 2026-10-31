@@ -995,6 +995,16 @@ pub fn raise_focused_window_of_pid(pid: i32) -> bool {
 /// its own leaves AppKit's key window where it was. No other window of the
 /// process is addressed.
 pub fn raise_exact_window_of_pid(pid: i32, window_id: u32) -> bool {
+    raise_exact_window_with_guard(pid, window_id, &|| true)
+}
+
+/// Same exact-window requests, with revalidation after AX reads and between
+/// mutations. Used by persistent switch_window's lock/cancellation guard.
+pub(crate) fn raise_exact_window_with_guard(
+    pid: i32,
+    window_id: u32,
+    ready: &impl Fn() -> bool,
+) -> bool {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
@@ -1012,9 +1022,9 @@ pub fn raise_exact_window_of_pid(pid: i32, window_id: u32) -> bool {
         let Some(target) = target else {
             return false;
         };
-        let raised = perform_action(target, "AXRaise") == kAXErrorSuccess;
-        let main = set_bool_attr_true(target, "AXMain") == kAXErrorSuccess;
-        let focused = set_bool_attr_true(target, "AXFocused") == kAXErrorSuccess;
+        let raised = ready() && perform_action(target, "AXRaise") == kAXErrorSuccess;
+        let main = ready() && set_bool_attr_true(target, "AXMain") == kAXErrorSuccess;
+        let focused = ready() && set_bool_attr_true(target, "AXFocused") == kAXErrorSuccess;
         CFRelease(target as CFTypeRef);
         raised || main || focused
     }

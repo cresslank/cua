@@ -165,6 +165,7 @@ pub fn classify_tool(tool: &str) -> ActionClass {
         | "press_key"
         | "hotkey"
         | "bring_to_front"
+        | "switch_window"
         | "set_window_frame" => ActionClass::DesktopRaw,
         "browser_click"
         | "browser_type"

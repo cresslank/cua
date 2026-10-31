@@ -24,6 +24,7 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 mod transport;
+pub(crate) mod window_switch;
 
 /// Fence both transports, cancel pending RPCs and join the cursor dispatcher.
 pub fn shutdown() {
@@ -772,6 +773,26 @@ pub fn gnome_shell_session() -> bool {
             .split(':')
             .any(|desktop| desktop.eq_ignore_ascii_case("gnome"))
     }) || unique_bus_owner(COMPOSITOR_DEST).is_some()
+}
+
+/// GNOME X11 does not require WinRects, but its screensaver owns lock state.
+/// Unavailable readback is not permission to focus a client over the lock UI.
+pub(crate) fn require_unlocked_x11_session() -> anyhow::Result<()> {
+    if !gnome_shell_session() {
+        return Ok(());
+    }
+    let raw = transport::call_result(
+        "org.gnome.ScreenSaver",
+        "/org/gnome/ScreenSaver",
+        "org.gnome.ScreenSaver.GetActive",
+        &[],
+        Duration::from_millis(800),
+    )
+    .map_err(|error| {
+        anyhow::anyhow!("shell_not_ready: GNOME lock readback unavailable: {error}")
+    })?;
+    anyhow::ensure!(raw == "false", "session_locked");
+    Ok(())
 }
 
 fn parse_quoted_string(raw: &str) -> Option<String> {
@@ -2255,7 +2276,7 @@ mod tests {
     #[test]
     fn bundled_helper_v15_preserves_host_owned_modifier_badge_chips() {
         assert!(EXTENSION_SOURCE.contains("GetVersion()"));
-        assert!(EXTENSION_SOURCE.contains("const HELPER_API_VERSION = 16;"));
+        assert!(EXTENSION_SOURCE.contains("const HELPER_API_VERSION = 17;"));
         assert!(EXTENSION_SOURCE.contains("return HELPER_API_VERSION;"));
         assert!(EXTENSION_SOURCE.contains("SetCursorState"));
         assert!(EXTENSION_SOURCE.contains("SetCursorColor"));
