@@ -74,8 +74,9 @@ try:
     args = {k: target[k] for k in ('pid', 'window_id')}
     baseline = keys()
     assert baseline == 0, ('fixture received a key before switching', baseline)
-    for mode in ('minimized', 'workspace', 'overview', 'keyboard', 'keyboard_default', 'refusal', 'post_proof'):
-        control('Setup', 'keyboard' if mode == 'keyboard_default' else mode)
+    timings = []
+    for mode in ('minimized', 'workspace', 'overview', 'keyboard', 'auto_after_keyboard', 'native_after_keyboard', 'keyboard_default', 'refusal', 'post_proof'):
+        control('Setup', 'keyboard' if mode in ('keyboard_default', 'auto_after_keyboard', 'native_after_keyboard') else mode)
         time.sleep(0.5)
         before = control('Observe')
         if mode in ('minimized', 'keyboard', 'keyboard_default', 'refusal', 'post_proof'):
@@ -88,7 +89,15 @@ try:
         switch_args = dict(**args, method='keyboard' if mode in ('keyboard', 'keyboard_default', 'refusal', 'post_proof') else 'native')
         if mode != 'keyboard_default':
             switch_args['query'] = 'SHOULD NEVER REACH CLIENT' if mode in ('refusal', 'post_proof') else 'Cua Switch Probe'
+        if mode == 'auto_after_keyboard':
+            switch_args['method'] = 'auto'
+        started = time.monotonic()
         result = tool('switch_window', switch_args)
+        elapsed_ms = (time.monotonic() - started) * 1000
+        # Measure only the public MCP operation, not fixture setup/settling.
+        timing = dict(event='timing', case=mode, method=switch_args['method'], elapsed_ms=elapsed_ms)
+        timings.append(timing)
+        print(json.dumps(timing), flush=True)
         structured = result.get('structuredContent', {})
         time.sleep(0.5)
         after = control('Observe')
@@ -118,7 +127,14 @@ try:
     ordinary = tool('press_key', dict(**args, key='F24', delivery_mode='background'))
     assert ordinary.get('isError') is True and 'background_unavailable' in json.dumps(ordinary), ordinary
     assert keys() == baseline, 'ordinary key bypassed native-Wayland background refusal'
-    print('SWITCH-LAB PASS 7 cases; zero client text/Return/Escape keys', flush=True)
+    # Native-only activation and the first auto call after a keyboard switch
+    # must not inherit an impossible libei readiness wait. Keep safety/focus
+    # assertions above authoritative even when a timing budget is exceeded.
+    for timing in timings:
+        budget_ms = 2000 if timing['case'] in ('keyboard', 'keyboard_default') else 300 if timing['case'] in ('auto_after_keyboard', 'native_after_keyboard') else None
+        if budget_ms is not None:
+            assert timing['elapsed_ms'] < budget_ms, ('switch latency budget exceeded', budget_ms, timing)
+    print('SWITCH-LAB PASS 9 cases; zero client text/Return/Escape keys', flush=True)
 finally:
     proc.stdin.close()
     try:

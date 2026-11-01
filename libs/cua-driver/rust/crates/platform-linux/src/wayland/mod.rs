@@ -136,7 +136,10 @@ pub fn ensure_raw_input_ready_for_tool(tool: &str, args: &serde_json::Value) -> 
                 if peer.has("shell-search-focus-v1")
                     && peer.state().is_ok_and(|state| !state.session_locked)
                 {
-                    let _ = libei::reconnect_for_readiness("keyboard");
+                    // EIS interface names are exact protocol identifiers. A
+                    // generic "keyboard" can never become ready and consumes
+                    // the entire command deadline, even before an auto/native rung.
+                    let _ = libei::reconnect_for_readiness("ei_keyboard");
                 }
             }
         }
