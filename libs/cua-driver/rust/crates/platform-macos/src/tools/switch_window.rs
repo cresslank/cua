@@ -247,55 +247,98 @@ fn process_started(pid: i32) -> Option<(u64, u64)> {
     }
 }
 
+const LEGACY_SPOTLIGHT: (&str, &str) = (
+    "com.apple.Spotlight",
+    "/System/Library/CoreServices/Spotlight.app/Contents/MacOS/Spotlight",
+);
+const CAMPO_SPOTLIGHT: (&str, &str) = (
+    "com.apple.campo",
+    "/System/Applications/Siri AI.app/Contents/MacOS/Siri AI",
+);
+
+fn spotlight_host(bundle: Option<&str>, executable: Option<&str>) -> bool {
+    matches!((bundle, executable), (Some(bundle), Some(path))
+        if (bundle, path) == LEGACY_SPOTLIGHT || (bundle, path) == CAMPO_SPOTLIGHT)
+}
+
 /// Pure authorization boundary: neither an app name, an AX text role, nor a
 /// native fronting receipt alone authorizes any shell text or command key.
+#[derive(Clone, Copy)]
 struct SpotlightObservation<'a> {
     pid: i32,
     bundle: Option<&'a str>,
+    executable: Option<&'a str>,
+    started: Option<(u64, u64)>,
+    final_started: Option<(u64, u64)>,
     element_pid: Option<i32>,
     role: Option<&'a str>,
     subrole: Option<&'a str>,
+    identifier: Option<&'a str>,
     focused: Option<bool>,
     final_key_owner: Option<i32>,
 }
 
 impl SpotlightObservation<'_> {
-    fn proven(&self) -> bool {
-        self.pid > 0
-            && self.bundle == Some("com.apple.Spotlight")
+    fn proven(&self) -> SwitchResult<()> {
+        // macOS 27.2's Spotlight panel is hosted by Siri AI, NOT Dock or the
+        // CampoRemoteService remote-view process. Trusted system-wide AX and
+        // WindowServer observations agree on this field's owning/key-focus pid.
+        // Siri has other text fields: its host identity alone is insufficient.
+        let search_field = if self.bundle == Some(CAMPO_SPOTLIGHT.0) {
+            self.role == Some("AXTextField")
+                && self.subrole == Some("AXSearchField")
+                && self.identifier == Some("SpotlightSearchField")
+        } else {
+            search_field_role(self.role, self.subrole)
+        };
+        (self.pid > 0
+            && spotlight_host(self.bundle, self.executable)
+            && self.started.is_some_and(|started| started.0 != 0)
+            && self.final_started == self.started
             && self.element_pid == Some(self.pid)
-            && search_field_role(self.role, self.subrole)
+            && search_field
             && self.focused == Some(true)
-            && self.final_key_owner == Some(self.pid)
+            && self.final_key_owner == Some(self.pid))
+        .then_some(())
+        .ok_or(Refusal("shell_not_ready"))
     }
 }
 
 fn spotlight() -> Option<Spotlight> {
     let pid = crate::input::skylight::key_focus_pid()?;
     let started = process_started(pid)?;
-    if crate::apps::bundle_id_for_pid(pid).as_deref() != Some("com.apple.Spotlight") {
+    if !spotlight_host(
+        crate::apps::bundle_id_for_pid(pid).as_deref(),
+        crate::apps::path_of_pid(pid).as_deref(),
+    ) {
         return None;
     }
     let system = unsafe { Element::owned(AXUIElementCreateSystemWide()) }?;
     let field = system.attr("AXFocusedUIElement")?;
     let bundle = crate::apps::bundle_id_for_pid(pid);
+    let executable = crate::apps::path_of_pid(pid);
     let element_pid = field.pid();
     let role = field.string("AXRole");
     let subrole = field.string("AXSubrole");
+    let identifier = field.string("AXIdentifier");
     let focused = unsafe { ax::copy_bool_attr(field.0, "AXFocused") };
-    // Reject a focus change during the AX round trips.
+    // Reject a focus or process-incarnation change during the AX round trips.
     SpotlightObservation {
         pid,
         bundle: bundle.as_deref(),
+        executable: executable.as_deref(),
+        started: Some(started),
+        final_started: process_started(pid),
         element_pid,
         role: role.as_deref(),
         subrole: subrole.as_deref(),
+        identifier: identifier.as_deref(),
         focused,
         final_key_owner: crate::input::skylight::key_focus_pid(),
     }
     .proven()
-    .then_some(())?;
-    (process_started(pid) == Some(started)).then_some(Spotlight {
+    .ok()?;
+    Some(Spotlight {
         pid,
         started,
         field,
@@ -1243,55 +1286,164 @@ mod tests {
         }
     }
 
+    fn observed_spotlight(campo: bool) -> SpotlightObservation<'static> {
+        let (bundle, executable) = if campo {
+            CAMPO_SPOTLIGHT
+        } else {
+            LEGACY_SPOTLIGHT
+        };
+        SpotlightObservation {
+            pid: 42,
+            bundle: Some(bundle),
+            executable: Some(executable),
+            started: Some((123, 456)),
+            final_started: Some((123, 456)),
+            element_pid: Some(42),
+            role: Some("AXTextField"),
+            subrole: Some("AXSearchField"),
+            identifier: campo.then_some("SpotlightSearchField"),
+            focused: Some(true),
+            final_key_owner: Some(42),
+        }
+    }
+
+    fn assert_receiver_refused(observation: SpotlightObservation<'_>) {
+        let mut events = RecordedEvents::default();
+        let outcome = (|| {
+            observation.proven()?;
+            // No receiver proof => no select-all or query events.
+            spotlight_query(&Receiver::focused(), &mut events, "Slack")?;
+            Ok(true)
+        })();
+        assert_eq!(outcome, Err(Refusal("shell_not_ready")));
+        assert!(events.deliveries.is_empty());
+        let args =
+            SwitchArgs::parse(&json!({"pid": 99, "window_id": 7, "method": "keyboard"})).unwrap();
+        let result = finish_keyboard(&args, 7, Vec::new(), outcome);
+        assert_eq!(result.is_error, Some(true));
+        let result = result.structured_content.unwrap();
+        assert_eq!(result["code"], "shell_not_ready");
+        assert_eq!(result["effect"], "refused");
+        assert_eq!(result["attempts"][0]["outcome"], "refused");
+        assert_eq!(result["focused"], false);
+    }
+
+    #[test]
+    fn spotlight_accepts_legacy_and_observed_campo_receiver_without_a_cg_window() {
+        // Campo's layer-23 system dialog is absent from list_windows. Neither
+        // receiver proof nor query delivery requires a shell CGWindow record.
+        for observation in [
+            observed_spotlight(false),
+            SpotlightObservation {
+                role: Some("AXSearchField"),
+                subrole: None,
+                ..observed_spotlight(false)
+            },
+            observed_spotlight(true),
+        ] {
+            assert_eq!(observation.proven(), Ok(()));
+        }
+    }
+
     #[test]
     fn spotlight_proof_fails_closed_on_every_missing_or_contested_receiver_fact() {
-        fn valid() -> SpotlightObservation<'static> {
-            SpotlightObservation {
-                pid: 42,
-                bundle: Some("com.apple.Spotlight"),
-                element_pid: Some(42),
-                role: Some("AXTextField"),
-                subrole: Some("AXSearchField"),
-                focused: Some(true),
-                final_key_owner: Some(42),
+        for campo in [false, true] {
+            let valid = observed_spotlight(campo);
+            for bundle in [
+                None,
+                Some("com.apple.Terminal"),
+                Some("com.apple.spotlight"),
+                Some("com.apple.dock"),
+                Some("com.apple.CampoRemoteService"),
+            ] {
+                assert_receiver_refused(SpotlightObservation { bundle, ..valid });
             }
+            for executable in [
+                None,
+                Some("/tmp/Spotlight"),
+                Some("/tmp/Siri AI"),
+                Some("/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"),
+            ] {
+                assert_receiver_refused(SpotlightObservation {
+                    executable,
+                    ..valid
+                });
+            }
+            // A trusted bundle identifier paired with the other host's path is
+            // not an allowed identity; host contracts are pairs, not two lists.
+            assert_receiver_refused(SpotlightObservation {
+                executable: Some(if campo {
+                    LEGACY_SPOTLIGHT.1
+                } else {
+                    CAMPO_SPOTLIGHT.1
+                }),
+                ..valid
+            });
+            for started in [None, Some((0, 0))] {
+                assert_receiver_refused(SpotlightObservation {
+                    started,
+                    final_started: started,
+                    ..valid
+                });
+            }
+            for final_started in [None, Some((123, 457)), Some((124, 456))] {
+                assert_receiver_refused(SpotlightObservation {
+                    final_started,
+                    ..valid
+                });
+            }
+            for element_pid in [None, Some(99)] {
+                assert_receiver_refused(SpotlightObservation {
+                    element_pid,
+                    ..valid
+                });
+            }
+            for focused in [None, Some(false)] {
+                assert_receiver_refused(SpotlightObservation { focused, ..valid });
+            }
+            for final_key_owner in [None, Some(99)] {
+                assert_receiver_refused(SpotlightObservation {
+                    final_key_owner,
+                    ..valid
+                });
+            }
+            for role in [None, Some("AXTextArea"), Some("AXButton")] {
+                assert_receiver_refused(SpotlightObservation { role, ..valid });
+            }
+            for subrole in [None, Some("AXSecureTextField"), Some("AXUnknown")] {
+                assert_receiver_refused(SpotlightObservation { subrole, ..valid });
+            }
+            assert_receiver_refused(SpotlightObservation { pid: 0, ..valid });
         }
-        assert!(valid().proven());
-        for bundle in [
+    }
+
+    #[test]
+    fn campo_requires_exact_spotlight_identifier_and_role_not_arbitrary_siri_or_dock_fields() {
+        let valid = observed_spotlight(true);
+        for identifier in [
             None,
-            Some("com.apple.Terminal"),
-            Some("com.apple.spotlight"),
+            Some(""),
+            Some("SiriSearchField"),
+            Some("spotlightsearchfield"),
+            Some("SpotlightSearchField-extra"),
         ] {
-            assert!(!SpotlightObservation { bundle, ..valid() }.proven());
+            assert_receiver_refused(SpotlightObservation {
+                identifier,
+                ..valid
+            });
         }
-        for element_pid in [None, Some(99)] {
-            assert!(!SpotlightObservation {
-                element_pid,
-                ..valid()
-            }
-            .proven());
+        assert_receiver_refused(SpotlightObservation {
+            role: Some("AXSearchField"),
+            ..valid
+        });
+        for identifier in [None, Some("SpotlightSearchField")] {
+            assert_receiver_refused(SpotlightObservation {
+                bundle: Some("com.apple.dock"),
+                executable: Some("/System/Library/CoreServices/Dock.app/Contents/MacOS/Dock"),
+                identifier,
+                ..valid
+            });
         }
-        for focused in [None, Some(false)] {
-            assert!(!SpotlightObservation { focused, ..valid() }.proven());
-        }
-        for final_key_owner in [None, Some(99)] {
-            assert!(!SpotlightObservation {
-                final_key_owner,
-                ..valid()
-            }
-            .proven());
-        }
-        assert!(!SpotlightObservation { pid: 0, ..valid() }.proven());
-        assert!(!SpotlightObservation {
-            role: None,
-            ..valid()
-        }
-        .proven());
-        assert!(!SpotlightObservation {
-            subrole: None,
-            ..valid()
-        }
-        .proven());
     }
 
     #[test]
