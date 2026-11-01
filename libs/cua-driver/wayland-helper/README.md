@@ -9,7 +9,7 @@ normal Wayland client cannot do these things globally.
 
 It exposes `org.cua.WinRects` on the session bus:
 
-- `GetVersion() -> uint`: this fork's helper API version (v17, with the v8
+- `GetVersion() -> uint`: this fork's helper API version (v18, with the v8
   semantic cursor/session-badge API). The driver accepts it only after resolving
   the helper's immutable D-Bus owner and proving that owner is the current
   user's system-installed `gnome-shell` process.
@@ -212,7 +212,8 @@ poll requires the exact target to own compositor focus on the active workspace,
 with no overview or Shell keyboard grab. Duplicates never replay activation.
 
 `GetSwitchState() -> json` advertises `shell-search-focus-v1`. Readback includes
-protocol/epoch, `overview_visible`, `session_locked`,
+protocol/epoch, `overview_visible`, `overview_shown`, `overview_animating`,
+`monitor_ready`, `session_locked`,
 `search_entry_has_key_focus`, `key_focus_in_shell_ui`, `modal_count`,
 `overlay_key_is_super` (the configured Mutter overlay binding), exact
 `focus_window` token and `focus_pid`, plus foreground/persistent transaction-open
@@ -221,17 +222,54 @@ The search-entry boolean is positive proof
 that Shell's real overview entry owns Clutter key focus, not merely that the
 overview is visible. `FocusSwitchSearch(target)` is a separate explicit action:
 it may focus only the known mapped Shell search entry inside an unlocked,
-visible overview with no extra modal or helper transaction. GNOME normally
-forwards the first printable key to activate search; focusing the entry explicitly
-avoids that unproven character. GetSwitchState remains read-only. Missing
+fully shown overview with a usable monitor layout and no extra modal or helper
+transaction. GNOME normally forwards the first printable key to activate search;
+focusing the entry explicitly avoids that unproven character. GetSwitchState
+remains read-only. Missing
 API/state never authorizes keys.
 
 `DeliverSwitchSearch(target,query)` and `CancelSwitchSearch(target)` advertise
-`shell-search-delivery-v1`. Delivery rechecks the full Shell focus predicate,
-exact target and matching running Shell application search result, then sets the
-entry text and activates that result synchronously in the compositor main loop.
+`shell-search-delivery-v1`. Delivery rechecks lifecycle/monitor readiness, the full
+Shell focus predicate, exact target and matching running Shell application search
+result, then sets the entry text and activates that result synchronously in the
+compositor main loop.
 No match refuses `switch_unverified`; lost overview/focus refuses `shell_not_ready`.
-Cancellation uses `Main.overview.hide()`. Neither method emits keyboard events.
+Cancellation uses only guarded public `Main.overview.hide()`. Its `hide_requested`
+and legacy `cancelled` booleans mean the hide request was accepted, not that the
+overview finished hiding. The reply includes fresh switch-state flags; callers
+poll `GetSwitchState` for hidden, non-animating state before declaring cleanup
+complete. Cancellation does not require a shown overview or ready monitor, so
+it can request cleanup during a transition or after monitor disconnection.
+Neither method emits keyboard events.
+
+### Overview lifecycle and monitor readiness (v18)
+
+`shell-search-lifecycle-v1` advertises the additive readiness contract.
+`overview_shown` is true only when GNOME's public `visible` and `visibleTarget`
+getters are true and `animationInProgress` is exactly false. The public visible
+actor alone is not evidence that showing finished or hiding has not begun.
+`overview_animating` is conservatively true when the animation getter is not a
+boolean. `monitor_ready` requires a nonempty `Main.layoutManager.monitors` array,
+an integer `primaryIndex` in range, and positive finite primary-monitor width
+and height. No background actor content is probed, and no private animation
+callbacks, flags or animation settings are changed.
+
+Both focus acquisition and receiver-owned query delivery require
+`overview_shown` and `monitor_ready` in addition to their existing predicates;
+focus acquisition rechecks after the focus grab. New drivers require the new
+capability for the keyboard route only. Older drivers can still use the new
+helper, whose receiver guards refuse showing, hiding and monitorless states.
+
+The desktop-free JavaScript gate and in-memory guard mutation checks are:
+
+```sh
+node --test tests/*.test.mjs
+node tests/switch-lifecycle-mutations.mjs
+```
+
+The tests execute shipped runtime methods in a VM with compositor objects only
+at the external edge. Mutation checks run the complete delivery regression
+module against changed source bytes without writing or swapping runtime files.
 
 The Linux `switch_window` keyboard route emits only the configured overlay Super
 through a previously prepared RemoteDesktop/EIS transport (optional readiness
@@ -240,7 +278,7 @@ binding after queue/device waits. Query, Return and Escape never enter libei or 
 virtual keyboard. The whole-action host-wide lease still serializes agents, while
 receiver-owned synchronous delivery eliminates the physical-focus check/post
 race for launcher contents. Attempts report `delivery: "shell_search"`; exact
-PID/window focus readback remains mandatory for success. API 17 is unreleased;
+PID/window focus readback remains mandatory for success. API 18 is unreleased;
 the exact-target protocol and stable bootstrap bytes remain unchanged.
 No other tool's GNOME desktop-input refusal or capture/foreground guard changes.
 
@@ -261,7 +299,7 @@ because RemoteDesktop/libei input is global to the compositor focus.
 ## Versions and other apps that bundle the helper
 
 The UUID `winrects@cua` and session-bus name `org.cua.WinRects` are shared with
-other apps, including T3 Code. This implementation reports helper API 17 in
+other apps, including T3 Code. This implementation reports helper API 18 in
 `GetVersion()` and its closure manifest. `metadata.json` remains the stable
 bootstrap release (16), not the selected implementation version. Exact-target authority is a separate
 protocol 4 capability contract: a larger API version alone never proves it.

@@ -27,7 +27,7 @@ import {
     overlayKeyUsesLeftSuper,
 } from './policy.js';
 
-const HELPER_API_VERSION = 17;
+const HELPER_API_VERSION = 18;
 const EXACT_TARGET_PROTOCOL_VERSION = 4;
 const FOREGROUND_TIMEOUT_MS = 30_000;
 const CURSOR_IDLE_TIMEOUT_US = 5 * 60 * 1_000_000;
@@ -1300,6 +1300,7 @@ export default class WinRectsRuntime {
                 'persistent-switch-v1',
                 'shell-search-focus-v1',
                 'shell-search-delivery-v1',
+                'shell-search-lifecycle-v1',
             ],
         });
     }
@@ -1529,10 +1530,23 @@ export default class WinRectsRuntime {
 
     GetSwitchState() {
         const focus = global.stage.get_key_focus();
-        const entry = Main.overview.searchEntry?.clutter_text;
+        const entry = Main.overview?.searchEntry?.clutter_text;
+        // These public getters distinguish a fully shown overview from the visible
+        // actor retained during showing/hiding. Unknown animation state is busy.
+        const overviewVisible = Main.overview?.visible === true;
+        const overviewAnimation = Main.overview?.animationInProgress;
+        const overviewAnimating = typeof overviewAnimation === 'boolean' ? overviewAnimation : true;
+        const monitors = Main.layoutManager?.monitors;
+        const primaryIndex = Main.layoutManager?.primaryIndex;
+        const primary = Array.isArray(monitors) && Number.isInteger(primaryIndex)
+            && primaryIndex >= 0 && primaryIndex < monitors.length ? monitors[primaryIndex] : null;
         const state = {
             protocol_version: EXACT_TARGET_PROTOCOL_VERSION, epoch: this._epoch,
-            overview_visible: Main.overview?.visible === true,
+            overview_visible: overviewVisible,
+            overview_shown: overviewVisible && Main.overview?.visibleTarget === true && !overviewAnimating,
+            overview_animating: overviewAnimating,
+            monitor_ready: Boolean(primary && Number.isFinite(primary.width) && primary.width > 0
+                && Number.isFinite(primary.height) && primary.height > 0),
             overlay_key_is_super: overlayKeyUsesLeftSuper(new Gio.Settings({schema_id: 'org.gnome.mutter'}).get_string('overlay-key')),
             session_locked: Main.sessionMode?.isLocked !== false || Main.sessionMode?.currentMode !== 'user',
             search_entry_has_key_focus: Boolean(entry && entry === focus && entry.has_key_focus()),
@@ -1555,18 +1569,19 @@ export default class WinRectsRuntime {
         const entry = Main.overview?.searchEntry?.clutter_text;
         let code = state.session_locked ? 'session_locked' : null;
         if (!code && !target) code = 'window_not_found';
-        if (!code && !shellSearchCanRequestFocus({
+        if (!code && (!state.overview_shown || !state.monitor_ready || !shellSearchCanRequestFocus({
             overviewVisible: state.overview_visible, sessionLocked: state.session_locked,
             busy: state.foreground_transaction_open || state.persistent_switch_open,
             entryAvailable: Boolean(entry?.mapped), modalCount: state.modal_count,
-        })) code = 'shell_not_ready';
+        }))) code = 'shell_not_ready';
         if (!code) {
             // Super opens overview, but GNOME normally leaves the entry without
             // Clutter focus until it forwards a printable key. Do not send that
             // first unproven key: explicitly focus our known Shell-owned entry.
             entry.grab_key_focus();
             state = JSON.parse(this.GetSwitchState());
-            if (!state.shell_search_has_focus || state.foreground_transaction_open || state.persistent_switch_open) code = 'shell_not_ready';
+            if (!state.overview_shown || !state.monitor_ready || !state.shell_search_has_focus
+                || state.foreground_transaction_open || state.persistent_switch_open) code = 'shell_not_ready';
         }
         return JSON.stringify({...state, ...(code ? {code} : {})});
     }
@@ -1585,7 +1600,8 @@ export default class WinRectsRuntime {
             if (state.session_locked) return reply(false, 'session_locked');
             const target = this._resolveTarget(targetId);
             if (!target) return reply(false, 'window_not_found');
-            if (!state.shell_search_has_focus || state.foreground_transaction_open || state.persistent_switch_open)
+            if (!state.overview_shown || !state.monitor_ready || !state.shell_search_has_focus
+                || state.foreground_transaction_open || state.persistent_switch_open)
                 return reply(false, 'shell_not_ready');
             const entry = Main.overview.searchEntry?.clutter_text;
             if (!entry?.mapped || global.stage.get_key_focus() !== entry)
@@ -1615,11 +1631,13 @@ export default class WinRectsRuntime {
     CancelSwitchSearch(targetId) {
         const state = JSON.parse(this.GetSwitchState());
         // API hide only: even if a client acquired focus, no Escape can reach it.
-        const cancelled = state.session_locked === false && state.overview_visible
-            && state.key_focus_in_shell_ui && !state.foreground_transaction_open && !state.persistent_switch_open;
+        // Acceptance is not completion: hide may still be animating on return.
+        const cancelled = state.session_locked === false && state.overview_visible && state.modal_count <= 1
+            && (state.key_focus_in_shell_ui || state.overview_animating)
+            && !state.foreground_transaction_open && !state.persistent_switch_open;
         if (cancelled) Main.overview.hide();
-        return JSON.stringify({protocol_version: EXACT_TARGET_PROTOCOL_VERSION, epoch: this._epoch,
-            target: targetId, delivery: 'shell_search', cancelled});
+        return JSON.stringify({...JSON.parse(this.GetSwitchState()),
+            target: targetId, delivery: 'shell_search', cancelled, hide_requested: cancelled});
     }
 
     _switchFocused(target, targetId) {

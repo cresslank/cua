@@ -35,7 +35,7 @@ optional `reason` and `delivery` (`shell_search` for GNOME keyboard attempts). `
 `effect` is `verified`, `unverifiable`, or `refused`. `focused` is compositor/OS
 readback, never an activation-request receipt. No verified focus means an MCP
 error with structured `code`: `session_locked`, `window_not_found`,
-`target_ambiguous`, `switch_unverified`, `keyboard_unavailable`, `shell_not_ready`,
+`target_ambiguous`, `switch_unverified`, `keyboard_unavailable`, `shell_not_ready`, `overview_stuck`,
 or `unsupported`. Malformed arguments report `invalid_arguments` before OS work.
 
 ## Routes and safety boundaries
@@ -56,9 +56,22 @@ sets search text plus activates the matching running application result in one
 synchronous compositor-main-loop operation. It uses the Shell application search
 for the exact query and the target window's tracked application identity; no
 matching application means `switch_unverified`, never an arbitrary first result.
-`CancelSwitchSearch(target)` hides overview with the Shell API, never Escape.
-Capability `shell-search-delivery-v1` is mandatory for the keyboard route.
-Helper API 17 adds these capabilities; the loader ABI and protocol stay unchanged,
+`CancelSwitchSearch(target)` requests overview hide with the Shell API, never Escape.
+Request acceptance is not hidden-state proof: the driver reads back completion,
+waits up to 1.5 seconds and retries once after animation ends. Ineffective hide or
+unavailable cleanup readback reports `overview_stuck`, retaining the original
+failure in the attempt reason. It never forces animation callbacks, mutates Shell
+state flags, or restarts Shell. Reconnect a disconnected display and close overview
+manually before retrying; rollback alone cannot repair an already stuck Shell.
+
+Helper API 18 adds `shell-search-lifecycle-v1`, mandatory alongside
+`shell-search-delivery-v1` for keyboard switching. It reports fully-shown and
+animation state plus primary-monitor readiness. Search focus and delivery require
+fully shown overview, not merely a visible actor. No active monitor refuses before
+Super after at most 250 ms of readiness polling; this avoids starting overview
+without a frame clock. Normal ready sessions incur no fixed settle delay. Older
+helpers remain compatible with native switching but refuse the keyboard route.
+The loader ABI and protocol stay unchanged,
 and the stable `extension.js` bootstrap is unchanged. A separately approved
 helper rollout is required; updating the binary never updates the live helper.
 

@@ -195,7 +195,7 @@ class Lab:
                                 "await new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {resolve(); return GLib.SOURCE_REMOVE;}));\n"
                                 "export default class extends Runtime { constructor(context) { "
                                 "super(context); globalThis.__cuaHotreloadObserver.importConstructed = true; } }\n").encode()
-        manifest = dict(loader_abi=1, entrypoint='main.js', helper_api=17, protocol=4,
+        manifest = dict(loader_abi=1, entrypoint='main.js', helper_api=18, protocol=4,
                         files=[dict(path=name, size=len(data), sha256=sha(data)) for name, data in sorted(files.items())])
         manifest_bytes = (json.dumps(manifest, sort_keys=True, separators=(',', ':')) + '\n').encode()
         digest = sha(manifest_bytes)
@@ -225,7 +225,7 @@ class Lab:
                                     and s.get('loaded_digest') == digest and self.owner(BUS) else False), 15)
         caps = self.helper('GetCapabilities')
         version = self.helper('GetVersion')[0]
-        require(version == 17 and caps['protocol_version'] == 4, f'helper compatibility mismatch: {version}, {caps}')
+        require(version == 18 and caps['protocol_version'] == 4, f'helper compatibility mismatch: {version}, {caps}')
         require(status['selected_digest'] == digest and status['loader_abi'] == 1, f'loader provenance mismatch: {status}')
         require(status['epoch'] == caps['epoch'], 'loader/helper epoch disagree')
         require(not fresh or caps['epoch'] not in self.epochs, 'runtime epoch reused')

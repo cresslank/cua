@@ -36,13 +36,22 @@ export default class SwitchLab extends Extension {
         return JSON.stringify({target: target?.get_stable_sequence(), pid: target?.get_pid(),
             minimized: target?.minimized, workspace: target?.get_workspace()?.index(),
             active_workspace: global.workspace_manager.get_active_workspace_index(),
-            overview: Main.overview.visible, focus: focused?.get_title(), focus_pid: focused?.get_pid(), post_proof_hit: this._postProofHit === true});
+            overview: Main.overview.visible, focus: focused?.get_title(), focus_pid: focused?.get_pid(), post_proof_hit: this._postProofHit === true,
+            animation: Main.overview.animationInProgress, hide_calls: this._hideCalls ?? 0,
+            held_show_completion: !!this._heldShowCompletion});
     }
 
     Setup(mode) {
         const target = this._window('cua-lab-probe');
         const cover = this._window('cua-lab-cover');
         if (!target || !cover) throw new Error('missing private GTK fixtures');
+        if (this._savedMonitors) {
+            Main.layoutManager.monitors = this._savedMonitors;
+            Main.layoutManager.primaryIndex = this._savedPrimaryIndex;
+            this._savedMonitors = null;
+        }
+        if (this._originalHide) Main.overview.hide = this._originalHide;
+        this._hideCalls = 0;
         this._denying = mode === 'refusal';
         this._postProofHit = false;
         const runtime = Main.extensionManager.lookup('winrects@cua')?.stateObj?._runtime;
@@ -77,6 +86,32 @@ export default class SwitchLab extends Extension {
         if (mode === 'minimized' || mode === 'keyboard' || mode === 'refusal' || mode === 'post_proof') target.minimize();
         if (mode === 'workspace') target.change_workspace_by_index(1, false);
         if (mode === 'overview') Main.overview.show();
+        if (mode === 'no_monitor') {
+            // A private layout seam reproduces the no-primary-monitor predicate,
+            // without changing physical outputs or the owner's configuration.
+            this._savedMonitors = Main.layoutManager.monitors;
+            this._savedPrimaryIndex = Main.layoutManager.primaryIndex;
+            Main.layoutManager.monitors = [];
+            Main.layoutManager.primaryIndex = -1;
+        }
+        if (mode === 'cleanup_retry') {
+            this._originalHide ??= Main.overview.hide;
+            Main.overview.hide = (...args) => {
+                if (++this._hideCalls === 1) return; // accepted but ineffective request
+                return this._originalHide.apply(Main.overview, args);
+            };
+        }
+        if (mode === 'showing_stuck') {
+            const actor = Main.overview._overview;
+            this._originalAnimate ??= actor.animateToOverview;
+            actor.animateToOverview = (state, onComplete) => {
+                this._originalAnimate.call(actor, state, () => {
+                    // Test-only lost completion, not a claim that a caught signal
+                    // exception aborts GNOME. The real Overview state stays SHOWING.
+                    this._heldShowCompletion = onComplete;
+                });
+            };
+        }
         return this.Observe();
     }
 
@@ -84,6 +119,12 @@ export default class SwitchLab extends Extension {
         this._denying = false;
         const runtime = Main.extensionManager.lookup('winrects@cua')?.stateObj?._runtime;
         if (runtime && this._originalFocusSearch) runtime.FocusSwitchSearch = this._originalFocusSearch;
+        if (this._originalHide) Main.overview.hide = this._originalHide;
+        if (this._originalAnimate) Main.overview._overview.animateToOverview = this._originalAnimate;
+        if (this._savedMonitors) {
+            Main.layoutManager.monitors = this._savedMonitors;
+            Main.layoutManager.primaryIndex = this._savedPrimaryIndex;
+        }
         if (this._idle) GLib.source_remove(this._idle);
         if (this._signal) Main.overview.disconnect(this._signal);
         this._object?.unexport();

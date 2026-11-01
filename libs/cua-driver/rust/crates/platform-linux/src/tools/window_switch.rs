@@ -130,6 +130,7 @@ fn code(error: &anyhow::Error, default: &'static str) -> &'static str {
         "target_ambiguous" => "target_ambiguous",
         "keyboard_unavailable" => "keyboard_unavailable",
         "shell_not_ready" => "shell_not_ready",
+        "overview_stuck" => "overview_stuck",
         "unsupported" => "unsupported",
         "switch_unverified" => "switch_unverified",
         _ => default,
@@ -472,6 +473,7 @@ mod tests {
             "target_ambiguous",
             "keyboard_unavailable",
             "shell_not_ready",
+            "overview_stuck",
             "unsupported",
             "switch_unverified",
         ] {

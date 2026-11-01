@@ -28,7 +28,7 @@ def package(source, output):
         files[path.relative_to(source / 'impl').as_posix()] = path.read_bytes()
     if not files or len(files) > 64 or sum(map(len, files.values())) > 2 * 1024 * 1024:
         raise ValueError('implementation budget exceeded')
-    manifest = json.dumps(dict(loader_abi=1, entrypoint='main.js', helper_api=17, protocol=4,
+    manifest = json.dumps(dict(loader_abi=1, entrypoint='main.js', helper_api=18, protocol=4,
         files=[dict(path=name, size=len(data), sha256=sha(data)) for name, data in files.items()]),
         sort_keys=True, separators=(',', ':')).encode() + b'\n'
     digest = sha(manifest)
