@@ -76,12 +76,14 @@ Query, Return and Escape never enter the virtual keyboard. A physical focus
 change after proof is either processed before the synchronous Shell RPC and
 refused, or after receiver-owned delivery; it cannot redirect text into a client.
 
-macOS requires an explicitly enabled `com.apple.symbolichotkeys` entry 64 with
-standard parameters `[32,49,1048576]` (Command-Space). Missing, unreadable, disabled
-or remapped settings refuse with `keyboard_unavailable` and zero input; missing
-defaults are not guessed. The shortcut consists of back-to-back Command-flagged
-Space down/up events, with no separate modifier transitions or sleeps. All later
-query/select-all/Return/Escape events use `CGEventPostToPid` to the retained
+macOS reads the effective `com.apple.symbolichotkeys` preference domain. An absent
+`AppleSymbolicHotKeys` dictionary (including a missing plist), an empty dictionary,
+or absent entry 64 uses macOS's enabled Command-Space default. A present entry 64
+must be explicitly enabled with standard parameters `[32,49,1048576]`; disabled,
+remapped or malformed settings and preference-synchronization failures refuse
+with `keyboard_unavailable` and zero input. The shortcut consists of back-to-back
+Command-flagged Space down/up events, with no separate modifier transitions or
+sleeps. All later query/select-all/Return/Escape events use `CGEventPostToPid` to the retained
 Spotlight process. Every delivery revalidates bundle, process incarnation,
 AX search-field identity and WindowServer focus; focus loss cannot redirect
 already-authorized input into the newly focused client. Exact focus readback
