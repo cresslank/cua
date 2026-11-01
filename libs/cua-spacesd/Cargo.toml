@@ -1,3 +1,4 @@
+# Comment-only CI routing verification; no runtime or dependency changes.
 [workspace]
 resolver = "2"
 members = [

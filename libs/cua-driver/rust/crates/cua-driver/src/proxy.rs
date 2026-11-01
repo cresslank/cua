@@ -16,6 +16,7 @@
 //!   Putting the proxy here avoids `mcp-server → cua-driver` reverse
 //!   coupling.
 
+// Comment-only CI routing verification; no behavior changes.
 use std::sync::Arc;
 
 use cua_driver_core::mcp_wire::{self, ProtocolSession};
