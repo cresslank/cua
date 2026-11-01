@@ -316,15 +316,30 @@ impl CommandSender {
     // readiness callers, not input dispatch; the worker remains available to
     // refuse commands while portal consent is pending. The opener is a real
     // dependency seam shared by production and the hermetic worker regression.
+    #[tracing::instrument(
+        name = "libei_readiness",
+        level = "debug",
+        skip(self, open),
+        fields(reused = tracing::field::Empty, lock_ms = tracing::field::Empty,
+               open_ms = tracing::field::Empty, wait_ms = tracing::field::Empty)
+    )]
     fn connect(
         &self,
         interface: &'static str,
         open: impl FnOnce() -> anyhow::Result<(reis::ei::Context, PortalKeepAlive)>,
     ) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let span = tracing::Span::current();
         let _ready = self.readiness.lock().unwrap_or_else(|e| e.into_inner());
+        span.record("lock_ms", started.elapsed().as_secs_f64() * 1000.0);
         self.check_running()?;
-        if !self.live.load(Ordering::Acquire) {
-            let (context, keepalive) = open()
+        let reused = self.live.load(Ordering::Acquire);
+        span.record("reused", reused);
+        if !reused {
+            let opening = Instant::now();
+            let opened = open();
+            span.record("open_ms", opening.elapsed().as_secs_f64() * 1000.0);
+            let (context, keepalive) = opened
                 .map_err(|error| anyhow::anyhow!("failed to obtain EIS connection: {error}"))?;
             self.check_running()?;
             self.tx
@@ -336,7 +351,15 @@ impl CommandSender {
             // A lease-free readiness request is also the handoff acknowledgement.
             // The caller waits for device negotiation below before admission.
         }
-        self.wait_ready(interface)
+        let waiting = Instant::now();
+        let result = self.wait_ready(interface);
+        span.record("wait_ms", waiting.elapsed().as_secs_f64() * 1000.0);
+        tracing::debug!(
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            ready = result.is_ok(),
+            "libei readiness completed"
+        );
+        result
     }
 
     fn wait_ready(&self, interface: &'static str) -> anyhow::Result<()> {

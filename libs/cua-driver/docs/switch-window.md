@@ -116,6 +116,15 @@ and zero query/Return/Escape key presses at both GTK client receivers. Mutter
 may forward the initial Super press before consuming its release; this explicit
 contract exception is counted separately in every receipt. Full MCP receipts and Shell,
 receiver, relay and private-session logs are retained in `SWITCH_LAB_EVIDENCE`.
+The fixture also records monotonic MCP call timings and bounds successful
+keyboard switches to 2 seconds and same-workspace auto/native follow-ups to
+300 milliseconds; setup sleeps and workspace-transition animation are not part
+of those follow-up cases. Enable `CUA_LOG=platform_linux::wayland::libei=debug`
+to inspect the `libei_readiness` span's exact interface, reused connection,
+readiness-lock, connection-open and device-wait timings. Readiness must request
+`ei_keyboard`, the negotiated EIS interface, not the generic name `keyboard`;
+the latter can only expire the 20-second device deadline, including before an
+`auto` call that eventually succeeds through native activation.
 The matching ignored `switch_window_gnome_test` is in the manual E2E allowlist.
 The fixture's copied runner checks actual Cua Cargo/lane processes, not unrelated
 Rust repositories, and records any contender's cwd. On a shared qualification

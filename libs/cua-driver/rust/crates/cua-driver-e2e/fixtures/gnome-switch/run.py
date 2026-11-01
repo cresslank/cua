@@ -50,7 +50,7 @@ Gtk.main()''')
     if filename == 'lab_probe.py':
         code = code.replace('class Lab(Gtk.Window):', "GLib.set_prgname('org.cua.SwitchProbe')\nGLib.set_application_name('Cua Switch Probe')\n\nclass Lab(Gtk.Window):")
     path.write_text(code)
-# The normal cover is optional; keep it mapped for all seven switch scenarios.
+# The normal cover is optional; keep it mapped for all nine switch scenarios.
 inner = lab/'lab_shell_inner.sh'
 text = inner.read_text()
 text = text.replace("['winrects@cua', 'noov@lab']", "['winrects@cua', 'noov@lab', 'switch@lab']")
@@ -69,7 +69,7 @@ text = text.replace(anchor, '''WAYLAND_DISPLAY=wl-cuaq GDK_BACKEND=wayland /usr/
 fixed_cover=$!
 sleep 1
 ''' + anchor)
-text = text.replace('env CUA_DRIVER_RS_ENABLE_WAYLAND=1', 'env SWITCH_LAB_OUT="$out" CUA_DRIVER_RS_ENABLE_WAYLAND=1')
+text = text.replace('env CUA_DRIVER_RS_ENABLE_WAYLAND=1', 'env CUA_LOG=platform_linux::wayland::libei=debug SWITCH_LAB_OUT="$out" CUA_DRIVER_RS_ENABLE_WAYLAND=1')
 text = text.replace('kill $rpid $ppid $cpid', 'kill $rpid $ppid $cpid $fixed_cover').replace('wait $rpid $ppid $cpid', 'wait $rpid $ppid $cpid $fixed_cover')
 inner.write_text(text)
 (lab/'switch-extension.js').write_bytes((here/'extension.js').read_bytes())
@@ -84,4 +84,4 @@ completed = subprocess.run(['bash', str(lab/runner.name), label, str(packaged), 
 print('SWITCH_LAB_EVIDENCE=' + str(out), flush=True)
 log = (out/'mcp.log').read_text()
 print(log, flush=True)
-assert completed.returncode == 0 and 'SWITCH-LAB PASS 7 cases; zero client text/Return/Escape keys' in log
+assert completed.returncode == 0 and 'SWITCH-LAB PASS 9 cases; zero client text/Return/Escape keys' in log
