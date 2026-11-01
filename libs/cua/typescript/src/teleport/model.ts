@@ -20,7 +20,7 @@ export type Move = "app_only" | "app_with_files" | "app_with_state"
 /** Credential-shaped state the signed-in state move leaves out by default,
  * opted into one group at a time: `sign_ins` is the session cookies (what
  * keeps the app signed in). Each group's items are secrets in the plan. */
-export type SensitiveGroup = "sign_ins" | "passwords" | "history"
+export type SensitiveGroup = "sign_ins" | "site_data" | "passwords" | "history"
 
 /** One row of "Teleport an app…". */
 export interface CatalogEntry {

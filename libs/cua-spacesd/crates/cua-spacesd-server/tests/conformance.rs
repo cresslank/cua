@@ -2026,6 +2026,66 @@ async fn teleport_receive_files_drops_special_mode_bits() {
     assert_eq!(mode & 0o7777, 0o755, "setuid/setgid bits are dropped");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn zen_normalized_capability_and_manifest_are_additive() {
+    let t = target().await;
+    // Remote qualification may intentionally target an older guest.
+    if t.local.is_none() {
+        return;
+    }
+    for transport in TRANSPORTS {
+        let c = t.client(transport).await;
+        let caps = c
+            .system()
+            .get_capabilities(GetCapabilitiesRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let zen = caps
+            .features
+            .iter()
+            .find(|f| f.name == "teleport.zen")
+            .expect("Zen capability");
+        assert!(zen.supported);
+        assert_eq!(
+            zen.attributes.get("format").map(String::as_str),
+            Some("normalized-gecko-v1")
+        );
+        assert_eq!(
+            zen.attributes.get("destination").map(String::as_str),
+            Some("firefox")
+        );
+        assert_eq!(
+            zen.attributes.get("platform").map(String::as_str),
+            Some("linux")
+        );
+        let manifest = c
+            .teleport()
+            .get_manifest(GetManifestRequest {
+                app: "zen".into(),
+                scope: 0,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(manifest.supported);
+        assert!(manifest.supported_apps.iter().any(|app| app == "zen"));
+        assert!(manifest.supported_apps.iter().any(|app| app == "firefox"));
+        let unknown = c
+            .teleport()
+            .get_manifest(GetManifestRequest {
+                app: "zen-unknown".into(),
+                scope: 0,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(!unknown.supported);
+    }
+    t.cleanup().await;
+}
+
 #[tokio::test]
 async fn teleport_import_session_in_chunks() {
     use cua_spacesd_teleport::bundle::BundleWriter;

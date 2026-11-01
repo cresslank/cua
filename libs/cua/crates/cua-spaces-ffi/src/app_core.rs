@@ -1281,6 +1281,7 @@ pub fn app_sensitive_group_sdk(group: AppSensitiveGroup) -> super::TeleportSensi
     use core::teleport::flow::SensitiveGroup as G;
     match group {
         G::SignIns => super::TeleportSensitiveGroup::SignIns,
+        G::SiteData => super::TeleportSensitiveGroup::SiteData,
         G::Passwords => super::TeleportSensitiveGroup::Passwords,
         G::History => super::TeleportSensitiveGroup::History,
     }
@@ -1429,6 +1430,7 @@ fn catalog_entry(e: crate::TeleportCatalogEntry) -> AppCatalogEntry {
                 use core::teleport::flow::SensitiveGroup as G;
                 match g {
                     super::TeleportSensitiveGroup::SignIns => G::SignIns,
+                    super::TeleportSensitiveGroup::SiteData => G::SiteData,
                     super::TeleportSensitiveGroup::Passwords => G::Passwords,
                     super::TeleportSensitiveGroup::History => G::History,
                 }

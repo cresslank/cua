@@ -2468,16 +2468,21 @@ dependencies = [
 name = "cua-spacesd-teleport"
 version = "0.8.0"
 dependencies = [
+ "aes 0.8.4",
+ "base64 0.22.1",
+ "cbc 0.1.2",
  "cua-chromium-storage",
  "cua-teleport-bundle",
  "hex",
  "ignore",
+ "libc",
  "rand 0.8.8",
  "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "url",
  "zeroize",
 ]
 

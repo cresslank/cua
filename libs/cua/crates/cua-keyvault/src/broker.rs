@@ -77,6 +77,14 @@ fn budget_key(caller: &CallerIdentity) -> String {
 pub trait UserPresence: Send + Sync {
     /// Asks the user to confirm `reason`. `Ok` only when they did.
     fn confirm(&self, reason: &str) -> Result<()>;
+    /// A distinct saved-password confirmation. Implementations must label the
+    /// native prompt explicitly; a generic presence grant is not sufficient.
+    /// Older embedders fail closed until they implement this gate.
+    fn confirm_saved_passwords(&self, _reason: &str) -> Result<()> {
+        Err(Error::PresenceFailed(
+            "saved-password confirmation is unavailable".into(),
+        ))
+    }
 }
 
 /// A presence gate for tests: always yes or always no, recording reasons.
@@ -86,6 +94,8 @@ pub struct FakePresence {
     pub allow: std::sync::atomic::AtomicBool,
     /// Reasons asked, in order.
     pub asked: std::sync::Mutex<Vec<String>>,
+    /// Requests through the distinct saved-password gate (not OS evidence).
+    pub saved_passwords_asked: std::sync::Mutex<Vec<String>>,
 }
 
 impl FakePresence {
@@ -94,6 +104,7 @@ impl FakePresence {
         Self {
             allow: std::sync::atomic::AtomicBool::new(allow),
             asked: Default::default(),
+            saved_passwords_asked: Default::default(),
         }
     }
 
@@ -104,6 +115,14 @@ impl FakePresence {
 }
 
 impl UserPresence for FakePresence {
+    fn confirm_saved_passwords(&self, reason: &str) -> Result<()> {
+        self.saved_passwords_asked
+            .lock()
+            .unwrap()
+            .push(reason.into());
+        self.confirm(reason)
+    }
+
     fn confirm(&self, reason: &str) -> Result<()> {
         self.asked.lock().unwrap().push(reason.to_string());
         if self.allow.load(std::sync::atomic::Ordering::SeqCst) {
@@ -151,13 +170,23 @@ impl Selector {
             Selector::Item { id } => &item.id == id,
             Selector::Site { app, site } => {
                 item.kind.deliverable()
-                    && &item.provider_id == app
-                    && item
-                        .domain
-                        .as_deref()
-                        .is_some_and(|d| host_in_site(&crate::record::host_of(d), site))
+                    && (&item.provider_id == app || (item.provider_id == "zen" && is_zen(app)))
+                    && item.domain.as_deref().is_some_and(|d| {
+                        if item.provider_id == "zen" {
+                            crate::record::exact_site_matches(
+                                d,
+                                site,
+                                item.kind == ItemKind::Cookie,
+                            )
+                        } else {
+                            host_in_site(&crate::record::host_of(d), site)
+                        }
+                    })
             }
-            Selector::App { app } => item.kind.deliverable() && &item.provider_id == app,
+            Selector::App { app } => {
+                item.kind.deliverable()
+                    && (&item.provider_id == app || (item.provider_id == "zen" && is_zen(app)))
+            }
             Selector::Login { site } => {
                 item.kind == ItemKind::Password
                     && item.domain.as_deref().is_some_and(|d| {
@@ -244,6 +273,32 @@ pub struct ImportSpec {
     /// own per-site choice of passwords); `None`: those of `domains`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_domains: Option<Vec<String>>,
+}
+
+/// Exact Zen identities; never classify a Firefox or a substring as Zen.
+fn is_zen(app: &str) -> bool {
+    ["zen", "zen-browser", "app.zen_browser.zen"]
+        .iter()
+        .any(|id| id.eq_ignore_ascii_case(app))
+}
+
+fn requests_passwords(spec: &ImportSpec) -> bool {
+    spec.passwords
+        || spec.sites.iter().any(|s| s.include_passwords)
+        || (is_zen(&spec.app)
+            && spec
+                .paths
+                .as_ref()
+                .is_some_and(|p| p.iter().any(|p| p == "zen/logins.json")))
+}
+
+fn validate_password_confirmation(spec: &ImportSpec) -> Result<()> {
+    if requests_passwords(spec) && !spec.confirm_passwords {
+        return Err(Error::Invalid(
+            "saved passwords need the explicit second confirmation (confirm_passwords)".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// One domain a browser holds secrets for, as the inventory shows it:
@@ -451,6 +506,16 @@ pub trait Backend: Send + Sync {
             profile: profile.map(str::to_string),
             ..Default::default()
         })
+    }
+    /// Check destination compatibility before presence or source capture. A
+    /// backend must opt in to Zen's normalized Gecko contract explicitly.
+    async fn preflight_target(&self, app: &str, _target: &str) -> Result<()> {
+        if is_zen(app) {
+            return Err(Error::Unsupported(
+                "Zen requires a guest advertising teleport.zen normalized-gecko-v1 for Firefox on Linux".into(),
+            ));
+        }
+        Ok(())
     }
     /// Captures the chosen items. Blocking. Called only after user presence.
     fn capture(&self, spec: &ImportSpec) -> Result<Vec<Captured>>;
@@ -1335,6 +1400,22 @@ impl Broker {
             .map_err(|e| Error::Backend(format!("presence prompt task: {e}")))?
     }
 
+    async fn confirm_with_passwords(&self, reason: String, passwords: bool) -> Result<()> {
+        if !passwords {
+            return self.confirm(reason).await;
+        }
+        let p = self.presence.clone();
+        tokio::task::spawn_blocking(move || p.confirm_saved_passwords(&reason))
+            .await
+            .map_err(|e| Error::Backend(format!("password presence prompt task: {e}")))?
+    }
+
+    async fn confirm_import(&self, reason: String, spec: &ImportSpec) -> Result<()> {
+        validate_password_confirmation(spec)?;
+        self.confirm_with_passwords(reason, requests_passwords(spec))
+            .await
+    }
+
     fn audit(st: &mut State, event: AuditEvent) {
         if let Some(v) = st.vault.as_mut()
             && let Err(e) = v.audit(event)
@@ -1895,7 +1976,7 @@ impl Broker {
             }
         }
         let reason = import_reason(&spec, caller);
-        self.confirm(reason).await?;
+        self.confirm_import(reason, &spec).await?;
         let captured = self.capture_confirmed(spec).await?;
         Ok(self.store_captured(caller, captured).await?.report)
     }
@@ -1912,11 +1993,7 @@ impl Broker {
     /// The capture half of [`Self::import_confirmed`] (after presence):
     /// checks the selection, then reads it on a blocking thread.
     async fn capture_confirmed(&self, spec: ImportSpec) -> Result<Vec<Captured>> {
-        if spec.sites.iter().any(|s| s.include_passwords) && !spec.confirm_passwords {
-            return Err(Error::Invalid(
-                "saved passwords need the explicit second confirmation (confirm_passwords)".into(),
-            ));
-        }
+        validate_password_confirmation(&spec)?;
         if spec.sites.is_empty() && !spec.whole_app {
             return Err(Error::Invalid(
                 "nothing selected: choose sites, or the whole app session".into(),
@@ -2002,14 +2079,15 @@ impl Broker {
             }
         }
         validate_target(&target)?;
-        let with_passwords = spec.passwords && spec.confirm_passwords;
+        self.backend.preflight_target(&spec.app, &target).await?;
+        let with_passwords = requests_passwords(&spec) && spec.confirm_passwords;
         let reason = format!(
             "Teleport {} to {} ({})",
             describe_spec(&spec),
             target,
             caller.display()
         );
-        self.confirm(reason).await?;
+        self.confirm_import(reason, &spec).await?;
         tell(TeleportStage::Reading);
         let captured = self.capture_confirmed(spec).await?;
         if save {
@@ -2110,11 +2188,14 @@ impl Broker {
         } else {
             format!("the saved passwords for {}", spec.sites.join(", "))
         };
-        self.confirm(format!(
-            "Import {what} from {} into the Cua Keyvault ({})",
-            spec.app,
-            caller.display()
-        ))
+        self.confirm_with_passwords(
+            format!(
+                "Import {what} from {} into the Cua Keyvault ({})",
+                spec.app,
+                caller.display()
+            ),
+            true,
+        )
         .await?;
         let b = self.backend.clone();
         let spec2 = spec.clone();
@@ -2911,11 +2992,27 @@ impl Broker {
                 human_secs(secs)
             )
         };
-        self.confirm(reason).await?;
+        let imports = imports_for(&view.needs_import, &opts, view.request.paths.as_deref());
+        let providers: BTreeSet<_> = imports
+            .iter()
+            .map(|s| s.app.as_str())
+            .chain(view.items.iter().map(|i| i.provider_id.as_str()))
+            .collect();
+        for app in providers {
+            for target in &targets {
+                self.backend.preflight_target(app, target).await?;
+            }
+        }
+        for spec in &imports {
+            validate_password_confirmation(spec)?;
+        }
+        let passwords = imports.iter().any(requests_passwords)
+            || view.items.iter().any(|i| i.kind == ItemKind::Password);
+        self.confirm_with_passwords(reason, passwords).await?;
 
         // Import what the request named but the vault does not hold yet.
         let mut item_ids: Vec<String> = view.items.iter().map(|i| i.id.clone()).collect();
-        for spec in imports_for(&view.needs_import, &opts, view.request.paths.as_deref()) {
+        for spec in imports {
             for it in self.import_confirmed(caller, spec).await? {
                 if !item_ids.contains(&it.id) {
                     item_ids.push(it.id);
@@ -3410,14 +3507,21 @@ impl Broker {
             let labels: Vec<String> = req.items.iter().map(|i| meta.items[i].label()).collect();
             (authority, out, labels, ttl, auto_wipe)
         };
+        // Check every provider before prompting or superseding any live import.
+        for (provider, ..) in &groups {
+            self.backend.preflight_target(provider, &req.target).await?;
+        }
         if authority == Authority::Interactive && presence == PresenceAlready::NotConfirmed {
-            self.confirm(format!(
-                "Teleport {} to {} [{}] ({})",
-                labels.join(", "),
-                req.target,
-                short_id(&target_id),
-                caller.display()
-            ))
+            self.confirm_with_passwords(
+                format!(
+                    "Teleport {} to {} [{}] ({})",
+                    labels.join(", "),
+                    req.target,
+                    short_id(&target_id),
+                    caller.display()
+                ),
+                req.include_passwords,
+            )
             .await?;
         }
         // Record the authorization before anything leaves the vault, and
@@ -4039,7 +4143,7 @@ fn describe_spec(spec: &ImportSpec) -> String {
         let sites: Vec<&str> = spec.sites.iter().map(|s| s.site.as_str()).collect();
         format!("{} from {}", sites.join(", "), spec.app)
     };
-    let pw = if spec.passwords || spec.sites.iter().any(|s| s.include_passwords) {
+    let pw = if requests_passwords(spec) {
         " INCLUDING SAVED PASSWORDS"
     } else {
         ""

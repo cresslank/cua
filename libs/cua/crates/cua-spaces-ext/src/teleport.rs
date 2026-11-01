@@ -579,6 +579,26 @@ pub struct TeleportSelection {
     pub profile: Option<String>,
 }
 
+impl TeleportSelection {
+    fn import_spec(&self, approval: &Approval) -> cua_keyvault::broker::ImportSpec {
+        cua_keyvault::broker::ImportSpec {
+            app: approval.app.clone(),
+            profile: self.profile.clone(),
+            sites: vec![],
+            whole_app: true,
+            cookies: cua_keyvault::broker::CookieFilter::default(),
+            confirm_passwords: self.include_passwords,
+            paths: Some(approval.paths.clone()),
+            domains: self.cookie_domains.clone(),
+            passwords: self.include_passwords,
+            password_domains: self
+                .password_domains
+                .clone()
+                .filter(|_| self.include_passwords),
+        }
+    }
+}
+
 /// Session teleport on a [`Space`]: what it can import, and the export and
 /// import of an approved app session.
 #[allow(async_fn_in_trait)]
@@ -744,21 +764,7 @@ impl SpaceTeleport for Space {
             agents.install_skills(h).await?;
         }
 
-        let spec = cua_keyvault::broker::ImportSpec {
-            app: approval.app.clone(),
-            profile: selection.profile.clone(),
-            sites: vec![],
-            whole_app: true,
-            cookies: cua_keyvault::broker::CookieFilter::default(),
-            confirm_passwords: true,
-            paths: Some(approval.paths.clone()),
-            domains: selection.cookie_domains.clone(),
-            passwords: selection.include_passwords,
-            password_domains: selection
-                .password_domains
-                .clone()
-                .filter(|_| selection.include_passwords),
-        };
+        let spec = selection.import_spec(approval);
         let mut client = cua_keyvault::client::KeyvaultClient::connect_default()
             .await
             .map_err(|e| Error::HostCapabilityMissing {
@@ -1143,6 +1149,11 @@ fn select_for_request(
         })
         .map(String::as_str)
         .collect();
+    if !stores.is_empty() && provider == cua_teleport::layout::zen::ID {
+        return Err(Error::TeleportRefused(
+            "saved password stores are never moved by teleport_app; ask the user to use cua keyvault import-passwords --app zen with native saved-password confirmation".into(),
+        ));
+    }
     if !stores.is_empty() {
         return Err(Error::TeleportRefused(format!(
             "saved password stores are never moved by teleport_app ({}); use request_site_login \
@@ -1530,6 +1541,35 @@ mod tests {
             select_for_request(&m, "firefox", "space-1", Some(&["nope".into()]), true).is_err()
         );
         assert!(select_for_request(&m, "firefox", "space-1", Some(&[]), true).is_err());
+    }
+
+    #[test]
+    fn zen_named_passwords_are_not_confirmed_by_paths_or_mcp_acknowledgement() {
+        let mut m = selection_manifest();
+        m.app = "zen".into();
+        for item in &mut m.items {
+            item.relative_path = item.relative_path.replace("firefox/", "zen/");
+        }
+        let err = select_for_request(
+            &m,
+            "zen",
+            "space-1",
+            Some(&["zen/logins.json".into()]),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("cua keyvault import-passwords --app zen"),
+            "{err}"
+        );
+        let approval = m
+            .approving("space-1", &["zen/logins.json".into()], true)
+            .unwrap();
+        let mut selection = TeleportSelection::default();
+        assert!(!selection.import_spec(&approval).confirm_passwords);
+        selection.include_passwords = true;
+        assert!(selection.import_spec(&approval).confirm_passwords);
     }
 
     /// One access request as filed: app, target, paths, reason.

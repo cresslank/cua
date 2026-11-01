@@ -73,12 +73,15 @@ pub enum TeleportSensitiveGroup {
     Passwords,
     /// Browsing history.
     History,
+    /// Credential-bearing localStorage, separate from cookies and passwords.
+    SiteData,
 }
 
 impl From<ux::SensitiveGroup> for TeleportSensitiveGroup {
     fn from(g: ux::SensitiveGroup) -> Self {
         match g {
             ux::SensitiveGroup::SignIns => Self::SignIns,
+            ux::SensitiveGroup::SiteData => Self::SiteData,
             ux::SensitiveGroup::Passwords => Self::Passwords,
             ux::SensitiveGroup::History => Self::History,
         }
@@ -89,6 +92,7 @@ impl From<TeleportSensitiveGroup> for ux::SensitiveGroup {
     fn from(g: TeleportSensitiveGroup) -> Self {
         match g {
             TeleportSensitiveGroup::SignIns => Self::SignIns,
+            TeleportSensitiveGroup::SiteData => Self::SiteData,
             TeleportSensitiveGroup::Passwords => Self::Passwords,
             TeleportSensitiveGroup::History => Self::History,
         }

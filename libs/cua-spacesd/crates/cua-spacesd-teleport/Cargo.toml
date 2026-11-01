@@ -20,6 +20,12 @@ ignore = "0.4"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+url.workspace = true
+tempfile.workspace = true
+libc = "0.2"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc", "block-padding"] }
+base64 = "0.22"
 # Creating the destination's own Safe Storage secret when re-encrypting
 # cookies (`cookies.rs`): never the source's key, always a fresh one this
 # guest generates for itself.

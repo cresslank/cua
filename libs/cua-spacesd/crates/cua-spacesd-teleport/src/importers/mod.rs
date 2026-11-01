@@ -10,6 +10,8 @@ pub mod electron;
 pub mod firefox;
 pub mod steam;
 pub mod whatsapp;
+#[cfg(target_os = "linux")]
+pub mod zen;
 
 use std::path::Path;
 

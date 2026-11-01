@@ -114,10 +114,15 @@ pub trait TeleportApproval: Send + Sync {
 /// Options for [`Teleport::manifest`] and [`Teleport::send`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, uniffi::Record)]
 pub struct TeleportOptions {
-    /// Chrome profile to capture: a name ("Profile 1") or a path. Default
-    /// `Default`.
+    /// Browser profile: Chrome name/path, or an exact Zen profile selector
+    /// beneath its browser root. The legacy field name is kept for callers.
     #[uniffi(default = None)]
     pub chrome_profile: Option<String>,
+    /// A separate explicit confirmation to include Zen saved passwords.
+    /// Selecting `zen/logins.json` alone is not confirmation. The Keyvault
+    /// still requires its native password-labeled presence prompt.
+    #[uniffi(default = false)]
+    pub confirm_saved_passwords: bool,
     /// Display name for the app (UI only). Default: the app id.
     #[uniffi(default = None)]
     pub display_name: Option<String>,
@@ -197,7 +202,7 @@ pub(crate) fn teleport_err(e: cua_teleport::Error) -> CuaError {
             // this delivery yet; the caller must set
             // TeleportOptions::relay_plaintext_ack after showing the user
             // the warning in `m`.
-            E::RelayUnsealed => CuaError::PermissionDenied(m),
+            E::RelayUnsealed | E::ZenKeyvaultRequired => CuaError::PermissionDenied(m),
             E::Teleport(_) | E::Task(_) => CuaError::Internal(m),
         }
     }
@@ -294,24 +299,7 @@ impl Teleport {
             }
         }
         let paths: Vec<String> = selected.iter().map(|i| i.rel_path.clone()).collect();
-        // A Chromium variant (Microsoft Edge) is captured from its own profile.
-        let capture_app = if cua_teleport::layout::chrome::is_edge(&app_ref.app_id) {
-            app_ref.app_id.clone()
-        } else {
-            manifest.provider_id.clone()
-        };
-        let spec = cua_keyvault::broker::ImportSpec {
-            app: capture_app,
-            profile: None,
-            sites: vec![],
-            whole_app: true,
-            cookies: cua_keyvault::broker::CookieFilter::default(),
-            confirm_passwords: true,
-            paths: Some(paths.clone()),
-            domains: None,
-            passwords: false,
-            password_domains: None,
-        };
+        let spec = keyvault_spec(&app_ref, &manifest, paths.clone(), &options);
         run(async move {
             let mut client = cua_keyvault::client::KeyvaultClient::connect_default()
                 .await
@@ -351,7 +339,7 @@ impl Teleport {
 
     fn teleporter(&self, options: &TeleportOptions) -> cua_teleport::Teleporter {
         cua_teleport::Teleporter::with_registry(
-            cua_teleport::ExportRegistry::with_builtin_host_and_chrome_profile(
+            cua_teleport::ExportRegistry::with_builtin_host_and_profile(
                 self.host.clone(),
                 options.chrome_profile.clone(),
             ),
@@ -416,6 +404,71 @@ impl Teleport {
                 .into())
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod confirmation_tests {
+    use super::*;
+
+    #[test]
+    fn zen_keyvault_spec_keeps_exact_profile_and_requires_separate_confirmation() {
+        let manifest = cua_teleport::TransferManifest {
+            provider_id: "zen".into(),
+            app_display_name: "Zen".into(),
+            scope: cua_teleport::TransferScope::FullProfile,
+            items: vec![],
+            total_est_bytes: 0,
+            notes: vec![],
+        };
+        for selector in ["selected", "/synthetic/.zen/Profiles/selected"] {
+            let mut options = TeleportOptions {
+                chrome_profile: Some(selector.into()),
+                ..Default::default()
+            };
+            for alias in ["zen", "zen-browser", "app.zen_browser.zen"] {
+                let app = app_ref(alias.into(), &options);
+                let paths = vec!["zen/logins.json".into()];
+                let spec = keyvault_spec(&app, &manifest, paths.clone(), &options);
+                assert_eq!(spec.app, "zen");
+                assert_eq!(spec.profile.as_deref(), Some(selector));
+                assert_eq!(spec.paths, Some(paths.clone()));
+                assert!(
+                    !spec.confirm_passwords,
+                    "a named password item is not a second confirmation"
+                );
+                options.confirm_saved_passwords = true;
+                assert!(keyvault_spec(&app, &manifest, paths, &options).confirm_passwords);
+                options.confirm_saved_passwords = false;
+            }
+        }
+    }
+}
+
+fn keyvault_spec(
+    app_ref: &cua_teleport::AppRef,
+    manifest: &cua_teleport::TransferManifest,
+    paths: Vec<String>,
+    options: &TeleportOptions,
+) -> cua_keyvault::broker::ImportSpec {
+    // A Chromium variant (Microsoft Edge) is captured from its own profile.
+    let capture_app = if cua_teleport::layout::chrome::is_edge(&app_ref.app_id) {
+        app_ref.app_id.clone()
+    } else {
+        manifest.provider_id.clone()
+    };
+    cua_keyvault::broker::ImportSpec {
+        app: capture_app,
+        profile: options.chrome_profile.clone(),
+        sites: vec![],
+        whole_app: true,
+        cookies: cua_keyvault::broker::CookieFilter::default(),
+        confirm_passwords: manifest.provider_id != cua_teleport::layout::zen::ID
+            || options.confirm_saved_passwords,
+        paths: Some(paths),
+        domains: None,
+        passwords: false,
+        password_domains: None,
     }
 }
 
@@ -496,6 +549,16 @@ impl Teleport {
         approval: Option<Arc<dyn TeleportApproval>>,
         options: Option<TeleportOptions>,
     ) -> Result<TeleportResult> {
+        let options = options.unwrap_or_default();
+        let app_ref = app_ref(app.clone(), &options);
+        if self
+            .teleporter(&options)
+            .provider_id(&app_ref)
+            .map_err(teleport_err)?
+            == cua_teleport::layout::zen::ID
+        {
+            return Err(teleport_err(cua_teleport::Error::ZenKeyvaultRequired));
+        }
         let env = sandbox.spacesd(None).await?;
         self.send_to(
             env.inner().clone(),
@@ -503,7 +566,7 @@ impl Teleport {
             scope,
             selected_items,
             approval,
-            options.unwrap_or_default(),
+            options,
         )
         .await
     }

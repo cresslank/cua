@@ -11802,7 +11802,11 @@ export enum AppSensitiveGroup {
     /**
      * Browsing history.
      */
-    History = "history"
+    History = "history",
+    /**
+     * Credential-bearing localStorage, separate from cookies and passwords.
+     */
+    SiteData = "siteData"
 }
 
 const FfiConverterTypeAppSensitiveGroup = (() => {
@@ -11814,6 +11818,7 @@ const FfiConverterTypeAppSensitiveGroup = (() => {
                 case 1: return AppSensitiveGroup.SignIns;
                 case 2: return AppSensitiveGroup.Passwords;
                 case 3: return AppSensitiveGroup.History;
+                case 4: return AppSensitiveGroup.SiteData;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -11822,6 +11827,7 @@ const FfiConverterTypeAppSensitiveGroup = (() => {
                 case AppSensitiveGroup.SignIns: return ordinalConverter.write(1, into);
                 case AppSensitiveGroup.Passwords: return ordinalConverter.write(2, into);
                 case AppSensitiveGroup.History: return ordinalConverter.write(3, into);
+                case AppSensitiveGroup.SiteData: return ordinalConverter.write(4, into);
             }
         }
         allocationSize(value: TypeName): number {
@@ -52975,7 +52981,11 @@ export enum TeleportSensitiveGroup {
     /**
      * Browsing history.
      */
-    History = "history"
+    History = "history",
+    /**
+     * Credential-bearing localStorage, separate from cookies and passwords.
+     */
+    SiteData = "siteData"
 }
 
 const FfiConverterTypeTeleportSensitiveGroup = (() => {
@@ -52987,6 +52997,7 @@ const FfiConverterTypeTeleportSensitiveGroup = (() => {
                 case 1: return TeleportSensitiveGroup.SignIns;
                 case 2: return TeleportSensitiveGroup.Passwords;
                 case 3: return TeleportSensitiveGroup.History;
+                case 4: return TeleportSensitiveGroup.SiteData;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -52995,6 +53006,7 @@ const FfiConverterTypeTeleportSensitiveGroup = (() => {
                 case TeleportSensitiveGroup.SignIns: return ordinalConverter.write(1, into);
                 case TeleportSensitiveGroup.Passwords: return ordinalConverter.write(2, into);
                 case TeleportSensitiveGroup.History: return ordinalConverter.write(3, into);
+                case TeleportSensitiveGroup.SiteData: return ordinalConverter.write(4, into);
             }
         }
         allocationSize(value: TypeName): number {
@@ -53551,10 +53563,16 @@ const FfiConverterTypeTeleportDrop = (() => {
  */
 export type TeleportOptions = {
     /**
-     * Chrome profile to capture: a name ("Profile 1") or a path. Default
-     * `Default`.
+     * Browser profile: Chrome name/path, or an exact Zen profile selector
+     * beneath its browser root. The legacy field name is kept for callers.
      */
     chromeProfile?: string,
+    /**
+     * A separate explicit confirmation to include Zen saved passwords.
+     * Selecting `zen/logins.json` alone is not confirmation. The Keyvault
+     * still requires its native password-labeled presence prompt.
+     */
+    confirmSavedPasswords: boolean,
     /**
      * Display name for the app (UI only). Default: the app id.
      */
@@ -53585,6 +53603,7 @@ export type TeleportOptions = {
 export const TeleportOptions = (() => {
     const defaults = () => ({
         chromeProfile: undefined,
+        confirmSavedPasswords: false,
         displayName: undefined,
         launchAfter: undefined,
         closeRunningApp: false,
@@ -53606,6 +53625,7 @@ const FfiConverterTypeTeleportOptions = (() => {
         read(from: RustBuffer): TypeName {
             return {
                 chromeProfile: FfiConverterOptionalString.read(from),
+                confirmSavedPasswords: FfiConverterBool.read(from),
                 displayName: FfiConverterOptionalString.read(from),
                 launchAfter: FfiConverterOptionalBoolean.read(from),
                 closeRunningApp: FfiConverterBool.read(from),
@@ -53614,6 +53634,7 @@ const FfiConverterTypeTeleportOptions = (() => {
         }
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterOptionalString.write(value.chromeProfile, into);
+            FfiConverterBool.write(value.confirmSavedPasswords, into);
             FfiConverterOptionalString.write(value.displayName, into);
             FfiConverterOptionalBoolean.write(value.launchAfter, into);
             FfiConverterBool.write(value.closeRunningApp, into);
@@ -53621,6 +53642,7 @@ const FfiConverterTypeTeleportOptions = (() => {
         }
         allocationSize(value: TypeName): number {
             return FfiConverterOptionalString.allocationSize(value.chromeProfile) +
+             FfiConverterBool.allocationSize(value.confirmSavedPasswords) +
              FfiConverterOptionalString.allocationSize(value.displayName) +
              FfiConverterOptionalBoolean.allocationSize(value.launchAfter) +
              FfiConverterBool.allocationSize(value.closeRunningApp) +

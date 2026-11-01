@@ -98,6 +98,12 @@ pub enum Error {
     /// The [`Approval`] callback declined. Nothing was read or sent.
     #[error("teleport was not approved")]
     NotApproved,
+    /// Zen must use the Keyvault backend, which checks the exact guest
+    /// capability and obtains scoped, native consent before capture.
+    #[error(
+        "zen_keyvault_required: Zen teleport requires Keyvault consent; use send_through_keyvault"
+    )]
+    ZenKeyvaultRequired,
     /// The sandbox has no importer for this app.
     #[error("the sandbox cannot import {app:?}: {reason}")]
     Unsupported {
@@ -376,6 +382,9 @@ impl Teleporter {
         // relay delivery too. `upload_bundle` makes the real decision,
         // after trying to seal, only reaching the gate when it could not.
         let provider_id = self.provider_id(app)?;
+        if provider_id == crate::layout::zen::ID {
+            return Err(Error::ZenKeyvaultRequired);
+        }
         // Ask the guest first, so the user is never prompted for a transfer
         // the sandbox cannot take.
         let manifest = env

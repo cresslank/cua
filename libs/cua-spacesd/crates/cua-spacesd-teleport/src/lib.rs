@@ -43,12 +43,28 @@ pub use host::{
 };
 pub use ledger::{ImportRecord, KeychainRef, Ledger, LedgerStore, WipeReport};
 pub use receiver::{
-    conflict_free_path, validate_relative_path, IgnoreRules, ImportError, ImportOutcome, Receiver,
+    conflict_free_path, validate_relative_path, IgnoreRules, ImportCancellation, ImportError,
+    ImportOutcome, Receiver,
 };
 
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
+
+/// Import result plus a transaction/admission lease held through ledger commit
+/// and launch. Dropping an uncommitted lease rolls back a staged transaction.
+pub type GuardedImport = (LaunchSpec, Option<Box<dyn ImportLease>>);
+
+/// A staged import's commit/rollback owner. Existing importers use no lease.
+pub trait ImportLease: Send {
+    /// Publish success after the durable ledger callback has succeeded.
+    fn commit(&mut self);
+    /// Release browser exclusion immediately before our own spawn. Admission
+    /// remains held until the launch attempt returns.
+    fn prepare_launch(&mut self) {}
+    /// Restore the predecessor on ledger failure, before any browser launches.
+    fn rollback(&mut self) -> Result<()>;
+}
 
 /// One application's session importer (receiver side).
 pub trait ImportProvider: Send + Sync {
@@ -74,6 +90,19 @@ pub trait ImportProvider: Send + Sync {
         platform: Platform,
         record: &mut ImportRecord,
     ) -> Result<LaunchSpec>;
+
+    /// Like [`Self::import_recorded`], retaining any destination admission lease
+    /// through the receiver's launch attempt. Existing providers need no lease.
+    fn import_with_lease(
+        &self,
+        bundle: &mut dyn Read,
+        dest_home: &Path,
+        platform: Platform,
+        record: &mut ImportRecord,
+    ) -> Result<GuardedImport> {
+        self.import_recorded(bundle, dest_home, platform, record)
+            .map(|spec| (spec, None))
+    }
 
     /// [`Self::import_recorded`] without keeping the record.
     fn import_to(
@@ -113,6 +142,8 @@ impl ImportRegistry {
         let mut registry = Self::new();
         registry.register(Box::new(ChromeImporter::new().with_host(host.clone())));
         registry.register(Box::new(FirefoxImporter::new()));
+        #[cfg(target_os = "linux")]
+        registry.register(Box::new(importers::zen::ZenImporter::new()));
         registry.register(Box::new(ElectronImporter::slack().with_host(host.clone())));
         registry.register(Box::new(
             ElectronImporter::discord().with_host(host.clone()),
@@ -155,7 +186,15 @@ mod tests {
     fn builtin_ids_match_the_shared_layout() {
         let registry = ImportRegistry::with_builtin_host(default_host());
         let ids: Vec<&str> = registry.importers().iter().map(|i| i.id()).collect();
-        assert_eq!(ids, layout::PROVIDER_IDS);
+        let mut expected: Vec<_> = layout::PROVIDER_IDS
+            .iter()
+            .copied()
+            .filter(|id| *id != "zen")
+            .collect();
+        if cfg!(target_os = "linux") {
+            expected.insert(2, "zen");
+        }
+        assert_eq!(ids, expected);
         assert!(registry.find_by_id("unity-hub").is_some());
         assert!(registry.find_by_id("nope").is_none());
     }

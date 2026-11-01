@@ -38,6 +38,8 @@
   "teleport.move.app_only": "Just the app",
   "teleport.move.app_with_files": "The app with files or folders",
   "teleport.move.app_with_state": "The app with its signed-in state",
+  "teleport.sensitive.site_data.label": "Site storage",
+  "teleport.sensitive.site_data.detail": "Sends localStorage, which may contain credentials. Not extensions or IndexedDB.",
   "teleport.sensitive.sign_ins.label": "Keep me signed in",
   "teleport.sensitive.sign_ins.detail": "Sends the session cookies.",
   "teleport.sensitive.passwords.label": "Saved passwords",

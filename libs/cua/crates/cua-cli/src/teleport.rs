@@ -52,10 +52,10 @@ pub struct AppArgs {
     /// "claude-code").
     #[arg(long)]
     pub app: String,
-    /// `tabs` (open tabs and session state) or `full` (the whole profile).
+    /// `tabs` (open tabs) or `full` (supported profile data; provider defaults apply).
     #[arg(long, default_value = "full", value_parser = parse_scope)]
     pub scope: String,
-    /// Chrome profile to capture: a name ("Profile 1") or a path.
+    /// Browser profile: Chrome name/path, or an exact Zen profile name/path beneath its browser root.
     #[arg(long)]
     pub profile: Option<String>,
     /// Display name for the app (UI only).
@@ -95,6 +95,11 @@ pub struct PushArgs {
     /// bulky items (cookies, transcripts) out unless named here.
     #[arg(long = "include", conflicts_with = "all")]
     pub include: Vec<String>,
+    /// Separately confirm including Zen saved passwords. Naming the login
+    /// item or using --all alone is not confirmation; native password-labeled
+    /// Keyvault presence is still required.
+    #[arg(long)]
+    pub confirm_passwords: bool,
     /// Send every item the scope offers.
     #[arg(long)]
     pub all: bool,

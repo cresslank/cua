@@ -30,6 +30,8 @@ pub mod browser_cookies;
 pub mod cookies;
 pub mod favicons;
 pub mod firefox_store;
+pub mod gecko_profile;
+pub mod gecko_store;
 pub mod host;
 pub mod keychain;
 pub mod passwords;

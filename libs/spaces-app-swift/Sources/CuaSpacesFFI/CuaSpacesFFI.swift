@@ -52280,10 +52280,16 @@ public func FfiConverterTypeTeleportDrop_lower(_ value: TeleportDrop) -> RustBuf
  */
 public struct TeleportOptions: Equatable, Hashable {
     /**
-     * Chrome profile to capture: a name ("Profile 1") or a path. Default
-     * `Default`.
+     * Browser profile: Chrome name/path, or an exact Zen profile selector
+     * beneath its browser root. The legacy field name is kept for callers.
      */
     public var chromeProfile: String?
+    /**
+     * A separate explicit confirmation to include Zen saved passwords.
+     * Selecting `zen/logins.json` alone is not confirmation. The Keyvault
+     * still requires its native password-labeled presence prompt.
+     */
+    public var confirmSavedPasswords: Bool
     /**
      * Display name for the app (UI only). Default: the app id.
      */
@@ -52311,9 +52317,14 @@ public struct TeleportOptions: Equatable, Hashable {
     // declare one manually.
     public init(
         /**
-         * Chrome profile to capture: a name ("Profile 1") or a path. Default
-         * `Default`.
+         * Browser profile: Chrome name/path, or an exact Zen profile selector
+         * beneath its browser root. The legacy field name is kept for callers.
          */chromeProfile: String? = nil,
+        /**
+         * A separate explicit confirmation to include Zen saved passwords.
+         * Selecting `zen/logins.json` alone is not confirmation. The Keyvault
+         * still requires its native password-labeled presence prompt.
+         */confirmSavedPasswords: Bool = false,
         /**
          * Display name for the app (UI only). Default: the app id.
          */displayName: String? = nil,
@@ -52333,6 +52344,7 @@ public struct TeleportOptions: Equatable, Hashable {
          * Local and direct Spaces are unaffected.
          */relayPlaintextAck: Bool = false) {
         self.chromeProfile = chromeProfile
+        self.confirmSavedPasswords = confirmSavedPasswords
         self.displayName = displayName
         self.launchAfter = launchAfter
         self.closeRunningApp = closeRunningApp
@@ -52356,6 +52368,7 @@ public struct FfiConverterTypeTeleportOptions: FfiConverterRustBuffer {
         return
             try TeleportOptions(
                 chromeProfile: FfiConverterOptionString.read(from: &buf),
+                confirmSavedPasswords: FfiConverterBool.read(from: &buf),
                 displayName: FfiConverterOptionString.read(from: &buf),
                 launchAfter: FfiConverterOptionBool.read(from: &buf),
                 closeRunningApp: FfiConverterBool.read(from: &buf),
@@ -52365,6 +52378,7 @@ public struct FfiConverterTypeTeleportOptions: FfiConverterRustBuffer {
 
     public static func write(_ value: TeleportOptions, into buf: inout [UInt8]) {
         FfiConverterOptionString.write(value.chromeProfile, into: &buf)
+        FfiConverterBool.write(value.confirmSavedPasswords, into: &buf)
         FfiConverterOptionString.write(value.displayName, into: &buf)
         FfiConverterOptionBool.write(value.launchAfter, into: &buf)
         FfiConverterBool.write(value.closeRunningApp, into: &buf)
@@ -62228,6 +62242,10 @@ public enum AppSensitiveGroup: Equatable, Hashable {
      * Browsing history.
      */
     case history
+    /**
+     * Credential-bearing localStorage, separate from cookies and passwords.
+     */
+    case siteData
 
 
 
@@ -62255,6 +62273,8 @@ public struct FfiConverterTypeAppSensitiveGroup: FfiConverterRustBuffer {
 
         case 3: return .history
 
+        case 4: return .siteData
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -62273,6 +62293,10 @@ public struct FfiConverterTypeAppSensitiveGroup: FfiConverterRustBuffer {
 
         case .history:
             writeInt(&buf, Int32(3))
+
+
+        case .siteData:
+            writeInt(&buf, Int32(4))
 
         }
     }
@@ -69584,6 +69608,10 @@ public enum TeleportSensitiveGroup: Equatable, Hashable {
      * Browsing history.
      */
     case history
+    /**
+     * Credential-bearing localStorage, separate from cookies and passwords.
+     */
+    case siteData
 
 
 
@@ -69611,6 +69639,8 @@ public struct FfiConverterTypeTeleportSensitiveGroup: FfiConverterRustBuffer {
 
         case 3: return .history
 
+        case 4: return .siteData
+
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -69629,6 +69659,10 @@ public struct FfiConverterTypeTeleportSensitiveGroup: FfiConverterRustBuffer {
 
         case .history:
             writeInt(&buf, Int32(3))
+
+
+        case .siteData:
+            writeInt(&buf, Int32(4))
 
         }
     }

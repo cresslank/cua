@@ -617,6 +617,32 @@ fn delete_login_row(row: &LoginRowRef) -> rusqlite::Result<usize> {
     )
 }
 
+fn wipe_file(path: &Path, dest_home: &Path, report: &mut WipeReport) {
+    let rel = match confine(path, dest_home) {
+        Ok(rel) => rel,
+        Err(why) => {
+            report.refused.push((path.to_path_buf(), why));
+            return;
+        }
+    };
+    match probe(dest_home, &rel) {
+        Ok(Probe::Missing) => {}
+        Ok(Probe::Present(meta)) if meta.is_dir() => report.refused.push((
+            path.to_path_buf(),
+            "ledgered as a file but is a directory".into(),
+        )),
+        Ok(Probe::Present(_)) => match std::fs::remove_file(path) {
+            Ok(()) => report.removed_paths.push(path.to_path_buf()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => {
+                report.errors.push(format!("{}: {e}", path.display()));
+                report.failed.file_written(path);
+            }
+        },
+        Err(why) => report.refused.push((path.to_path_buf(), why)),
+    }
+}
+
 /// Undoes `ledger` under `dest_home`: removes its files, the directories it
 /// created (see below), its Keychain items and its cookie rows (through
 /// `host` for the Keychain; everything else directly).
@@ -628,28 +654,28 @@ fn delete_login_row(row: &LoginRowRef) -> rusqlite::Result<usize> {
 /// after the import therefore keep their directory.
 pub fn wipe(ledger: &Ledger, dest_home: &Path, host: &dyn HostEffects) -> WipeReport {
     let mut report = WipeReport::default();
-    for path in &ledger.files {
-        let rel = match confine(path, dest_home) {
-            Ok(rel) => rel,
-            Err(why) => {
-                report.refused.push((path.clone(), why));
-                continue;
+    #[cfg(target_os = "linux")]
+    let _zen_lease = if ledger.provider == "zen" && !ledger.record().is_empty() {
+        match crate::importers::zen::wipe_lease(dest_home) {
+            Ok(lease) => lease,
+            Err(error) => {
+                // Busy/running profiles are retried by the existing ledger
+                // sweeper. Never forget a wipe that could not acquire admission.
+                report.failed = ledger.record();
+                report.errors.push(error.to_string());
+                return report;
             }
-        };
-        match probe(dest_home, &rel) {
-            Ok(Probe::Missing) => {}
-            Ok(Probe::Present(meta)) if meta.is_dir() => report
-                .refused
-                .push((path.clone(), "ledgered as a file but is a directory".into())),
-            Ok(Probe::Present(_)) => match std::fs::remove_file(path) {
-                Ok(()) => report.removed_paths.push(path.clone()),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    report.errors.push(format!("{}: {e}", path.display()));
-                    report.failed.file_written(path);
-                }
-            },
-            Err(why) => report.refused.push((path.clone(), why)),
+        }
+    } else {
+        None
+    };
+    // Never unlink a browser's admission inode before the data writes finish:
+    // another browser could create/lock a replacement inode during the wipe.
+    let zen_lock = (ledger.provider == "zen")
+        .then(|| dest_home.join(".mozilla/firefox/Profiles/cua.zen-import/.parentlock"));
+    for path in &ledger.files {
+        if Some(path) != zen_lock.as_ref() {
+            wipe_file(path, dest_home, &mut report);
         }
     }
     for row in &ledger.cookie_rows {
@@ -737,6 +763,9 @@ pub fn wipe(ledger: &Ledger, dest_home: &Path, host: &dyn HostEffects) -> WipeRe
             }
             Err(why) => report.refused.push((r.db.clone(), why)),
         }
+    }
+    if let Some(lock) = zen_lock.filter(|lock| ledger.files.contains(lock)) {
+        wipe_file(&lock, dest_home, &mut report);
     }
     let mut dirs: Vec<(PathBuf, PathBuf)> = Vec::new();
     for path in &ledger.directories {

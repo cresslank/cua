@@ -509,10 +509,11 @@ fn readiness_lists_profiles_and_checks_the_chosen_one_without_reading_values() {
         r.files.say.contains("Default") && r.files.say.contains("Profile 1"),
         "{r:?}"
     );
-    // An app that has no profiles has nothing to report.
-    let r = b.readiness("firefox", None).unwrap();
-    assert_eq!(r.files.state, Access::Granted);
-    assert!(r.profiles.is_empty());
+    // This fixture registers only Chrome. An unregistered app is unsupported,
+    // never a misleading granted readiness result.
+    assert!(
+        matches!(b.readiness("firefox", None), Err(cua_keyvault::Error::Unsupported(m)) if m.contains("no session provider"))
+    );
 }
 
 /// A refused read reaches the person as the plain sentence, not as

@@ -23,6 +23,11 @@
       "launch": { "bin": "firefox" },
       "opens_files": true
     },
+    "zen": {
+      "name": "Zen",
+      "match": ["zen", "zen-browser", "app.zen_browser.zen"],
+      "provider": "zen"
+    },
     "chrome": {
       "name": "Google Chrome",
       "match": ["com.google.Chrome", "Google Chrome", "google-chrome", "chrome"],

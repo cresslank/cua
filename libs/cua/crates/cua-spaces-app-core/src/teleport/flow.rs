@@ -79,6 +79,8 @@ pub enum SensitiveGroup {
     Passwords,
     /// Browsing history.
     History,
+    /// Credential-bearing localStorage, separate from cookies and passwords.
+    SiteData,
 }
 
 impl SensitiveGroup {
@@ -86,6 +88,7 @@ impl SensitiveGroup {
     pub fn label(self) -> Msg {
         Msg::new(match self {
             SensitiveGroup::SignIns => "teleport.sensitive.sign_ins.label",
+            SensitiveGroup::SiteData => "teleport.sensitive.site_data.label",
             SensitiveGroup::Passwords => "teleport.sensitive.passwords.label",
             SensitiveGroup::History => "teleport.sensitive.history.label",
         })
@@ -95,6 +98,7 @@ impl SensitiveGroup {
     pub fn detail(self) -> Msg {
         Msg::new(match self {
             SensitiveGroup::SignIns => "teleport.sensitive.sign_ins.detail",
+            SensitiveGroup::SiteData => "teleport.sensitive.site_data.detail",
             SensitiveGroup::Passwords => "teleport.sensitive.passwords.detail",
             SensitiveGroup::History => "teleport.sensitive.history.detail",
         })

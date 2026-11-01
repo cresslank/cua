@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use super::apps::HostApp;
 use crate::Platform;
-use crate::layout::{chrome, firefox};
+use crate::layout::{chrome, firefox, zen};
 use crate::registry::ProviderInfo;
 
 /// The target table, as shipped.
@@ -157,6 +157,8 @@ pub enum SensitiveGroup {
     Passwords,
     /// Browsing history.
     History,
+    /// Credential-bearing localStorage, separate from cookies and passwords.
+    SiteData,
 }
 
 impl SensitiveGroup {
@@ -164,14 +166,16 @@ impl SensitiveGroup {
     pub fn as_str(self) -> &'static str {
         match self {
             SensitiveGroup::SignIns => "sign_ins",
+            SensitiveGroup::SiteData => "site_data",
             SensitiveGroup::Passwords => "passwords",
             SensitiveGroup::History => "history",
         }
     }
 
     /// Every group, in UI order.
-    pub const ALL: [SensitiveGroup; 3] = [
+    pub const ALL: [SensitiveGroup; 4] = [
         SensitiveGroup::SignIns,
+        SensitiveGroup::SiteData,
         SensitiveGroup::Passwords,
         SensitiveGroup::History,
     ];
@@ -218,6 +222,9 @@ pub const OPT_IN_ITEMS: &[(&str, &str, SensitiveGroup)] = &[
     (firefox::ID, "logins.json", SensitiveGroup::Passwords),
     (firefox::ID, "key4.db", SensitiveGroup::Passwords),
     (firefox::ID, "places.sqlite", SensitiveGroup::History),
+    (zen::ID, "cookies.sqlite", SensitiveGroup::SignIns),
+    (zen::ID, "storage", SensitiveGroup::SiteData),
+    (zen::ID, "logins.json", SensitiveGroup::Passwords),
 ];
 
 /// Where the app comes from in the Space.
@@ -395,10 +402,27 @@ pub fn classify(
     host: Platform,
     hint: &TargetHint,
 ) -> CatalogEntry {
-    let target = targets().iter().find(|(_, t)| app_matches(app, &t.matches));
+    let target = targets().iter().find(|(id, t)| {
+        if id.as_str() == zen::ID {
+            app.app_id.as_deref().is_some_and(|id| {
+                zen::APP_IDS
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(id))
+            })
+        } else {
+            app_matches(app, &t.matches)
+        }
+    });
     let provider = match target.and_then(|(_, t)| t.provider.as_deref()) {
         Some(pid) => providers.iter().find(|p| p.info.id == pid),
         None => providers.iter().find(|p| {
+            if p.info.id == zen::ID {
+                return app.app_id.as_deref().is_some_and(|id| {
+                    zen::APP_IDS
+                        .iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(id))
+                });
+            }
             let mut aliases = p.info.app_ids.clone();
             aliases.push(p.info.id.clone());
             app_matches(app, &aliases)
@@ -410,7 +434,7 @@ pub fn classify(
         .or_else(|| app.app_id.clone())
         .unwrap_or_else(|| slug(&app.name));
     let name = target
-        .filter(|_| app.name.is_empty())
+        .filter(|(id, _)| app.name.is_empty() || id.as_str() == zen::ID)
         .map(|(_, t)| t.name.clone())
         .unwrap_or_else(|| app.name.clone());
 
@@ -512,6 +536,15 @@ pub fn classify(
                         .into()
                 }
             });
+        }
+    }
+    if entry.provider_id.as_deref() == Some(zen::ID) {
+        entry.moves.retain(|m| *m == MoveKind::AppWithState);
+        entry.reason = Some("Zen session migrates into the Space's Firefox; Zen workspaces, extensions, preferences and history are not moved.".into());
+        if space_os != Platform::Linux {
+            entry.capability = Capability::Unsupported;
+            entry.moves.clear();
+            entry.reason = Some("Zen → Firefox session migration requires a Linux Space advertising normalized-gecko-v1.".into());
         }
     }
     entry
@@ -843,6 +876,50 @@ mod tests {
         assert_eq!(hits, ["vscode"]);
         assert_eq!(search(&all, "  ").len(), 4);
         assert_eq!(search(&all, "mozilla fire").len(), 1);
+    }
+
+    #[test]
+    fn zen_has_a_canonical_identity_and_three_distinct_unchecked_groups() {
+        let providers = providers();
+        let e = classify(
+            &app("A different browser", "app.zen_browser.zen"),
+            &providers,
+            Platform::Linux,
+            &TargetHint::default(),
+        );
+        assert_eq!(
+            (e.id.as_str(), e.name.as_str(), e.provider_id.as_deref()),
+            ("zen", "Zen", Some("zen"))
+        );
+        assert_eq!(e.capability, Capability::Full);
+        assert_eq!(e.moves, [MoveKind::AppWithState]);
+        assert!(e.reason.unwrap().contains("Firefox"));
+        assert_eq!(
+            e.sensitive_groups,
+            [
+                SensitiveGroup::SignIns,
+                SensitiveGroup::SiteData,
+                SensitiveGroup::Passwords
+            ]
+        );
+        let spoof = classify(
+            &app("zen", "unrelated.browser"),
+            &providers,
+            Platform::Linux,
+            &TargetHint::default(),
+        );
+        assert_ne!(spoof.provider_id.as_deref(), Some("zen"));
+        let mac = classify(
+            &app("Zen", "zen"),
+            &providers,
+            Platform::Linux,
+            &TargetHint {
+                os: Some(Platform::MacOS),
+                arch: None,
+            },
+        );
+        assert_eq!(mac.capability, Capability::Unsupported);
+        assert!(mac.moves.is_empty());
     }
 
     #[test]
