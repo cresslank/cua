@@ -43,7 +43,7 @@ any final newline. The packager emits sorted-key compact JSON plus LF; readers
 hash bytes, not reserialized JSON. Its manifest is:
 
 ```json
-{"entrypoint":"main.js","files":[{"path":"main.js","sha256":"<sha256-of-file-bytes>","size":123}],"helper_api":17,"loader_abi":1,"protocol":4}
+{"entrypoint":"main.js","files":[{"path":"main.js","sha256":"<sha256-of-file-bytes>","size":123}],"helper_api":18,"loader_abi":1,"protocol":4}
 ```
 
 Each `files` element has exactly `path`, `sha256`, `size`; the manifest has

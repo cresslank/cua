@@ -2276,7 +2276,7 @@ mod tests {
     #[test]
     fn bundled_helper_v15_preserves_host_owned_modifier_badge_chips() {
         assert!(EXTENSION_SOURCE.contains("GetVersion()"));
-        assert!(EXTENSION_SOURCE.contains("const HELPER_API_VERSION = 17;"));
+        assert!(EXTENSION_SOURCE.contains("const HELPER_API_VERSION = 18;"));
         assert!(EXTENSION_SOURCE.contains("return HELPER_API_VERSION;"));
         assert!(EXTENSION_SOURCE.contains("SetCursorState"));
         assert!(EXTENSION_SOURCE.contains("SetCursorColor"));

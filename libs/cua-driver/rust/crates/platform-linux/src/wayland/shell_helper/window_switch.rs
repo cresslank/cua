@@ -21,6 +21,13 @@ pub(crate) struct SwitchState {
     protocol_version: u64,
     epoch: String,
     pub overview_visible: bool,
+    // Older helpers remain usable for native switching, never keyboard admission.
+    #[serde(default)]
+    pub overview_shown: bool,
+    #[serde(default)]
+    pub overview_animating: bool,
+    #[serde(default)]
+    pub monitor_ready: bool,
     pub overlay_key_is_super: bool,
     pub session_locked: bool,
     pub search_entry_has_key_focus: bool,
@@ -35,6 +42,9 @@ pub(crate) struct SwitchState {
 impl SwitchState {
     pub fn search_ready(&self) -> bool {
         self.overview_visible
+            && self.overview_shown
+            && !self.overview_animating
+            && self.monitor_ready
             && !self.session_locked
             && !self.foreground_transaction_open
             && !self.persistent_switch_open
@@ -50,13 +60,20 @@ impl SwitchState {
             && !self.persistent_switch_open
     }
 
+    pub fn overview_hidden(&self) -> bool {
+        !self.overview_visible
+            && !self.overview_animating
+            && !self.search_entry_has_key_focus
+            && self.modal_count == 0
+    }
+
     pub fn idle(&self) -> bool {
         !self.foreground_transaction_open && !self.persistent_switch_open
     }
 
     pub fn target_focused(&self, target: &SwitchTarget) -> bool {
         !self.session_locked
-            && !self.overview_visible
+            && self.overview_hidden()
             && !self.key_focus_in_shell_ui
             && self.idle()
             && self.modal_count == 0
@@ -162,13 +179,23 @@ impl SwitchPeer {
         Ok(())
     }
 
-    pub fn cancel_search(&self, target: &SwitchTarget) -> anyhow::Result<()> {
-        self.call(
+    pub fn cancel_search(&self, target: &SwitchTarget) -> anyhow::Result<SwitchState> {
+        let raw = self.call(
             "CancelSwitchSearch",
             &[target.target_id.clone()],
             Duration::from_millis(800),
         )?;
-        Ok(())
+        let value: serde_json::Value =
+            serde_json::from_str(extract_json_object(&raw).unwrap_or(""))?;
+        anyhow::ensure!(
+            value["protocol_version"] == REQUIRED_EXACT_TARGET_PROTOCOL
+                && value["epoch"] == self.epoch
+                && value["target"] == target.target_id
+                && value["delivery"] == "shell_search",
+            "shell_not_ready: mismatched search cancellation identity"
+        );
+        // cancelled/hide_requested only mean request acceptance. Read state instead.
+        Ok(serde_json::from_value(value)?)
     }
 
     pub fn targets(&self, pid: u32) -> anyhow::Result<Vec<SwitchTarget>> {
@@ -343,6 +370,8 @@ mod tests {
         assert!(!state(base.clone()).search_ready());
         for (key, value) in [
             ("overview_visible", json!(true)),
+            ("overview_animating", json!(true)),
+            ("search_entry_has_key_focus", json!(true)),
             ("session_locked", json!(true)),
             ("key_focus_in_shell_ui", json!(true)),
             ("modal_count", json!(1)),
@@ -357,6 +386,8 @@ mod tests {
         }
         let mut search = base;
         search["overview_visible"] = json!(true);
+        search["overview_shown"] = json!(true);
+        search["monitor_ready"] = json!(true);
         search["search_entry_has_key_focus"] = json!(true);
         search["key_focus_in_shell_ui"] = json!(true);
         assert!(state(search.clone()).search_ready());
@@ -384,6 +415,9 @@ mod tests {
         assert!(!state(search.clone()).target_focused(&target));
         for (key, value) in [
             ("overview_visible", false),
+            ("overview_shown", false),
+            ("overview_animating", true),
+            ("monitor_ready", false),
             ("search_entry_has_key_focus", false),
             ("key_focus_in_shell_ui", false),
             ("session_locked", true),

@@ -75,7 +75,7 @@ try:
     baseline = keys()
     assert baseline == 0, ('fixture received a key before switching', baseline)
     timings = []
-    for mode in ('minimized', 'workspace', 'overview', 'keyboard', 'auto_after_keyboard', 'native_after_keyboard', 'keyboard_default', 'refusal', 'post_proof'):
+    for mode in ('minimized', 'workspace', 'overview', 'keyboard', 'auto_after_keyboard', 'native_after_keyboard', 'keyboard_default', 'refusal', 'post_proof', 'no_monitor', 'cleanup_retry', 'showing_stuck'):
         control('Setup', 'keyboard' if mode in ('keyboard_default', 'auto_after_keyboard', 'native_after_keyboard') else mode)
         time.sleep(0.5)
         before = control('Observe')
@@ -86,9 +86,9 @@ try:
         if mode == 'overview':
             assert before['overview'] is True, before
         start_keys, start_overlays = keys(), overlays()
-        switch_args = dict(**args, method='keyboard' if mode in ('keyboard', 'keyboard_default', 'refusal', 'post_proof') else 'native')
+        switch_args = dict(**args, method='keyboard' if mode in ('keyboard', 'keyboard_default', 'refusal', 'post_proof', 'no_monitor', 'cleanup_retry', 'showing_stuck') else 'native')
         if mode != 'keyboard_default':
-            switch_args['query'] = 'SHOULD NEVER REACH CLIENT' if mode in ('refusal', 'post_proof') else 'Cua Switch Probe'
+            switch_args['query'] = 'SHOULD NEVER REACH CLIENT' if mode in ('refusal', 'post_proof', 'cleanup_retry') else 'Cua Switch Probe'
         if mode == 'auto_after_keyboard':
             switch_args['method'] = 'auto'
         started = time.monotonic()
@@ -101,9 +101,20 @@ try:
         structured = result.get('structuredContent', {})
         time.sleep(0.5)
         after = control('Observe')
-        if mode in ('refusal', 'post_proof'):
-            assert result.get('isError') is True and structured.get('code') == 'shell_not_ready', result
-            assert not structured['focused'] and structured['effect'] == 'refused', structured
+        if mode in ('refusal', 'post_proof', 'no_monitor', 'cleanup_retry', 'showing_stuck'):
+            expected = 'overview_stuck' if mode == 'showing_stuck' else 'switch_unverified' if mode == 'cleanup_retry' else 'shell_not_ready'
+            assert result.get('isError') is True and structured.get('code') == expected, result
+            if mode == 'no_monitor':
+                assert overlays() == start_overlays and not after['overview'], after
+                assert elapsed_ms < 1500, timing
+            if mode == 'cleanup_retry':
+                assert after['hide_calls'] >= 2 and not after['overview'] and not after['animation'], after
+            if mode == 'showing_stuck':
+                assert after['held_show_completion'] and after['overview'] and after['animation'], after
+                assert elapsed_ms < 6500, timing
+                reasons = str(structured['attempts'])
+                assert 'overview did not hide' in reasons and 'original switch failure' in reasons, structured
+            assert not structured['focused'] and structured['effect'] == ('unverifiable' if mode == 'cleanup_retry' else 'refused'), structured
             if mode == 'post_proof':
                 assert after['post_proof_hit'] is True and after['focus'] == 'cua-lab-probe', after
                 assert 'CLIENT-KEY' not in (out/'probe.log').read_text(), 'post-proof delivery reached probe'
@@ -134,7 +145,7 @@ try:
         budget_ms = 2000 if timing['case'] in ('keyboard', 'keyboard_default') else 300 if timing['case'] in ('auto_after_keyboard', 'native_after_keyboard') else None
         if budget_ms is not None:
             assert timing['elapsed_ms'] < budget_ms, ('switch latency budget exceeded', budget_ms, timing)
-    print('SWITCH-LAB PASS 9 cases; zero client text/Return/Escape keys', flush=True)
+    print('SWITCH-LAB PASS 12 cases; zero client text/Return/Escape keys', flush=True)
 finally:
     proc.stdin.close()
     try:
