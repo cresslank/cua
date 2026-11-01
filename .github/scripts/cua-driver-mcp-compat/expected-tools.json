@@ -70,11 +70,15 @@
     "zoom"
   ],
   "platformTools": {
+    "darwin": [
+      "switch_window"
+    ],
     "linux": [
       "mouse_button_down",
       "mouse_button_up",
       "mouse_drag",
-      "parallel_mouse_drag"
+      "parallel_mouse_drag",
+      "switch_window"
     ],
     "win32": [
       "debug_window_info"

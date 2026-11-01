@@ -9,6 +9,8 @@ use cua_driver_core::tool::ToolRegistry;
 mod impl_;
 #[cfg(target_os = "linux")]
 pub(crate) mod page;
+#[cfg(target_os = "linux")]
+mod window_switch;
 
 #[cfg(not(target_os = "linux"))]
 mod stubs;

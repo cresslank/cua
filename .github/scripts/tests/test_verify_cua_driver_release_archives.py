@@ -40,6 +40,8 @@ CURRENT_HELPER_MEMBERS = (
     "wayland-helper/tests/hotreload_verify.py",
     "wayland-helper/tests/policy.test.mjs",
     "wayland-helper/tests/run_gnome_devkit.sh",
+    "wayland-helper/tests/switch-delivery.test.mjs",
+    "wayland-helper/tests/switch-policy.test.mjs",
     "wayland-helper/winrects@cua/extension.js",
     "wayland-helper/winrects@cua/impl/main.js",
     "wayland-helper/winrects@cua/impl/policy.js",

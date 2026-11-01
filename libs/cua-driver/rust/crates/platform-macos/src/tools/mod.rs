@@ -19,6 +19,7 @@ mod right_click;
 mod scroll;
 mod set_value;
 mod set_window_frame;
+mod switch_window;
 mod type_text;
 // `screenshot` / `screenshot_compat` modules removed in PR #1692 —
 // `get_window_state` capture_mode:"vision" is the canonical screenshot
@@ -1145,6 +1146,7 @@ pub fn register_all(
         bring_to_front::BringToFrontTool,
         &pid_window_candidates,
     ));
+    registry.register(Box::new(switch_window::SwitchWindowTool));
     registry.register(Box::new(set_window_frame::SetWindowFrameTool));
     registry.register(Box::new(invoke_menu::InvokeMenuTool));
     registry.register(pid_window_guarded(

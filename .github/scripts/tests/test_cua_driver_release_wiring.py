@@ -1160,15 +1160,35 @@ fi
         self.assertEqual(
             expected["platformTools"],
             {
+                "darwin": ["switch_window"],
                 "linux": [
                     "mouse_button_down",
                     "mouse_button_up",
                     "mouse_drag",
                     "parallel_mouse_drag",
+                    "switch_window",
                 ],
                 "win32": ["debug_window_info"],
             },
         )
+        # Keep the pinned-client fixture aligned with the captured public tool
+        # surfaces. Platform-only tools must not leak into the common roster.
+        for platform, snapshot in (
+            ("darwin", "macos"),
+            ("linux", "linux"),
+            ("win32", "windows"),
+        ):
+            with self.subTest(platform=platform):
+                tools = json.loads(
+                    self.read(
+                        "scripts/docs-generators/cli-specs/"
+                        f"cua-driver-mcp-{snapshot}.json"
+                    )
+                )["tools"]
+                self.assertEqual(
+                    sorted(expected["baseTools"] + expected["platformTools"][platform]),
+                    sorted(tool["name"] for tool in tools),
+                )
 
     def test_installer_compatibility_runs_current_installers_on_releases(
         self,

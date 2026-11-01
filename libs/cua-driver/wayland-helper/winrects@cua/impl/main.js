@@ -20,9 +20,14 @@ import {
     shellInputIsGrabbed,
     targetIsOnActiveStage,
     targetTokenMatches,
+    persistentSwitchRefusal,
+    persistentSwitchFocused,
+    shellSearchHasFocus,
+    shellSearchCanRequestFocus,
+    overlayKeyUsesLeftSuper,
 } from './policy.js';
 
-const HELPER_API_VERSION = 16;
+const HELPER_API_VERSION = 17;
 const EXACT_TARGET_PROTOCOL_VERSION = 4;
 const FOREGROUND_TIMEOUT_MS = 30_000;
 const CURSOR_IDLE_TIMEOUT_US = 5 * 60 * 1_000_000;
@@ -31,6 +36,11 @@ const IFACE = `<node><interface name="org.cua.WinRects">
 <method name="GetVersion"><arg type="u" direction="out" name="version"/></method>
 <method name="GetCapabilities"><arg type="s" direction="out" name="json"/></method>
 <method name="GetRects"><arg type="s" direction="out" name="json"/></method>
+<method name="GetSwitchState"><arg type="s" direction="out" name="json"/></method>
+<method name="FocusSwitchSearch"><arg type="s" direction="in" name="target"/><arg type="s" direction="out" name="json"/></method>
+<method name="DeliverSwitchSearch"><arg type="s" direction="in" name="target"/><arg type="s" direction="in" name="query"/><arg type="s" direction="out" name="json"/></method>
+<method name="CancelSwitchSearch"><arg type="s" direction="in" name="target"/><arg type="s" direction="out" name="json"/></method>
+<method name="SwitchToTarget"><arg type="s" direction="in" name="transaction"/><arg type="s" direction="in" name="target"/><arg type="s" direction="out" name="json"/></method>
 <method name="CaptureTargetPreview"><arg type="s" direction="in" name="target"/><arg type="u" direction="in" name="max_dimension"/><arg type="s" direction="out" name="capture_json"/></method>
 <method name="CaptureTarget"><arg type="s" direction="in" name="target"/><arg type="s" direction="out" name="capture_json"/></method>
 <method name="BeginForeground"><arg type="s" direction="in" name="transaction"/><arg type="s" direction="in" name="target"/><arg type="s" direction="out" name="json"/></method>
@@ -727,6 +737,8 @@ export default class WinRectsRuntime {
         this._cursors = new Map();
         this._signals = [];
         this._foreground = null;
+        this._switching = null;
+        this._switches = new Map();
         this._cleanupErrors = [];
     }
 
@@ -849,6 +861,7 @@ export default class WinRectsRuntime {
     }
 
     reloadBlockedReason() {
+        if (this._switching) return 'persistent_switch_open: idle reload required';
         return this._foreground ? 'foreground_transaction_open: idle reload required; no abort or restore attempted' : null;
     }
 
@@ -887,8 +900,10 @@ export default class WinRectsRuntime {
             Gio.DBusSignalFlags.NONE,
             (_connection, _sender, _path, _interface, _signal, parameters) => {
                 const [name, oldOwner, newOwner] = parameters.deep_unpack();
-                if (name.startsWith(':') && oldOwner && !newOwner)
+                if (name.startsWith(':') && oldOwner && !newOwner) {
                     this._removeCursorsForConnection(name);
+                    if (this._switching?.owner === name) this._switching.ownerAlive = false;
+                }
             }
         );
 
@@ -1282,6 +1297,9 @@ export default class WinRectsRuntime {
                 'exact-target-activation-v1',
                 'shell-grab-classification-v1',
                 'refusal-reasons-v1',
+                'persistent-switch-v1',
+                'shell-search-focus-v1',
+                'shell-search-delivery-v1',
             ],
         });
     }
@@ -1496,7 +1514,220 @@ export default class WinRectsRuntime {
         }
     }
 
+    // Readback only. Missing Shell internals are never positive focus proof.
+    _switchShellFocus() {
+        if (!Main.uiGroup || typeof Main.overview?.visible !== 'boolean' || !Number.isInteger(Main.modalCount))
+            throw new Error('shell_not_ready: unavailable Shell focus metadata');
+        let actor = global.stage.get_key_focus();
+        for (let depth = 0; actor && depth < 128; ++depth) {
+            if (actor === Main.uiGroup) return true;
+            actor = actor.get_parent(); // unreadable ancestry is a refusal, not false
+        }
+        if (actor) throw new Error('shell_not_ready: invalid Shell focus ancestry');
+        return false;
+    }
+
+    GetSwitchState() {
+        const focus = global.stage.get_key_focus();
+        const entry = Main.overview.searchEntry?.clutter_text;
+        const state = {
+            protocol_version: EXACT_TARGET_PROTOCOL_VERSION, epoch: this._epoch,
+            overview_visible: Main.overview?.visible === true,
+            overlay_key_is_super: overlayKeyUsesLeftSuper(new Gio.Settings({schema_id: 'org.gnome.mutter'}).get_string('overlay-key')),
+            session_locked: Main.sessionMode?.isLocked !== false || Main.sessionMode?.currentMode !== 'user',
+            search_entry_has_key_focus: Boolean(entry && entry === focus && entry.has_key_focus()),
+            key_focus_in_shell_ui: this._switchShellFocus(), modal_count: Main.modalCount,
+            foreground_transaction_open: Boolean(this._foreground), persistent_switch_open: Boolean(this._switching),
+            focus_window: global.display.focus_window ? this._targetId(global.display.focus_window) : null,
+            focus_pid: global.display.focus_window?.get_pid() ?? null,
+        };
+        state.shell_search_has_focus = shellSearchHasFocus({
+            overviewVisible: state.overview_visible, sessionLocked: state.session_locked,
+            searchEntryHasKeyFocus: state.search_entry_has_key_focus, keyFocusInShellUi: state.key_focus_in_shell_ui,
+            modalCount: state.modal_count,
+        });
+        return JSON.stringify(state);
+    }
+
+    FocusSwitchSearch(targetId) {
+        let state = JSON.parse(this.GetSwitchState());
+        const target = this._resolveTarget(targetId);
+        const entry = Main.overview?.searchEntry?.clutter_text;
+        let code = state.session_locked ? 'session_locked' : null;
+        if (!code && !target) code = 'window_not_found';
+        if (!code && !shellSearchCanRequestFocus({
+            overviewVisible: state.overview_visible, sessionLocked: state.session_locked,
+            busy: state.foreground_transaction_open || state.persistent_switch_open,
+            entryAvailable: Boolean(entry?.mapped), modalCount: state.modal_count,
+        })) code = 'shell_not_ready';
+        if (!code) {
+            // Super opens overview, but GNOME normally leaves the entry without
+            // Clutter focus until it forwards a printable key. Do not send that
+            // first unproven key: explicitly focus our known Shell-owned entry.
+            entry.grab_key_focus();
+            state = JSON.parse(this.GetSwitchState());
+            if (!state.shell_search_has_focus || state.foreground_transaction_open || state.persistent_switch_open) code = 'shell_not_ready';
+        }
+        return JSON.stringify({...state, ...(code ? {code} : {})});
+    }
+
+    // Synchronous compositor-main-loop delivery. No queued/global key events:
+    // physical focus changes before this call refuse, and cannot interleave with
+    // the receiver-owned text/activation below. Shell's application search is
+    // synchronous; never activate a web result, command or an unmatched app.
+    DeliverSwitchSearch(targetId, query) {
+        const reply = (delivered, code = null) => JSON.stringify({
+            protocol_version: EXACT_TARGET_PROTOCOL_VERSION, epoch: this._epoch,
+            target: targetId, delivery: 'shell_search', delivered, ...(code ? {code} : {}),
+        });
+        try {
+            const state = JSON.parse(this.GetSwitchState());
+            if (state.session_locked) return reply(false, 'session_locked');
+            const target = this._resolveTarget(targetId);
+            if (!target) return reply(false, 'window_not_found');
+            if (!state.shell_search_has_focus || state.foreground_transaction_open || state.persistent_switch_open)
+                return reply(false, 'shell_not_ready');
+            const entry = Main.overview.searchEntry?.clutter_text;
+            if (!entry?.mapped || global.stage.get_key_focus() !== entry)
+                return reply(false, 'shell_not_ready');
+            if (typeof query !== 'string' || !query.trim() || [...query].length > 256 || /[\p{Cc}]/u.test(query))
+                return reply(false, 'keyboard_unavailable');
+            const app = Shell.WindowTracker.get_default().get_window_app(target);
+            const matches = Shell.AppSystem.search(query.trim().split(/\s+/u).join(' ')).flat();
+            // Match the actual running window's Shell application identity, not
+            // its title or a caller-supplied desktop id. No app launch is allowed.
+            if (!app || !app.get_windows().includes(target) || target.get_pid() <= 0
+                || !matches.includes(app.get_id())) return reply(false, 'switch_unverified');
+            entry.set_text(query);
+            if (entry.get_text() !== query) return reply(false, 'switch_unverified');
+            Main.overview.hide();
+            target.unminimize();
+            // Use Shell's exact-window activation for the matched running result;
+            // Shell.App.activate_window can choose attention-only under a zero
+            // D-Bus timestamp instead of focusing the requested window.
+            Main.activateWindow(target);
+            return reply(true);
+        } catch (_) {
+            return reply(false, 'shell_not_ready');
+        }
+    }
+
+    CancelSwitchSearch(targetId) {
+        const state = JSON.parse(this.GetSwitchState());
+        // API hide only: even if a client acquired focus, no Escape can reach it.
+        const cancelled = state.session_locked === false && state.overview_visible
+            && state.key_focus_in_shell_ui && !state.foreground_transaction_open && !state.persistent_switch_open;
+        if (cancelled) Main.overview.hide();
+        return JSON.stringify({protocol_version: EXACT_TARGET_PROTOCOL_VERSION, epoch: this._epoch,
+            target: targetId, delivery: 'shell_search', cancelled});
+    }
+
+    _switchFocused(target, targetId) {
+        return persistentSwitchFocused({
+            sessionLocked: Main.sessionMode?.isLocked !== false || Main.sessionMode?.currentMode !== 'user',
+            targetResolved: this._resolveTarget(targetId) === target,
+            focusMatches: global.display.focus_window === target,
+            workspaceActive: this._windowOnActiveWorkspace(target), minimized: target.minimized,
+            overviewVisible: Main.overview?.visible, keyFocusInShellUi: this._switchShellFocus(),
+            modalCount: Main.modalCount,
+        });
+    }
+
+    SwitchToTargetAsync([transaction, targetId], invocation) {
+        const owner = invocation.get_sender();
+        const reply = (focused, reason, alreadyFocused = false) => invocation.return_value(new GLib.Variant('(s)', [JSON.stringify({
+            protocol_version: EXACT_TARGET_PROTOCOL_VERSION, epoch: this._epoch,
+            transaction, target: targetId, focused, reason, already_focused: alreadyFocused,
+        })]));
+        if (!owner?.startsWith(':') || typeof transaction !== 'string' || !/^cua-switch-[A-Za-z0-9._:-]{8,160}$/.test(transaction)) {
+            reply(false, 'shell_not_ready'); return;
+        }
+        const target = this._resolveTarget(targetId);
+        const previous = this._switches.get(transaction);
+        if (previous) {
+            // IDs are owner-bound. A duplicate reads current state, never replays.
+            const same = previous.owner === owner && previous.targetId === targetId;
+            const focused = Boolean(same && target && this._switchFocused(target, targetId));
+            reply(focused, focused ? null : (same ? 'switch_unverified' : 'shell_not_ready'));
+            return;
+        }
+        const reason = persistentSwitchRefusal({
+            sessionLocked: Main.sessionMode?.isLocked, userSession: Main.sessionMode?.currentMode === 'user',
+            targetResolved: Boolean(target), busy: Boolean(this._foreground || this._switching),
+            modalChildPresent: target ? Boolean(this._visibleModalChild(target)) : false,
+        });
+        if (reason) { reply(false, reason); return; }
+        if (this._switchFocused(target, targetId)) {
+            this._switches.set(transaction, {owner, targetId});
+            if (this._switches.size > 64) this._switches.delete(this._switches.keys().next().value);
+            reply(true, null, true); return;
+        }
+        const record = {owner, targetId, ownerAlive: true, activated: false};
+        this._switches.set(transaction, record);
+        if (this._switches.size > 64) this._switches.delete(this._switches.keys().next().value);
+        this._switching = record;
+        const finish = (focused, why) => {
+            if (this._switching === record) this._switching = null;
+            reply(focused, why);
+        };
+        try {
+            // Only this dedicated action may dismiss Shell chrome. Unknown modal
+            // UI remains open and fails the bounded compositor readback.
+            Main.overview.hide();
+            Main.panel.closeCalendar();
+            Main.panel.menuManager.activeMenu?.close();
+            // Shell 45-50 has no public messageTray.close(). Hide only a live
+            // banner; calendar/notification-list UI is closed above.
+            if (Main.messageTray._notification && Main.messageTray._banner)
+                Main.messageTray._hideNotification(false);
+            if (Main.sessionMode?.isLocked !== false || Main.sessionMode?.currentMode !== 'user') {
+                finish(false, 'session_locked'); return;
+            }
+            if (this._resolveTarget(targetId) !== target) { finish(false, 'window_not_found'); return; }
+            const deadline = GLib.get_monotonic_time() + 1_200_000;
+            this._timeout(GLib.PRIORITY_DEFAULT, 25, () => {
+                try {
+                    if (GLib.get_monotonic_time() >= deadline) {
+                        finish(false, record.activated ? 'switch_unverified' : 'shell_not_ready'); return GLib.SOURCE_REMOVE;
+                    }
+                    if (!record.ownerAlive) {
+                        finish(false, 'shell_not_ready'); return GLib.SOURCE_REMOVE;
+                    }
+                    if (Main.sessionMode?.isLocked !== false || Main.sessionMode?.currentMode !== 'user') {
+                        finish(false, 'session_locked'); return GLib.SOURCE_REMOVE;
+                    }
+                    if (this._resolveTarget(targetId) !== target) {
+                        finish(false, 'window_not_found'); return GLib.SOURCE_REMOVE;
+                    }
+                    if (!record.activated && this._captureContextIsSafe() && !this._switchShellFocus()) {
+                        if (this._visibleModalChild(target)) {
+                            finish(false, 'shell_not_ready'); return GLib.SOURCE_REMOVE;
+                        }
+                        if (target.minimized) target.unminimize();
+                        // Main.activateWindow handles workspace activation. Save no
+                        // prior focus/workspace: this is not a temporary action.
+                        record.activated = true;
+                        Main.activateWindow(target);
+                    }
+                    if (this._switchFocused(target, targetId)) {
+                        finish(true, null); return GLib.SOURCE_REMOVE;
+                    }
+                    return GLib.SOURCE_CONTINUE;
+                } catch (error) {
+                    finish(false, `shell_not_ready: ${String(error).slice(0, 256)}`);
+                    return GLib.SOURCE_REMOVE;
+                }
+            });
+        } catch (error) {
+            finish(false, `shell_not_ready: ${String(error).slice(0, 256)}`);
+        }
+    }
+
     BeginForegroundAsync([transaction, targetId], invocation) {
+        if (this._switching) {
+            invocation.return_dbus_error('org.cua.WinRects.InputBusy', 'input_busy: persistent switch active');
+            return;
+        }
         if (typeof transaction !== 'string' || !/^cua-fg-[A-Za-z0-9._:-]{8,160}$/.test(transaction)) {
             invocation.return_dbus_error(
                 'org.cua.WinRects.InvalidTransaction',

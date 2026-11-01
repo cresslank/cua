@@ -1,7 +1,7 @@
 {
  "tools": [
   {
-   "description": "List Linux apps — both currently running and installed-but-not-running — with per-app state flags:\n\n- running: is a process for this app live? (pid is 0 when false)\n- active: reserved (Linux X11/Wayland focus model differs from frontmost-app); always false.\n- kind: `\"desktop\"` for XDG `.desktop` launcher entries.\n- launch_path: the launcher command from `Exec=` (field codes stripped). Pass to `launch_app(launch_path=...)`.\n- bundle_id: the XDG \"desktop file id\" — the `.desktop` file's path relative to its XDG `applications/` root with the `.desktop` suffix stripped and path separators replaced with `-` (e.g. `kde4/konqbrowser.desktop` → `kde4-konqbrowser`).\n- last_used: RFC3339 mtime of the `.desktop` file, when readable.\n- windows: the app's current top-level windows (same records as list_windows); empty for a process without one.\n\nRunning apps come from `/proc`. Installed apps come from XDG Desktop Entry files in $XDG_DATA_HOME/applications and each $XDG_DATA_DIRS entry's applications/ subdir. Entries with `NoDisplay=true` or `Hidden=true` are filtered. A `.desktop` file whose launcher matches a running process (by basename), or whose WM_CLASS a top-level window carries, is merged into a single entry with `running: true`.\n\nUse this for \"is X installed?\" as well as \"is X running?\". For per-window state — visibility, geometry, titles — call list_windows instead.",
+   "description": "List Linux apps — both currently running and installed-but-not-running — with per-app state flags:\n\n- running: is a process for this app live? (pid is 0 when false)\n- active: reserved (Linux X11/Wayland focus model differs from frontmost-app); always false.\n- kind: `\"desktop\"` for XDG `.desktop` launcher entries.\n- launch_path: the launcher command from `Exec=` (field codes stripped). Pass to `launch_app(launch_path=...)`.\n- bundle_id: the XDG \"desktop file id\" — the `.desktop` file's path relative to its XDG `applications/` root with the `.desktop` suffix stripped and path separators replaced with `-` (e.g. `kde4/konqbrowser.desktop` → `kde4-konqbrowser`).\n- last_used: RFC3339 mtime of the `.desktop` file, when readable.\n- windows: the app's current top-level windows (same records as list_windows); empty for a process without one.\n\nRunning apps come from `/proc`. Installed apps come from XDG Desktop Entry files in $XDG_DATA_HOME/applications and each $XDG_DATA_DIRS entry's applications/ subdir. Entries with `NoDisplay=true` or `Hidden=true` are filtered. A `.desktop` file is merged with a running process only from an exact, unambiguous executable path or a constrained `--name` desktop-ID claim corroborated by StartupWMClass when present; ambiguous aliases fail closed.\n\nUse this for \"is X installed?\" as well as \"is X running?\". For per-window state — visibility, geometry, titles — call list_windows instead.",
    "destructive": false,
    "idempotent": true,
    "input_schema": {
@@ -319,7 +319,7 @@
       "type": "string"
      },
      "urls": {
-      "description": "URLs to open via xdg-open.",
+      "description": "URLs to open through the resolved XDG desktop handler, with xdg-open as a compatibility fallback.",
       "items": {
        "type": "string"
       },
@@ -356,7 +356,7 @@
    "read_only": false
   },
   {
-   "description": "Persistently activate a window so subsequent input lands on it. This deliberately breaks the no-foreground contract and is not part of the normal input ladder. For an ordinary `background_unavailable` response, retry only the refused action with `delivery_mode:\"foreground\"`; the input tool performs its own activate, act, and restore sequence. Use `bring_to_front` only for a focus-proxy surface that must remain foreground across multiple calls, such as a remote desktop session, or when repeated action-scoped activation prevents the remote surface from accepting input. X11: EWMH _NET_ACTIVE_WINDOW activation (the `wmctrl -a` equivalent, with proper timestamp handling to beat focus-stealing prevention). Wayland: activates through a target-addressable compositor adapter (wlroots foreign-toplevel or the GNOME Shell helper) and refuses when the compositor offers no safe adapter. Matches the macOS / Windows bring_to_front rung.",
+   "description": "Persistently activate a window so subsequent input lands on it. X11: EWMH _NET_ACTIVE_WINDOW activation (the `wmctrl -a` equivalent, proper timestamp handling to beat focus-stealing prevention) — call it before `delivery_mode:\"foreground\"` input to avoid a per-call flash, or to escalate when background injection didn't land. Wayland: activates through a target-addressable compositor adapter (wlroots foreign-toplevel or the GNOME Shell helper) and refuses when the compositor offers no safe adapter. Matches the macOS / Windows bring_to_front rung.",
    "destructive": false,
    "idempotent": true,
    "input_schema": {
@@ -371,7 +371,7 @@
       "type": "string"
      },
      "window_id": {
-      "description": "X11 window id (xid) to activate. If omitted, the first window of `pid` is used.",
+      "description": "Exact window id to activate. Required when a Wayland process owns more than one toplevel.",
       "type": "integer"
      }
     },
@@ -381,6 +381,52 @@
     "type": "object"
    },
    "name": "bring_to_front",
+   "read_only": false
+  },
+  {
+   "description": "Persistently switch to a running app's window. This changes foreground focus and does not restore prior focus. auto tries exact native activation first, then real Shell/Spotlight keyboard search only after refusal or unverified activation. Keyboard text and Return require proven launcher search-field focus. Success requires compositor/OS focus readback, never request acceptance. GNOME Wayland requires an unambiguous exact toplevel and compatible helper; X11 supports native activation only. macOS verifies the exact focused window. Locked sessions refuse.",
+   "destructive": false,
+   "idempotent": true,
+   "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+     "method": {
+      "default": "auto",
+      "description": "auto tries native then keyboard on refusal/unverified focus; native and keyboard use only the named route.",
+      "enum": [
+       "auto",
+       "native",
+       "keyboard"
+      ],
+      "type": "string"
+     },
+     "pid": {
+      "description": "Process ID of the running target application.",
+      "maximum": 2147483647,
+      "minimum": 1,
+      "type": "integer"
+     },
+     "query": {
+      "description": "Keyboard search text without control characters. Defaults to the target application's display name.",
+      "minLength": 1,
+      "type": "string"
+     },
+     "session": {
+      "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+      "type": "string"
+     },
+     "window_id": {
+      "description": "Exact window ID from fresh list_windows discovery. Required for a Wayland PID with multiple toplevels.",
+      "minimum": 1,
+      "type": "integer"
+     }
+    },
+    "required": [
+     "pid"
+    ],
+    "type": "object"
+   },
+   "name": "switch_window",
    "read_only": false
   },
   {
@@ -481,7 +527,7 @@
    "read_only": false
   },
   {
-   "description": "Click against a target pid. **Prefer `element_token` over pixel coordinates** — element_token works on backgrounded / hidden windows, surfaces a stable handle, and tells you what you're clicking via the cached AT-SPI element's role + label. Reach for `x, y` only when the target is a canvas / custom-drawn surface that doesn't appear in the AT-SPI tree.\n\nProvide either (window_id + x/y) or (pid + element_token). x/y are WINDOW-LOCAL pixels of window_id (the get_window_state screenshot frame); a point outside the window is refused (point_outside_window) and every pixel result reports the resolved window_point / screen_point. Background delivery first resolves the accessible under the point and fires its action (the result says `hit: <role> \"<name>\" action=...`; a file / list item is selected through its container: `selected: ...`), else presses the real virtual pointer there. A click that opens a popup menu names it (`popup: {window_id, bounds}`): pass that window_id to get_window_state to index its items. The token is stale once the next get_window_state of the same window replaces its snapshot — re-snapshot every turn before clicking.\n\nAfter a zoom call, pass from_zoom=true to auto-translate zoom-image coords back to full-window space.\n\n`count`: 1 (default), 2 for a double-click, 3 for a triple-click (selects a line / paragraph in editors) — one press train with real double-click cadence, in background and foreground alike; there is no separate triple_click tool.\n\nbutton: \"left\" (default), \"right\", or \"middle\". Defaults to left so the field is fully back-compat. X11: routes through XSendEvent ButtonPress/Release with the matching button code. Native Wayland: only left-button is supported via the virtual-pointer protocol — right/middle return an error rather than silently degrading to left. `modifier` holds ctrl/shift/alt/super for the click on X11. Native Wayland refuses modified pointer clicks until its input protocol can carry keyboard modifier state.",
+   "description": "Click against a target pid. **Prefer `element_token` over pixel coordinates** — element_token works on backgrounded / hidden windows, surfaces a stable handle, and tells you what you're clicking via the cached AT-SPI element's role + label. Reach for `x, y` only when the target is a canvas / custom-drawn surface that doesn't appear in the AT-SPI tree.\n\nProvide either (window_id + x/y) or (pid + element_token). Routes via XSendEvent (no focus steal). element_token cache is scoped per (pid, window_id) and is replaced by the next get_window_state of the same window — re-snapshot every turn before clicking.\n\nAfter a zoom call, pass from_zoom=true to auto-translate zoom-image coords back to full-window space.\n\nbutton: \"left\" (default), \"right\", or \"middle\". Defaults to left so the field is fully back-compat. X11: routes through XSendEvent ButtonPress/Release with the matching button code. Native Wayland: only left-button is supported via the virtual-pointer protocol — right/middle return an error rather than silently degrading to left. `modifier` holds ctrl/shift/alt/super for the click on X11. Native Wayland refuses modified pointer clicks until its input protocol can carry keyboard modifier state.",
    "destructive": true,
    "idempotent": false,
    "input_schema": {
@@ -510,7 +556,8 @@
       "type": "string"
      },
      "count": {
-      "description": "Number of clicks in one press train: 1 (default), 2 = double-click, 3 = triple-click (line/paragraph selection). There is no separate triple_click tool — pass count: 3 here.",
+      "description": "Click count — 1 (single), 2 (double), or 3 (triple). Default 1.",
+      "maximum": 3,
       "minimum": 1,
       "type": "integer"
      },
@@ -612,7 +659,7 @@
    "read_only": false
   },
   {
-   "description": "Double-click at (x,y) or an element_token (AT-SPI bounds). Background delivery on X11 sends real button events from the session's virtual master pointer (path mpx_pointer); a point covered by another application's window is refused (target_occluded), one covered by this app's own dialog is retargeted to it (retargeted_to). No focus steal. Provide either (window_id + x/y) or (pid + element_token). After a zoom call, pass from_zoom=true to auto-translate zoom-image coords.",
+   "description": "Double-click at (x,y) or an element_token (AT-SPI bounds) via XSendEvent. No focus steal. Provide either (window_id + x/y) or (pid + element_token). After a zoom call, pass from_zoom=true to auto-translate zoom-image coords.",
    "destructive": true,
    "idempotent": false,
    "input_schema": {
@@ -677,7 +724,7 @@
    "read_only": false
   },
   {
-   "description": "Right-click at (x,y) or an element_token (AT-SPI bounds). Background delivery on X11 sends real button events from the session's virtual master pointer (path mpx_pointer); a point covered by another application's window is refused (target_occluded), one covered by this app's own dialog is retargeted to it (retargeted_to), one outside the window is refused (point_outside_window; x/y are window-local pixels, the result reports window_point / screen_point). No focus steal. When a context menu opens, the result names it (`popup: {window_id, bounds, title}`): call get_window_state(pid, window_id=<that id>) to index its menu items and click them by element_token. Provide either (window_id + x/y) or (pid + element_token). After a zoom call, pass from_zoom=true to auto-translate zoom-image coords.",
+   "description": "Right-click at (x,y) or an element_token (AT-SPI bounds) via XSendEvent. No focus steal. Provide either (window_id + x/y) or (pid + element_token). After a zoom call, pass from_zoom=true to auto-translate zoom-image coords.",
    "destructive": true,
    "idempotent": false,
    "input_schema": {
@@ -749,7 +796,7 @@
    "read_only": false
   },
   {
-   "description": "Press-drag-release gesture from (from_x, from_y) to (to_x, to_y) in window-local screenshot pixels. Background delivery on X11 is one real held gesture on the session's virtual master pointer (path mpx_pointer: press, interpolated motion, release) — it lands on GTK/VCL/Qt/Chromium; a point covered by another application's window is refused (target_occluded), one covered by this app's own dialog is retargeted to it. Headless servers fall back to XSendEvent. duration_ms (default 500), steps (default 20). No focus steal. Limits and fallbacks: `get_guide({topic:\"drag\"})`.",
+   "description": "Press-drag-release gesture from (from_x, from_y) to (to_x, to_y) in window-local screenshot pixels via XSendEvent (ButtonPress + MotionNotify × steps + ButtonRelease). duration_ms (default 500), steps (default 20). No focus steal. Limits and fallbacks: `get_guide({topic:\"drag\"})`.",
    "destructive": true,
    "idempotent": false,
    "input_schema": {
@@ -1386,7 +1433,7 @@
    "read_only": false
   },
   {
-   "description": "Press a combination of keys simultaneously, e.g. [\"ctrl\",\"c\"] for Copy. Delivered to the target window without focus steal (real key events from a virtual master keyboard on X11); target does NOT need to be frontmost. Window-manager chords cannot reach the WM that way: alt+F4 on a window target closes that window through the WM (_NET_CLOSE_WINDOW, effect confirmed when it unmaps); super+*, alt+tab, ctrl+alt+* and other WM bindings are refused with code wm_chord_unavailable — use bring_to_front / list_windows / kill_app or delivery_mode:\"foreground\" instead.",
+   "description": "Press a combination of keys simultaneously, e.g. [\"ctrl\",\"c\"] for Copy. Sent via XSendEvent directly to the target pid; target does NOT need to be frontmost.",
    "destructive": true,
    "idempotent": false,
    "input_schema": {
@@ -1491,15 +1538,6 @@
    "input_schema": {
     "additionalProperties": false,
     "properties": {
-     "delivery_mode": {
-      "default": "background",
-      "description": "Input delivery mode. 'background' (default) never activates or raises the target window. On X11 it injects via XTEST / the XInput2 master pointer (no focus steal). On Wayland it goes through libei + xdg-desktop-portal, which injects to the compositor's input focus — Wayland's security model has no per-window background targeting, so a specific non-focused window cannot be aimed at; when no libei backend is available the tool returns a structured background_unavailable error. 'foreground' is the explicit escalation: activate the target (X11 _NET_ACTIVE_WINDOW; Wayland compositor activate), inject, then restore the prior active window — a brief focus swap unless the target was already active. Matches the macOS / Windows delivery_mode surface.",
-      "enum": [
-       "background",
-       "foreground"
-      ],
-      "type": "string"
-     },
      "element_token": {
       "description": "Element handle `<snapshot_id>:<row>` from get_window_state: row `[11]` of a read whose snapshot_id is s0000002a is \"s0000002a:11\" (also in `structuredContent.elements[].element_token`). Returns an explicit stale error naming the current snapshots once a newer read supersedes it.",
       "pattern": "^s[0-9a-f]{8}:[0-9]+$",
@@ -1514,7 +1552,7 @@
       "type": "string"
      },
      "value": {
-      "description": "New value. Written through AT-SPI EditableText/Value when the element exposes them; otherwise (GTK2 spin scales, VCL spin buttons) the field is clicked with the session's real pointer, its text selected and replaced through the virtual keyboard and committed with Tab, then read back.",
+      "description": "New value for the element.",
       "type": "string"
      },
      "window_id": {
@@ -1782,6 +1820,11 @@
       "description": "Cursor instance to move. Default: 'default'.",
       "type": "string"
      },
+     "pid": {
+      "description": "Window scope: process ID of the target window. Supply with window_id; required on GNOME Wayland and in Wayland inject mode.",
+      "minimum": 1,
+      "type": "integer"
+     },
      "scope": {
       "default": "window",
       "description": "\"window\" (default) moves only the agent cursor overlay; \"desktop\" moves the real OS pointer.",
@@ -1827,6 +1870,11 @@
       ],
       "type": "object"
      },
+     "window_id": {
+      "description": "Window scope: target window id, supplied with pid. Makes x and y window-local.",
+      "minimum": 1,
+      "type": "integer"
+     },
      "x": {
       "description": "Destination X. Window scope: window-local pixels of window_id when pid and window_id are given, otherwise screen coordinates of the agent cursor overlay. Desktop scope: get_desktop_state screenshot pixels.",
       "type": "number"
@@ -1834,16 +1882,6 @@
      "y": {
       "description": "Destination Y, in the same space as x.",
       "type": "number"
-     },
-     "pid": {
-      "description": "Window scope: process ID of the target window. Supply with window_id; required on GNOME Wayland and in Wayland inject mode.",
-      "minimum": 1,
-      "type": "integer"
-     },
-     "window_id": {
-      "description": "Window scope: target window id, supplied with pid. Makes x and y window-local.",
-      "minimum": 1,
-      "type": "integer"
      }
     },
     "required": [
@@ -1957,7 +1995,7 @@
       "type": "number"
      },
      "glide_duration_ms": {
-      "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` or the default `steady` timing also fixes the duration.\nClamped to 0..5000.",
+      "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` or the default `steady` timing also fixes the duration.\nExplicit zero uses speed-based motion unless a timing preset was selected.\nClamped to 0..5000.",
       "type": "number"
      },
      "idle_hide_ms": {
@@ -2124,7 +2162,7 @@
    "read_only": true
   },
   {
-   "description": "Return current cua-driver-rs configuration.",
+   "description": "Return current cua-driver-rs configuration, including the agent_cursor.glide_duration_ms default. Explicit motion overrides are reported by get_agent_cursor_state.",
    "destructive": false,
    "idempotent": true,
    "input_schema": {
@@ -2141,12 +2179,18 @@
    "read_only": true
   },
   {
-   "description": "Update cua-driver-rs configuration. capture_mode / max_image_dimension take effect immediately.\n\nPass each setting as its own field: `{\"capture_mode\": \"som\", \"max_image_dimension\": 0}`.\n\nThe experimental_pip keys persist to ~/.cua-driver/config.json and apply on next daemon restart (the PiP backend is initialised once at startup; Linux ships only the trait stub today — see issue #1729).\n\n`cursor.motion.style`, `cursor.motion.timing` and `cursor.motion.effects.<name>` (`on`, `off`, or `default`) save the default cursor motion for sessions started afterwards. `cursor.motion: \"default\"` clears every saved cursor motion default.\n\n`cursor.badges` (`minimal` default, `verbose`, or `off`) sets the agent cursor badge for every cursor at once.\n\n`cursor.float` (resting float) is `on` (default), `off` or `default`; `cursor.marks` (action marks) and `cursor.rotate` (turn toward travel) are `on`, `off` (default) or `default`. All apply to every cursor at once.",
+   "description": "Update cua-driver-rs configuration. capture_mode / max_image_dimension and agent_cursor_glide_duration_ms take effect immediately.\n\nTwo input shapes (both accepted, matching Windows/Swift):\n- **Legacy {key, value} compatibility wire form**: `{\"key\": \"max_image_dimension\", \"value\": 800}` — single leaf write.\n- **Typed per-field (preferred)**: `{\"capture_mode\": \"ax\", \"max_image_dimension\": 0}`.\n\nThe experimental_pip keys persist to ~/.cua-driver/config.json and apply on next daemon restart (the PiP backend is initialised once at startup; Linux ships only the trait stub today — see issue #1729).\n\n`cursor.motion.style`, `cursor.motion.timing` and `cursor.motion.effects.<name>` (`on`, `off`, or `default`) save the default cursor motion for sessions started afterwards. `cursor.motion: \"default\"` clears every saved cursor motion default.\n\n`cursor.badges` (`minimal` default, `verbose`, or `off`) sets the agent cursor badge for every cursor at once.\n\n`cursor.float` (resting float) is `on` (default), `off` or `default`; `cursor.marks` (action marks) and `cursor.rotate` (turn toward travel) are `on`, `off` (default) or `default`. All apply to every cursor at once.",
    "destructive": false,
    "idempotent": true,
    "input_schema": {
     "additionalProperties": false,
     "properties": {
+     "agent_cursor_glide_duration_ms": {
+      "description": "Default agent cursor glide duration in milliseconds (clamped to 0..5000). 0 preserves speed-based motion. Applies immediately; explicit set_agent_cursor_motion glide duration wins.",
+      "maximum": 5000,
+      "minimum": 0,
+      "type": "number"
+     },
      "capture_mode": {
       "description": "Default capture mode for get_window_state. (\"som\"/\"screenshot\" still decode as deprecated aliases.)",
       "enum": [
@@ -2248,7 +2292,7 @@
       "type": "string"
      },
      "cursor.motion.timing": {
-      "description": "Saved default cursor move timing for new sessions. Built-in default: steady (a 600 ms floor on every move).",
+      "description": "Saved default cursor move timing for new sessions. Built-in default: steady (a 600 ms floor when no glide duration is configured). An explicit timing preset takes precedence over speed-based zero.",
       "enum": [
        "native",
        "fitts",
@@ -2509,7 +2553,7 @@
      },
      "delivery_mode": {
       "default": "background",
-      "description": "Existing-profile attachment only. background (default) attaches in the background when the browser window is on another Space than the user's, and otherwise refuses with background_unavailable, before any visible effect, where attaching would bring the browser in front of the user's app. foreground accepts that, for a screen nobody else is using or when the user agreed; the app that was in front is brought back afterwards.",
+      "description": "Existing-profile attachment only. background (default) refuses with background_unavailable, before any visible effect, where attaching would bring the browser in front of the user's app. foreground accepts that, for a screen nobody else is using or when the user agreed; the app that was in front is brought back afterwards.",
       "enum": [
        "background",
        "foreground"
@@ -3209,7 +3253,7 @@
         "type": "number"
        },
        "glide_duration_ms": {
-        "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` or the default `steady` timing also fixes the duration.\nClamped to 0..5000.",
+        "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` or the default `steady` timing also fixes the duration.\nExplicit zero uses speed-based motion unless a timing preset was selected.\nClamped to 0..5000.",
         "type": "number"
        },
        "idle_hide_ms": {

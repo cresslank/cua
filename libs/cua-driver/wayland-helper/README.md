@@ -9,7 +9,7 @@ normal Wayland client cannot do these things globally.
 
 It exposes `org.cua.WinRects` on the session bus:
 
-- `GetVersion() -> uint`: this fork's helper API version (v16, with the v8
+- `GetVersion() -> uint`: this fork's helper API version (v17, with the v8
   semantic cursor/session-badge API). The driver accepts it only after resolving
   the helper's immutable D-Bus owner and proving that owner is the current
   user's system-installed `gnome-shell` process.
@@ -199,7 +199,58 @@ and a quarantine lease owner that survives driver loss and helper retirement.
 End/Abort/watchdog restoration and transport close are not that proof. No new
 input capability or native-terminal retirement hook is advertised here.
 
-## Other compositors
+## Persistent window switching (v17)
+
+`SwitchToTarget(transaction,target) -> json` advertises `persistent-switch-v1`.
+It binds the transaction to the caller's unique bus owner and the exact helper
+epoch/target. It refuses a locked/non-user session, concurrent foreground/switch
+transactions, stale targets, and a target with a modal child. Only this explicit
+persistent action may close overview, calendar/panel menus and a notification
+banner, unminimize a window or activate another workspace through
+`Main.activateWindow`. It never saves or restores prior focus. A bounded 1.2 s
+poll requires the exact target to own compositor focus on the active workspace,
+with no overview or Shell keyboard grab. Duplicates never replay activation.
+
+`GetSwitchState() -> json` advertises `shell-search-focus-v1`. Readback includes
+protocol/epoch, `overview_visible`, `session_locked`,
+`search_entry_has_key_focus`, `key_focus_in_shell_ui`, `modal_count`,
+`overlay_key_is_super` (the configured Mutter overlay binding), exact
+`focus_window` token and `focus_pid`, plus foreground/persistent transaction-open
+flags. An outstanding restoring/activating transaction refuses keyboard input.
+The search-entry boolean is positive proof
+that Shell's real overview entry owns Clutter key focus, not merely that the
+overview is visible. `FocusSwitchSearch(target)` is a separate explicit action:
+it may focus only the known mapped Shell search entry inside an unlocked,
+visible overview with no extra modal or helper transaction. GNOME normally
+forwards the first printable key to activate search; focusing the entry explicitly
+avoids that unproven character. GetSwitchState remains read-only. Missing
+API/state never authorizes keys.
+
+`DeliverSwitchSearch(target,query)` and `CancelSwitchSearch(target)` advertise
+`shell-search-delivery-v1`. Delivery rechecks the full Shell focus predicate,
+exact target and matching running Shell application search result, then sets the
+entry text and activates that result synchronously in the compositor main loop.
+No match refuses `switch_unverified`; lost overview/focus refuses `shell_not_ready`.
+Cancellation uses `Main.overview.hide()`. Neither method emits keyboard events.
+
+The Linux `switch_window` keyboard route emits only the configured overlay Super
+through a previously prepared RemoteDesktop/EIS transport (optional readiness
+runs before the input lease for auto/keyboard). The worker rechecks the overlay
+binding after queue/device waits. Query, Return and Escape never enter libei or a
+virtual keyboard. The whole-action host-wide lease still serializes agents, while
+receiver-owned synchronous delivery eliminates the physical-focus check/post
+race for launcher contents. Attempts report `delivery: "shell_search"`; exact
+PID/window focus readback remains mandatory for success. API 17 is unreleased;
+the exact-target protocol and stable bootstrap bytes remain unchanged.
+No other tool's GNOME desktop-input refusal or capture/foreground guard changes.
+
+Implementation-only activation uses the existing reviewed hot-reload transaction;
+the bootstrap bytes, loader ABI 1 and exact-target protocol 4 are unchanged.
+The driver's existing full-width incarnation-qualified public IDs and collision
+rejection remain unchanged. The helper's full epoch-qualified target token is
+the exact-identity authority.
+
+### Non-GNOME Wayland
 
 wlroots compositors such as Sway and labwc do not need this helper: cua-driver
 uses foreign-toplevel activation, virtual-pointer input, and layer-shell there.
@@ -210,8 +261,9 @@ because RemoteDesktop/libei input is global to the compositor focus.
 ## Versions and other apps that bundle the helper
 
 The UUID `winrects@cua` and session-bus name `org.cua.WinRects` are shared with
-other apps, including T3 Code. This bundle reports helper API 16 in both
-`GetVersion()` and `metadata.json`. Exact-target authority is a separate
+other apps, including T3 Code. This implementation reports helper API 17 in
+`GetVersion()` and its closure manifest. `metadata.json` remains the stable
+bootstrap release (16), not the selected implementation version. Exact-target authority is a separate
 protocol 4 capability contract: a larger API version alone never proves it.
 Legacy global capture/activation requests are refused, and clients must prove
 the helper incarnation and exact target before requesting pixels or input.

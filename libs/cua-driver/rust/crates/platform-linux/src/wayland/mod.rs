@@ -29,6 +29,7 @@ pub use semantic_input::input_route_for_tool;
 pub mod shell_helper;
 pub mod sway_ipc;
 mod virtual_keyboard;
+pub(crate) mod window_switch;
 // RemoteDesktop/libei input is portable and ships in release binaries.
 // PipeWire ScreenCast capture is no longer built here (the portal-capture feature is kept for downstream forwarding).
 #[cfg(feature = "portal-input")]
@@ -121,6 +122,26 @@ pub fn is_gnome_wayland_session() -> bool {
 /// Wait for portal/libei before the dispatch grant or foreground transaction.
 /// Native/inject routes never open a portal just because an action is admitted.
 pub fn ensure_raw_input_ready_for_tool(tool: &str, args: &serde_json::Value) -> Result<(), String> {
+    if tool == "switch_window" {
+        // Prepare a possible keyboard rung before taking either input lease.
+        // A readiness failure must not suppress native activation: the adapter
+        // reports keyboard_unavailable only if that rung is actually needed.
+        // An explicit native request never opens an input session.
+        #[cfg(feature = "portal-input")]
+        if args.get("method").and_then(serde_json::Value::as_str) != Some("native")
+            && cua_driver_core::window_switch::SwitchArgs::parse(args).is_ok()
+            && is_gnome_wayland_session()
+        {
+            if let Ok(peer) = shell_helper::window_switch::SwitchPeer::connect() {
+                if peer.has("shell-search-focus-v1")
+                    && peer.state().is_ok_and(|state| !state.session_locked)
+                {
+                    let _ = libei::reconnect_for_readiness("keyboard");
+                }
+            }
+        }
+        return Ok(());
+    }
     let session = if !is_wayland() || is_inject_mode() {
         InputReadinessSession::Bypass
     } else if is_gnome_wayland_session() {

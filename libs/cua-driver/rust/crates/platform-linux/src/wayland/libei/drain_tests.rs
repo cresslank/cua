@@ -238,12 +238,10 @@ impl CommandSender {
 }
 
 async fn assert_owned(waiter: &Receiver<anyhow::Result<()>>) {
+    let reply = waiter.recv_timeout(Duration::from_millis(100));
     assert!(
-        matches!(
-            waiter.recv_timeout(Duration::from_millis(100)),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout)
-        ),
-        "command replied before drain"
+        matches!(reply, Err(crossbeam_channel::RecvTimeoutError::Timeout)),
+        "command replied before drain: {reply:?}"
     );
     assert_eq!(
         global()
@@ -488,18 +486,25 @@ async fn cancelled_unstarted_command_releases_captured_lease_without_replay() {
 async fn foreground_commands_share_one_drain_deadline_under_backpressure() {
     let _serial = LEASE_TEST.lock().await;
     let mut fixture = Fixture::start();
-    // Model a transaction whose Begin/validation already used 22s of its 25s
+    // Model a transaction whose Begin/validation already used 15s of its 25s
     // input budget. Both sends use the real thread-local scope and sender.
-    let start = Instant::now() - Duration::from_secs(22);
+    // Leave scheduler headroom for two real 32K-character batches: the old 3s
+    // budget plus an artificial 2s sleep could expire before the second blocked
+    // command's ownership probe on a loaded runner. Exact deadline equality
+    // below, not time spent sleeping, proves that the budget was not renewed.
+    let start = Instant::now() - Duration::from_secs(15);
     let scope = super::super::foreground_deadline::Scope::begin(start);
     let deadline = start + Duration::from_secs(25);
     let (waiter, first) = fixture.sender.queue_owned_text().await;
     assert_eq!(first.deadline, deadline);
-    assert!(readable(&fixture.peer, Duration::from_secs(1)));
+    assert!(readable(
+        &fixture.peer,
+        deadline.saturating_duration_since(Instant::now())
+    ));
     assert_owned(&waiter).await;
-    // Keep the peer stopped while the first command consumes most of the
-    // remaining budget, then allow that command to complete successfully.
-    thread::sleep(Duration::from_secs(2));
+    // The ownership probe observes real backpressure with the peer stopped.
+    // Allow only this first command to drain successfully; keep the second
+    // blocked until the same transaction deadline discards the transport.
     let server = fixture.server.clone();
     let reader = thread::spawn(move || read_text_batch(server));
     wait_for_reply(waiter, first).unwrap();
@@ -510,7 +515,10 @@ async fn foreground_commands_share_one_drain_deadline_under_backpressure() {
         second.deadline, deadline,
         "later command renewed the transaction budget"
     );
-    assert!(readable(&fixture.peer, Duration::from_millis(500)));
+    assert!(readable(
+        &fixture.peer,
+        deadline.saturating_duration_since(Instant::now())
+    ));
     assert_owned(&waiter).await;
     let error = wait_for_reply(waiter, second).unwrap_err();
     assert_eq!(error.to_string(), "input_unavailable: libei output drain failed; EIS connection discarded: libei output drain deadline expired");

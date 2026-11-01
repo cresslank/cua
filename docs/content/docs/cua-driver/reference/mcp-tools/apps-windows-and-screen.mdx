@@ -19,6 +19,7 @@ import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
 | [`launch_app`](#launch_app) | Launch a macOS app in the background: the target does NOT come to the foreground. | macOS, Linux, Windows |
 | [`kill_app`](#kill_app) | Force-terminate a process by pid (kill -9 equivalent on macOS / Linux; taskkill /F equivalent on Windows). | macOS, Linux, Windows |
 | [`bring_to_front`](#bring_to_front) | Persistently activate an app and leave it in the foreground. | macOS, Linux, Windows |
+| [`switch_window`](#switch_window) | Persistently switch to a running app's window. | macOS, Linux |
 | [`set_window_frame`](#set_window_frame) | Set one exact top-level window's frame in the desktop-coordinate space reported by list_windows and verify the resulting geometry through an independent readback. | macOS, Linux, Windows |
 | [`invoke_menu`](#invoke_menu) | Resolve an exact application-menu path one live native level at a time and invoke its final item through accessibility APIs. | macOS, Linux, Windows |
 | [`debug_window_info`](#debug_window_info) | Diagnostic: dump everything cua-driver sees about a pid's top-level windows from the daemon's session perspective. | Windows |
@@ -77,7 +78,7 @@ List Linux apps, both currently running and installed-but-not-running, with per-
 - last_used: RFC3339 mtime of the `.desktop` file, when readable.
 - windows: the app's current top-level windows (same records as list_windows); empty for a process without one.
 
-Running apps come from `/proc`. Installed apps come from XDG Desktop Entry files in $XDG_DATA_HOME/applications and each $XDG_DATA_DIRS entry's applications/ subdir. Entries with `NoDisplay=true` or `Hidden=true` are filtered. A `.desktop` file whose launcher matches a running process (by basename), or whose WM_CLASS a top-level window carries, is merged into a single entry with `running: true`.
+Running apps come from `/proc`. Installed apps come from XDG Desktop Entry files in $XDG_DATA_HOME/applications and each $XDG_DATA_DIRS entry's applications/ subdir. Entries with `NoDisplay=true` or `Hidden=true` are filtered. A `.desktop` file is merged with a running process only from an exact, unambiguous executable path or a constrained `--name` desktop-ID claim corroborated by StartupWMClass when present; ambiguous aliases fail closed.
 
 Use this for "is X installed?" as well as "is X running?". For per-window state, visibility, geometry, titles, call list_windows instead.
 
@@ -212,7 +213,7 @@ Launch a Linux app in the background. Provide launch_path (preferred: round-trip
 | <span id="launch_app--linux--bundle_id"></span>`bundle_id` | `string` |  | Ignored on Linux (macOS/Windows concept). |
 | <span id="launch_app--linux--launch_path"></span>`launch_path` | `string` |  | Round-trip the `launch_path` returned by `list_apps`: the Exec= command from the .desktop file with XDG field codes already stripped. Highest precedence on Linux; spawned directly via the system shell. |
 | <span id="launch_app--linux--name"></span>`name` | `string` |  | App name or command to launch. Tried as a direct command first, then matched against installed .desktop applications (exact display name, desktop-file id, or Exec basename; else an unambiguous display-name substring). |
-| <span id="launch_app--linux--urls"></span>`urls` | `string[]` |  | URLs to open via xdg-open. |
+| <span id="launch_app--linux--urls"></span>`urls` | `string[]` |  | URLs to open through the resolved XDG desktop handler, with xdg-open as a compatibility fallback. |
 
 </Tab>
 <Tab value="Windows">
@@ -305,14 +306,14 @@ Persistently activate an app and leave it in the foreground. Most input does not
 </Tab>
 <Tab value="Linux">
 
-Persistently activate a window so subsequent input lands on it. This deliberately breaks the no-foreground contract and is not part of the normal input ladder. For an ordinary `background_unavailable` response, retry only the refused action with `delivery_mode:"foreground"`; the input tool performs its own activate, act, and restore sequence. Use `bring_to_front` only for a focus-proxy surface that must remain foreground across multiple calls, such as a remote desktop session, or when repeated action-scoped activation prevents the remote surface from accepting input. X11: EWMH _NET_ACTIVE_WINDOW activation (the `wmctrl -a` equivalent, with proper timestamp handling to beat focus-stealing prevention). Wayland: activates through a target-addressable compositor adapter (wlroots foreign-toplevel or the GNOME Shell helper) and refuses when the compositor offers no safe adapter. Matches the macOS / Windows bring_to_front rung.
+Persistently activate a window so subsequent input lands on it. X11: EWMH _NET_ACTIVE_WINDOW activation (the `wmctrl -a` equivalent, proper timestamp handling to beat focus-stealing prevention); call it before `delivery_mode:"foreground"` input to avoid a per-call flash, or to escalate when background injection didn't land. Wayland: activates through a target-addressable compositor adapter (wlroots foreign-toplevel or the GNOME Shell helper) and refuses when the compositor offers no safe adapter. Matches the macOS / Windows bring_to_front rung.
 
 **Linux parameters**
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | <span id="bring_to_front--linux--pid"></span>`pid` | `integer` | required | Process ID of the app to activate. |
-| <span id="bring_to_front--linux--window_id"></span>`window_id` | `integer` |  | X11 window id (xid) to activate. If omitted, the first window of `pid` is used. |
+| <span id="bring_to_front--linux--window_id"></span>`window_id` | `integer` |  | Exact window id to activate. Required when a Wayland process owns more than one toplevel. |
 
 </Tab>
 <Tab value="Windows">
@@ -338,6 +339,26 @@ Implementation uses the `AttachThreadInput` trick to bypass Windows' foreground-
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | <span id="bring_to_front--session"></span>`session` | `string` |  | For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session. |
+
+**Example arguments**
+
+```json
+{"pid":1}
+```
+
+### `switch_window`
+
+Persistently switch to a running app's window. This changes foreground focus and does not restore prior focus. auto tries exact native activation first, then real Shell/Spotlight keyboard search only after refusal or unverified activation. Keyboard text and Return require proven launcher search-field focus. Success requires compositor/OS focus readback, never request acceptance. GNOME Wayland requires an unambiguous exact toplevel and compatible helper; X11 supports native activation only. macOS verifies the exact focused window. Locked sessions refuse.
+
+Effect: mutating, idempotent. Platforms: macOS, Linux.
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| <span id="switch_window--method"></span>`method` | `"auto" \| "native" \| "keyboard"` | `"auto"` | auto tries native then keyboard on refusal/unverified focus; native and keyboard use only the named route. |
+| <span id="switch_window--pid"></span>`pid` | `integer` | required | Process ID of the running target application. Range: 1 to 2147483647. |
+| <span id="switch_window--query"></span>`query` | `string` |  | Keyboard search text without control characters. Defaults to the target application's display name. |
+| <span id="switch_window--session"></span>`session` | `string` |  | For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session. |
+| <span id="switch_window--window_id"></span>`window_id` | `integer` |  | Exact window ID from fresh list_windows discovery. Required for a Wayland PID with multiple toplevels. Minimum: 1. |
 
 **Example arguments**
 
@@ -420,7 +441,7 @@ START NARROW: a read walks at most 250 nodes by default and says `Tree truncated
 
 DIFF READS (use them for every re-read after acting): `since:"latest"`, or `since:<snapshot_id>` from an earlier read of the same window, returns only what changed: `+` added, `~` changed, `-` removed rows (removed ids are the old snapshot's), a `reindexed:` line if indices shifted, or `no change since …; focused element is …`. The response carries a NEW snapshot_id: use it in tokens. An unknown, expired, other-window or differently-scoped (query/max_elements/max_depth) `since` falls back to a full read; `since_status` says why.
 
-A new snapshot of the same (pid, window_id) replaces the previous one and stales its tokens (`invalidated_snapshot_ids`). `include_screenshot:false` returns the tree only and keeps the last screenshot's pixel frame while the window keeps its size; `include_accessibility_tree:false` returns only the screenshot and keeps the current snapshot's rows and tokens valid (use it, not `max_elements:1`, when you just need to look); adding `display_only:true` (live previews) also leaves the pixel frame alone. The tree can lie on some surfaces (Electron, Catalyst, virtualized rows with `h:1` frames): cross-check the screenshot, and use pixel x,y at action time only for elements missing from the tree.
+A new snapshot of the same (pid, window_id) replaces the previous one and stales its tokens (`invalidated_snapshot_ids`). `include_screenshot:false` returns the tree only and keeps a valid same-session screenshot frame at the same known window size; `include_accessibility_tree:false` refreshes the screenshot while preserving live same-session rows and tokens. Scrolling containers may leave non-visible, non-selected rows unread (`collapsed_rows`); scroll or search to reveal them. The tree can lie on some surfaces (Electron, Catalyst, virtualized rows with `h:1` frames): cross-check the screenshot, and use pixel x,y at action time only for elements missing from the tree.
 
 Refusals: `window_id_not_found`; `window_owner_pid_mismatch` names the real `owner_pid` (sandboxed Open/Save panels belong to a panel service). `degraded_reason` `ax_window_unresolved` or `ax_app_launching` (the latter with `truncation_reason: app_lookup_timeout`) means an empty tree: re-snapshot, or act with `delivery_mode:"foreground"`. `degraded_reason` `screen_locked` means the screen saver, display sleep or a lock hid every window from accessibility: wake and unlock the Mac, then re-snapshot; foreground input would reach the lock screen. `px_frame_mismatch` / `px_capture_unavailable` omit the unprovable screenshot; the AX payload stays valid.
 
@@ -779,26 +800,85 @@ Start, escalate, inspect and end lifecycle sessions.
 
 ### `start_session`
 
+Effect: mutating, idempotent. Platforms: macOS, Linux, Windows.
+
+<Tabs items={['macOS', 'Linux', 'Windows']} groupId="platform" persist>
+<Tab value="macOS">
+
 Optionally create or return a lifecycle session before acting. For multi-call work, prefer a short public `session` label and repeat it on every call that accepts it; an omitted value uses the authenticated transport lease's implicit session instead. This tool is optional because an ordinary action can create or reuse a named run directly. Use it to set the initial cursor theme before acting or to revive a public name after it has ended; ordinary actions never revive ended names. `capture_scope` is deprecated compatibility input; new callers select window or desktop modality per action. Idempotent.
 
-Effect: mutating, idempotent. Platforms: macOS, Linux, Windows.
+**macOS parameters**
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| <span id="start_session--macos--cursor_motion"></span>`cursor_motion` | `object` |  | Optional initial cursor motion (style, timing, effects and tuning). The host applies it before the cursor is first made visible. A later `set_agent_cursor_motion` call wins; this wins over the saved default (`cursor.motion.*` in the driver config) and the built-in `signature_arc`. Reduced motion always wins. |
+| <span id="start_session--macos--cursor_motion-arc_flow"></span>`cursor_motion.arc_flow` | `number` |  | Added to the arc asymmetry of `signature_arc`, `spring_settle` and `comet_swoop`: positive moves the apex toward the destination. Clamped to -1..1 (default 0). |
+| <span id="start_session--macos--cursor_motion-arc_size"></span>`cursor_motion.arc_size` | `number` |  | Scales the arc of `signature_arc`, `spring_settle` and `comet_swoop`: 0.25 (default) keeps the style's arc, 0 is a straight line, 0.5 doubles it. Clamped to 0..1. |
+| <span id="start_session--macos--cursor_motion-dwell_after_click_ms"></span>`cursor_motion.dwell_after_click_ms` | `number` |  | Pause after a click animation, in milliseconds. Clamped to 0..5000 (default 80). |
+| <span id="start_session--macos--cursor_motion-effects"></span>`cursor_motion.effects` | `object` |  | Turn effects on or off. Omit a field to keep it; `"default"` restores the style default. |
+| <span id="start_session--macos--cursor_motion-end_handle"></span>`cursor_motion.end_handle` | `number` |  | Arc control-point offset from the end, as a fraction of the distance, for `signature_arc`, `spring_settle` and `comet_swoop`. Clamped to 0..1 (default 0.3). |
+| <span id="start_session--macos--cursor_motion-glide_duration_ms"></span>`cursor_motion.glide_duration_ms` | `number` |  | Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A nonzero value with `native` or the default `steady` timing also fixes the duration. Explicit zero uses speed-based motion unless a timing preset was selected. Clamped to 0..5000. |
+| <span id="start_session--macos--cursor_motion-idle_hide_ms"></span>`cursor_motion.idle_hide_ms` | `number` |  | Hide the cursor after this many idle milliseconds; 0 never hides it. Clamped to 0..60000 (default 15000). |
+| <span id="start_session--macos--cursor_motion-spring"></span>`cursor_motion.spring` | `number` |  | Arrival spring damping for `classic`: 1 is critically damped, 0.3 is bouncy. Clamped to 0.3..1 (default 0.72). |
+| <span id="start_session--macos--cursor_motion-start_handle"></span>`cursor_motion.start_handle` | `number` |  | Arc control-point offset from the start, as a fraction of the distance, for `signature_arc`, `spring_settle` and `comet_swoop`. Clamped to 0..1 (default 0.3). |
+| <span id="start_session--macos--cursor_motion-style"></span>`cursor_motion.style` | `"signature_arc" \| "spring_settle" \| "magnetic" \| "comet_swoop" \| "adaptive" \| "classic"` |  | Trajectory style. `signature_arc` (default) is one arc with a small follow-through; `spring_settle` lands with one soft bounce; `magnetic` is pulled into the target; `comet_swoop` is a wide arc with a short trail; `adaptive` picks a careful approach for small targets and a swoop for long moves; `classic` is the previous Dubins glide. When the theme's reduced motion is on, every move is a short straight glide with no effects. |
+| <span id="start_session--macos--cursor_motion-timing"></span>`cursor_motion.timing` | `"native" \| "fitts" \| "fixed" \| "relaxed" \| "steady" \| "calm" \| "deliberate"` |  | `steady` (default) keeps the style's timing but makes every move take at least 600 ms, with a gentler ease; `relaxed` and `calm` do the same with a 450 or 750 ms floor. `native` uses the style's own timing; `fitts` scales the move time with distance and target size; `deliberate` is a slower Fitts curve (450..1300 ms); `fixed` uses glide_duration_ms (1430 ms when 0). |
+| <span id="start_session--macos--cursor_motion-turn_radius"></span>`cursor_motion.turn_radius` | `number` |  | Minimum turning radius of the `classic` glide path, in points; smaller turns tighter. Clamped to 1..1000 (default 80). |
+
+</Tab>
+<Tab value="Linux">
+
+Optionally create or return a lifecycle session before acting. For multi-call work, prefer a short public `session` label and repeat it on every call that accepts it; an omitted value uses the authenticated transport lease's implicit session instead. This tool is optional because an ordinary action can create or reuse a named run directly. Use it to set the initial cursor theme before acting or to revive a public name after it has ended; ordinary actions never revive ended names. `capture_scope` is deprecated compatibility input; new callers select window or desktop modality per action. Idempotent.
+
+**Linux parameters**
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| <span id="start_session--linux--cursor_motion"></span>`cursor_motion` | `object` |  | Optional initial cursor motion (style, timing, effects and tuning). The host applies it before the cursor is first made visible. A later `set_agent_cursor_motion` call wins; this wins over the saved default (`cursor.motion.*` in the driver config) and the built-in `signature_arc`. Reduced motion always wins. |
+| <span id="start_session--linux--cursor_motion-arc_flow"></span>`cursor_motion.arc_flow` | `number` |  | Added to the arc asymmetry of `signature_arc`, `spring_settle` and `comet_swoop`: positive moves the apex toward the destination. Clamped to -1..1 (default 0). |
+| <span id="start_session--linux--cursor_motion-arc_size"></span>`cursor_motion.arc_size` | `number` |  | Scales the arc of `signature_arc`, `spring_settle` and `comet_swoop`: 0.25 (default) keeps the style's arc, 0 is a straight line, 0.5 doubles it. Clamped to 0..1. |
+| <span id="start_session--linux--cursor_motion-dwell_after_click_ms"></span>`cursor_motion.dwell_after_click_ms` | `number` |  | Pause after a click animation, in milliseconds. Clamped to 0..5000 (default 80). |
+| <span id="start_session--linux--cursor_motion-effects"></span>`cursor_motion.effects` | `object` |  | Turn effects on or off. Omit a field to keep it; `"default"` restores the style default. |
+| <span id="start_session--linux--cursor_motion-end_handle"></span>`cursor_motion.end_handle` | `number` |  | Arc control-point offset from the end, as a fraction of the distance, for `signature_arc`, `spring_settle` and `comet_swoop`. Clamped to 0..1 (default 0.3). |
+| <span id="start_session--linux--cursor_motion-glide_duration_ms"></span>`cursor_motion.glide_duration_ms` | `number` |  | Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A nonzero value with `native` or the default `steady` timing also fixes the duration. Explicit zero uses speed-based motion unless a timing preset was selected. Clamped to 0..5000. |
+| <span id="start_session--linux--cursor_motion-idle_hide_ms"></span>`cursor_motion.idle_hide_ms` | `number` |  | Hide the cursor after this many idle milliseconds; 0 never hides it. Clamped to 0..60000 (default 15000). |
+| <span id="start_session--linux--cursor_motion-spring"></span>`cursor_motion.spring` | `number` |  | Arrival spring damping for `classic`: 1 is critically damped, 0.3 is bouncy. Clamped to 0.3..1 (default 0.72). |
+| <span id="start_session--linux--cursor_motion-start_handle"></span>`cursor_motion.start_handle` | `number` |  | Arc control-point offset from the start, as a fraction of the distance, for `signature_arc`, `spring_settle` and `comet_swoop`. Clamped to 0..1 (default 0.3). |
+| <span id="start_session--linux--cursor_motion-style"></span>`cursor_motion.style` | `"signature_arc" \| "spring_settle" \| "magnetic" \| "comet_swoop" \| "adaptive" \| "classic"` |  | Trajectory style. `signature_arc` (default) is one arc with a small follow-through; `spring_settle` lands with one soft bounce; `magnetic` is pulled into the target; `comet_swoop` is a wide arc with a short trail; `adaptive` picks a careful approach for small targets and a swoop for long moves; `classic` is the previous Dubins glide. When the theme's reduced motion is on, every move is a short straight glide with no effects. |
+| <span id="start_session--linux--cursor_motion-timing"></span>`cursor_motion.timing` | `"native" \| "fitts" \| "fixed" \| "relaxed" \| "steady" \| "calm" \| "deliberate"` |  | `steady` (default) keeps the style's timing but makes every move take at least 600 ms, with a gentler ease; `relaxed` and `calm` do the same with a 450 or 750 ms floor. `native` uses the style's own timing; `fitts` scales the move time with distance and target size; `deliberate` is a slower Fitts curve (450..1300 ms); `fixed` uses glide_duration_ms (1430 ms when 0). |
+| <span id="start_session--linux--cursor_motion-turn_radius"></span>`cursor_motion.turn_radius` | `number` |  | Minimum turning radius of the `classic` glide path, in points; smaller turns tighter. Clamped to 1..1000 (default 80). |
+
+</Tab>
+<Tab value="Windows">
+
+Optionally create or return a lifecycle session before acting. For multi-call work, prefer a short public `session` label and repeat it on every call that accepts it; an omitted value uses the authenticated transport lease's implicit session instead. This tool is optional because an ordinary action can create or reuse a named run directly. Use it to set the initial cursor theme before acting or to revive a public name after it has ended; ordinary actions never revive ended names. `capture_scope` is deprecated compatibility input; new callers select window or desktop modality per action. Idempotent.
+
+**Windows parameters**
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| <span id="start_session--windows--cursor_motion"></span>`cursor_motion` | `object` |  | Optional initial cursor motion (style, timing, effects and tuning). The host applies it before the cursor is first made visible. A later `set_agent_cursor_motion` call wins; this wins over the saved default (`cursor.motion.*` in the driver config) and the built-in `signature_arc`. Reduced motion always wins. |
+| <span id="start_session--windows--cursor_motion-arc_flow"></span>`cursor_motion.arc_flow` | `number` |  | Added to the arc asymmetry of `signature_arc`, `spring_settle` and `comet_swoop`: positive moves the apex toward the destination. Clamped to -1..1 (default 0). |
+| <span id="start_session--windows--cursor_motion-arc_size"></span>`cursor_motion.arc_size` | `number` |  | Scales the arc of `signature_arc`, `spring_settle` and `comet_swoop`: 0.25 (default) keeps the style's arc, 0 is a straight line, 0.5 doubles it. Clamped to 0..1. |
+| <span id="start_session--windows--cursor_motion-dwell_after_click_ms"></span>`cursor_motion.dwell_after_click_ms` | `number` |  | Pause after a click animation, in milliseconds. Clamped to 0..5000 (default 80). |
+| <span id="start_session--windows--cursor_motion-effects"></span>`cursor_motion.effects` | `object` |  | Turn effects on or off. Omit a field to keep it; `"default"` restores the style default. |
+| <span id="start_session--windows--cursor_motion-end_handle"></span>`cursor_motion.end_handle` | `number` |  | Arc control-point offset from the end, as a fraction of the distance, for `signature_arc`, `spring_settle` and `comet_swoop`. Clamped to 0..1 (default 0.3). |
+| <span id="start_session--windows--cursor_motion-glide_duration_ms"></span>`cursor_motion.glide_duration_ms` | `number` |  | Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A nonzero value with `native` or the default `steady` timing also fixes the duration. Clamped to 0..5000. |
+| <span id="start_session--windows--cursor_motion-idle_hide_ms"></span>`cursor_motion.idle_hide_ms` | `number` |  | Hide the cursor after this many idle milliseconds; 0 never hides it. Clamped to 0..60000 (default 15000). |
+| <span id="start_session--windows--cursor_motion-spring"></span>`cursor_motion.spring` | `number` |  | Arrival spring damping for `classic`: 1 is critically damped, 0.3 is bouncy. Clamped to 0.3..1 (default 0.72). |
+| <span id="start_session--windows--cursor_motion-start_handle"></span>`cursor_motion.start_handle` | `number` |  | Arc control-point offset from the start, as a fraction of the distance, for `signature_arc`, `spring_settle` and `comet_swoop`. Clamped to 0..1 (default 0.3). |
+| <span id="start_session--windows--cursor_motion-style"></span>`cursor_motion.style` | `"signature_arc" \| "spring_settle" \| "magnetic" \| "comet_swoop" \| "adaptive" \| "classic"` |  | Trajectory style. `signature_arc` (default) is one arc with a small follow-through; `spring_settle` lands with one soft bounce; `magnetic` is pulled into the target; `comet_swoop` is a wide arc with a short trail; `adaptive` picks a careful approach for small targets and a swoop for long moves; `classic` is the previous Dubins glide. When the theme's reduced motion is on, every move is a short straight glide with no effects. |
+| <span id="start_session--windows--cursor_motion-timing"></span>`cursor_motion.timing` | `"native" \| "fitts" \| "fixed" \| "relaxed" \| "steady" \| "calm" \| "deliberate"` |  | `steady` (default) keeps the style's timing but makes every move take at least 600 ms, with a gentler ease; `relaxed` and `calm` do the same with a 450 or 750 ms floor. `native` uses the style's own timing; `fitts` scales the move time with distance and target size; `deliberate` is a slower Fitts curve (450..1300 ms); `fixed` uses glide_duration_ms (1430 ms when 0). |
+| <span id="start_session--windows--cursor_motion-turn_radius"></span>`cursor_motion.turn_radius` | `number` |  | Minimum turning radius of the `classic` glide path, in points; smaller turns tighter. Clamped to 1..1000 (default 80). |
+
+</Tab>
+</Tabs>
+
+**Parameters on every platform**
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
 | <span id="start_session--capture_scope"></span>`capture_scope` | `"auto" \| "window" \| "desktop"` |  | Deprecated compatibility policy. New callers select window or desktop modality on each action instead of storing it on the session. |
-| <span id="start_session--cursor_motion"></span>`cursor_motion` | `object` |  | Optional initial cursor motion (style, timing, effects and tuning). The host applies it before the cursor is first made visible. A later `set_agent_cursor_motion` call wins; this wins over the saved default (`cursor.motion.*` in the driver config) and the built-in `signature_arc`. Reduced motion always wins. |
-| <span id="start_session--cursor_motion-arc_flow"></span>`cursor_motion.arc_flow` | `number` |  | Added to the arc asymmetry of `signature_arc`, `spring_settle` and `comet_swoop`: positive moves the apex toward the destination. Clamped to -1..1 (default 0). |
-| <span id="start_session--cursor_motion-arc_size"></span>`cursor_motion.arc_size` | `number` |  | Scales the arc of `signature_arc`, `spring_settle` and `comet_swoop`: 0.25 (default) keeps the style's arc, 0 is a straight line, 0.5 doubles it. Clamped to 0..1. |
-| <span id="start_session--cursor_motion-dwell_after_click_ms"></span>`cursor_motion.dwell_after_click_ms` | `number` |  | Pause after a click animation, in milliseconds. Clamped to 0..5000 (default 80). |
-| <span id="start_session--cursor_motion-effects"></span>`cursor_motion.effects` | `object` |  | Turn effects on or off. Omit a field to keep it; `"default"` restores the style default. |
-| <span id="start_session--cursor_motion-end_handle"></span>`cursor_motion.end_handle` | `number` |  | Arc control-point offset from the end, as a fraction of the distance, for `signature_arc`, `spring_settle` and `comet_swoop`. Clamped to 0..1 (default 0.3). |
-| <span id="start_session--cursor_motion-glide_duration_ms"></span>`cursor_motion.glide_duration_ms` | `number` |  | Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A nonzero value with `native` or the default `steady` timing also fixes the duration. Clamped to 0..5000. |
-| <span id="start_session--cursor_motion-idle_hide_ms"></span>`cursor_motion.idle_hide_ms` | `number` |  | Hide the cursor after this many idle milliseconds; 0 never hides it. Clamped to 0..60000 (default 15000). |
-| <span id="start_session--cursor_motion-spring"></span>`cursor_motion.spring` | `number` |  | Arrival spring damping for `classic`: 1 is critically damped, 0.3 is bouncy. Clamped to 0.3..1 (default 0.72). |
-| <span id="start_session--cursor_motion-start_handle"></span>`cursor_motion.start_handle` | `number` |  | Arc control-point offset from the start, as a fraction of the distance, for `signature_arc`, `spring_settle` and `comet_swoop`. Clamped to 0..1 (default 0.3). |
-| <span id="start_session--cursor_motion-style"></span>`cursor_motion.style` | `"signature_arc" \| "spring_settle" \| "magnetic" \| "comet_swoop" \| "adaptive" \| "classic"` |  | Trajectory style. `signature_arc` (default) is one arc with a small follow-through; `spring_settle` lands with one soft bounce; `magnetic` is pulled into the target; `comet_swoop` is a wide arc with a short trail; `adaptive` picks a careful approach for small targets and a swoop for long moves; `classic` is the previous Dubins glide. When the theme's reduced motion is on, every move is a short straight glide with no effects. |
-| <span id="start_session--cursor_motion-timing"></span>`cursor_motion.timing` | `"native" \| "fitts" \| "fixed" \| "relaxed" \| "steady" \| "calm" \| "deliberate"` |  | `steady` (default) keeps the style's timing but makes every move take at least 600 ms, with a gentler ease; `relaxed` and `calm` do the same with a 450 or 750 ms floor. `native` uses the style's own timing; `fitts` scales the move time with distance and target size; `deliberate` is a slower Fitts curve (450..1300 ms); `fixed` uses glide_duration_ms (1430 ms when 0). |
-| <span id="start_session--cursor_motion-turn_radius"></span>`cursor_motion.turn_radius` | `number` |  | Minimum turning radius of the `classic` glide path, in points; smaller turns tighter. Clamped to 1..1000 (default 80). |
 | <span id="start_session--cursor_theme"></span>`cursor_theme` | `object` |  | Optional initial cursor theme. The host applies it before the cursor is first made visible, avoiding a flash of the default theme. |
 | <span id="start_session--cursor_theme-reduced_motion"></span>`cursor_theme.reduced_motion` | `"auto" \| "on" \| "off"` | `"auto"` |  |
 | <span id="start_session--cursor_theme-theme_id"></span>`cursor_theme.theme_id` | `string` |  |  |

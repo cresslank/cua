@@ -215,6 +215,20 @@ struct CommandCompletion {
 struct CommandExecution {
     cancelled: bool,
     lease: cua_driver_core::blocking::ActionLeaseScope,
+    validate: Option<DispatchValidation>,
+}
+
+/// Positive focus proof evaluated by the worker after queue/readiness waits,
+/// immediately before producing input. Only the dedicated switch route uses it.
+pub(crate) type DispatchValidation = Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
+
+fn validate_dispatch(
+    validate: Option<&(dyn Fn() -> anyhow::Result<()> + Send + Sync)>,
+) -> anyhow::Result<()> {
+    if let Some(validate) = validate {
+        validate()?;
+    }
+    Ok(())
 }
 
 struct QueuedCommand {
@@ -353,6 +367,14 @@ impl CommandSender {
     }
 
     fn send(&self, command: Cmd) -> anyhow::Result<Arc<CommandCompletion>> {
+        self.send_validated(command, None)
+    }
+
+    fn send_validated(
+        &self,
+        command: Cmd,
+        validate: Option<DispatchValidation>,
+    ) -> anyhow::Result<Arc<CommandCompletion>> {
         self.check_running()?;
         if !matches!(command, Cmd::Shutdown) {
             cua_driver_core::action_lease::require_raw_input_allowed()
@@ -363,6 +385,7 @@ impl CommandSender {
             execution: Mutex::new(CommandExecution {
                 cancelled: false,
                 lease: cua_driver_core::blocking::ActionLeaseScope::capture(),
+                validate,
             }),
         });
         let queued = QueuedCommand {
@@ -634,6 +657,20 @@ pub fn press_key(keycode: u32) -> anyhow::Result<()> {
         })
         .map_err(|e| anyhow::anyhow!("libei worker channel closed: {e}"))?;
     wait_for_reply(rx_r, completion)
+}
+
+/// The switch fallback can emit only Mutter's configured overlay key. Query,
+/// commit and cancellation are receiver-routed Shell RPCs, never EIS input.
+
+pub(crate) fn switch_overlay(validate: DispatchValidation) -> anyhow::Result<()> {
+    ensure_started()?; // starts only the worker, never an EIS/portal connection
+    let (reply, rx) = bounded(1);
+    let command = Cmd::PressKey {
+        keycode: 125,
+        reply,
+    };
+    let completion = tx()?.send_validated(command, Some(validate))?;
+    wait_for_reply(rx, completion)
 }
 
 /// Submit an ordered sequence of evdev key press/release transitions.
@@ -1114,9 +1151,20 @@ fn run_calloop(
                 if execution.cancelled || Instant::now() >= completion.deadline {
                     command.reply(Err(command_timeout()));
                 } else {
-                    execution
-                        .lease
-                        .run(|| state.handle_command(command, completion.deadline));
+                    execution.lease.run(|| {
+                        let validation =
+                            validate_dispatch(execution.validate.as_deref()).and_then(|()| {
+                                if execution.validate.is_some() {
+                                    state.validate_switch_command(command)?;
+                                }
+                                Ok(())
+                            });
+                        if let Err(error) = validation {
+                            command.reply(Err(error));
+                        } else {
+                            state.handle_command(command, completion.deadline);
+                        }
+                    });
                 }
                 execution.lease = Default::default();
                 drop(execution);
@@ -1444,6 +1492,21 @@ impl EisState {
     /// an absolute-pointer device that never arrives — and vice versa. Commands
     /// run before their device exists fail with "no EIS device negotiated yet",
     /// so `run_calloop` queues them until this holds (or their deadline expires).
+    fn validate_switch_command(&self, cmd: &Cmd) -> anyhow::Result<()> {
+        if let Cmd::TypeText { text, .. } = cmd {
+            // Unlike ordinary best-effort text, a launcher query cannot silently
+            // drop characters or guess the US keymap and then press Return.
+            anyhow::ensure!(
+                self.device_with_interface("ei_text").is_some()
+                    || text
+                        .chars()
+                        .all(|scalar| self.keymap_chars.contains_key(&scalar)),
+                "keyboard_unavailable: exact query is not representable by the prepared keyboard"
+            );
+        }
+        Ok(())
+    }
+
     fn cmd_ready(&self, cmd: &Cmd) -> bool {
         const DEVICE_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(200);
         if self
@@ -2062,6 +2125,40 @@ pub(super) mod local_eis {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn switch_dispatch_validation_preserves_exact_refusal() {
+        let refused = || anyhow::bail!("shell_not_ready: search focus changed while queued");
+        assert_eq!(
+            super::validate_dispatch(Some(&refused))
+                .unwrap_err()
+                .to_string(),
+            "shell_not_ready: search focus changed while queued"
+        );
+        super::validate_dispatch(Some(&|| Ok(()))).unwrap();
+        super::validate_dispatch(None).unwrap();
+    }
+
+    #[test]
+    fn switch_query_never_silently_drops_or_guesses_unmapped_scalars() {
+        let mut state = super::EisState::default();
+        let (reply, _rx) = crossbeam_channel::bounded(1);
+        let cmd = super::Cmd::TypeText {
+            text: "a".into(),
+            reply: reply.clone(),
+        };
+        assert_eq!(
+            state.validate_switch_command(&cmd).unwrap_err().to_string(),
+            "keyboard_unavailable: exact query is not representable by the prepared keyboard"
+        );
+        state.keymap_chars.insert('a', (30, false));
+        state.validate_switch_command(&cmd).unwrap();
+        assert!(state
+            .validate_switch_command(&super::Cmd::TypeText {
+                text: "a文".into(),
+                reply
+            })
+            .is_err());
+    }
     use super::*;
 
     #[test]

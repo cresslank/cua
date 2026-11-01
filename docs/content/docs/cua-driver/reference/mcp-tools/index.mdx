@@ -59,6 +59,7 @@ List, launch, quit, front and arrange apps and windows. [Reference](/cua-driver/
 | <span id="launch_app"></span>[`launch_app`](/cua-driver/reference/mcp-tools/apps-windows-and-screen#launch_app) | Launch a macOS app in the background: the target does NOT come to the foreground. | macOS, Linux, Windows |
 | <span id="kill_app"></span>[`kill_app`](/cua-driver/reference/mcp-tools/apps-windows-and-screen#kill_app) | Force-terminate a process by pid (kill -9 equivalent on macOS / Linux; taskkill /F equivalent on Windows). | macOS, Linux, Windows |
 | <span id="bring_to_front"></span>[`bring_to_front`](/cua-driver/reference/mcp-tools/apps-windows-and-screen#bring_to_front) | Persistently activate an app and leave it in the foreground. | macOS, Linux, Windows |
+| <span id="switch_window"></span>[`switch_window`](/cua-driver/reference/mcp-tools/apps-windows-and-screen#switch_window) | Persistently switch to a running app's window. | macOS, Linux |
 | <span id="set_window_frame"></span>[`set_window_frame`](/cua-driver/reference/mcp-tools/apps-windows-and-screen#set_window_frame) | Set one exact top-level window's frame in the desktop-coordinate space reported by list_windows and verify the resulting geometry through an independent readback. | macOS, Linux, Windows |
 | <span id="invoke_menu"></span>[`invoke_menu`](/cua-driver/reference/mcp-tools/apps-windows-and-screen#invoke_menu) | Resolve an exact application-menu path one live native level at a time and invoke its final item through accessibility APIs. | macOS, Linux, Windows |
 | <span id="debug_window_info"></span>[`debug_window_info`](/cua-driver/reference/mcp-tools/apps-windows-and-screen#debug_window_info) | Diagnostic: dump everything cua-driver sees about a pid's top-level windows from the daemon's session perspective. | Windows |
@@ -219,7 +220,7 @@ Configuration, permissions, health, updates, extensions and on-demand guides. [R
 
 | Tool | Description | Platforms |
 | --- | --- | --- |
-| <span id="get_config"></span>[`get_config`](/cua-driver/reference/mcp-tools/batch-recording-and-settings#get_config) | Return the current cua-driver-rs configuration. | macOS, Linux, Windows |
+| <span id="get_config"></span>[`get_config`](/cua-driver/reference/mcp-tools/batch-recording-and-settings#get_config) | Return the current cua-driver-rs configuration, including the session-effective agent_cursor.glide_duration_ms default. | macOS, Linux, Windows |
 | <span id="set_config"></span>[`set_config`](/cua-driver/reference/mcp-tools/batch-recording-and-settings#set_config) | Update cua-driver-rs configuration. | macOS, Linux, Windows |
 | <span id="check_permissions"></span>[`check_permissions`](/cua-driver/reference/mcp-tools/batch-recording-and-settings#check_permissions) | Report TCC permission status for Accessibility and Screen Recording. | macOS, Linux, Windows |
 | <span id="health_report"></span>[`health_report`](/cua-driver/reference/mcp-tools/batch-recording-and-settings#health_report) | Single-call end-to-end driver diagnostics. | macOS, Linux, Windows |

@@ -146,7 +146,10 @@ pub fn begin_tool(name: &str, args: &Value) -> Option<(String, CursorAction)> {
 
 /// Tools whose whole job is to bring an app or window to the foreground.
 fn brings_app_to_front(name: &str) -> bool {
-    matches!(name, "bring_to_front" | "activate_app" | "browser_activate")
+    matches!(
+        name,
+        "bring_to_front" | "switch_window" | "activate_app" | "browser_activate"
+    )
 }
 
 /// The keys a key tool presses together: `hotkey`'s `keys` (an array, or a

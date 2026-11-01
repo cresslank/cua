@@ -14607,6 +14607,9 @@ pub fn build_registry_with_provider(
         snapshot_window_resolver(state.clone()),
     );
     r.register(pid_window_guarded(BringToFrontTool, &pid_window_candidates));
+    // The new tool owns strict parsing and exact-target selection. Do not wrap
+    // it in the legacy PID fallback resolver (Wayland ambiguity must refuse).
+    r.register(Box::new(super::window_switch::SwitchWindowTool));
     r.register(Box::new(SetWindowFrameTool));
     r.register(Box::new(InvokeMenuTool));
     r.register(pid_window_guarded(
