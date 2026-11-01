@@ -23,6 +23,7 @@ use crate::types::{LaunchSpec, Platform, WindowRestore};
 pub const PROVIDER_IDS: &[&str] = &[
     chrome::ID,
     firefox::ID,
+    zen::ID,
     electron::SLACK.id,
     electron::DISCORD.id,
     electron::VSCODE.id,
@@ -430,6 +431,23 @@ user_pref("network.proxy.socks_remote_dns", true);
 
     /// Where the app is installed on a macOS source (install probe).
     pub const MACOS_APP: &str = "/Applications/Firefox.app";
+}
+
+/// Linux Zen source identity and its normalized Firefox destination contract.
+/// This is session migration, not native Zen workspace/profile restoration.
+pub mod zen {
+    pub const ID: &str = "zen";
+    pub const DISPLAY: &str = "Zen";
+    pub const APP_IDS: &[&str] = &["zen", "zen-browser", "app.zen_browser.zen"];
+    pub const LINUX_SOURCE_ROOTS: &[&str] = &[".zen", ".var/app/app.zen_browser.zen/.zen"];
+    pub const BUNDLE_PREFIX: &str = "zen";
+    pub const TABS_JSON: &str = "zen/tabs.json";
+    pub const COOKIES: &str = "zen/cookies.sqlite";
+    pub const STORAGE: &str = "zen/storage";
+    pub const LOGINS: &str = "zen/logins.json";
+    pub const DEST_PROFILE: &str = "cua.zen-import";
+    pub const CAPABILITY: &str = "teleport.zen";
+    pub const FORMAT: &str = "normalized-gecko-v1";
 }
 
 /// Electron / Chromium apps (Slack, Discord, Unity Hub).
@@ -880,6 +898,26 @@ pub fn landing_path(provider_id: &str, rel_path: &str, platform: Platform) -> Op
                     firefox::DEST_PROFILE
                 )
             }),
+        // Only normalized entries are accepted by the Zen receiver; these are
+        // review keys, not permission to deliver arbitrary profile-relative files.
+        zen::ID if platform == Platform::Linux => match rel_path {
+            zen::COOKIES => Some(format!(
+                "{}/Profiles/{}/cookies.sqlite",
+                firefox::root_for(platform),
+                zen::DEST_PROFILE
+            )),
+            zen::STORAGE => Some(format!(
+                "{}/Profiles/{}/storage",
+                firefox::root_for(platform),
+                zen::DEST_PROFILE
+            )),
+            zen::LOGINS => Some(format!(
+                "{}/Profiles/{}/logins.json",
+                firefox::root_for(platform),
+                zen::DEST_PROFILE
+            )),
+            _ => None,
+        },
         steam::ID => steam::remap(rel_path, platform),
         whatsapp::ID => whatsapp::remap(rel_path),
         claude_code::ID => claude_code::remap(rel_path),
@@ -934,6 +972,7 @@ mod tests {
             [
                 "chrome",
                 "firefox",
+                "zen",
                 "slack",
                 "discord",
                 "vscode",

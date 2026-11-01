@@ -71,6 +71,7 @@ async fn doctor(
     out: &mut dyn Write,
 ) -> Result<i32, CuaError> {
     use cua_keyvault::broker::Access;
+    provider_id(&args.app)?;
     let mut client = cua_keyvault::client::KeyvaultClient::connect_default()
         .await
         .map_err(|e| {
@@ -182,6 +183,10 @@ pub fn teleport_err(e: cua_teleport::Error) -> CuaError {
             CuaError::Unsupported(m)
         }
         E::Teleport(T::UnsupportedScope { .. }) => CuaError::Unsupported(m),
+        E::Teleport(T::Provider(ref p)) if p.starts_with("zen_platform_unsupported:") => {
+            CuaError::Unsupported(m)
+        }
+        E::Teleport(T::Provider(ref p)) if p.starts_with("zen_") => CuaError::InvalidArgument(m),
         E::Teleport(T::Provider(p))
             if p.contains("not authorized")
                 || p.contains("Full Disk Access")
@@ -192,7 +197,7 @@ pub fn teleport_err(e: cua_teleport::Error) -> CuaError {
         // S1: refused because the destination is a relay: Space and
         // nothing has sealed this delivery yet; `--relay-plaintext-ack`
         // (or the equivalent option) opts in for one send.
-        E::RelayUnsealed => CuaError::PermissionDenied(m),
+        E::RelayUnsealed | E::ZenKeyvaultRequired => CuaError::PermissionDenied(m),
         E::Teleport(_) | E::Task(_) => CuaError::Internal(m),
     }
 }
@@ -208,8 +213,22 @@ fn app_ref(args: &AppArgs) -> AppRef {
     }
 }
 
+/// Static identity validation does not read a browser or contact the daemon.
+fn provider_id(app: &str) -> Result<String, CuaError> {
+    let registry = ExportRegistry::with_builtin();
+    let app = AppRef {
+        app_id: app.into(),
+        display_name: app.into(),
+        platform: Platform::current(),
+    };
+    registry
+        .resolve_for_app(&app)
+        .map(|p| p.id().to_string())
+        .map_err(|e| teleport_err(cua_teleport::Error::Teleport(e)))
+}
+
 fn teleporter(host: &Arc<dyn HostEffects>, args: &AppArgs) -> Teleporter {
-    Teleporter::with_registry(ExportRegistry::with_builtin_host_and_chrome_profile(
+    Teleporter::with_registry(ExportRegistry::with_builtin_host_and_profile(
         host.clone(),
         args.profile.clone(),
     ))
@@ -268,6 +287,10 @@ async fn push(
     json: bool,
     out: &mut dyn Write,
 ) -> Result<i32, CuaError> {
+    let provider = provider_id(&args.app.app)?;
+    if provider == cua_teleport::layout::zen::ID && args.read_as_caller {
+        return Err(CuaError::PermissionDenied("zen_keyvault_required: Zen teleport requires Keyvault consent; --read-as-caller is not supported".into()));
+    }
     match (&args.sandbox, &args.url) {
         (Some(name), _) => push_through_keyvault(host, name, &args, json, out).await,
         (None, Some(_)) if args.read_as_caller => {
@@ -432,18 +455,7 @@ async fn push_through_keyvault(
                 .join(", ")
         );
     }
-    let spec = cua_keyvault::broker::ImportSpec {
-        app: manifest.provider_id.clone(),
-        profile: args.app.profile.clone(),
-        sites: vec![],
-        whole_app: true,
-        cookies: cua_keyvault::broker::CookieFilter::default(),
-        confirm_passwords: true,
-        paths: Some(paths.clone()),
-        domains: None,
-        passwords: false,
-        password_domains: None,
-    };
+    let spec = keyvault_spec(&manifest, paths.clone(), args);
     let outcome = client
         .import_and_teleport_launching(spec, sandbox.to_string(), false, !args.no_launch, |_| {})
         .await
@@ -480,6 +492,26 @@ async fn push_through_keyvault(
     Ok(0)
 }
 
+fn keyvault_spec(
+    manifest: &cua_teleport::TransferManifest,
+    paths: Vec<String>,
+    args: &PushArgs,
+) -> cua_keyvault::broker::ImportSpec {
+    cua_keyvault::broker::ImportSpec {
+        app: manifest.provider_id.clone(),
+        profile: args.app.profile.clone(),
+        sites: vec![],
+        whole_app: true,
+        cookies: cua_keyvault::broker::CookieFilter::default(),
+        confirm_passwords: manifest.provider_id != cua_teleport::layout::zen::ID
+            || args.confirm_passwords,
+        paths: Some(paths),
+        domains: None,
+        passwords: false,
+        password_domains: None,
+    }
+}
+
 /// `cua teleport push --url URL --read-as-caller`: the old direct path, kept
 /// only behind that flag: this process reads the app and uploads to an
 /// arbitrary spacesd endpoint, skipping the Keyvault.
@@ -490,6 +522,11 @@ async fn push_direct(
     json: bool,
     out: &mut dyn Write,
 ) -> Result<i32, CuaError> {
+    if provider_id(&args.app.app)? == cua_teleport::layout::zen::ID {
+        return Err(CuaError::PermissionDenied(
+            "zen_keyvault_required: Zen teleport requires Keyvault consent".into(),
+        ));
+    }
     let env = match (&args.sandbox, &args.url) {
         // A direct sandbox needs its registered token.
         (Some(name), _) => cua_cli::sandbox::env_of(cua, name).await?,
@@ -628,6 +665,44 @@ mod tests {
     }
 
     #[test]
+    fn zen_push_password_confirmation_is_off_by_default_and_separate_from_include_or_all() {
+        let manifest = cua_teleport::TransferManifest {
+            provider_id: "zen".into(),
+            app_display_name: "Zen".into(),
+            scope: TransferScope::FullProfile,
+            items: vec![],
+            total_est_bytes: 0,
+            notes: vec![],
+        };
+        for flags in [vec!["--include", "zen/logins.json"], vec!["--all"]] {
+            let mut argv = vec![
+                "teleport",
+                "push",
+                "--app",
+                "zen",
+                "--sandbox",
+                "lab",
+                "--profile",
+                "selected",
+            ];
+            argv.extend(flags);
+            let TeleportCmd::Push(a) = parse(&argv) else {
+                panic!()
+            };
+            assert!(!a.confirm_passwords);
+            let paths = vec!["zen/logins.json".into()];
+            let spec = keyvault_spec(&manifest, paths.clone(), &a);
+            assert!(!spec.confirm_passwords);
+            assert_eq!(spec.profile.as_deref(), Some("selected"));
+            argv.push("--confirm-passwords");
+            let TeleportCmd::Push(a) = parse(&argv) else {
+                panic!()
+            };
+            assert!(a.confirm_passwords && keyvault_spec(&manifest, paths, &a).confirm_passwords);
+        }
+    }
+
+    #[test]
     fn providers_lists_every_builtin_app_as_json() {
         let (_home, host) = fake_home();
         let mut out = Vec::new();
@@ -641,7 +716,11 @@ mod tests {
             .collect();
         assert_eq!(ids, cua_teleport::layout::PROVIDER_IDS);
         assert!(
-            v[2]["app_ids"]
+            v.as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == "slack")
+                .unwrap()["app_ids"]
                 .to_string()
                 .contains("com.tinyspeck.slackmacgap")
         );
@@ -874,6 +953,86 @@ mod tests {
             assert!(READ_AS_CALLER_WARNING.contains(word), "{word}");
         }
         assert!(!READ_AS_CALLER_WARNING.contains('\u{b7}'));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn zen_cli_uses_the_exact_profile_and_refuses_ambiguity_and_locks() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".zen");
+        for name in ["a", "b"] {
+            std::fs::create_dir_all(root.join("Profiles").join(name)).unwrap();
+        }
+        std::fs::write(root.join("profiles.ini"), "[Profile0]\nName=a\nPath=Profiles/a\nIsRelative=1\n[Profile1]\nName=b\nPath=Profiles/b\nIsRelative=1\n").unwrap();
+        let host: Arc<dyn HostEffects> = Arc::new(FakeHost::new().with_home(home.path()));
+        let TeleportCmd::Manifest(a) =
+            parse(&["teleport", "manifest", "--app", "app.zen_browser.zen"])
+        else {
+            panic!()
+        };
+        let err = manifest(&host, a, &mut Vec::new()).await.unwrap_err();
+        assert!(
+            matches!(&err, CuaError::InvalidArgument(m) if m == "provider error: zen_profile_ambiguous: multiple profiles without a default; select a profile explicitly"),
+            "{err:?}"
+        );
+        let named = || {
+            let TeleportCmd::Manifest(a) =
+                parse(&["teleport", "manifest", "--app", "zen", "--profile", "b"])
+            else {
+                panic!()
+            };
+            a
+        };
+        let mut out = Vec::new();
+        manifest(&host, named(), &mut out).await.unwrap();
+        let m: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(m["provider_id"], "zen");
+        assert_eq!(m["app_display_name"], "Zen");
+        std::fs::write(root.join("Profiles/b/lock"), "locked").unwrap();
+        let err = manifest(&host, named(), &mut Vec::new()).await.unwrap_err();
+        assert!(
+            matches!(err, CuaError::InvalidArgument(m) if m == "provider error: zen_profile_locked: close Zen and retry; lock artifacts are never removed automatically")
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_doctor_refuses_before_daemon_contact() {
+        let TeleportCmd::Doctor(a) = parse(&["teleport", "doctor", "--app", "not-a-browser"])
+        else {
+            panic!()
+        };
+        assert!(
+            matches!(doctor(a, true, &mut Vec::new()).await, Err(CuaError::Unsupported(m)) if m == "no session provider matches app \"not-a-browser\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn zen_push_never_uses_the_read_as_caller_escape_hatch() {
+        let (_home, host) = fake_home();
+        let dirs = tempfile::tempdir().unwrap();
+        let cua = Cua::from_runtime(
+            cua_daemon::Runtime::new(cua_daemon::RuntimeConfig {
+                state_dir: Some(dirs.path().to_path_buf()),
+                spaces_home: Some(dirs.path().join("cua")),
+                teleport_home: Some(dirs.path().join("cua")),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let TeleportCmd::Push(a) = parse(&[
+            "teleport",
+            "push",
+            "--app",
+            "zen",
+            "--url",
+            "127.0.0.1:1",
+            "--read-as-caller",
+        ]) else {
+            panic!()
+        };
+        assert!(
+            matches!(push(&cua, &host, a, true, &mut Vec::new()).await, Err(CuaError::PermissionDenied(m)) if m.starts_with("zen_keyvault_required:"))
+        );
     }
 
     #[test]

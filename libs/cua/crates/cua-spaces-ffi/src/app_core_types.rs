@@ -2639,6 +2639,8 @@ pub enum AppSensitiveGroup {
     Passwords,
     /// Browsing history.
     History,
+    /// Credential-bearing localStorage, separate from cookies and passwords.
+    SiteData,
 }
 
 /// One opt-in checkbox of the options step.

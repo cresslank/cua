@@ -25,6 +25,42 @@ use crate::host::{EffectKind, HostCommand, HostEffects};
 use crate::ledger::{ImportRecord, Ledger, WipeReport};
 use crate::{ImportRegistry, Platform};
 
+/// Cancellation authority for an RPC-owned blocking import. Cancellation and
+/// entry to the irreversible durable callback race by one atomic decision. Once
+/// commit wins, cancellation cannot promise rollback, but still suppresses a
+/// launch not yet admitted. Nontransactional/legacy providers are unchanged.
+#[derive(Clone, Default)]
+pub struct ImportCancellation {
+    state: Arc<std::sync::atomic::AtomicU8>,
+    stopped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ImportCancellation {
+    /// Stop an RPC-owned import. Nonblocking, including from an async Drop guard.
+    pub fn cancel(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.stopped.store(true, SeqCst);
+        let _ = self.state.compare_exchange(0, 1, SeqCst, SeqCst);
+    }
+
+    fn commit(&self, callback: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        use std::sync::atomic::Ordering::SeqCst;
+        // 0 = cancellable, 1 = cancelled, 2 = commit admitted, 3 = durable.
+        // No check-then-callback gap: after this CAS the callback owns the
+        // decision and must finish even if the RPC future is dropped.
+        self.state
+            .compare_exchange(0, 2, SeqCst, SeqCst)
+            .map_err(|_| "RPC cancelled before commit decision".to_owned())?;
+        callback()?;
+        self.state.store(3, SeqCst);
+        Ok(())
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 /// Shared configuration and importer registry.
 pub struct Receiver {
     /// App-session importers.
@@ -120,9 +156,39 @@ impl Receiver {
     /// runs; entries are checksum-verified before each is written.
     pub fn import_bundle<R: Read + Seek>(
         &self,
+        bundle: R,
+        app: &str,
+        launch: bool,
+    ) -> Result<ImportOutcome, ImportError> {
+        self.import_bundle_with_commit(bundle, app, launch, |_, _| Ok(()))
+    }
+
+    /// Import with a durable ledger callback, before launch and while any
+    /// profile transaction/admission lease is held. A failed callback restores
+    /// a transactional provider's predecessor rather than deleting its files.
+    pub fn import_bundle_with_commit<R: Read + Seek>(
+        &self,
+        bundle: R,
+        app: &str,
+        launch: bool,
+        commit: impl FnMut(&str, &ImportRecord) -> Result<(), String>,
+    ) -> Result<ImportOutcome, ImportError> {
+        self.import_bundle_cancellable(bundle, app, launch, &ImportCancellation::default(), commit)
+    }
+
+    /// RPC-owned variant. Zen is reversible until the atomic commit decision
+    /// immediately before the durable callback. A cancellation that wins there
+    /// restores the predecessor without calling the ledger or launching. Once
+    /// that callback is admitted it runs to completion; a successful ledger is
+    /// a committed import even if its RPC reply is lost. Cancellation observed
+    /// before launch admission suppresses launch, not the committed import.
+    pub fn import_bundle_cancellable<R: Read + Seek>(
+        &self,
         mut bundle: R,
         app: &str,
         launch: bool,
+        cancellation: &ImportCancellation,
+        mut commit: impl FnMut(&str, &ImportRecord) -> Result<(), String>,
     ) -> Result<ImportOutcome, ImportError> {
         let header = BundleReader::open_with_limit(&mut bundle, self.max_total_bytes)
             .map_err(|e| ImportError::InvalidBundle(e.to_string()))?
@@ -143,7 +209,7 @@ impl Receiver {
             .find_by_id(&provider_id)
             .ok_or_else(|| ImportError::UnknownProvider(provider_id.clone()))?;
         let mut record = ImportRecord::default();
-        let spec = match provider.import_recorded(
+        let (spec, mut lease) = match provider.import_with_lease(
             &mut bundle,
             &self.dest_home,
             Platform::current(),
@@ -157,6 +223,32 @@ impl Receiver {
                 return Err(ImportError::Failed(e.to_string()));
             }
         };
+        let committed = if provider_id == "zen" {
+            cancellation.commit(|| commit(&provider_id, &record))
+        } else {
+            commit(&provider_id, &record)
+        };
+        if let Err(why) = committed {
+            if let Some(lease) = lease.as_mut() {
+                lease.rollback().map_err(|e| {
+                    ImportError::Failed(format!("ledger failed; rollback also failed: {e}"))
+                })?;
+            } else {
+                let partial = Ledger::new("", &provider_id, &record, 0, 0);
+                let report = self.wipe(&partial);
+                if !report.complete() || !report.refused.is_empty() {
+                    return Err(ImportError::Failed(
+                        "ledger failed and partial import could not be wiped".into(),
+                    ));
+                }
+            }
+            return Err(ImportError::Failed(format!(
+                "could not record import ledger; import rolled back: {why}"
+            )));
+        }
+        if let Some(lease) = lease.as_mut() {
+            lease.commit();
+        }
         let mut imported: Vec<String> = header
             .entries
             .iter()
@@ -164,25 +256,35 @@ impl Receiver {
             .collect();
         imported.sort();
         imported.dedup();
-        let (launched, pid, launch_error) = if launch {
-            match launch_app(&*self.host, &spec, Platform::current()) {
-                Ok(pid) => {
-                    eprintln!(
-                        "teleport: launched {} ({})",
-                        provider_id,
-                        pid.map(|p| format!("pid {p}"))
-                            .unwrap_or_else(|| "via LaunchServices".into())
-                    );
-                    (true, pid, None)
+        let (launched, pid, launch_error) =
+            if launch && provider_id == "zen" && cancellation.stopped() {
+                (
+                    false,
+                    None,
+                    Some("RPC cancelled after commit; import committed, launch suppressed".into()),
+                )
+            } else if launch {
+                if let Some(lease) = lease.as_mut() {
+                    lease.prepare_launch();
                 }
-                Err(why) => {
-                    eprintln!("warning: teleport: could not launch {provider_id}: {why}");
-                    (false, None, Some(why))
+                match launch_app(&*self.host, &spec, Platform::current()) {
+                    Ok(pid) => {
+                        eprintln!(
+                            "teleport: launched {} ({})",
+                            provider_id,
+                            pid.map(|p| format!("pid {p}"))
+                                .unwrap_or_else(|| "via LaunchServices".into())
+                        );
+                        (true, pid, None)
+                    }
+                    Err(why) => {
+                        eprintln!("warning: teleport: could not launch {provider_id}: {why}");
+                        (false, None, Some(why))
+                    }
                 }
-            }
-        } else {
-            (false, None, None)
-        };
+            } else {
+                (false, None, None)
+            };
         Ok(ImportOutcome {
             provider_id,
             imported,

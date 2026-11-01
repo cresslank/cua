@@ -39,7 +39,8 @@ use cua_keyvault::{Error as KvError, Result as KvResult};
 use cua_spaces::Spaces;
 use cua_spacesd_client::pb;
 use cua_teleport::bundle::{BundleReader, BundleWriter};
-use cua_teleport::{BundleSource, SendOptions, TransferScope};
+use cua_teleport::providers::zen::{self, ZenProvider};
+use cua_teleport::{BundleSource, ExportProvider, SendOptions, TransferScope};
 use cua_teleport_bundle::cookies::CookieItem;
 use sha2::{Digest, Sha256};
 
@@ -103,7 +104,7 @@ impl DaemonBackend {
             platform: cua_teleport::Platform::current(),
             profiled: Arc::new(|host, profile| {
                 AppSessions::from_registry(
-                    cua_teleport::ExportRegistry::with_builtin_host_and_chrome_profile(
+                    cua_teleport::ExportRegistry::with_builtin_host_and_profile(
                         host,
                         Some(profile.to_string()),
                     ),
@@ -280,6 +281,209 @@ fn site_entry(
 }
 
 impl DaemonBackend {
+    fn provider_id(&self, app: &str) -> KvResult<String> {
+        self.sessions
+            .provider_id(app)
+            .ok_or_else(|| KvError::Unsupported(format!("no session provider matches app {app:?}")))
+    }
+
+    fn zen_provider(&self, profile: Option<&str>) -> ZenProvider {
+        let p = ZenProvider::new().with_host(self.host.clone());
+        match profile {
+            Some(selector) => p.with_profile(selector),
+            None => p,
+        }
+    }
+
+    fn zen_profile(
+        &self,
+        profile: Option<&str>,
+    ) -> KvResult<cua_teleport::gecko_profile::ResolvedGeckoProfile> {
+        self.zen_provider(profile)
+            .resolve_profile(self.platform)
+            .map_err(|e| backend_err("resolve Zen profile", e))
+    }
+
+    /// Zen inventory uses the same constrained selector and closed-profile
+    /// readers as capture; host/origin labels are never registrable-domain grants.
+    fn zen_inventory(&self, profile: Option<&str>) -> KvResult<Inventory> {
+        use cua_teleport::gecko_store as gs;
+        let p = self.zen_profile(profile)?;
+        p.ensure_closed()
+            .map_err(|e| backend_err("check Zen profile", e))?;
+        let mut domains = std::collections::BTreeMap::new();
+        for c in gs::read_cookies(&p).map_err(|e| backend_err("list Zen cookies", e))? {
+            let d = site_entry(&mut domains, record::host_of(&c.host_key));
+            d.cookies += 1;
+            d.session_cookies += u32::from(c.expires_utc == 0);
+            d.signin |= record::looks_like_signin(&c.name);
+        }
+        for v in gs::read_local_storage(&p).map_err(|e| backend_err("list Zen storage", e))? {
+            site_entry(&mut domains, v.origin.clone()).local_storage += 1;
+        }
+        for origin in gs::login_hosts(&p).map_err(|e| backend_err("list Zen login origins", e))? {
+            site_entry(&mut domains, origin).passwords += 1;
+        }
+        Ok(Inventory {
+            provider_id: zen::ID.into(),
+            app_display: zen::DISPLAY.into(),
+            profile: Some(p.dir.to_string_lossy().into_owned()),
+            domains: domains.into_values().collect(),
+            notes: vec![
+                "Zen → Firefox; exact host/origin selection, no container or partition flattening"
+                    .into(),
+            ],
+        })
+    }
+
+    fn capture_zen(&self, spec: &ImportSpec) -> KvResult<Vec<Captured>> {
+        use cua_teleport::gecko_store as gs;
+        let passwords = spec.passwords
+            || spec.sites.iter().any(|s| s.include_passwords)
+            || spec
+                .paths
+                .as_ref()
+                .is_some_and(|p| p.iter().any(|p| p == zen::LOGINS));
+        if passwords && !spec.confirm_passwords {
+            return Err(KvError::Invalid(
+                "saved passwords need the explicit second confirmation (confirm_passwords)".into(),
+            ));
+        }
+        for selection in spec
+            .sites
+            .iter()
+            .map(|s| &s.site)
+            .chain(spec.domains.iter().flatten())
+            .chain(spec.password_domains.iter().flatten())
+        {
+            record::exact_site_selection(selection)?;
+        }
+        let provider = self.zen_provider(spec.profile.as_deref());
+        let p = provider
+            .resolve_profile(self.platform)
+            .map_err(|e| backend_err("resolve Zen profile", e))?;
+        let manifest = provider
+            .manifest(
+                &cua_teleport::AppRef {
+                    app_id: zen::ID.into(),
+                    display_name: zen::DISPLAY.into(),
+                    platform: self.platform,
+                },
+                None,
+                TransferScope::FullProfile,
+            )
+            .map_err(|e| backend_err("read Zen manifest", e))?;
+        let paths: Vec<String> = if spec.whole_app {
+            spec.paths.clone().unwrap_or_else(|| {
+                manifest
+                    .items
+                    .iter()
+                    .filter(|i| i.default_checked)
+                    .map(|i| i.rel_path.clone())
+                    .collect()
+            })
+        } else {
+            Vec::new()
+        };
+        if paths
+            .iter()
+            .any(|path| !manifest.items.iter().any(|i| &i.rel_path == path))
+        {
+            return Err(KvError::Invalid(
+                "zen_selection_invalid: unsupported or unavailable Zen item".into(),
+            ));
+        }
+        let wants = |path: &str| paths.iter().any(|p| p == path);
+        let within_domains = |value: &str, cookie: bool| {
+            spec.domains.as_ref().is_none_or(|sites| {
+                sites
+                    .iter()
+                    .any(|s| record::exact_site_matches(value, s, cookie))
+            })
+        };
+        let selected_sites = |value: &str, cookie: bool, storage: bool, password: bool| {
+            spec.sites.iter().any(|s| {
+                (!storage || s.include_storage)
+                    && (!password || s.include_passwords)
+                    && record::exact_site_matches(value, &s.site, cookie)
+            })
+        };
+        let source = p.dir.to_string_lossy().into_owned();
+        let mut out = Vec::new();
+        let mut keep = |n: record::NewRecord| {
+            let (meta, payload) = n.into_item(zen::ID, zen::DISPLAY, &source, "full");
+            out.push(Captured { meta, payload });
+        };
+        if wants(zen::TABS_JSON) {
+            let tabs = gs::read_tabs(&p).map_err(|e| backend_err("read Zen tabs", e))?;
+            keep(record::file_record(
+                zen::TABS_JSON,
+                0o600,
+                &serde_json::to_vec(&tabs)?,
+            )?);
+        }
+        if wants(zen::COOKIES) || !spec.sites.is_empty() {
+            for c in gs::read_cookies(&p).map_err(|e| backend_err("read Zen cookies", e))? {
+                if within_domains(&c.host_key, true)
+                    && (wants(zen::COOKIES) || selected_sites(&c.host_key, true, false, false))
+                {
+                    let c = cookie_record_of(&c);
+                    if keep_cookie(&c, &spec.cookies) {
+                        keep(record::cookie_record(&c)?);
+                    }
+                }
+            }
+        }
+        if wants(zen::STORAGE) || spec.sites.iter().any(|s| s.include_storage) {
+            for v in gs::read_local_storage(&p).map_err(|e| backend_err("read Zen storage", e))? {
+                if within_domains(&v.origin, false)
+                    && (wants(zen::STORAGE) || selected_sites(&v.origin, false, true, false))
+                {
+                    keep(record::local_storage_record(&record::LocalStorageRecord {
+                        key: v.key.clone(),
+                        origin: v.origin.clone(),
+                        value: v.value.clone(),
+                        key_raw: v.key_raw.clone(),
+                        value_raw: v.value_raw.clone(),
+                    })?);
+                }
+            }
+        }
+        if passwords {
+            for l in gs::read_logins(&p)
+                .map_err(|e| backend_err("read Zen saved passwords", e))?
+                .logins
+            {
+                let password_domains = spec.password_domains.as_ref().or(spec.domains.as_ref());
+                let whole = spec.whole_app
+                    && (spec.passwords || wants(zen::LOGINS))
+                    && password_domains.is_none_or(|s| {
+                        s.iter()
+                            .any(|s| record::exact_site_matches(&l.origin, s, false))
+                    });
+                let site = selected_sites(&l.origin, false, false, true)
+                    && within_domains(&l.origin, false)
+                    && spec.password_domains.as_ref().is_none_or(|sites| {
+                        sites
+                            .iter()
+                            .any(|s| record::exact_site_matches(&l.origin, s, false))
+                    });
+                if whole || site {
+                    let password = String::from_utf8(l.password.clone())
+                        .map_err(|_| KvError::Corrupt("Zen login password is not UTF-8".into()))?;
+                    keep(record::password_record(&LoginRecord {
+                        origin: l.origin.clone(),
+                        username: l.username.clone(),
+                        password,
+                    })?);
+                }
+            }
+        }
+        p.ensure_closed()
+            .map_err(|e| backend_err("check Zen profile", e))?;
+        Ok(out)
+    }
+
     /// Firefox's sites with counts from its plaintext stores: cookies by host,
     /// localStorage by origin, saved logins by hostname. Nothing is decrypted.
     fn firefox_inventory(
@@ -475,10 +679,67 @@ fn in_sites(domain: &str, sites: &[String]) -> bool {
     sites.iter().any(|s| record::site_of(s) == site)
 }
 
+fn require_zen_destination(manifest: &pb::GetManifestResponse) -> KvResult<()> {
+    if !manifest.supported || !manifest.app_installed {
+        return Err(KvError::Unsupported(
+            "Zen delivery requires the Space's installed Firefox destination".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_zen_capability(caps: &pb::GetCapabilitiesResponse) -> KvResult<()> {
+    let matches: Vec<_> = caps
+        .features
+        .iter()
+        .filter(|f| f.name == "teleport.zen")
+        .collect();
+    if matches.len() != 1
+        || !matches[0].supported
+        || [
+            ("format", "normalized-gecko-v1"),
+            ("destination", "firefox"),
+            ("platform", "linux"),
+        ]
+        .iter()
+        .any(|(k, v)| matches[0].attributes.get(*k).map(String::as_str) != Some(*v))
+    {
+        return Err(KvError::Unsupported("Zen requires a guest advertising teleport.zen normalized-gecko-v1 for Firefox on Linux; update the Space image before capture".into()));
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl Backend for DaemonBackend {
     fn resolve_target(&self, name: &str) -> KvResult<String> {
         self.immutable_id(name)
+    }
+
+    async fn preflight_target(&self, app: &str, target: &str) -> KvResult<()> {
+        let provider = self.provider_id(app)?;
+        if provider == zen::ID {
+            let space = self.open_target(target).await?;
+            let caps = space
+                .spacesd()
+                .map_err(|e| backend_err("spacesd channel", e))?
+                .refresh_capabilities()
+                .await
+                .map_err(|e| backend_err("check Zen destination", e))?;
+            require_zen_capability(&caps)?;
+            let manifest = space
+                .spacesd()
+                .map_err(|e| backend_err("spacesd channel", e))?
+                .teleport()
+                .get_manifest(pb::GetManifestRequest {
+                    app: zen::ID.into(),
+                    scope: pb::TeleportScope::Profile as i32,
+                })
+                .await
+                .map_err(|e| backend_err("check Zen Firefox destination", e))?
+                .into_inner();
+            require_zen_destination(&manifest)?;
+        }
+        Ok(())
     }
 
     fn favicons(
@@ -503,8 +764,14 @@ impl Backend for DaemonBackend {
     }
 
     fn inventory(&self, app: &str, profile: Option<&str>) -> KvResult<Inventory> {
-        let manifest = self
-            .sessions
+        let provider_id = self.provider_id(app)?;
+        if provider_id == zen::ID {
+            return self.zen_inventory(profile);
+        }
+        let named = profile.map(|p| (self.profiled)(self.host.clone(), p));
+        let manifest = named
+            .as_ref()
+            .unwrap_or(&self.sessions)
             .manifest(app, TeleportScope::Full)
             .map_err(|e| backend_err("read manifest", e))?;
         // A browser's domains with counts, from the plaintext columns of its
@@ -607,14 +874,36 @@ impl Backend for DaemonBackend {
         use cua_keyvault::broker::{Access, BrowserProfile, ReadinessCheck};
         use cua_teleport::privacy as px;
         let mut out = Readiness {
-            provider_id: self
-                .sessions
-                .provider_id(app)
-                .unwrap_or_else(|| app.to_string()),
+            provider_id: self.provider_id(app)?,
             app_display: self.app_display(app),
             profile: profile.map(str::to_string),
             ..Default::default()
         };
+        if out.provider_id == zen::ID {
+            let p = self.zen_profile(profile)?;
+            p.ensure_closed()
+                .map_err(|e| backend_err("check Zen profile", e))?;
+            out.app_display = zen::DISPLAY.into();
+            out.profile = Some(p.dir.to_string_lossy().into_owned());
+            let profiles = cua_teleport::gecko_profile::profiles(&*self.host, self.platform)
+                .map_err(|e| backend_err("list Zen profiles", e))?;
+            out.default_profile = profiles
+                .iter()
+                .find(|p| p.is_default)
+                .map(|p| p.dir.to_string_lossy().into_owned());
+            out.profiles = profiles
+                .into_iter()
+                .map(|p| BrowserProfile {
+                    dir: p.dir.to_string_lossy().into_owned(),
+                    name: p.name,
+                    account: None,
+                    last_used: p.is_default,
+                })
+                .collect();
+            out.files.state = Access::Granted;
+            out.tabs.state = Access::Granted;
+            return Ok(out);
+        }
         // Only a Chromium-family browser has profiles and a cookie store to
         // look at; the other apps have nothing to report here.
         if app != "chrome" && app != "edge" && app != "chromium" {
@@ -697,6 +986,10 @@ impl Backend for DaemonBackend {
     }
 
     fn capture(&self, spec: &ImportSpec) -> KvResult<Vec<Captured>> {
+        let canonical = self.provider_id(&spec.app)?;
+        if canonical == zen::ID {
+            return self.capture_zen(spec);
+        }
         let source = spec.profile.clone().unwrap_or_else(|| "default".into());
         let mut out: Vec<Captured> = Vec::new();
         let mut display = self.app_display(&spec.app);
@@ -786,6 +1079,18 @@ impl Backend for DaemonBackend {
     }
 
     fn capture_passwords(&self, spec: &PasswordImportSpec) -> KvResult<Vec<Captured>> {
+        if self.provider_id(&spec.app)? == zen::ID {
+            return self.capture_zen(&ImportSpec {
+                app: zen::ID.into(),
+                profile: spec.profile.clone(),
+                whole_app: true,
+                paths: Some(Vec::new()),
+                passwords: true,
+                confirm_passwords: true,
+                password_domains: (!spec.sites.is_empty()).then(|| spec.sites.clone()),
+                ..Default::default()
+            });
+        }
         if spec.app != "chrome" {
             return Err(KvError::Unsupported(format!(
                 "importing saved passwords from {} is not supported yet (chrome is)",
@@ -870,6 +1175,7 @@ impl Backend for DaemonBackend {
         stage: cua_keyvault::broker::StageSink,
         launch: bool,
     ) -> KvResult<DeliveryOutcome> {
+        self.preflight_target(provider_id, target).await?;
         let space = self.open_target(target).await?;
         stage(TeleportStage::Packing);
         let spacesd = space
@@ -974,6 +1280,11 @@ impl Backend for DaemonBackend {
 pub struct OsPresence;
 
 impl UserPresence for OsPresence {
+    fn confirm_saved_passwords(&self, reason: &str) -> KvResult<()> {
+        cua_teleport::biometric::confirm_saved_passwords(reason)
+            .map_err(|e| KvError::PresenceFailed(e.to_string()))
+    }
+
     fn confirm(&self, reason: &str) -> KvResult<()> {
         cua_teleport::biometric::authorize_sensitive_export(reason)
             .map_err(|e| KvError::PresenceFailed(e.to_string()))
@@ -1403,6 +1714,77 @@ impl SiteLoginBroker for McpSiteLoginBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zen_requires_a_present_destination_browser_before_capture() {
+        for (supported, installed) in [(false, false), (true, false), (false, true)] {
+            assert!(matches!(
+                require_zen_destination(&pb::GetManifestResponse {
+                    supported,
+                    app_installed: installed,
+                    ..Default::default()
+                }),
+                Err(KvError::Unsupported(_))
+            ));
+        }
+        require_zen_destination(&pb::GetManifestResponse {
+            supported: true,
+            app_installed: true,
+            ..Default::default()
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn zen_capability_requires_supported_and_each_exact_contract_attribute() {
+        let feature = pb::Feature {
+            name: "teleport.zen".into(),
+            supported: true,
+            attributes: [
+                ("format".into(), "normalized-gecko-v1".into()),
+                ("destination".into(), "firefox".into()),
+                ("platform".into(), "linux".into()),
+            ]
+            .into(),
+            ..Default::default()
+        };
+        let caps = pb::GetCapabilitiesResponse {
+            features: vec![feature.clone()],
+            ..Default::default()
+        };
+        require_zen_capability(&caps).unwrap();
+        let mut bad = Vec::new();
+        bad.push(pb::GetCapabilitiesResponse::default());
+        let mut f = feature.clone();
+        f.supported = false;
+        bad.push(pb::GetCapabilitiesResponse {
+            features: vec![f],
+            ..Default::default()
+        });
+        for key in ["format", "destination", "platform"] {
+            let mut f = feature.clone();
+            f.attributes.remove(key);
+            bad.push(pb::GetCapabilitiesResponse {
+                features: vec![f],
+                ..Default::default()
+            });
+            let mut f = feature.clone();
+            f.attributes.insert(key.into(), "different".into());
+            bad.push(pb::GetCapabilitiesResponse {
+                features: vec![f],
+                ..Default::default()
+            });
+        }
+        bad.push(pb::GetCapabilitiesResponse {
+            features: vec![feature.clone(), feature],
+            ..Default::default()
+        });
+        for caps in bad {
+            assert!(
+                matches!(require_zen_capability(&caps), Err(KvError::Unsupported(m)) if m.contains("normalized-gecko-v1"))
+            );
+        }
+    }
 
     #[test]
     fn a_release_build_never_honours_the_test_requirement() {

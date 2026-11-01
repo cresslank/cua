@@ -70,6 +70,8 @@ pub enum Decision {
 pub struct GrantedItem {
     pub id: String,
     pub site: String,
+    /// Verified vault provider identity; Zen retries must never deliver another browser's item.
+    pub provider_id: Option<String>,
 }
 
 /// Keyvault failures the tool reports with their own kind.
@@ -171,8 +173,11 @@ pub fn default_broker() -> std::sync::Arc<dyn Broker> {
 pub fn browser_app(browser: &str) -> Result<&'static str, String> {
     match browser.trim().to_ascii_lowercase().as_str() {
         "firefox" => Ok("firefox"),
+        "zen" | "zen-browser" | "app.zen_browser.zen" => Ok("zen"),
         "chrome" | "chromium" | "google-chrome" | "brave" | "edge" => Ok("chrome"),
-        other => Err(format!("browser must be firefox or chrome, not {other:?}")),
+        other => Err(format!(
+            "browser must be firefox, zen or chrome, not {other:?}"
+        )),
     }
 }
 
@@ -212,6 +217,64 @@ pub fn sites(value: &Value) -> Result<Vec<String>, String> {
         );
     }
     Ok(out)
+}
+
+/// Zen selectors preserve exact host/origin authority, including ports. Unlike
+/// the legacy Chromium parser this never strips www, scheme or a URL path.
+pub fn zen_sites(value: &Value) -> Result<Vec<String>, String> {
+    let list = value
+        .as_array()
+        .ok_or("zen sites must be an explicit array of hosts or HTTP(S) origins")?;
+    let mut out = Vec::new();
+    for v in list {
+        let s = v.as_str().ok_or("zen sites must be strings")?;
+        if s.is_empty() || s.trim() != s || s.contains('*') || s == "all" {
+            return Err("zen sites require exact nonempty hosts/origins, never wildcards".into());
+        }
+        if s.contains("://") {
+            let u = url::Url::parse(s).map_err(|_| "invalid Zen origin")?;
+            if !matches!(u.scheme(), "http" | "https")
+                || u.host_str().is_none()
+                || !u.username().is_empty()
+                || u.password().is_some()
+                || u.query().is_some()
+                || u.fragment().is_some()
+                || u.path() != "/"
+            {
+                return Err(
+                    "zen site URL must be an exact HTTP(S) origin, not a path or credentials"
+                        .into(),
+                );
+            }
+        } else if url::Host::parse(s).is_err() || s.contains(['/', ':', '?', '#', '@']) {
+            return Err("zen site must be an exact host or HTTP(S) origin".into());
+        }
+        if !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
+        }
+    }
+    if out.is_empty() {
+        return Err("zen sites must not be empty".into());
+    }
+    Ok(out)
+}
+
+/// Exact Zen host/origin comparison at the final retry boundary. Cookie host
+/// labels have no scheme/port; origin-bearing records must keep both. This is
+/// deliberately not a registrable-domain or subdomain match.
+fn zen_site_matches(value: &str, selected: &str) -> bool {
+    let host = |s: &str| s.trim_start_matches('.').to_ascii_lowercase();
+    let parse = |s: &str| {
+        url::Url::parse(s)
+            .ok()
+            .filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some())
+    };
+    match (parse(value), parse(selected)) {
+        (Some(v), Some(s)) => v.origin() == s.origin(),
+        (Some(v), None) => v.host_str().is_some_and(|h| host(h) == host(selected)),
+        (None, Some(s)) => s.host_str().is_some_and(|h| host(value) == host(h)),
+        (None, None) => host(value) == host(selected),
+    }
 }
 
 /// The grant duration from `duration_minutes` (default 15, at most 24 h).
@@ -343,9 +406,19 @@ pub async fn complete(
         }),
         Decision::Granted { token, items } => {
             let mut delivered = vec![];
-            for item in items.iter().filter(|i| sites.contains(&i.site)) {
+            for item in items.iter().filter(|i| {
+                if app == "zen" {
+                    i.provider_id.as_deref() == Some("zen")
+                        && sites.iter().any(|s| zen_site_matches(&i.site, s))
+                } else {
+                    sites.contains(&i.site)
+                }
+            }) {
                 let r = broker.teleport(&token, &item.id, sandbox).await?;
                 delivered.push(json!({"site": item.site, "result": r}));
+            }
+            if app == "zen" && delivered.is_empty() {
+                return Err(BrokerError::Keyvault { code: "invalid".into(), message: "Zen retry has no granted Zen items matching the exact requested host/origin".into() });
             }
             Ok(json!({
                 "consent_required": false,
@@ -397,6 +470,34 @@ mod tests {
                 .unwrap()
                 .push((token.into(), item.into(), target.into()));
             Ok(json!({"import_id": format!("imp-{item}")}))
+        }
+    }
+
+    #[test]
+    fn zen_identity_and_exact_origins_survive_the_mcp_boundary() {
+        for alias in ["zen", "zen-browser", "app.zen_browser.zen"] {
+            assert_eq!(browser_app(alias).unwrap(), "zen");
+        }
+        let sites = json!([
+            "https://www.a.example:8443",
+            "localhost",
+            "127.0.0.1",
+            "https://www.a.example:8443"
+        ]);
+        assert_eq!(
+            zen_sites(&sites).unwrap(),
+            ["https://www.a.example:8443", "localhost", "127.0.0.1"]
+        );
+        for bad in [
+            json!([]),
+            json!(["*"]),
+            json!(["a.example/path"]),
+            json!(["https://a.example/login"]),
+            json!(["https://a.example?token=x"]),
+            json!(["https://u:p@a.example"]),
+            json!(["moz-extension://x"]),
+        ] {
+            assert!(zen_sites(&bad).is_err(), "{bad}");
         }
     }
 
@@ -488,10 +589,12 @@ mod tests {
                 GrantedItem {
                     id: "i-gh".into(),
                     site: "github.com".into(),
+                    provider_id: None,
                 },
                 GrantedItem {
                     id: "i-x".into(),
                     site: "example.org".into(),
+                    provider_id: None,
                 },
             ],
         });

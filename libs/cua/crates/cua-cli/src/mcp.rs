@@ -580,7 +580,7 @@ const TOOLS: &[Tool] = &[
                 "browser",
                 "string",
                 true,
-                "firefox or chrome (chromium, brave and edge profiles use chrome)",
+                "firefox, chrome or zen (chromium, brave and edge profiles use chrome)",
             ),
             (
                 "sites",
@@ -925,7 +925,7 @@ fn schema(t: &Tool) -> Value {
             p["enum"] = json!(["auto", "container", "vm", "microvm"]);
         }
         if t.name == "teleport_browser_session" && *n == "browser" {
-            p["enum"] = json!(["firefox", "chrome"]);
+            p["enum"] = json!(["firefox", "chrome", "zen"]);
         }
         if t.name == "sandbox_list" && *n == "location" {
             p["enum"] = json!(["local", "direct"]);
@@ -1642,7 +1642,12 @@ impl Server {
         use crate::teleport_session as ts;
         let bad = |e: String| CuaError::InvalidArgument(format!("teleport_browser_session: {e}"));
         let app = ts::browser_app(a["browser"].as_str().unwrap_or_default()).map_err(bad)?;
-        let sites = ts::sites(&a["sites"]).map_err(bad)?;
+        let sites = if app == "zen" {
+            ts::zen_sites(&a["sites"])
+        } else {
+            ts::sites(&a["sites"])
+        }
+        .map_err(bad)?;
         let duration = ts::duration(&a["duration_minutes"]).map_err(bad)?;
         let sb = self
             .cua

@@ -197,6 +197,48 @@ async fn run_suite(cua: Arc<Cua>, env: &fixtures::SpacesdFixture) {
 
     let sb = cua.sandboxes().create(direct(&env.url)).await.unwrap();
 
+    // Zen has no direct-send authority, including the default AutoApprove route.
+    for alias in ["zen", "zen-browser", "app.zen_browser.zen", "ZEN"] {
+        let record = Arc::new(Record {
+            approve: true,
+            ..Default::default()
+        });
+        let err = teleport
+            .send(
+                sb.clone(),
+                alias.into(),
+                TeleportScope::Full,
+                Some(vec!["zen/logins.json".into()]),
+                Some(record.clone()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CuaError::PermissionDenied(ref m) if m.starts_with("zen_keyvault_required:")),
+            "{err}"
+        );
+        let connection = sb.spacesd(Some(5_000)).await.unwrap();
+        let err = teleport
+            .send_env(
+                connection,
+                alias.into(),
+                TeleportScope::Full,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, CuaError::PermissionDenied(ref m) if m.starts_with("zen_keyvault_required:")),
+            "{err}"
+        );
+        assert!(record.seen.lock().unwrap().is_empty());
+        assert!(host.authorizations().is_empty());
+        assert!(env.mock.state.teleport_imports().is_empty());
+    }
+
     // Declined consent: nothing read, nothing sent, no OS prompt.
     let decline = Arc::new(Record::default());
     let err = teleport

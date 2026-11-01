@@ -208,7 +208,16 @@ impl ServerBuilder {
             },
         ];
         for app in teleport.supported_apps() {
-            core_features.push(feature(&format!("teleport.{app}"), true, ""));
+            let mut f = feature(&format!("teleport.{app}"), true, "");
+            if app == "zen" {
+                // Additive negotiation in the existing Feature attributes;
+                // old guests do not advertise this normalized wire contract.
+                f.attributes
+                    .insert("format".into(), "normalized-gecko-v1".into());
+                f.attributes.insert("destination".into(), "firefox".into());
+                f.attributes.insert("platform".into(), "linux".into());
+            }
+            core_features.push(f);
         }
         // `TeleportService.WipeImport`, import ledgers and
         // `ImportOptions.expires_at_ms`.

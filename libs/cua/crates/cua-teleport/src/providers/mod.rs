@@ -10,3 +10,4 @@ pub mod firefox;
 pub mod steam;
 pub(crate) mod util;
 pub mod whatsapp;
+pub mod zen;

@@ -306,6 +306,20 @@ mod macos {
 /// (`apps/cua-spaces-desktop/packaging/ai.cua.spaces.policy` installs it).
 pub const POLKIT_ACTION: &str = "ai.cua.spaces.keyvault";
 
+/// A separately shipped static prompt that explicitly includes saved passwords.
+/// Linux cannot display an unprivileged caller's dynamic `reason`.
+pub const POLKIT_PASSWORD_ACTION: &str = "ai.cua.spaces.keyvault.passwords";
+
+/// Confirm access to saved passwords with an explicitly labeled native prompt.
+/// Neither the unverified-export override nor the debug skip can authorize this
+/// gate. Tests must inject `UserPresence` rather than bypass native consent.
+pub fn confirm_saved_passwords(reason: &str) -> Result<(), AuthError> {
+    confirm_user_native(
+        POLKIT_PASSWORD_ACTION,
+        &format!("{reason} INCLUDING SAVED PASSWORDS"),
+    )
+}
+
 /// The polkit action the Cua Spaces app asks for before it approves another
 /// device for the account (the same policy file).
 pub const POLKIT_DEVICE_ACTION: &str = "ai.cua.spaces.devices";
@@ -321,6 +335,10 @@ pub fn confirm_user(polkit_action: &str, reason: &str) -> Result<(), AuthError> 
     if skip_is_honored(cfg!(debug_assertions), env_flag(SKIP_ENV)) {
         return Ok(());
     }
+    confirm_user_native(polkit_action, reason)
+}
+
+fn confirm_user_native(polkit_action: &str, reason: &str) -> Result<(), AuthError> {
     #[cfg(target_os = "macos")]
     {
         let _ = polkit_action;
@@ -1079,6 +1097,39 @@ mod tests {
         assert_eq!(proc_start_time("1 (x) S 1"), None);
     }
 
+    #[test]
+    fn password_presence_routes_to_native_password_action_without_overrides() {
+        // Routing evidence only: no real OS prompt is attempted by this test.
+        let source = include_str!("biometric.rs");
+        let body = source
+            .split(concat!("pub fn confirm_", "saved_passwords(reason:"))
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        assert!(body.contains("confirm_user_native("));
+        assert!(body.contains("POLKIT_PASSWORD_ACTION,"));
+        assert!(!body.contains("SKIP_ENV") && !body.contains("ALLOW_UNVERIFIED_ENV"));
+        let source = include_str!("../../cua-spaces-ext/src/daemon/keyvault.rs");
+        let presence = source
+            .split("impl UserPresence for OsPresence {")
+            .nth(1)
+            .unwrap()
+            .split("\n}\n")
+            .next()
+            .unwrap();
+        let password = presence
+            .split(concat!("fn confirm_", "saved_passwords("))
+            .nth(1)
+            .unwrap()
+            .split("fn confirm(")
+            .next()
+            .unwrap();
+        assert!(password.contains("biometric::confirm_saved_passwords(reason)"));
+        assert!(!password.contains("authorize_sensitive_export"));
+    }
+
     /// The policy file the `.deb` installs names the action the gate asks for.
     #[test]
     fn the_polkit_policy_names_the_action_the_gate_asks_for() {
@@ -1089,6 +1140,19 @@ mod tests {
         .expect("the policy file the deb installs");
         assert!(policy.contains(&format!("<action id=\"{POLKIT_ACTION}\">")));
         assert!(policy.contains(&format!("<action id=\"{POLKIT_DEVICE_ACTION}\">")));
+        let password_action = policy
+            .split(&format!("<action id=\"{POLKIT_PASSWORD_ACTION}\">"))
+            .nth(1)
+            .expect("separate saved-password action")
+            .split("</action>")
+            .next()
+            .unwrap();
+        assert!(password_action.contains(
+            "<message>Confirm it is you to use the Cua Keyvault INCLUDING SAVED PASSWORDS</message>"
+        ));
+        assert!(password_action.contains("<allow_active>auth_self</allow_active>"));
+        assert!(password_action.contains("<allow_any>auth_self</allow_any>"));
+        assert!(password_action.contains("<allow_inactive>no</allow_inactive>"));
         // The user's own password or fingerprint, every time, in a session
         // they are at: a local desktop (active) or a remote desktop, which
         // polkit files under "any" (xrdp, VNC: CUA-1725). Never without
@@ -1097,17 +1161,17 @@ mod tests {
             policy
                 .matches("<allow_active>auth_self</allow_active>")
                 .count(),
-            2
+            3
         );
         assert_eq!(
             policy.matches("<allow_any>auth_self</allow_any>").count(),
-            2
+            3
         );
         assert_eq!(
             policy
                 .matches("<allow_inactive>no</allow_inactive>")
                 .count(),
-            2
+            3
         );
         assert!(!policy.contains(">yes<") && !policy.contains("auth_self_keep"));
         // Only root may pass polkit details, so the messages carry no `$(...)`.

@@ -36,6 +36,15 @@
       <allow_active>auth_self</allow_active>
     </defaults>
   </action>
+  <action id="ai.cua.spaces.keyvault.passwords">
+    <description>Confirm access including saved passwords</description>
+    <message>Confirm it is you to use the Cua Keyvault INCLUDING SAVED PASSWORDS</message>
+    <defaults>
+      <allow_any>auth_self</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
   <action id="ai.cua.spaces.devices">
     <description>Approve a device for your Cua account</description>
     <message>Confirm it is you to approve a device for your Cua account</message>

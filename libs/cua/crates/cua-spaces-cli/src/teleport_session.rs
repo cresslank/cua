@@ -49,10 +49,14 @@ impl Broker for KeyvaultBroker {
                 page.items
                     .into_iter()
                     .filter_map(|m| {
-                        m.domain
-                            .as_deref()
-                            .map(cua_keyvault::record::site_of)
-                            .map(|s| (m.id, s))
+                        m.domain.as_deref().map(|d| {
+                            let site = if m.provider_id == "zen" {
+                                d.to_string()
+                            } else {
+                                cua_keyvault::record::site_of(d)
+                            };
+                            (m.id, (site, m.provider_id))
+                        })
                     })
                     .collect()
             }
@@ -112,7 +116,7 @@ fn to_kv_access_request(request: &AccessRequest) -> cua_keyvault::broker::Access
 /// granted item id with its site from `site_of`.
 fn cli_decision(
     decision: cua_keyvault::broker::Decision,
-    site_of: &std::collections::HashMap<String, String>,
+    site_of: &std::collections::HashMap<String, (String, String)>,
 ) -> Decision {
     match decision {
         cua_keyvault::broker::Decision::Pending => Decision::Pending,
@@ -122,8 +126,16 @@ fn cli_decision(
             items: items
                 .into_iter()
                 .map(|id| {
-                    let site = site_of.get(&id).cloned().unwrap_or_else(|| id.clone());
-                    GrantedItem { id, site }
+                    let (site, provider_id) = site_of
+                        .get(&id)
+                        .cloned()
+                        .map(|(s, p)| (s, Some(p)))
+                        .unwrap_or_else(|| (id.clone(), None));
+                    GrantedItem {
+                        id,
+                        site,
+                        provider_id,
+                    }
                 })
                 .collect(),
         },
@@ -195,8 +207,14 @@ mod tests {
         use std::collections::HashMap;
         // The vault knows both items' sites, but only github.com was requested.
         let site_of = HashMap::from([
-            ("i-gh".to_string(), "github.com".to_string()),
-            ("i-x".to_string(), "example.org".to_string()),
+            (
+                "i-gh".to_string(),
+                ("github.com".to_string(), "firefox".to_string()),
+            ),
+            (
+                "i-x".to_string(),
+                ("example.org".to_string(), "firefox".to_string()),
+            ),
         ]);
         let kv = cua_keyvault::broker::Decision::Granted {
             token: "cuakv1.tok".into(),
@@ -214,11 +232,13 @@ mod tests {
                 items: vec![
                     GrantedItem {
                         id: "i-gh".into(),
-                        site: "github.com".into()
+                        site: "github.com".into(),
+                        provider_id: Some("firefox".into()),
                     },
                     GrantedItem {
                         id: "i-x".into(),
-                        site: "example.org".into()
+                        site: "example.org".into(),
+                        provider_id: Some("firefox".into()),
                     },
                 ],
             }
@@ -241,6 +261,81 @@ mod tests {
             )]
         );
         assert!(!done.to_string().contains("cuakv1"), "token never leaves");
+    }
+
+    #[tokio::test]
+    async fn zen_retry_preserves_provider_and_exact_origin_without_psl_widening() {
+        use std::collections::HashMap;
+        let metadata = HashMap::from([
+            (
+                "good".into(),
+                ("https://a.example:8443".into(), "zen".into()),
+            ),
+            (
+                "scheme".into(),
+                ("http://a.example:8443".into(), "zen".into()),
+            ),
+            (
+                "port".into(),
+                ("https://a.example:9443".into(), "zen".into()),
+            ),
+            (
+                "child".into(),
+                ("https://child.a.example:8443".into(), "zen".into()),
+            ),
+            (
+                "firefox".into(),
+                ("https://a.example:8443".into(), "firefox".into()),
+            ),
+        ]);
+        let decision = cli_decision(
+            cua_keyvault::broker::Decision::Granted {
+                token: "cuakv1.tok".into(),
+                grant_id: "g".into(),
+                items: metadata.keys().cloned().collect(),
+                targets: vec!["local:web".into()],
+                not_after_ms: 0,
+            },
+            &metadata,
+        );
+        let fake = Fake::default();
+        *fake.decision.lock().unwrap() = Some(decision);
+        let done = complete(
+            &fake,
+            "local:web",
+            "zen",
+            &["https://a.example:8443".into()],
+            "req-1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(done["delivered"].as_array().unwrap().len(), 1);
+        assert_eq!(fake.delivered.lock().unwrap()[0].1, "good");
+        assert!(!done.to_string().contains("cuakv1"));
+    }
+
+    #[test]
+    fn zen_exact_selection_is_filed_without_origin_or_profile_widening() {
+        let req = AccessRequest {
+            selectors: vec![SiteSelector {
+                app: "zen".into(),
+                site: "https://www.a.example:8443".into(),
+            }],
+            targets: vec!["local:disposable".into()],
+            duration: DEFAULT_DURATION,
+            reason: "explicit site".into(),
+        };
+        let kv = to_kv_access_request(&req);
+        assert_eq!(
+            kv.selectors,
+            [cua_keyvault::broker::Selector::Site {
+                app: "zen".into(),
+                site: "https://www.a.example:8443".into()
+            }]
+        );
+        assert_eq!(kv.targets, ["local:disposable"]);
+        assert_eq!(kv.paths, None);
+        assert_eq!(kv.uses, Some(1));
     }
 
     /// A connect failure maps to `requires_cua_app`, and a live-Keyvault error

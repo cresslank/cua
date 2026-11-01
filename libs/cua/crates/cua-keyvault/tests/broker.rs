@@ -31,6 +31,7 @@ struct FakeBackend {
     /// The `launch` flag of every launching delivery.
     launches: Mutex<Vec<bool>>,
     captures: Mutex<Vec<ImportSpec>>,
+    zen_supported: std::sync::atomic::AtomicBool,
     /// Makes every wipe fail like a removed Space or an expired import.
     wipe_gone: Mutex<bool>,
     /// Name -> immutable Space id. A name absent here resolves to a stable
@@ -104,6 +105,16 @@ fn password_item(app: &str, site: &str, user: &str) -> Captured {
 
 #[async_trait::async_trait]
 impl Backend for FakeBackend {
+    async fn preflight_target(&self, app: &str, _target: &str) -> cua_keyvault::Result<()> {
+        if ["zen", "zen-browser", "app.zen_browser.zen"].contains(&app)
+            && !self.zen_supported.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(Error::Unsupported(
+                "old guest lacks normalized-gecko-v1".into(),
+            ));
+        }
+        Ok(())
+    }
     fn resolve_target(&self, name: &str) -> cua_keyvault::Result<String> {
         Ok(self
             .target_ids
@@ -282,6 +293,236 @@ async fn rig() -> Rig {
         koala,
         evil,
     }
+}
+
+#[tokio::test]
+async fn zen_target_preflight_precedes_presence_capture_and_stored_delivery() {
+    let r = rig().await;
+    for alias in ["zen", "zen-browser", "app.zen_browser.zen"] {
+        let prompts = r.presence.asked.lock().unwrap().len();
+        let err = r
+            .broker
+            .import_and_teleport_launching(
+                &r.cua,
+                ImportSpec {
+                    app: alias.into(),
+                    whole_app: true,
+                    paths: Some(vec!["zen/tabs.json".into()]),
+                    ..Default::default()
+                },
+                "lab".into(),
+                false,
+                false,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Unsupported(m) if m == "old guest lacks normalized-gecko-v1"));
+        assert_eq!(r.presence.asked.lock().unwrap().len(), prompts);
+        assert!(r.backend.captures.lock().unwrap().is_empty());
+    }
+    r.broker
+        .import(
+            &r.cua,
+            ImportSpec {
+                app: "zen".into(),
+                sites: vec![SiteChoice {
+                    site: "a.example.test".into(),
+                    include_storage: false,
+                    include_passwords: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let ids: Vec<_> = all_items(&r).await.iter().map(|i| i.id.clone()).collect();
+    let prompts = r.presence.asked.lock().unwrap().len();
+    let req = TeleportRequest {
+        items: ids,
+        target: "lab".into(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        r.broker.teleport(&r.cua, req.clone()).await,
+        Err(Error::Unsupported(_))
+    ));
+    assert_eq!(r.presence.asked.lock().unwrap().len(), prompts);
+    assert!(r.backend.delivered.lock().unwrap().is_empty());
+    r.backend
+        .zen_supported
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    r.broker.teleport(&r.cua, req).await.unwrap();
+    assert_eq!(r.backend.delivered.lock().unwrap()[0].1, "zen");
+}
+
+#[tokio::test]
+async fn zen_old_guest_approval_does_not_prompt_or_capture_requested_paths() {
+    let r = rig().await;
+    let pending = r
+        .broker
+        .request_access(
+            &r.koala,
+            AccessRequest {
+                selectors: vec![Selector::App { app: "zen".into() }],
+                targets: vec!["lab".into()],
+                paths: Some(vec!["zen/cookies.sqlite".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let prompts = r.presence.asked.lock().unwrap().len();
+    assert!(matches!(
+        r.broker
+            .approve(&r.cua, &pending.id, ApproveOptions::default())
+            .await,
+        Err(Error::Unsupported(_))
+    ));
+    assert_eq!(r.presence.asked.lock().unwrap().len(), prompts);
+    assert!(r.backend.captures.lock().unwrap().is_empty());
+    assert!(r.backend.delivered.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn zen_saved_selection_is_exact_not_parent_or_sibling_and_aliases_keep_identity() {
+    let r = rig().await;
+    r.broker
+        .import(
+            &r.cua,
+            ImportSpec {
+                app: "zen".into(),
+                sites: [
+                    "a.example.test",
+                    "child.a.example.test",
+                    "b.example.test",
+                    "example.test",
+                ]
+                .iter()
+                .map(|s| SiteChoice {
+                    site: (*s).into(),
+                    include_storage: false,
+                    include_passwords: false,
+                })
+                .collect(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let zen_id = all_items(&r)
+        .await
+        .into_iter()
+        .find(|i| i.domain.as_deref() == Some(".a.example.test"))
+        .unwrap()
+        .id;
+    r.broker
+        .import(
+            &r.cua,
+            ImportSpec {
+                app: "firefox".into(),
+                sites: vec![SiteChoice {
+                    site: "a.example.test".into(),
+                    include_storage: false,
+                    include_passwords: false,
+                }],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let items = all_items(&r).await;
+    assert_eq!(
+        items.len(),
+        5,
+        "identical Firefox and Zen records never upsert across providers"
+    );
+    let expected = items
+        .into_iter()
+        .find(|i| i.provider_id == "zen" && i.domain.as_deref() == Some(".a.example.test"))
+        .unwrap()
+        .id;
+    assert_eq!(expected, zen_id);
+    for alias in ["zen", "zen-browser", "app.zen_browser.zen"] {
+        let pending = r
+            .broker
+            .request_access(
+                &r.koala,
+                AccessRequest {
+                    selectors: vec![Selector::Site {
+                        app: alias.into(),
+                        site: "a.example.test".into(),
+                    }],
+                    targets: vec!["lab".into()],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(pending.items.len(), 1);
+        assert_eq!(pending.items[0].id, expected);
+        assert_eq!(pending.items[0].provider_id, "zen");
+    }
+}
+
+#[tokio::test]
+async fn zen_named_password_path_and_whole_app_flag_cannot_bypass_second_confirmation() {
+    let r = rig().await;
+    r.backend
+        .zen_supported
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    for spec in [
+        ImportSpec {
+            app: "zen".into(),
+            whole_app: true,
+            paths: Some(vec!["zen/logins.json".into()]),
+            ..Default::default()
+        },
+        ImportSpec {
+            app: "zen-browser".into(),
+            whole_app: true,
+            passwords: true,
+            ..Default::default()
+        },
+    ] {
+        let e = r
+            .broker
+            .import_and_teleport_launching(&r.cua, spec, "lab".into(), false, false, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Error::Invalid(m) if m.contains("confirm_passwords")));
+    }
+    assert!(r.backend.captures.lock().unwrap().is_empty());
+    assert!(r.backend.delivered.lock().unwrap().is_empty());
+    assert!(r.presence.saved_passwords_asked.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn zen_named_password_path_uses_the_distinct_password_presence_gate() {
+    let r = rig().await;
+    r.broker
+        .import(
+            &r.cua,
+            ImportSpec {
+                app: "zen".into(),
+                whole_app: true,
+                confirm_passwords: true,
+                paths: Some(vec!["zen/logins.json".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        r.presence
+            .asked
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .contains("INCLUDING SAVED PASSWORDS")
+    );
+    assert_eq!(r.presence.saved_passwords_asked.lock().unwrap().len(), 1);
 }
 
 /// Every item, with names visible (opens the browse window).

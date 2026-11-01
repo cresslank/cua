@@ -61,6 +61,7 @@ tokio-tungstenite.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+rusqlite = { version = "0.40.1", default-features = false, features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 png = "0.18"
 cua-host = { workspace = true, features = ["testing"] }

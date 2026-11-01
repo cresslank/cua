@@ -770,13 +770,249 @@ impl RecordCodec for ChromiumCodec {
     }
 }
 
+/// Zen's closed normalized interchange contract. Reserved entries become
+/// structured records, never opaque files; raw source material is forbidden even
+/// with an opt-in. The saved-password second confirmation belongs to the broker.
+pub struct ZenCodec;
+
+impl ZenCodec {
+    fn validate(entries: &[PayloadEntry]) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for e in entries {
+            if !seen.insert(&e.rel_path) {
+                return Err(Error::Corrupt("duplicate Zen entry".into()));
+            }
+            let bytes = entry_bytes(e)?;
+            if e.rel_path == "zen/tabs.json" {
+                let _: Vec<String> = serde_json::from_slice(&bytes)
+                    .map_err(|_| Error::Corrupt("Zen tabs are not valid".into()))?;
+                continue;
+            }
+            let fields: &[&str] = match e.rel_path.as_str() {
+                COOKIES_ENTRY => &[
+                    "host_key",
+                    "name",
+                    "value",
+                    "path",
+                    "expires_utc",
+                    "is_secure",
+                    "is_httponly",
+                    "samesite",
+                    "creation_utc",
+                    "last_access_utc",
+                    "last_update_utc",
+                    "priority",
+                    "source_scheme",
+                    "source_port",
+                    "source_type",
+                    "has_cross_site_ancestor",
+                    "partition_key",
+                ],
+                LOCAL_STORAGE_ENTRY => &["origin", "key", "value", "key_raw", "value_raw"],
+                LOGINS_ENTRY => &["origin", "username", "password", "signon_realm"],
+                _ => {
+                    return Err(Error::Unsupported(
+                        "Zen raw profile files and source keys are never delivered".into(),
+                    ));
+                }
+            };
+            let rows: Vec<serde_json::Value> = serde_json::from_slice(&bytes)
+                .map_err(|_| Error::Corrupt("invalid normalized Zen entry".into()))?;
+            for row in rows {
+                let object = row
+                    .as_object()
+                    .ok_or_else(|| Error::Corrupt("invalid normalized Zen row".into()))?;
+                if object.keys().any(|k| !fields.contains(&k.as_str())) {
+                    return Err(Error::Unsupported(
+                        "unsupported Zen attributes are withheld, never flattened".into(),
+                    ));
+                }
+                if e.rel_path == COOKIES_ENTRY
+                    && object
+                        .get("partition_key")
+                        .is_some_and(|p| !p.is_null() && p.as_str() != Some(""))
+                {
+                    return Err(Error::Unsupported(
+                        "Zen partitioned cookies are withheld".into(),
+                    ));
+                }
+                if e.rel_path == LOCAL_STORAGE_ENTRY
+                    && ["key_raw", "value_raw"]
+                        .iter()
+                        .any(|k| object.get(*k).is_some_and(|v| !v.is_null()))
+                {
+                    return Err(Error::Unsupported(
+                        "Zen raw storage encodings are withheld".into(),
+                    ));
+                }
+                if e.rel_path == LOGINS_ENTRY {
+                    let login: LoginRow =
+                        serde_json::from_value(serde_json::Value::Object(object.clone()))
+                            .map_err(|_| Error::Corrupt("invalid normalized Zen login".into()))?;
+                    std::str::from_utf8(&login.password)
+                        .map_err(|_| Error::Corrupt("Zen password is not UTF-8".into()))?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl RecordCodec for ZenCodec {
+    fn id(&self) -> &'static str {
+        "normalized-gecko-v1"
+    }
+
+    fn export(&self, entries: Vec<PayloadEntry>, opts: &ExportOptions) -> Result<Exported> {
+        Self::validate(&entries)?;
+        for e in &entries {
+            let gate = match e.rel_path.as_str() {
+                COOKIES_ENTRY => Some("zen/cookies.sqlite"),
+                LOCAL_STORAGE_ENTRY => Some("zen/storage"),
+                LOGINS_ENTRY => Some("zen/logins.json"),
+                _ => None,
+            };
+            if gate.is_some_and(|key| !opts.opted_in.iter().any(|p| p == key)) {
+                return Err(Error::Invalid(
+                    "Zen sensitive entries need their exact manifest selection".into(),
+                ));
+            }
+        }
+        GenericCodec.export(entries, opts)
+    }
+
+    fn import(&self, payloads: &[ItemPayload]) -> Result<Vec<PayloadEntry>> {
+        if payloads.iter().any(|p| p.provider_id != "zen") {
+            return Err(Error::Invalid(
+                "Zen records must retain provider_id=zen".into(),
+            ));
+        }
+        for p in payloads {
+            let fields: &[&str] = match p.schema.as_str() {
+                COOKIE_V1 => &[
+                    "creation_utc",
+                    "expires_utc",
+                    "has_cross_site_ancestor",
+                    "host_key",
+                    "http_only",
+                    "last_access_utc",
+                    "last_update_utc",
+                    "name",
+                    "partition_key",
+                    "path",
+                    "priority",
+                    "same_site",
+                    "secure",
+                    "source_port",
+                    "source_scheme",
+                    "source_type",
+                    "value",
+                ],
+                LOCAL_STORAGE_V1 => &["key", "origin", "value", "key_raw", "value_raw"],
+                PASSWORD_V1 => &["origin", "username", "password"],
+                FILE_V1 => &["blob", "content", "mode", "path", "sha256", "size"],
+                _ => return Err(Error::Unsupported("unknown Zen record schema".into())),
+            };
+            let value: serde_json::Value = serde_json::from_str(&p.record)?;
+            if value
+                .as_object()
+                .is_none_or(|o| o.keys().any(|k| !fields.contains(&k.as_str())))
+            {
+                return Err(Error::Unsupported(
+                    "unsupported Zen record attributes are withheld".into(),
+                ));
+            }
+            if p.schema == FILE_V1 {
+                let f: FileRecord = serde_json::from_str(&p.record)?;
+                if f.path != "zen/tabs.json" {
+                    return Err(Error::Unsupported(
+                        "Zen file records may contain only normalized tabs".into(),
+                    ));
+                }
+                let bytes = b64()
+                    .decode(f.content.as_deref().unwrap_or(""))
+                    .map_err(|_| Error::Corrupt("invalid Zen tabs bytes".into()))?;
+                if f.size != bytes.len() as u64 || f.sha256 != sha256_hex(&bytes) {
+                    return Err(Error::Corrupt("Zen tabs size/checksum mismatch".into()));
+                }
+            }
+        }
+        let entries = GenericCodec.import(payloads)?;
+        Self::validate(&entries)?;
+        Ok(entries)
+    }
+}
+
 /// The codec for a provider id.
 pub fn codec_for(provider_id: &str) -> Box<dyn RecordCodec> {
     match provider_id {
+        "zen" => Box::new(ZenCodec),
         "chrome" | "chromium" | "brave" | "edge" | "arc" | "vivaldi" | "opera" => {
             Box::new(ChromiumCodec)
         }
         _ => Box::new(GenericCodec),
+    }
+}
+
+/// A Zen authorization label is an exact host or HTTP(S) origin, never a
+/// registrable-domain shortcut. Reject paths, credentials and context suffixes.
+pub fn exact_site_selection(value: &str) -> Result<(String, Option<String>)> {
+    let invalid = || {
+        Error::Invalid(
+            "exact_site_selection_invalid: choose an exact host or HTTP(S) origin".into(),
+        )
+    };
+    if value.trim() != value
+        || value.chars().any(|c| c.is_whitespace() || c.is_control())
+        || value.contains(['^', '@', '?', '#', '\\'])
+    {
+        return Err(invalid());
+    }
+    let is_origin = value.contains("://");
+    if is_origin
+        && value.split_once("://").is_some_and(|(_, rest)| {
+            rest.split_once('/')
+                .is_some_and(|(_, path)| !path.is_empty())
+        })
+    {
+        return Err(invalid());
+    }
+    if !is_origin && value.contains(':') && !(value.starts_with('[') && value.ends_with(']')) {
+        return Err(invalid());
+    }
+    let parsed = url::Url::parse(&if is_origin {
+        value.to_string()
+    } else {
+        format!("https://{value}")
+    })
+    .map_err(|_| invalid())?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.path() != "/"
+        || parsed.host_str().is_none()
+        || (!is_origin && (value.contains('/') || parsed.port().is_some()))
+    {
+        return Err(invalid());
+    }
+    let host = parsed.host_str().unwrap().to_string();
+    Ok((
+        host,
+        is_origin.then(|| parsed.origin().ascii_serialization()),
+    ))
+}
+
+pub fn exact_site_matches(value: &str, selection: &str, cookie: bool) -> bool {
+    let Ok((host, origin)) = exact_site_selection(selection) else {
+        return false;
+    };
+    if cookie {
+        return host_of(value) == host;
+    }
+    let Ok(v) = url::Url::parse(value) else {
+        return false;
+    };
+    match origin {
+        Some(o) => v.origin().ascii_serialization() == o,
+        None => v.host_str() == Some(&host),
     }
 }
 

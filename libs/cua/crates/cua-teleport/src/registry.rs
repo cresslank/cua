@@ -55,29 +55,42 @@ impl ExportRegistry {
         Self::builtin(host, None)
     }
 
-    /// Like [`Self::with_builtin_host`], capturing the named (or path-given)
-    /// Chrome profile instead of `Default`.
+    /// Compatibility alias for [`Self::with_builtin_host_and_profile`].
+    /// The selector is also honored by the constrained Zen provider.
     pub fn with_builtin_host_and_chrome_profile(
         host: Arc<dyn HostEffects>,
         chrome_profile: Option<String>,
     ) -> Self {
-        Self::builtin(host, chrome_profile)
+        Self::with_builtin_host_and_profile(host, chrome_profile)
     }
 
-    fn builtin(host: Arc<dyn HostEffects>, chrome_profile: Option<String>) -> Self {
+    /// Select the exact browser profile for Chrome or Zen. Each provider
+    /// applies its own browser-root constraint; this never aliases Zen to Firefox.
+    pub fn with_builtin_host_and_profile(
+        host: Arc<dyn HostEffects>,
+        profile: Option<String>,
+    ) -> Self {
+        Self::builtin(host, profile)
+    }
+
+    fn builtin(host: Arc<dyn HostEffects>, profile: Option<String>) -> Self {
         use crate::providers::{
             chrome::ChromeProvider, claude_code::ClaudeCodeProvider, electron::ElectronProvider,
             firefox::FirefoxProvider, steam::SteamProvider, whatsapp::WhatsAppProvider,
+            zen::ZenProvider,
         };
         let mut chrome = ChromeProvider::new().with_host(host.clone());
-        if let Some(profile) = chrome_profile {
-            chrome = chrome.with_profile(profile);
+        let mut zen = ZenProvider::new().with_host(host.clone());
+        if let Some(profile) = profile {
+            chrome = chrome.with_profile(profile.clone());
+            zen = zen.with_profile(profile);
         }
         let mut registry = Self::new();
         registry.register(Box::new(chrome));
         registry.register(Box::new(
             FirefoxProvider::new().structured().with_host(host.clone()),
         ));
+        registry.register(Box::new(zen));
         // Electron apps are Chromium underneath: their cookies and
         // localStorage travel as items, re-encrypted for the destination's
         // own key (see `ElectronProvider::structured`).

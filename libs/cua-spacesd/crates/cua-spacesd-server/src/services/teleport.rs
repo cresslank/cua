@@ -13,7 +13,8 @@ use cua_proto::env::v1::teleport_service_server::{TeleportService, TeleportServi
 use cua_proto::env::v1::*;
 use cua_spacesd_teleport::ledger::{create_private_dir_all, now_ms};
 use cua_spacesd_teleport::{
-    conflict_free_path, validate_relative_path, IgnoreRules, Ledger, LedgerStore, Receiver,
+    conflict_free_path, validate_relative_path, IgnoreRules, ImportCancellation, Ledger,
+    LedgerStore, Receiver,
 };
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -42,6 +43,29 @@ struct Import {
     received: u64,
     hasher: Sha256,
     expires: Instant,
+}
+
+/// Dropping a Tonic handler does not abort spawn_blocking. Transfer its stop
+/// authority explicitly; Drop must never wait for filesystem I/O or a mutex.
+struct CancelImportOnDrop(ImportCancellation);
+impl Drop for CancelImportOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+/// The blocking owner cleans even when its RPC reply is abandoned. Retain the
+/// upload mutex until cleanup, so a final-chunk retry cannot mutate its input.
+struct FinishImport {
+    imports: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<Import>>>>>,
+    id: String,
+    import: tokio::sync::OwnedMutexGuard<Import>,
+}
+impl Drop for FinishImport {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.import.staging);
+        self.imports.lock().expect("imports").remove(&self.id);
+    }
 }
 
 struct Transfer {
@@ -256,7 +280,9 @@ fn app_on_path(app: &str) -> bool {
             "chromium-browser",
         ],
         "chromium" => &["chromium", "chromium-browser"],
+        // Zen's normalized contract targets Firefox, not a guest Zen package.
         "firefox" => &["firefox", "firefox-esr"],
+        "zen" => &["firefox"],
         "vscode" => &["code"],
         other => return which(other),
     };
@@ -376,7 +402,7 @@ impl TeleportService for TeleportServiceImpl {
                     .clone()
             }
         };
-        let mut import = entry.lock().await;
+        let mut import = entry.lock_owned().await;
         let end = body.offset + body.data.len() as u64;
         let duplicate = if body.offset == import.received {
             let staging = import.staging.clone();
@@ -437,7 +463,30 @@ impl TeleportService for TeleportServiceImpl {
         let path = staging.clone();
         let import_id = body.import_id.clone();
         let ctx = self.ctx.clone();
+        let service = self.clone();
+        let expires_at_ms = options.expires_at_ms;
+        let received_bytes = import.received;
+        let finish = FinishImport {
+            imports: self.imports.clone(),
+            id: import_id.clone(),
+            import,
+        };
+        let cancellation = ImportCancellation::default();
+        let _cancel_on_drop = CancelImportOnDrop(cancellation.clone());
         let outcome = tokio::task::spawn_blocking(move || {
+            let _finish = finish;
+            // Zen keeps its predecessor/admission lease until this durable
+            // ledger succeeds, and only then may the browser launch. Preserve
+            // the existing providers' ledger path below.
+            let mut commit = |provider: &str, record: &cua_spacesd_teleport::ImportRecord| {
+                if provider == "zen" {
+                    service
+                        .write_ledger(&import_id, provider, record, expires_at_ms)
+                        .map_err(|e| e.to_string())
+                } else {
+                    Ok(())
+                }
+            };
             // S1: a sealed delivery (cua_machine_seal) is unsealed here,
             // before the bundle is parsed at all, so the importer below
             // never sees anything but the plaintext bundle it always has.
@@ -471,20 +520,27 @@ impl TeleportService for TeleportServiceImpl {
                     )
                 })?;
                 let cursor = std::io::Cursor::new(plaintext.to_vec());
-                Ok::<_, std::io::Error>(receiver.import_bundle(cursor, &app, options.launch_after))
+                Ok::<_, std::io::Error>(receiver.import_bundle_cancellable(
+                    cursor,
+                    &app,
+                    options.launch_after,
+                    &cancellation,
+                    &mut commit,
+                ))
             } else {
                 let file = std::fs::File::open(&path)?;
-                Ok::<_, std::io::Error>(receiver.import_bundle(file, &app, options.launch_after))
+                Ok::<_, std::io::Error>(receiver.import_bundle_cancellable(
+                    file,
+                    &app,
+                    options.launch_after,
+                    &cancellation,
+                    &mut commit,
+                ))
             }
         })
         .await
         .map_err(|e| crate::error::internal(e.to_string()))?
         .map_err(|e| io_status(&e, &staging))?;
-        let _ = tokio::fs::remove_file(&staging).await;
-        self.imports
-            .lock()
-            .expect("imports")
-            .remove(&body.import_id);
         if outcome.is_err() {
             crate::telemetry::counters().import_failed();
         }
@@ -502,7 +558,9 @@ impl TeleportService for TeleportServiceImpl {
         })?;
         // Every committed import is ledgered. If that fails the import is
         // undone: a session nobody can wipe must not stay in the guest.
-        let ledgered = {
+        let ledgered = if outcome.provider_id == "zen" {
+            Ok(())
+        } else {
             let service = self.clone();
             let import_id = body.import_id.clone();
             let provider = outcome.provider_id.clone();
@@ -538,7 +596,7 @@ impl TeleportService for TeleportServiceImpl {
             skipped.push(format!("launch: {why}"));
         }
         Ok(Response::new(ImportSessionResponse {
-            received_bytes: import.received,
+            received_bytes,
             duplicate,
             result: Some(ImportResult {
                 imported: outcome.imported,

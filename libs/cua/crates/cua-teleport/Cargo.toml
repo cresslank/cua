@@ -39,6 +39,7 @@ zeroize = "1"
 # Firefox localStorage values are raw Snappy blocks (dom/localstorage/SnappyUtils.cpp).
 snap = "1"
 tempfile.workspace = true
+url.workspace = true
 # The teleport UX core (`ux`): the pinned install manifest the catalog
 # classifies against (`cua_agents::installables`, a pure table).
 cua-agents.workspace = true
@@ -46,6 +47,9 @@ cua-agents.workspace = true
 plist = "1"
 # Window thumbnails for the drag preview: PNG-encoded, kept in memory.
 png = "0.18"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 # macOS-only: LocalAuthentication (Touch ID / device passcode) gate for
 # sensitive session exports.
