@@ -330,23 +330,25 @@ impl SpotlightReceiver for Spotlight {
     }
 }
 
-// These preference APIs never guess a default shortcut or request permissions.
+// Read the effective preference domain (including managed values), not just the
+// user-override plist. These APIs never request permissions.
 #[link(name = "CoreFoundation", kind = "framework")]
 extern "C" {
     fn CFPreferencesCopyAppValue(key: CFStringRef, app: CFStringRef) -> CFTypeRef;
     fn CFPreferencesAppSynchronize(app: CFStringRef) -> u8;
 }
 
-fn configured_spotlight_hotkeys() -> Option<CFType> {
-    let app = CFString::new("com.apple.symbolichotkeys");
-    let key = CFString::new("AppleSymbolicHotKeys");
+fn copy_app_preference(app: &str, key: &str) -> SwitchResult<Option<CFType>> {
+    let app = CFString::new(app);
+    let key = CFString::new(key);
     unsafe {
         // Refresh any cached preference value before authorizing global input.
         if CFPreferencesAppSynchronize(app.as_concrete_TypeRef()) == 0 {
-            return None;
+            // A failed read is not evidence that the override is absent.
+            return Err(Refusal("keyboard_unavailable"));
         }
         let value = CFPreferencesCopyAppValue(key.as_concrete_TypeRef(), app.as_concrete_TypeRef());
-        (!value.is_null()).then(|| CFType::wrap_under_create_rule(value))
+        Ok((!value.is_null()).then(|| CFType::wrap_under_create_rule(value)))
     }
 }
 
@@ -357,11 +359,18 @@ fn dictionary_value(value: &CFType, key: &str) -> Option<CFType> {
     Some(unsafe { CFType::wrap_under_get_rule(value) })
 }
 
-/// Entry 64 is Spotlight search. All three parameters must explicitly describe
-/// Command-Space (character, virtual key, modifiers), not a missing/default,
-/// disabled, remapped, or coercible lookalike value.
+/// Entry 64 is Spotlight search. The domain stores overrides: an absent
+/// dictionary or entry uses macOS's enabled Command-Space default. A present
+/// override must explicitly describe that exact shortcut; malformed values are
+/// not absence and must never inherit the default.
 fn command_space_configured(hotkeys: Option<&CFType>) -> Option<()> {
-    let entry = dictionary_value(hotkeys?, "64")?;
+    let Some(hotkeys) = hotkeys else {
+        return Some(());
+    };
+    hotkeys.downcast::<CFDictionary>()?;
+    let Some(entry) = dictionary_value(hotkeys, "64") else {
+        return Some(());
+    };
     if dictionary_value(&entry, "enabled")?.downcast::<CFBoolean>()? != CFBoolean::true_value() {
         return None;
     }
@@ -538,9 +547,9 @@ fn keyboard(args: &SwitchArgs, window_id: u32) -> SwitchResult<bool> {
     crate::post_action::cancel();
     ready()?;
     let mut events = NativeEvents;
-    let hotkeys = configured_spotlight_hotkeys();
+    let hotkeys = copy_app_preference("com.apple.symbolichotkeys", "AppleSymbolicHotKeys");
     ready()?;
-    open_spotlight(hotkeys.as_ref(), &mut events, ready)?;
+    open_spotlight(hotkeys?.as_ref(), &mut events, ready)?;
     let deadline = Instant::now() + SHELL_TIMEOUT;
     let shell = loop {
         ready()?;
@@ -816,8 +825,8 @@ mod tests {
     }
 
     #[test]
-    fn shortcut_refuses_missing_disabled_unverifiable_or_remapped_preferences_without_input() {
-        let mut invalid = vec![json!({}), json!({"65": command_space()["64"]}), json!(true)];
+    fn shortcut_refuses_present_disabled_malformed_or_remapped_preferences_without_input() {
+        let mut invalid = vec![json!(true), json!([]), json!("AppleSymbolicHotKeys")];
         for (path, replacements) in [
             ("/64", vec![json!({}), json!("64")]),
             ("/64/enabled", vec![json!(false), json!(1), json!("true")]),
@@ -840,26 +849,29 @@ mod tests {
                 ],
             ),
         ] {
-            // Removing any required fact must fail too (no implicit defaults).
-            let mut missing = command_space();
-            let (parent, key) = path.rsplit_once('/').unwrap();
-            missing
-                .pointer_mut(parent)
-                .unwrap()
-                .as_object_mut()
-                .unwrap()
-                .remove(key);
-            invalid.push(missing);
+            // Only the entire absent override inherits the OS default. Missing
+            // fields inside a present entry remain malformed and refuse.
+            if path != "/64" {
+                let mut missing = command_space();
+                let (parent, key) = path.rsplit_once('/').unwrap();
+                missing
+                    .pointer_mut(parent)
+                    .unwrap()
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(key);
+                invalid.push(missing);
+            }
             for replacement in replacements {
                 let mut value = command_space();
                 *value.pointer_mut(path).unwrap() = replacement;
                 invalid.push(value);
             }
         }
-        for value in std::iter::once(None).chain(invalid.into_iter().map(|v| Some(preference(v)))) {
+        for value in invalid.into_iter().map(preference) {
             let mut events = RecordedEvents::default();
             assert_eq!(
-                open_spotlight(value.as_ref(), &mut events, || Ok(())),
+                open_spotlight(Some(&value), &mut events, || Ok(())),
                 Err(Refusal("keyboard_unavailable"))
             );
             assert!(events.deliveries.is_empty(), "refusal emitted input");
@@ -867,16 +879,48 @@ mod tests {
     }
 
     #[test]
-    fn configured_shortcut_is_only_two_flagged_space_events_and_readiness_can_veto_both() {
+    fn missing_preference_file_uses_default_without_creating_a_user_override() {
+        // Exercise the real read-only preference seam against a fresh namespace,
+        // never the user's Spotlight configuration or any preference setters.
+        let app = format!("com.trycua.switch-window-test.{}", uuid::Uuid::new_v4());
+        let path = std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+            .join("Library/Preferences")
+            .join(format!("{app}.plist"));
+        assert!(!path.exists());
+        let value = copy_app_preference(&app, "AppleSymbolicHotKeys").unwrap();
+        assert!(value.is_none());
+        assert_command_space(value.as_ref());
+        assert!(!path.exists(), "read must not persist default overrides");
+    }
+
+    #[test]
+    fn absent_dictionary_uses_default_command_space() {
+        // CFPreferences returns NULL both for an absent AppleSymbolicHotKeys key
+        // and a nonexistent domain/file, but not for a malformed present value.
+        assert_command_space(None);
+    }
+
+    #[test]
+    fn absent_entry_and_empty_dictionary_use_default_command_space() {
+        for value in [json!({}), json!({"65": command_space()["64"]})] {
+            assert_command_space(Some(&preference(value)));
+        }
+    }
+
+    #[test]
+    fn enabled_standard_override_uses_command_space() {
+        assert_command_space(Some(&preference(command_space())));
+    }
+
+    fn assert_command_space(value: Option<&CFType>) {
         use core_graphics::event::{CGEventType, EventField};
-        let value = preference(command_space());
         let mut events = RecordedEvents::default();
         assert_eq!(
-            open_spotlight(Some(&value), &mut events, || Err(Refusal("session_locked"))),
+            open_spotlight(value, &mut events, || Err(Refusal("session_locked"))),
             Err(Refusal("session_locked"))
         );
         assert!(events.deliveries.is_empty());
-        open_spotlight(Some(&value), &mut events, || Ok(())).unwrap();
+        assert_eq!(open_spotlight(value, &mut events, || Ok(())), Ok(()));
         assert_eq!(
             events.deliveries.len(),
             2,
