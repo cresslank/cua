@@ -233,8 +233,23 @@ fn names<'a>(walk: &'a Collected<'_>) -> Vec<&'a str> {
     walk.visited.iter().map(|node| node.name.as_str()).collect()
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(start_paused = true)]
 async fn selected_tab_reached_before_cap_and_background_roots_reported() {
+    // This owns selected-tab pruning and the element cap, not D-Bus latency.
+    // A loaded runner can legitimately exhaust the 250 ms look-ahead deadline
+    // before tab 34: without a showing witness, retaining background contents
+    // (and eventually reporting node_budget) is the correct fail-open behavior.
+    // Freeze Tokio time without auto-advancing while the real private bus does
+    // I/O; leave production deadlines and the full 35-tab tree unchanged.
+    let keep_clock_frozen = tokio::spawn(async {
+        let wall_start = std::time::Instant::now();
+        // If the fixture stalls, stop suppressing auto-advance so the existing
+        // operation/call deadlines fail the test instead of spinning forever.
+        while wall_start.elapsed() < Duration::from_secs(60) {
+            tokio::task::yield_now().await;
+        }
+    });
+    let logical_start = tokio::time::Instant::now();
     for (selected, cap) in [(5, 5000), (0, 200), (5, 200), (34, 200)] {
         let mut tree = Tree::new();
         let window = tree.window();
@@ -259,6 +274,8 @@ async fn selected_tab_reached_before_cap_and_background_roots_reported() {
         assert!(!md.contains("closed menu"));
         assert_eq!(visits, 226); // frame + 35 * (two wrappers + doc) + selected controls
     }
+    assert_eq!(tokio::time::Instant::now(), logical_start);
+    keep_clock_frozen.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
