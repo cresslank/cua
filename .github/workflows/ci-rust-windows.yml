@@ -180,16 +180,28 @@ jobs:
         run: |
           cargo test -p cua-driver --test protocol_tools_call_test windows_foreground_policy::tests:: --locked
           if ($LASTEXITCODE -ne 0) { throw "foreground-policy safety tests failed with exit $LASTEXITCODE" }
-          cargo test -p cua-driver --test protocol_tools_call_test launch_edge_from_apps_folder_registration --locked -- --ignored --exact --nocapture
-          if ($LASTEXITCODE -ne 0) { throw "Edge AppsFolder launch test failed with exit $LASTEXITCODE" }
+          $failures = 0
+          for ($sample = 1; $sample -le 20; $sample++) {
+            Write-Host "[edge-diagnostic] sample=$sample"
+            cargo test -p cua-driver --test protocol_tools_call_test launch_edge_from_apps_folder_registration --locked -- --ignored --exact --nocapture
+            if ($LASTEXITCODE -ne 0) { $failures++ }
+          }
+          if ($failures -gt 0) { throw "Edge samples failed: $failures/20" }
       - name: Prove an elevated Driver launches apps with a standard-user token
+        if: ${{ !cancelled() }}
         working-directory: libs/cua-driver/rust
         env:
           CUA_TEST_REQUIRE_DRIVER_BIN: "1"
         run: |
           cargo build --locked -p cua-driver-testkit --example windows_launch_receiver
           if ($LASTEXITCODE -ne 0) { throw "owned launch receiver build failed with exit $LASTEXITCODE" }
-          cargo test -p cua-driver --test launch_app_standard_user_test --locked -- --ignored --nocapture
+          $failures = 0
+          for ($sample = 1; $sample -le 20; $sample++) {
+            Write-Host "[ping-diagnostic] sample=$sample"
+            cargo test -p cua-driver --test launch_app_standard_user_test --locked -- --ignored --nocapture
+            if ($LASTEXITCODE -ne 0) { $failures++ }
+          }
+          if ($failures -gt 0) { throw "PING samples failed: $failures/20" }
       - name: Run transport-independent authorization and SDK tests
         working-directory: libs/cua-driver/rust
         run: |
