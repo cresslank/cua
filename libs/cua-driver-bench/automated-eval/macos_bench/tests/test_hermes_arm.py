@@ -34,6 +34,7 @@ ARM = "cc-hermes-cua-jev"
 EXPECTED_TOOLS = (
     "computer_use",
     "cua_steps",
+    "cua_script",
     "cua_task",
     "cua_window",
     "cua_browser",
@@ -114,7 +115,9 @@ class HermesArmTest(unittest.TestCase):
         self.assertEqual(config["agent"]["image_input_mode"], "native")
         self.assertEqual(config["command_allowlist"], json.loads(self.allowlist.read_text()))
         self.assertIs(config["security"]["allow_lazy_installs"], False)
-        self.assertEqual(build.daemon_env, (ca.NO_SCRIPT_FLAG,))
+        self.assertEqual(build.daemon_env, (ca.SCRIPT_FLAG,))
+        self.assertEqual(ca.CUA_BUILDS["cc-cua-driver-main"].daemon_env, (ca.NO_SCRIPT_FLAG,))
+        self.assertEqual(ca.CUA_BUILDS["cc-cua-driver-script"].daemon_env, (ca.SCRIPT_FLAG,))
         self.assertTrue(build.home.is_relative_to(self.run_dir))
         self.assertNotIn("mcp_servers", config)
         poison = {
@@ -143,7 +146,8 @@ class HermesArmTest(unittest.TestCase):
                 self.assertEqual(observed[key], assignments[key])
             else:
                 self.assertNotIn(key, observed)
-        self.assertEqual(observed["CUA_DRIVER_DISABLE_RUN_SCRIPT"], "1")
+        self.assertEqual(observed["CUA_DRIVER_EXPERIMENTAL_SCRIPT"], "1")
+        self.assertNotIn("CUA_DRIVER_DISABLE_RUN_SCRIPT", observed)
         argv = ca.claude_argv(
             mcp_config=path, server=server, model="test-model", max_turns=1, max_budget_usd=1
         )
@@ -271,7 +275,7 @@ elif sys.argv[1]=='status':
         self.addCleanup(rb.shutdown, ctx)
         return ctx, build
 
-    def test_private_daemon_lifecycle_is_real_and_script_stays_off(self):
+    def test_private_daemon_lifecycle_is_real_and_script_enabled(self):
         ctx, build = self.owned_driver()
         rb.ensure_agent_daemon(ctx, ARM)
         proc = ctx.daemon
@@ -280,8 +284,8 @@ elif sys.argv[1]=='status':
         record = json.loads((build.state / "served.json").read_text())
         self.assertEqual(record["argv"][:3], ["serve", "--socket", build.socket])
         self.assertEqual(record["env"]["HOME"], str(build.home))
-        self.assertEqual(record["env"].get("CUA_DRIVER_DISABLE_RUN_SCRIPT"), "1")
-        self.assertNotIn("CUA_DRIVER_EXPERIMENTAL_SCRIPT", record["env"])
+        self.assertEqual(record["env"].get("CUA_DRIVER_EXPERIMENTAL_SCRIPT"), "1")
+        self.assertNotIn("CUA_DRIVER_DISABLE_RUN_SCRIPT", record["env"])
         rb.ensure_agent_daemon(ctx, ARM)
         assert ctx.daemon is not None
         self.assertEqual(ctx.daemon.pid, proc.pid)
@@ -291,7 +295,7 @@ elif sys.argv[1]=='status':
             os.kill(proc.pid, 0)
         ctx.daemon = None
 
-    def test_real_stdio_capture_branch_validates_seven_tools_images_and_refusals(self):
+    def test_real_stdio_capture_branch_validates_eight_tools_images_and_refusals(self):
         ctx, _ = self.owned_driver()
         server = self.root / "capture-edge.py"
         fixture = self.root / "fixture.json"
@@ -329,9 +333,9 @@ for line in sys.stdin:
         blank = b"P6\n2 1\n255\n" + b"\x00" * 6
         for names, image, refusal, expected in (
             (EXPECTED_TOOLS, colorful, False, None),
-            ((*EXPECTED_TOOLS, "terminal"), colorful, False, "expected exact seven"),
-            ((*EXPECTED_TOOLS, EXPECTED_TOOLS[0]), colorful, False, "expected exact seven"),
-            (EXPECTED_TOOLS[:-1], colorful, False, "expected exact seven"),
+            ((*EXPECTED_TOOLS, "terminal"), colorful, False, "expected exact eight"),
+            ((*EXPECTED_TOOLS, EXPECTED_TOOLS[0]), colorful, False, "expected exact eight"),
+            (EXPECTED_TOOLS[:-1], colorful, False, "expected exact eight"),
             (EXPECTED_TOOLS, blank, False, "blank image"),
             (EXPECTED_TOOLS, b"not an image", False, "decode failed"),
             (EXPECTED_TOOLS, None, False, "no image block"),
@@ -360,7 +364,7 @@ for line in sys.stdin:
                 self.assertEqual(name, f"{ARM} real capture")
                 self.assertEqual(status, "fail" if expected else "pass", detail)
                 self.assertIn(expected or "2x1 bytes=", detail)
-                if "expected exact seven" not in (expected or ""):
+                if "expected exact eight" not in (expected or ""):
                     calls = [json.loads(line) for line in call_log.read_text().splitlines()]
                     self.assertEqual(
                         calls,

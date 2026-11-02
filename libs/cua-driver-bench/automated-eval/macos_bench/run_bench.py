@@ -614,7 +614,7 @@ def real_capture_check(ctx: "Ctx", arm: str) -> tuple[str, str, str]:
         dest.unlink(missing_ok=True)
         if source == ca.HERMES_ARM:
             if set(tools) != set(ca.HERMES_TOOLS) or len(tool_list) != len(ca.HERMES_TOOLS):
-                raise RuntimeError("unexpected Hermes tools/list (expected exact seven GUI tools)")
+                raise RuntimeError("unexpected Hermes tools/list (expected exact eight GUI tools)")
             result = call("computer_use", {"action": "capture", "mode": "som", "app": "BenchLab"})
         elif source in ca.CUA_ARMS:
             if (
@@ -2689,7 +2689,7 @@ def make_ctx(args: argparse.Namespace) -> Ctx:
         for name, build in ca.CUA_BUILDS.items():
             ca.CUA_BUILDS[name] = replace(build, executable=ca.CUA_BIN, skills=ca.CUA_SKILLS)
             if ca.SCRIPT_FLAG not in build.daemon_env and ca.NO_SCRIPT_FLAG not in build.daemon_env:
-                # the explicit build ships run_script; only the script arm may expose it
+                # The explicit build ships run_script; only script-enabled builds expose it.
                 ca.CUA_BUILDS[name] = replace(
                     ca.CUA_BUILDS[name], daemon_env=(*build.daemon_env, ca.NO_SCRIPT_FLAG)
                 )

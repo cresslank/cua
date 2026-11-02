@@ -43,6 +43,15 @@ class Check:
     detail: str
 
 
+def prepare_hover_pointer() -> None:
+    """Reset only the disposable Linux fixture's pointer, before trial measurement."""
+    if detect_platform() != "linux" or os.environ.get("CDB_BENCH_DISPOSABLE") != "1":
+        return
+    if not Path("/.dockerenv").is_file():
+        raise RuntimeError("hover pointer preparation requires the disposable container")
+    subprocess.run(["xdotool", "mousemove", "0", "0"], check=True, timeout=5)
+
+
 def detect_platform(system: str | None = None) -> Platform:
     name = system if system is not None else platform.system()
     if name == "Darwin":
@@ -110,7 +119,7 @@ def hermes_mcp_env(home: Path, profile: Path, source: Path, binary: Path) -> dic
         "PYTHONNOUSERSITE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
         "HERMES_CUA_DRIVER_CMD": str(binary),
-        "CUA_DRIVER_DISABLE_RUN_SCRIPT": "1",
+        "CUA_DRIVER_EXPERIMENTAL_SCRIPT": "1",
         "CUA_DRIVER_RS_TELEMETRY_ENABLED": "false",
         "DO_NOT_TRACK": "1",
     }

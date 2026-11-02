@@ -550,6 +550,11 @@ def prepare_probe(
 def launch_lab(
     task: Task, seed: int, paths: dict[str, Path], lab_app: Path, app_env: dict[str, str]
 ) -> subprocess.Popen[bytes]:
+    # A previous trial can leave the private Xvfb pointer over the next hover
+    # window. Park it before mapping, before the sentinel baseline or agent starts.
+    # Never inject fixture input on an operator's native desktop.
+    if task.id == "MB-10":
+        desktop.prepare_hover_pointer()
     args = [
         *desktop.bench_app_argv("BenchLab", lab_app.parent),
         *task.app_args,

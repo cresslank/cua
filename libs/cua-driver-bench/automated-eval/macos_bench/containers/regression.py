@@ -33,6 +33,7 @@ def main() -> None:
         not in (
             "DISPLAY",
             "WAYLAND_DISPLAY",
+            "XDG_SESSION_TYPE",
             "DBUS_SESSION_BUS_ADDRESS",
             "XAUTHORITY",
             "AT_SPI_BUS_ADDRESS",

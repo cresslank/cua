@@ -94,7 +94,11 @@ class Lab:
 
     def values(self) -> dict:
         return {
-            key: widget.get_active_text()
+            key: (
+                ""
+                if self.args.mode == "irmodal" and key == "team" and widget.get_active() == 0
+                else widget.get_active_text()
+            )
             if isinstance(widget, Gtk.ComboBoxText)
             else widget.get_active()
             if isinstance(widget, Gtk.CheckButton)
@@ -202,16 +206,32 @@ class Lab:
             overlay_names=self.params["names"], clicks=[], hover_enter_count=0, hover_exit_count=0
         )
         zone = Gtk.EventBox()
-        zone.add_events(Gdk.EventMask.ENTER_NOTIFY_MASK | Gdk.EventMask.LEAVE_NOTIFY_MASK)
+        zone.get_accessible().set_name("Actions")
+        zone.add_events(
+            Gdk.EventMask.ENTER_NOTIFY_MASK
+            | Gdk.EventMask.LEAVE_NOTIFY_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+        )
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         zone.add(content)
         self.label("Hover here to reveal actions", content)
         actions = Gtk.Box(spacing=10)
-        content.pack_start(actions, False, False, 0)
         for name in self.params["names"]:
             self.button(name, lambda n=name: self.hover_click(n), actions)
-        self.hidden = [actions]
+        # Do not export the hidden actions in the window's accessibility tree at startup.
+        # Sensitivity and hover_click's guard also protect retained AT-SPI action handles.
+        actions.set_sensitive(False)
         self.visible = False
+
+        def reveal():
+            if self.visible:
+                return
+            self.visible = True
+            if actions.get_parent() is None:
+                content.pack_start(actions, False, False, 0)
+            actions.set_sensitive(True)
+            actions.show_all()
+            self.emit("overlay_shown")
 
         def crossing(widget, event, entered):
             if event.detail == Gdk.NotifyType.INFERIOR:
@@ -220,17 +240,32 @@ class Lab:
             self.emit(
                 "mouse", region="hot_zone", phase="mouseEntered" if entered else "mouseExited"
             )
-            self.visible = entered
-            actions.set_visible(entered)
             if entered:
-                self.emit("overlay_shown")
+                reveal()
+            else:
+                self.visible = False
+                actions.set_sensitive(False)
+                actions.hide()
+            return False
+
+        def motion(widget, event):
+            # Synthetic moves need not have a preceding enter (as on macOS).
+            if (
+                0 <= event.x < widget.get_allocated_width()
+                and 0 <= event.y < widget.get_allocated_height()
+            ):
+                self.emit("mouse", region="hot_zone", phase="mouseMoved", x=event.x, y=event.y)
+                reveal()
             return False
 
         zone.connect("enter-notify-event", crossing, True)
         zone.connect("leave-notify-event", crossing, False)
+        zone.connect("motion-notify-event", motion)
         self.box.pack_start(zone, True, True, 0)
 
     def hover_click(self, name: str) -> None:
+        if not self.visible:
+            return
         self.state["clicks"].append({"name": name})
         self.state.update(last_clicked=name, last_click_overlay_visible=self.visible)
         self.emit("overlay_click", name=name, overlay_visible=self.visible)
@@ -267,37 +302,79 @@ class Lab:
         )
         self.field("name")
         self.field("email")
+        self.button("Next", self.permission)
         self.step1 = list(self.box.get_children())
-        self.field("team", C.IR_TEAMS)
+        self.field("team", ["Choose a team", *C.IR_TEAMS])
         self.field("seats")
+        self.button("Back", lambda: self.show_page(1))
+        self.button("Submit", self.form_submit)
         self.step2 = [widget for widget in self.box.get_children() if widget not in self.step1]
         self.hidden = self.step2
-        self.submit_button = self.button("Next", self.permission)
+        self.show_page(1, emit=False)
         self.state["fields"] = self.values()
+        # A child overlay, not a new managed window: opening the permission prompt
+        # must not raise BenchLab above the user's foreground activity.
+        self.window.remove(self.box)
+        self.permission_layer = Gtk.Overlay()
+        self.permission_layer.add(self.box)
+        self.window.add(self.permission_layer)
+        self.permission_prompt = None
+
+    def show_page(self, page: int, *, emit: bool = True) -> None:
+        if self.state["prompt_state"] == "open":
+            return
+        self.window.set_focus(None)
+        for name, widget in self.fields.items():
+            active = (name in ("name", "email")) == (page == 1)
+            widget.set_can_focus(active)
+            if isinstance(widget, Gtk.Entry):
+                widget.set_editable(active)
+        for widgets, active in ((self.step1, page == 1), (self.step2, page == 2)):
+            for widget in widgets:
+                widget.set_sensitive(active)
+                widget.set_visible(active)
+        self.state["page"] = page
+        if emit:
+            self.emit("page", page=page)
 
     def permission(self) -> None:
+        if self.state["page"] != 1 or self.state["prompt_state"] == "open":
+            return
+        self.window.set_focus(None)
         self.state["next_count"] += 1
         self.emit("next", count=self.state["next_count"], values=self.values())
+        if self.state["prompt_state"] != "not_shown":
+            self.show_page(2)
+            return
         self.state["prompt_state"] = "open"
+        self.box.set_sensitive(False)
+        self.permission_prompt = Gtk.EventBox()
+        panel = Gtk.Frame(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin=24)
+        panel.add(content)
+        self.permission_prompt.add(panel)
+        self.label(f"Allow BenchLab to access {self.params['resource']}?", content)
+        for text, answer in (("Don’t Allow", "deny"), ("Allow", "allow")):
+            self.button(text, lambda a=answer: self.permission_answer(a), content)
+        self.permission_layer.add_overlay(self.permission_prompt)
+        self.permission_prompt.show_all()
         self.emit("permission_prompt_shown", resource=self.params["resource"])
-        self.dialog(
-            f"Allow BenchLab to access {self.params['resource']}?",
-            [("Don’t Allow", "deny"), ("Allow", "allow")],
-            self.permission_answer,
-        )
 
     def permission_answer(self, answer: str) -> None:
+        if self.state["prompt_state"] != "open" or self.permission_prompt is None:
+            return
+        self.permission_prompt.destroy()
+        self.permission_prompt = None
+        self.box.set_sensitive(True)
         self.state["prompt_answers"].append(answer)
-        self.state.update(page=2, prompt_state="denied" if answer == "deny" else "allowed")
+        self.state["prompt_state"] = "denied" if answer == "deny" else "allowed"
         self.emit("permission_answer", answer=answer, resource=self.params["resource"])
-        for widget in self.step1:
-            widget.hide()
-        for widget in self.step2:
-            widget.show_all()
-        self.submit_button.destroy()
-        self.button("Submit", self.form_submit).show()
+        self.show_page(2)
 
     def form_submit(self) -> None:
+        if self.state["page"] != 2 or self.state["prompt_state"] == "open":
+            return
+        self.window.set_focus(None)
         values = self.values()
         self.state.update(submit_count=self.state["submit_count"] + 1, submitted=values)
         self.emit("submit", values=values)

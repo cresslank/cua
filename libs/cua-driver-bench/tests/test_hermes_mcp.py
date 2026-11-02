@@ -198,6 +198,7 @@ class RealHermesTests(unittest.TestCase):
                 tools.close()
             from tools.registry import registry
             assert not registry.get_entry('cua_steps')
+            assert not registry.get_entry('cua_script')
         """)
         tools = json.loads(result.stdout)["tools"]
         self.assertEqual([tool["name"] for tool in tools], list(ad.TOOLS))
@@ -209,6 +210,22 @@ class RealHermesTests(unittest.TestCase):
         self.assertNotIn("restart_driver", browser["properties"])
         windows = next(t["inputSchema"] for t in tools if t["name"] == "cua_window")
         self.assertNotIn("arguments", windows["properties"])
+
+    def test_script_uses_native_schema_with_only_target_removed(self):
+        result = self.child("""\
+            tools = module['HermesTools']('script-schema-trial')
+            try:
+                import copy
+                original = copy.deepcopy(tools.registry.get_schema('cua_script')['parameters'])
+                expected = copy.deepcopy(original)
+                expected['properties'].pop('target', None)
+                expected['additionalProperties'] = False
+                assert tools.schemas['cua_script']['inputSchema'] == expected
+                assert tools.registry.get_schema('cua_script')['parameters'] == original
+            finally:
+                tools.close()
+        """)
+        self.assertEqual(result.stdout, "")
 
     def test_real_stdio_initialize_list_and_out_of_scope_refusal(self):
         requests = [
@@ -248,10 +265,11 @@ class RealHermesTests(unittest.TestCase):
             json.loads(replies[3]["result"]["content"][0]["text"])["code"], "invalid_gui_arguments"
         )
 
-    def test_native_human_lease_refuses_all_seven_tools(self):
+    def test_native_human_lease_refuses_all_eight_tools(self):
         calls = {
             "computer_use": {"action": "capture", "mode": "ax"},
             "cua_steps": {"app": "OwnedFixture", "steps": [{"do": "key", "keys": "tab"}]},
+            "cua_script": {"app": "OwnedFixture", "script": 'return "bounded";', "max_calls": 1},
             "cua_task": {
                 "app": "OwnedFixture",
                 "goal": "test",
@@ -308,6 +326,12 @@ class RealHermesTests(unittest.TestCase):
                     assert error.code == 'approval_denied'
                 else:
                     raise AssertionError('native approval unexpectedly allowed')
+                try:
+                    safety.require_approval('script', 'OwnedFixture', 'bounded plan')
+                except Exception as error:
+                    assert error.code == 'approval_denied'
+                else:
+                    raise AssertionError('native script approval unexpectedly allowed')
                 assert approval.is_approved('approval-trial', 'cua:click:background') is False
                 approval_context.reset_current_session_key(token)
                 print('native gates refused')
@@ -326,6 +350,10 @@ class RealHermesTests(unittest.TestCase):
             ("cua_browser", {"action": "prepare", "restart_driver": True}),
             ("cua_browser", {"action": "upload", "files": ["/private/file"]}),
             ("cua_verify", {"app": "OwnedFixture", "mode": "settled", "target": "space"}),
+            ("cua_script", {"app": "OwnedFixture", "script": "return 1;", "target": "space"}),
+            ("cua_script", {"app": "OwnedFixture", "script": "return 1;", "session": "other"}),
+            ("cua_script", {"app": "OwnedFixture", "script": "return 1;", "timeout_ms": 120001}),
+            ("cua_script", {"app": "OwnedFixture", "script": "return 1;", "max_calls": 501}),
             (
                 "cua_steps",
                 {"app": "OwnedFixture", "steps": [{"do": "script", "code": "forbidden"}]},
@@ -346,7 +374,11 @@ class RealHermesTests(unittest.TestCase):
             )
 
     def test_authorized_cua_scopes_use_native_allowlist_without_driver(self):
-        self.config["command_allowlist"] = ["cua:click:background", "cua:steps:run"]
+        self.config["command_allowlist"] = [
+            "cua:click:background",
+            "cua:steps:run",
+            "cua:script:run",
+        ]
         self.write_config()
         result = self.child("""\
             tools = module['HermesTools']('authorized-trial')
@@ -357,6 +389,7 @@ class RealHermesTests(unittest.TestCase):
                 assert tools.computer._request_approval('click', {}) is None
                 safety = sys.modules['cua_jev_shared']._plugin_module('safety')
                 safety.require_approval('steps', 'OwnedFixture', 'authorized plan')
+                safety.require_approval('script', 'OwnedFixture', 'authorized bounded plan')
                 assert tools.computer._request_approval('click', {'delivery_mode': 'foreground'}) is not None
                 approval_context.reset_current_session_key(token)
                 print('exact native scope authorized; foreground denied')
@@ -364,6 +397,26 @@ class RealHermesTests(unittest.TestCase):
                 tools.close()
         """)
         self.assertIn("exact native scope authorized; foreground denied", result.stdout)
+
+    def test_native_script_compiler_refuses_escape_before_any_desktop_io(self):
+        # Real registry dispatch and plugin compiler, not an adapter risk-word filter.
+        scripts = [
+            'await cua.getApp("OwnedFixture");',
+            "return globalThis;",
+            "while (true) { }",
+            'await cua.typeText(rows[0], "text");',
+        ]
+        result = self.child(f"""\
+            tools = module['HermesTools']('script-compiler-trial')
+            try:
+                for source in {scripts!r}:
+                    reply = tools.call('cua_script', {{'app': 'OwnedFixture', 'script': source}})
+                    assert reply['isError'] is True, reply
+                    assert json.loads(reply['content'][0]['text'])['code'] == 'script_syntax', reply
+            finally:
+                tools.close()
+        """)
+        self.assertEqual(result.stdout, "")
 
     def test_config_change_closes_dispatch(self):
         result = self.child("""\

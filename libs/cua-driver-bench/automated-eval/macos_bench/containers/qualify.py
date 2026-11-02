@@ -153,9 +153,23 @@ def main() -> None:
         ],
         check=True,
     )
+    # Native GTK/AT-SPI parity contracts stay contained and credential-free.
+    subprocess.run(
+        [sys.executable, "linux/test_benchlab_atspi.py", "-v"],
+        env={**os.environ, "CDB_BENCHLAB_CONTAINED": "1"},
+        check=True,
+        timeout=90,
+    )
+    # Same Hermes arm, no model call: prove real bounded input and exact policy
+    # refusal through the adapter before any paid smoke can be dispatched.
+    subprocess.run(
+        [sys.executable, "containers/qualify_script.py"],
+        check=True,
+        timeout=180,
+    )
     if not a.smoke:
         print(
-            "PASS: offline three-arm preflight and six-row dry-run; paid smoke not dispatched",
+            "PASS: offline three-arm preflight, six-row dry-run and native script policy; paid smoke not dispatched",
             flush=True,
         )
         return

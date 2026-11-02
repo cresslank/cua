@@ -72,7 +72,8 @@ class PlatformConstantsTest(unittest.TestCase):
 
 class LinuxSingleBuildTest(unittest.TestCase):
     def test_explicit_binary_keeps_the_run_steps_only_arms_without_run_script(self) -> None:
-        # One explicit driver backs every arm on Linux; it ships run_script, which only the script arm may expose.
+        # One explicit driver backs every arm. Hermes exposes only its gated script wrapper;
+        # the direct main arm remains run_steps-only.
         with tempfile.TemporaryDirectory() as tmp:
             saved = dict(ca.CUA_BUILDS)
             saved_globals = (ca.PINS_FILE, ca.CUA_BIN, ca.CUA_SKILLS)
@@ -86,10 +87,14 @@ class LinuxSingleBuildTest(unittest.TestCase):
                     rb.make_ctx(args)
                 for arm, build in ca.CUA_BUILDS.items():
                     self.assertEqual(
-                        ca.SCRIPT_FLAG in build.daemon_env, arm == "cc-cua-driver-script", arm
+                        ca.SCRIPT_FLAG in build.daemon_env,
+                        arm in ("cc-cua-driver-script", ca.HERMES_ARM),
+                        arm,
                     )
                     self.assertEqual(
-                        ca.NO_SCRIPT_FLAG in build.daemon_env, arm != "cc-cua-driver-script", arm
+                        ca.NO_SCRIPT_FLAG in build.daemon_env,
+                        arm not in ("cc-cua-driver-script", ca.HERMES_ARM),
+                        arm,
                     )
             finally:
                 ca.CUA_BUILDS.clear()
