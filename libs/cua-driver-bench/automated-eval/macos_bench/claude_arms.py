@@ -15,9 +15,9 @@ skill) differs.
 * ``cc-codex-cu``: OpenAI's Codex computer-use ``cua_repl`` launcher as MCP server ``codex-cu``
   (configuration supplied by the codex-access worker, used unmodified). No skill.
 
-Nothing here reads credentials. ``claude`` keeps using the existing OAuth login because HOME is
-left alone; everything else that could leak (CLAUDE_CODE_* variables, user settings, user skills,
-plugins, hooks, CLAUDE.md files, auto memory, other MCP servers) is removed.
+Explicit file credentials use claude_credentials: fresh fd and empty auth stores per spawn.
+Legacy non-container runs without a file retain the upstream login behavior. Container spawns
+require an explicit credential and never read a login profile.
 """
 
 from __future__ import annotations
@@ -26,14 +26,17 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
+import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import desktop_runtime as desktop
+from hermes_mcp import SERVER_NAME as HERMES_SERVER, TOOLS as HERMES_TOOLS
 
 HERE = Path(__file__).resolve().parent
 # WORK holds everything the harness creates or downloads: the private Cua Driver install, the Codex MCP config,
@@ -107,6 +110,7 @@ SCRIPT_FLAG = ("CUA_DRIVER_EXPERIMENTAL_SCRIPT", "1")
 # Amendment 13: arms A and A-skill stay run_steps-only on every build. Builds before #4936 do not know this switch
 # and have run_script off anyway; later builds turn it off with it.
 NO_SCRIPT_FLAG = ("CUA_DRIVER_DISABLE_RUN_SCRIPT", "1")
+HERMES_ARM = "cc-hermes-cua-jev"
 RUN_SCRIPT_ADDENDUM = (
     "\n\nFor any task with more than one or two actions, write ONE run_script call: a JavaScript async function "
     'body that uses `cua.getApp("<App>")` and app.click/typeText/setValue/pressKey/scroll with {role, name} '
@@ -186,7 +190,129 @@ CUA_BUILDS = {
         prompt_addendum=RUN_SCRIPT_ADDENDUM,
     ),
 }
-CUA_ARMS = tuple(CUA_BUILDS)
+# Hermes uses the same pinned main executable, but a distinct daemon, HOME and socket.
+# CUA_ARMS means the direct driver MCP + skill surface; DRIVER_ARMS owns daemon lifecycle.
+CUA_BUILDS[HERMES_ARM] = CuaBuild(
+    HERMES_ARM,
+    "main",
+    CUA_MAIN_APP,
+    "/tmp/cdb-bench-cua-hermes.sock",
+    WORK / "hermes-cua-jev" / "daemon-state",
+    CUA_MAIN_DIR / "skills" / "cua-driver",
+    daemon_env=(NO_SCRIPT_FLAG,),
+)
+CUA_ARMS = tuple(a for a in CUA_BUILDS if a != HERMES_ARM)
+DRIVER_ARMS = tuple(CUA_BUILDS)
+
+
+@dataclass(frozen=True)
+class HermesOptions:
+    """All inputs are explicit, read-only paths; the allowlist is a JSON array of cua: scopes."""
+
+    source: Path
+    python: Path
+    plugin: Path
+    allowlist: Path
+
+    def authorized_scopes(self) -> list[str]:
+        for path in (self.source, self.python, self.plugin, self.allowlist):
+            if not path.is_absolute():
+                raise ValueError("Hermes paths must be absolute")
+        if not (self.source / "tools/computer_use/tool.py").is_file():
+            raise ValueError("--hermes-source must contain the real Hermes core")
+        if not self.python.is_file() or not os.access(self.python, os.X_OK):
+            raise ValueError("--hermes-python must be an executable dependency interpreter")
+        if not (self.plugin / "plugin.yaml").is_file():
+            raise ValueError("--hermes-cua-jev must contain plugin.yaml")
+        scopes = json.loads(self.allowlist.read_text("utf-8"))
+        if not isinstance(scopes, list) or any(
+            not isinstance(scope, str) or not scope.startswith("cua:") for scope in scopes
+        ):
+            raise ValueError(
+                "--hermes-allowlist must be a JSON array containing only authorized cua: scopes"
+            )
+        return scopes
+
+
+def _private_dir(path: Path) -> None:
+    path.mkdir(mode=0o700, exist_ok=True)
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise ValueError("Hermes runtime directories must be owned private directories (0700)")
+
+
+def hermes_mcp_config(run_dir: Path, options: HermesOptions) -> tuple[Path, str]:
+    """Provision only synthetic config + the chosen plugin; scrub even Claude's inherited env."""
+    scopes = options.authorized_scopes()  # refuse before creating any runtime material
+    root = run_dir.resolve() / "hermes-runtime"
+    _private_dir(root)
+    home = root / "home"
+    profile = home / ".hermes"
+    for directory in (home, home / "tmp", profile, profile / "plugins", root / "daemon-state"):
+        _private_dir(directory)
+    _private_dir(root / "daemon-state" / "home")
+    plugin = profile / "plugins" / "cua-jev"
+    if not plugin.is_symlink():
+        plugin.symlink_to(options.plugin, target_is_directory=True)
+    if plugin.resolve() != options.plugin.resolve():
+        raise ValueError("isolated cua-jev plugin does not match --hermes-cua-jev")
+    socket_id = hashlib.sha256(str(run_dir.resolve()).encode()).hexdigest()[:16]
+    build = replace(
+        CUA_BUILDS[HERMES_ARM],
+        socket=str(Path(tempfile.gettempdir()) / f"cdb-hermes-{socket_id}.sock"),
+        state=root / "daemon-state",
+    )
+    CUA_BUILDS[HERMES_ARM] = build
+    config = {
+        # This tool host feeds Claude Code directly; pixels must not route to an
+        # unrelated auxiliary model (nor incur unaccounted provider spend).
+        "model": {"provider": "anthropic", "default": "claude-sonnet-5-5"},
+        "agent": {"image_input_mode": "native"},
+        "computer_use": {
+            "backend": "cua-jev",
+            "daemon_socket": build.socket,
+            "permission_mode": "standard",
+        },
+        "approvals": {
+            "mode": "manual",
+            "single_query_mode": "deny",
+            "unattended_mode": "deny",
+            "cron_mode": "deny",
+        },
+        "security": {"allow_lazy_installs": False},
+        "bot_desktop": {"auto_start": False},
+        "command_allowlist": scopes,
+        "plugins": {
+            "enabled": ["cua-jev"],
+            "isolation": "inprocess",
+            "entries": {"cua-jev": {"settings": {"browser_grant": False}}},
+        },
+    }
+    config_path = profile / "config.yaml"
+    if config_path.is_symlink():
+        raise ValueError("isolated config must not be a symlink")
+    config_path.write_text(json.dumps(config, indent=2) + "\n", "utf-8")  # JSON is YAML
+    config_path.chmod(0o600)
+    env = desktop.hermes_mcp_env(home, profile, options.source, build.bin)
+    # MCP env is normally merged into Claude's environment. env -i is essential:
+    # no OAuth fd context, provider keys, inherited PYTHONPATH or approval bypasses.
+    entry = {
+        "type": "stdio",
+        "command": "/usr/bin/env",
+        "args": [
+            "-i",
+            *[f"{key}={value}" for key, value in sorted(env.items())],
+            str(options.python),
+            "-s",
+            "-B",
+            str(HERE / "hermes_mcp.py"),
+        ],
+        "env": {},
+    }
+    path = run_dir / f"mcp-{HERMES_ARM}.json"
+    path.write_text(json.dumps({"mcpServers": {HERMES_SERVER: entry}}, indent=2) + "\n", "utf-8")
+    return path, HERMES_SERVER
+
 
 # The Chromium switch that forces renderer accessibility. No arm shipped here sets it; the pack's Electron apps
 # already append it themselves (app.commandLine.appendSwitch). Kept so a future arm can opt in per arm.
@@ -321,6 +447,7 @@ CODEX_ARMS = {
 CWD_ROOT = Path("/tmp/cdb-bench-cwd/work")  # outside every git checkout, same path for both arms
 
 ARM_DESCRIPTIONS = {
+    HERMES_ARM: "Claude Code + real Hermes core/cua-jev GUI-only MCP (seven tools), private main driver, run_script off, no skill",
     "cc-cua-driver": "Claude Code + Cua Driver 0.34.0 MCP + Cua Driver skill (0.34.0 release)",
     "cc-cua-driver-main": "Claude Code + Cua Driver built from main (pinned commit) MCP + the skill of that commit, "
     "run_script off (CUA_DRIVER_DISABLE_RUN_SCRIPT=1 from Amendment 13)",
@@ -405,10 +532,20 @@ def resolve_codex_cu_config(explicit: Path | None = None) -> Path | None:
 
 
 def mcp_config_for(
-    arm: str, run_dir: Path, codex_cu_config: Path | None = None
+    arm: str,
+    run_dir: Path,
+    codex_cu_config: Path | None = None,
+    *,
+    hermes: HermesOptions | None = None,
 ) -> tuple[Path, str]:
     """Write the arm's ``--mcp-config`` file under ``run_dir`` and return (path, server name)."""
     run_dir.mkdir(parents=True, exist_ok=True)
+    if arm == HERMES_ARM:
+        if hermes is None:
+            raise ValueError(
+                "Hermes requires explicit source, interpreter, plugin and allowlist paths"
+            )
+        return hermes_mcp_config(run_dir, hermes)
     if arm in CUA_BUILDS:
         build = CUA_BUILDS[arm]
         config = {
@@ -465,7 +602,7 @@ def prepare_cwd(arm: str, cwd: Path = CWD_ROOT) -> Path:
     if cwd.exists():
         shutil.rmtree(cwd)
     cwd.mkdir(parents=True)
-    if arm in CUA_BUILDS:
+    if arm in CUA_ARMS:
         target = cwd / ".claude" / "skills" / "cua-driver"
         target.parent.mkdir(parents=True)
         # The module-level CUA_SKILLS stays the source for 0.34.0 so tests can point it elsewhere.
@@ -481,18 +618,6 @@ def claude_env() -> dict[str, str]:
     env.setdefault("TERM", "xterm-256color")
     env.update(CLAUDE_ENV_FIXED)
     return env
-
-
-def open_token_fd() -> int | None:
-    """A fresh inheritable fd on the OAuth token file (None when unset). The token never enters an
-    environment variable, an argv or a log: claude reads it from the descriptor named by
-    CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR. Every spawn needs its own fd (the offset is shared)."""
-    path = os.environ.get(TOKEN_FILE_ENV)
-    if not path:
-        return None
-    fd = os.open(path, os.O_RDONLY)
-    os.set_inheritable(fd, True)
-    return fd
 
 
 def builtin_tools(tool_search: bool = True, coding: bool = False) -> list[str]:

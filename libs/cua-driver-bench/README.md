@@ -7,8 +7,10 @@ harness, the agent, the model, the prompts and the limits are the same for every
 setup; only the computer-use tool changes.
 
 This directory holds the harness, the public task set and the method of
-**Bench v2**. Bench v2 is **macOS-only for now**: every task, app and
-measurement assumes a macOS 26 desktop.
+**Bench v2**. The registered measurements assume a macOS 26 desktop. A private
+headless Linux X11 runner and an experimental Hermes tool-layer arm are also
+available; see [Linux isolation and qualification](automated-eval/macos_bench/HERMES_LINUX.md).
+Linux infrastructure checks are not published comparative scores.
 
 | Path | What it is |
 | --- | --- |

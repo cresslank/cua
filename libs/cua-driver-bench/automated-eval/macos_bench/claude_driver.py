@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-import claude_arms as ca
+import claude_credentials as credentials
 from desktop_runtime import record_or_reap
 from desktop_runtime import stop_group as kill_group
 
@@ -60,29 +60,33 @@ def run_claude(
     state: dict[str, Any] = {"result_seen": False, "elicitations": [], "lines": 0}
     done = threading.Event()
     with (
+        credentials.spawn(argv, env) as auth,
         stream_path.open("w", encoding="utf-8") as stream,
         stderr_path.open("wb") as err,
         elicitation_path.open("w", encoding="utf-8") as elog,
     ):
-        token_fd = ca.open_token_fd()
-        if token_fd is not None:
-            env = {**env, "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": str(token_fd)}
-        try:
-            proc = subprocess.Popen(
-                argv,
-                cwd=str(cwd),
-                env=env,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=err,
-                text=True,
-                bufsize=1,
-                start_new_session=True,
-                pass_fds=(token_fd,) if token_fd is not None else (),
-            )
-        finally:
-            if token_fd is not None:
-                os.close(token_fd)
+        proc = subprocess.Popen(
+            auth.argv,
+            cwd=str(cwd),
+            env=auth.env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+            pass_fds=auth.pass_fds,
+        )
+        state["billing_mode"] = auth.mode
+
+        def pump_stderr() -> None:
+            assert proc.stderr is not None
+            for line in proc.stderr:
+                err.write(auth.redact(line).encode("utf-8"))
+                err.flush()
+
+        error_reader = threading.Thread(target=pump_stderr, daemon=True)
+        error_reader.start()
         record_or_reap(proc, "claude")
         lock = threading.Lock()
 
@@ -98,7 +102,7 @@ def run_claude(
         def pump() -> None:
             assert proc.stdout is not None
             for line in proc.stdout:
-                line = line.rstrip("\n")
+                line = auth.redact(line.rstrip("\n"))
                 if not line.strip():
                     continue
                 stream.write(f"{time.time() * 1000:.1f}\t{line}\n")
@@ -178,13 +182,16 @@ def run_claude(
                 kill_group(proc.pid)
                 break
             time.sleep(0.25)
-        reader.join(timeout=5)
         # A killed claude can leave MCP children in the group; make sure none survive the trial.
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except OSError:
             pass
+        proc.wait(timeout=5)
+        reader.join(timeout=5)
+        error_reader.join(timeout=5)
     return {
+        "billing_mode": state.get("billing_mode"),
         "returncode": proc.returncode,
         "timed_out": timed_out,
         "aborted": aborted,

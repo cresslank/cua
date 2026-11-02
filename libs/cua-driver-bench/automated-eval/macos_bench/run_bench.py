@@ -14,6 +14,7 @@ Arms (run_bench.py never mixes them up with the Codex pilot arms):
     cc-cua-driver   Claude Code + Cua Driver 0.34.0 MCP + the Cua Driver skill of that release
     cc-cua-driver-main  the same with Cua Driver built from a pinned main commit and its skill (Amendment 3)
     cc-codex-cu     Claude Code + Codex computer-use `cua_repl` MCP (server `codex-cu`), no skill
+    cc-hermes-cua-jev  Claude Code + real Hermes/cua-jev GUI-only MCP, private driver (Linux only)
 Fallback arms (`codex exec --json`, behind --allow-codex-arms; not run at scale): codex-native-cu,
 codex-cua-driver. They reuse run_pilot.py.
 
@@ -56,6 +57,7 @@ import claude_arms as ca  # noqa: E402
 import cdb_adapter  # noqa: E402
 import codex_native as cxn  # noqa: E402
 import browser_use_cli as bu
+import claude_credentials as credentials
 import claude_driver  # noqa: E402
 import claude_events  # noqa: E402
 import recorder as rec  # noqa: E402
@@ -136,6 +138,7 @@ class Ctx:
     arm_names: list[str]
     full_task_ids: list[str] = field(default_factory=list)  # positions in the pre-registered order
     mcp: dict[str, tuple[Path, str]] = field(default_factory=dict)
+    hermes_options: ca.HermesOptions | None = None
     recorder: Any = None
     compress: rec.CompressQueue | None = None
     daemon: subprocess.Popen[bytes] | None = None
@@ -578,7 +581,7 @@ def real_capture_check(ctx: "Ctx", arm: str) -> tuple[str, str, str]:
     try:
         source = cxn.SOURCE_ARM.get(arm, arm)
         path, _ = ctx.mcp[arm]
-        if source in ca.CUA_ARMS:
+        if source in ca.DRIVER_ARMS:
             ensure_agent_daemon(ctx, source)
         if arm in cxn.ARMS:
             entry = cxn.server_entry(path, arm)
@@ -604,11 +607,16 @@ def real_capture_check(ctx: "Ctx", arm: str) -> tuple[str, str, str]:
         listed = client.request("tools/list", {}, timeout=60)
         if listed.get("error"):
             raise RuntimeError(str(listed["error"])[:300])
-        tools = {t["name"]: t for t in (listed.get("result") or {}).get("tools", [])}
+        tool_list = (listed.get("result") or {}).get("tools", [])
+        tools = {t["name"]: t for t in tool_list}
         dest = ctx.run_dir / "preflight-capture" / arm / "capture.png"
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.unlink(missing_ok=True)
-        if source in ca.CUA_ARMS:
+        if source == ca.HERMES_ARM:
+            if set(tools) != set(ca.HERMES_TOOLS) or len(tool_list) != len(ca.HERMES_TOOLS):
+                raise RuntimeError("unexpected Hermes tools/list (expected exact seven GUI tools)")
+            result = call("computer_use", {"action": "capture", "mode": "som", "app": "BenchLab"})
+        elif source in ca.CUA_ARMS:
             if (
                 "list_apps" not in tools
                 or len(tools) < 50
@@ -651,7 +659,9 @@ def real_capture_check(ctx: "Ctx", arm: str) -> tuple[str, str, str]:
         if image is not None:
             dest.write_bytes(base64.b64decode(image["data"], validate=True))
         elif not dest.is_file():
-            raise RuntimeError("no image block")
+            raise RuntimeError(
+                "no image block: " + claude_events._text_of(result.get("content"))[:300]
+            )
         return f"{arm} real capture", "pass", rec.capture_detail(dest)
     except Exception as error:
         return f"{arm} real capture", "fail", f"{type(error).__name__}: {error}"[:400]
@@ -812,8 +822,9 @@ def _collect_linux_evidence(artifacts: Path, arm: str, failed: bool) -> None:
     for name, log in logs.items():
         attempt(
             f"{name} log",
-            lambda name=name, log=log: log.is_file()
-            and shutil.copyfile(log, artifacts / f"{name}.log"),
+            lambda name=name, log=log: (
+                log.is_file() and shutil.copyfile(log, artifacts / f"{name}.log")
+            ),
         )
     if errors:
         try:
@@ -883,6 +894,7 @@ def run_attempt(ctx: Ctx, entry: dict[str, Any], attempt: int) -> dict[str, Any]
         "idle_at_start_s": round(idle_start),
         "idle_gate_relaxed": bool(args.idle_min and idle_start < args.idle_min),
         "claude_version": ctx.versions.get("claude"),
+        "billing_mode": credentials.billing_mode() if arm not in cxn.ARMS else None,
         "cua_driver_version": build_versions.get("cua_driver_version"),
         "cua_driver_sha256": build_versions.get("cua_driver_sha256"),
         "cua_driver_git_sha": build_versions.get("cua_driver_git_sha"),
@@ -908,6 +920,7 @@ def run_attempt(ctx: Ctx, entry: dict[str, Any], attempt: int) -> dict[str, Any]
         else None,
         # Amendment 20: the native Codex arm's identity (Codex CLI build, model, effort)
         "codex_native": ctx.versions.get("codex_native") if arm in cxn.ARMS else None,
+        "hermes_cua_jev": ctx.versions.get("hermes_cua_jev") if arm == ca.HERMES_ARM else None,
     }
     if arm in cxn.ARMS:
         row["model"], row["effort"] = cxn.MODEL, cxn.EFFORT
@@ -954,10 +967,10 @@ def run_attempt(ctx: Ctx, entry: dict[str, Any], attempt: int) -> dict[str, Any]
             subprocess.run(
                 ["pbcopy"], input=b"", capture_output=True
             )  # no stale clipboard between trials
-        if arm in ca.CUA_ARMS:
+        if arm in ca.DRIVER_ARMS:
             ensure_agent_daemon(ctx, arm)
         elif (
-            cxn.SOURCE_ARM.get(arm) in ca.CUA_ARMS
+            cxn.SOURCE_ARM.get(arm) in ca.DRIVER_ARMS
         ):  # A23: Cua Driver under Codex uses that build's daemon
             ensure_agent_daemon(ctx, cxn.SOURCE_ARM[arm])
         if getattr(args, "park_pointer", False):
@@ -1840,7 +1853,7 @@ def execute_trial(ctx: Ctx, entry: dict[str, Any]) -> dict[str, Any]:
             return row
         if (
             kind in ("mcp_start", "tool_setup")
-            and cxn.SOURCE_ARM.get(entry["arm"], entry["arm"]) in ca.CUA_ARMS
+            and cxn.SOURCE_ARM.get(entry["arm"], entry["arm"]) in ca.DRIVER_ARMS
         ):
             try:
                 ensure_agent_daemon(ctx, cxn.SOURCE_ARM.get(entry["arm"], entry["arm"]))
@@ -1876,23 +1889,23 @@ def quota_probe(ctx: Ctx) -> tuple[bool, str]:
     ]
     cwd = ca.prepare_cwd("cc-codex-cu", ca.CWD_ROOT)
     env = ca.claude_env()
-    token_fd = ca.open_token_fd()
-    if token_fd is not None:
-        env["CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"] = str(token_fd)
-    try:
-        done = subprocess.run(
-            argv,
-            cwd=str(cwd),
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            stdin=subprocess.DEVNULL,
-            pass_fds=(token_fd,) if token_fd is not None else (),
-        )
-    finally:
-        if token_fd is not None:
-            os.close(token_fd)
+    with credentials.spawn(argv, env) as auth:
+        try:
+            done = subprocess.run(
+                auth.argv,
+                cwd=str(cwd),
+                env=auth.env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                stdin=subprocess.DEVNULL,
+                pass_fds=auth.pass_fds,
+            )
+        except subprocess.TimeoutExpired:
+            # TimeoutExpired can carry unredacted captured stdout/stderr.
+            raise RuntimeError("Claude quota probe timed out") from None
+        done.stdout = auth.redact(done.stdout)
+        done.stderr = auth.redact(done.stderr)
     events = []
     for line in done.stdout.splitlines():
         try:
@@ -2008,7 +2021,7 @@ def native_codex_checks(ctx: Ctx, arm: str, with_models: bool) -> list[tuple[str
 
 def init_check(ctx: Ctx, arm: str) -> tuple[str, str]:
     """One trivial haiku call per arm through the real argv: verify the init event."""
-    if arm in ca.CUA_ARMS:
+    if arm in ca.DRIVER_ARMS:
         ensure_agent_daemon(ctx, arm)
     mcp_path, server = ctx.mcp[arm]
     cwd = ca.prepare_cwd(arm)
@@ -2053,6 +2066,8 @@ def init_check(ctx: Ctx, arm: str) -> tuple[str, str]:
     connected = [s for s in init["mcp_servers"] if s.get("status") == "connected"]
     if len(connected) != 1 or connected[0].get("name") != server or len(init["mcp_servers"]) != 1:
         problems.append(f"mcp_servers {init['mcp_servers']}")
+    if arm == ca.HERMES_ARM and init["mcp_tool_count"] != len(ca.HERMES_TOOLS):
+        problems.append(f"Hermes MCP tool count {init['mcp_tool_count']} != {len(ca.HERMES_TOOLS)}")
     has_skill = "cua-driver" in init["skills"]
     if has_skill != (arm in ca.CUA_ARMS):
         problems.append(f"cua-driver skill present={has_skill}")
@@ -2221,7 +2236,7 @@ def preflight(ctx: Ctx, with_models: bool = True) -> list[tuple[str, str, str]]:
             "pass" if got_skills and got_skills == main.get("skills_tree_sha256") else "fail",
             str(got_skills),
         )
-    for cua_arm in [a for a in ca.CUA_ARMS if a in ctx.arm_names]:
+    for cua_arm in [a for a in ca.DRIVER_ARMS if a in ctx.arm_names]:
         spec = ca.CUA_BUILDS[cua_arm]
         try:
             ensure_agent_daemon(ctx, cua_arm)
@@ -2363,18 +2378,25 @@ def preflight(ctx: Ctx, with_models: bool = True) -> list[tuple[str, str, str]]:
     if ctx.recorder is not None and ctx.recorder.name != "none":
         test = ctx.run_dir / "preflight-rec"
         shutil.rmtree(test, ignore_errors=True)
-        started = ctx.recorder.start(test)
-        time.sleep(3.0)
-        raw = ctx.recorder.stop() if started else None
-        dur = rec.ffprobe_duration(raw) if raw else None
-        try:
-            if not raw or not dur or dur <= 0.5:
-                raise RuntimeError(
-                    f"{raw} duration={dur} err={getattr(ctx.recorder, 'last_error', None)}"
-                )
-            add("recorder real capture (3 s test)", "pass", rec.capture_detail(raw))
-        except (OSError, RuntimeError, subprocess.SubprocessError) as error:
-            add("recorder real capture (3 s test)", "fail", str(error)[:300])
+        # Linux's empty desktop is a uniform frame. Keep the same real target
+        # visible until recording has finalized and its first frame is checked.
+        record_seconds = 10.0 if desktop.detect_platform() == "linux" else 3.0
+        capture_name = f"recorder real capture ({record_seconds:g} s test)"
+        with capture_subject(test / "subject"):
+            started = ctx.recorder.start(test)
+            # x11grab can still be probing at three seconds. Exercise an actual
+            # finalized clip, not the driver's bounded-shutdown failure path.
+            time.sleep(record_seconds)
+            raw = ctx.recorder.stop() if started else None
+            dur = rec.ffprobe_duration(raw) if raw else None
+            try:
+                if not raw or not dur or dur <= 0.5:
+                    raise RuntimeError(
+                        f"{raw} duration={dur} err={getattr(ctx.recorder, 'last_error', None)}"
+                    )
+                add(capture_name, "pass", rec.capture_detail(raw))
+            except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+                add(capture_name, "fail", str(error)[:300])
     else:
         add("screen recording", "warn", "disabled (--no-recorder)")
     gate = core.gate_decision(
@@ -2482,8 +2504,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--tell-budget", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--cua-bin", type=Path, help="driver executable (required on Linux)")
+    p.add_argument(
+        "--recorder-bin",
+        type=Path,
+        help="optional independent driver recorder executable; recorded in versions",
+    )
     p.add_argument("--cua-skills", type=Path, help="matching driver skill directory")
     p.add_argument("--pins", type=Path, help="platform-specific identity pins")
+    for flag, env_name, detail in (
+        ("source", "CDB_HERMES_SOURCE", "read-only Hermes source checkout"),
+        (
+            "python",
+            "CDB_HERMES_PYTHON",
+            "Hermes dependency interpreter (venv executable, not its resolved symlink)",
+        ),
+        (
+            "cua-jev",
+            "CDB_HERMES_CUA_JEV",
+            "read-only cua-jev plugin directory containing plugin.yaml",
+        ),
+        (
+            "allowlist",
+            "CDB_HERMES_ALLOWLIST",
+            "JSON array of operator-authorized cua: scopes; no live config is copied",
+        ),
+    ):
+        p.add_argument(
+            f"--hermes-{flag}",
+            type=Path,
+            default=os.environ.get(env_name),
+            help=f"cc-hermes-cua-jev: {detail} (default {env_name}; all four required)",
+        )
     p.add_argument(
         "--build-dir",
         type=Path,
@@ -2570,6 +2621,30 @@ def build_parser() -> argparse.ArgumentParser:
 
 def make_ctx(args: argparse.Namespace) -> Ctx:
     arm_names = [args.only_arm] if args.only_arm else list(args.arms)
+    hermes_options = None
+    if ca.HERMES_ARM in arm_names:
+        reason = desktop.arm_platform_error(ca.HERMES_ARM, ca.DRIVER_ARMS)
+        if reason:
+            raise SystemExit(reason)
+        if not args.bench_v2:
+            raise SystemExit("cc-hermes-cua-jev requires --bench-v2 (GUI-only)")
+        if args.command in ("run", "preflight") and os.environ.get("CDB_BENCH_DISPOSABLE") != "1":
+            raise SystemExit(
+                "cc-hermes-cua-jev requires CDB_BENCH_DISPOSABLE=1; never run on the host desktop"
+            )
+        names = ("hermes_source", "hermes_python", "hermes_cua_jev", "hermes_allowlist")
+        if any(getattr(args, name) is None for name in names):
+            raise SystemExit(
+                "cc-hermes-cua-jev requires --hermes-source, --hermes-python, --hermes-cua-jev and --hermes-allowlist"
+            )
+        # Do not resolve the interpreter symlink: that would lose its venv dependencies.
+        hermes_options = ca.HermesOptions(
+            *(getattr(args, name).expanduser().absolute() for name in names)
+        )
+        try:
+            hermes_options.authorized_scopes()
+        except (OSError, ValueError) as error:
+            raise SystemExit(f"cc-hermes-cua-jev unavailable: {error}") from None
     if bu.ARM in arm_names:
         bu.require_chatgpt()
     run_id = args.run_id or datetime.now(timezone.utc).strftime("run-%Y%m%dT%H%M%SZ")
@@ -2597,11 +2672,11 @@ def make_ctx(args: argparse.Namespace) -> Ctx:
     unsupported = []
     if desktop.detect_platform() == "linux":
         unsupported = [
-            f"unsupported-platform: {a} requires macOS" for a in arm_names if a not in ca.CUA_ARMS
+            reason for a in arm_names if (reason := desktop.arm_platform_error(a, ca.DRIVER_ARMS))
         ]
         for reason in unsupported:
             print(reason, file=sys.stderr)
-        arm_names = [a for a in arm_names if a in ca.CUA_ARMS]
+        arm_names = [a for a in arm_names if a in ca.DRIVER_ARMS]
         if not arm_names:
             raise SystemExit("no supported arms remain: " + "; ".join(unsupported))
     if args.pins:
@@ -2629,17 +2704,26 @@ def make_ctx(args: argparse.Namespace) -> Ctx:
     if args.claude_bin is not None:
         ca.CLAUDE_BIN = args.claude_bin
     ctx = Ctx(
-        args, run_dir, core.Ledger(args.ledger), tasks, task_ids, arm_names, full_task_ids=full_ids
+        args,
+        run_dir,
+        core.Ledger(args.ledger),
+        tasks,
+        task_ids,
+        arm_names,
+        full_task_ids=full_ids,
+        hermes_options=hermes_options,
     )
     ctx.cutoff = core.parse_utc(args.cutoff_utc) if args.cutoff_utc else None
     os_version = sw_vers()
     ctx.versions = {
-        "claude": claude_version(),
+        "claude": None if args.command == "dry-run" else claude_version(),
         "platform": desktop.detect_platform(),
         "unsupported_arms": unsupported,
         "os_version": os_version,
         "macos": os_version if desktop.detect_platform() == "macos" else None,
-        "bench_repo_commit": git_commit(HERE),
+        "bench_repo_commit": "not probed (dry-run)"
+        if args.command == "dry-run"
+        else git_commit(HERE),
         "bench_src_sha256": src_hash(),
     }
     return ctx
@@ -2697,7 +2781,12 @@ def setup_arms(ctx: Ctx) -> None:
     for arm in ctx.arm_names:
         if arm in arms.CLAUDE_ARMS:
             try:
-                ctx.mcp[arm] = ca.mcp_config_for(arm, ctx.run_dir, ctx.args.codex_cu_mcp)
+                ctx.mcp[arm] = ca.mcp_config_for(
+                    arm,
+                    ctx.run_dir,
+                    ctx.args.codex_cu_mcp,
+                    hermes=ctx.hermes_options,
+                )
             except (FileNotFoundError, ValueError) as error:
                 raise SystemExit(f"arm {arm} unavailable: {error}")
         elif (
@@ -2712,6 +2801,23 @@ def setup_arms(ctx: Ctx) -> None:
             except (FileNotFoundError, ValueError) as error:
                 raise SystemExit(f"arm {arm} unavailable: {error}")
             ctx.versions["codex_native"] = cxn.observed()
+    if ca.HERMES_ARM in ctx.mcp:
+        options = ctx.hermes_options
+        assert options is not None
+        ctx.versions["hermes_cua_jev"] = {
+            "source": str(options.source),
+            "source_commit": git_commit(options.source),
+            "python": str(options.python),
+            "plugin": str(options.plugin),
+            "plugin_manifest_sha256": ca.sha256_file(options.plugin / "plugin.yaml"),
+            "allowlist_sha256": ca.sha256_file(options.allowlist),
+            "adapter_sha256": ca.sha256_file(HERE / "hermes_mcp.py"),
+            "mcp_config_sha256": ca.sha256_file(ctx.mcp[ca.HERMES_ARM][0]),
+            "tools": list(ca.HERMES_TOOLS),
+            "environment": "env -i; no provider credentials",
+            "home": str(ctx.run_dir / "hermes-runtime" / "home"),
+            "hermes_home": str(ctx.run_dir / "hermes-runtime" / "home" / ".hermes"),
+        }
     if ctx.args.build_dir or desktop.detect_platform() == "linux":
         apps: dict[str, str] = {}
         for name in BENCH_APPS:
@@ -2727,9 +2833,16 @@ def start_recorder(ctx: Ctx) -> None:
     if ctx.args.no_recorder:
         ctx.recorder = rec.NullRecorder()
         return
-    ctx.rec_daemon = ca.start_cua_daemon(ca.RECORDER_SOCKET, ca.RECORDER_STATE, overlay=False)
+    recorder_binary = getattr(ctx.args, "recorder_bin", None) or ca.CUA_BIN
+    ctx.versions["recorder"] = {
+        "binary": str(recorder_binary),
+        "sha256": ca.sha256_file(recorder_binary),
+    }
+    ctx.rec_daemon = ca.start_cua_daemon(
+        ca.RECORDER_SOCKET, ca.RECORDER_STATE, overlay=False, binary=recorder_binary
+    )
     ctx.recorder = rec.CuaRecorder(
-        ca.CUA_BIN, ca.RECORDER_SOCKET, ca.cua_env(ca.RECORDER_STATE / "home")
+        recorder_binary, ca.RECORDER_SOCKET, ca.cua_env(ca.RECORDER_STATE / "home")
     )
     ctx.compress = rec.CompressQueue()
 
@@ -2954,7 +3067,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         # The runner owns both private daemons for the run: replace any leftover ones.
         stop_agent_daemons(ctx, keep=None)
         ca.stop_cua_daemon(ca.RECORDER_SOCKET, ca.RECORDER_STATE / "home")
-        cua_arms = [a for a in ctx.arm_names if a in ca.CUA_ARMS]
+        cua_arms = [a for a in ctx.arm_names if a in ca.DRIVER_ARMS]
         if cua_arms:
             ensure_agent_daemon(ctx, cua_arms[0])
         start_recorder(ctx)
@@ -3084,7 +3197,14 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
     for task_id, arm in ((t, a) for t in ctx.task_ids for a in ctx.arm_names):
         if arm in arms.CLAUDE_ARMS:
             try:
-                path, server = ca.mcp_config_for(arm, ctx.run_dir, args.codex_cu_mcp)
+                if arm not in ctx.mcp:
+                    ctx.mcp[arm] = ca.mcp_config_for(
+                        arm,
+                        ctx.run_dir,
+                        args.codex_cu_mcp,
+                        hermes=ctx.hermes_options,
+                    )
+                path, server = ctx.mcp[arm]
                 argv = ca.claude_argv(
                     mcp_config=path,
                     server=server,
@@ -3102,6 +3222,8 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
                     f"\n{task_id} {arm}:\n  "
                     + " ".join(json.dumps(a) if " " in a else a for a in argv)
                 )
+                if arm == ca.HERMES_ARM:
+                    print("  MCP (planned, not executed): " + path.read_text("utf-8").strip())
             except (FileNotFoundError, ValueError) as error:
                 print(f"\n{arm}: UNAVAILABLE ({error})")
     return 0
