@@ -2642,10 +2642,15 @@ impl Tool for LaunchAppTool {
             }
         };
 
-        // Strict no-activation is available only for the desktop launch path.
-        // UWP activation is broker-controlled and retains its existing
-        // restore-after-activation behavior.
-        let mut foreground_lock = if start_minimized && aumid_for_uwp.is_none() {
+        // Prevent activation throughout every app-identifying desktop launch,
+        // including separately dispatched URL handlers and window resolution.
+        // nShow alone is only a hint; a secondary process can otherwise steal
+        // foreground and be mistaken for unrelated user supersession by the
+        // restoration guard. Genuine user input still releases this OS lock,
+        // and the existing exact-owner restoration checks remain unchanged.
+        // URL-only calls keep their foreground carve-out. UWP activation is
+        // broker-controlled and retains its restore-after-activation behavior.
+        let foreground_lock = if restore_foreground && aumid_for_uwp.is_none() {
             Some(crate::input::ForegroundLockGuard::acquire())
         } else {
             None
@@ -2655,10 +2660,9 @@ impl Tool for LaunchAppTool {
             .is_some_and(|guard| !guard.acquired())
         {
             return ToolResult::error(
-                "Background minimized launch is unavailable because Windows did not grant the \
-                 foreground lock required to prevent the new process from activating. No process \
-                 was started. Launch without start_minimized only when a foreground change is \
-                 acceptable.",
+                "Background app launch is unavailable because Windows did not grant the \
+                 foreground lock required to prevent the app or its URL handlers from activating. \
+                 No process was started.",
             )
             .with_structured(json!({
                 "code": "background_unavailable",
@@ -3170,14 +3174,14 @@ impl Tool for LaunchAppTool {
             // app has its main window up within ~2 s of launch.
             let pre_pids = pre_launch_pids.clone();
             let basename_for_poll = stub_basename.clone();
-            let launch_foreground_lock = foreground_lock.take();
+            // The invocation retains foreground_lock through this pass and
+            // response construction, just as for a non-minimized app launch.
             (async move {
                 use std::collections::HashSet;
                 use windows::Win32::Foundation::HWND;
                 use windows::Win32::UI::WindowsAndMessaging::{
                     IsIconic, ShowWindow, SW_SHOWMINNOACTIVE,
                 };
-                let _foreground_lock = launch_foreground_lock;
                 let mut minimized: HashSet<u64> = immediate_hwnds_for_poll.into_iter().collect();
                 let mut idle_ticks_after_any_hit: u8 = 0;
                 let mut hit_count_total = minimized.len();

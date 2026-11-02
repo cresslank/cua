@@ -162,6 +162,7 @@ fn launch_edge_from_apps_folder_registration() {
             "urls": ["https://example.com"]
         }),
     );
+    eprintln!("Edge AppsFolder full MCP response: {}", launch.raw);
     assert!(
         !launch.is_error(),
         "Edge AppsFolder launch failed: {:?}",
