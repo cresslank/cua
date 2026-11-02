@@ -474,7 +474,6 @@ class SpawnOwnershipTest(unittest.TestCase):
 
         with (
             mock.patch.dict(os.environ, self.ledger()),
-            mock.patch.object(claude_driver.ca, "open_token_fd", return_value=None),
             mock.patch.object(claude_driver.subprocess, "Popen", self.spy),
             self.assertRaises(OSError),
         ):

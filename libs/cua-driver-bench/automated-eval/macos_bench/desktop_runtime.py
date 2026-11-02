@@ -88,6 +88,37 @@ def desktop_env(home: Path, extra: Mapping[str, str] | None = None) -> dict[str,
     return env
 
 
+def arm_platform_error(arm: str, driver_arms: Sequence[str]) -> str | None:
+    """Keep unsupported routes visible; Hermes' current private-socket bridge is Linux-only."""
+    linux = detect_platform() == "linux"
+    if arm == "cc-hermes-cua-jev" and not linux:
+        return f"unsupported-platform: {arm} requires Linux (private socket routing)"
+    if linux and arm not in driver_arms:
+        return f"unsupported-platform: {arm} requires macOS"
+    return None
+
+
+def hermes_mcp_env(home: Path, profile: Path, source: Path, binary: Path) -> dict[str, str]:
+    """Explicit tool-host environment, used behind env -i (never inherit agent/provider authority)."""
+    env = {
+        "HOME": str(home),
+        "HERMES_HOME": str(profile),
+        "TMPDIR": str(home / "tmp"),
+        "PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "C.UTF-8",
+        "PYTHONPATH": str(source),
+        "PYTHONNOUSERSITE": "1",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "HERMES_CUA_DRIVER_CMD": str(binary),
+        "CUA_DRIVER_DISABLE_RUN_SCRIPT": "1",
+        "CUA_DRIVER_RS_TELEMETRY_ENABLED": "false",
+        "DO_NOT_TRACK": "1",
+    }
+    if detect_platform() == "linux":
+        env.update({key: os.environ[key] for key in SESSION_KEYS if key in os.environ})
+    return env
+
+
 def bench_app_argv(name: str, build_dir: Path | None = None) -> list[str]:
     name = name.removesuffix(".app")
     if name not in ("BenchLab", "BenchSentinel"):
