@@ -2650,7 +2650,7 @@ impl Tool for LaunchAppTool {
         // and the existing exact-owner restoration checks remain unchanged.
         // URL-only calls keep their foreground carve-out. UWP activation is
         // broker-controlled and retains its restore-after-activation behavior.
-        let foreground_lock = if restore_foreground && aumid_for_uwp.is_none() {
+        let foreground_lock = if start_minimized && aumid_for_uwp.is_none() {
             Some(crate::input::ForegroundLockGuard::acquire())
         } else {
             None
