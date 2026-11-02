@@ -196,6 +196,15 @@ impl ForegroundFixture {
             if current == self.hwnd() && owner == std::process::id() {
                 return;
             }
+            if Instant::now() >= deadline {
+                // Diagnostic only: never reactivate or modify the success
+                // assertion. This PID handle has no termination authority.
+                eprintln!(
+                    "Edge unexpected foreground HWND={:#x}: {}",
+                    current.0 as usize,
+                    cua_driver_testkit::windows_process::describe_process(owner)
+                );
+            }
             assert!(
                 Instant::now() < deadline,
                 "expected owned foreground HWND={:#x} PID={}, got HWND={:#x} PID={owner}",
