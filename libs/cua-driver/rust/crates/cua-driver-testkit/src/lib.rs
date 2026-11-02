@@ -1,5 +1,7 @@
 //! Shared test harness for cua-driver integration tests.
 //!
+//! Baseline snapshot for Windows failure-rate attribution without PR #41.
+//!
 //! Before this crate, every `tests/*.rs` re-implemented the same machinery:
 //! `workspace_root()` / `driver_binary()` (×9), the JSON-RPC-over-stdio client
 //! (`send`/`call`/`init`, ×10), the Windows kill-on-close Job Object reaper
