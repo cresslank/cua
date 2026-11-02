@@ -54,6 +54,8 @@ mod reaper;
 mod response;
 pub mod sentinel;
 pub mod vertex;
+#[cfg(target_os = "windows")]
+pub mod windows_process;
 mod windows_setup;
 
 pub use browser_fixture::BrowserFixtureServer;
