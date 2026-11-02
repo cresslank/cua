@@ -106,11 +106,15 @@ impl<R> Drop for NativeTask<R> {
 /// Capture in the caller, before spawning/enqueuing, and retain through input,
 /// payload destruction and cleanup. This is not admission for another action.
 /// A long-lived worker must capture per command, never once for its lifetime.
+/// Also retains the originating session admission: dropping the async waiter
+/// cannot run session-end hooks while native payloads or restoration still own
+/// this scope. Propagate it to continuations just like the action lease.
 #[derive(Clone, Default)]
 pub struct ActionLeaseScope(
     Option<Arc<crate::action_lease::ActionLease>>,
     Option<Vec<Arc<AtomicBool>>>,
     crate::action_lease::InputRoute,
+    Option<Arc<crate::session::SessionDispatchGuard>>,
 );
 
 impl ActionLeaseScope {
@@ -122,6 +126,10 @@ impl ActionLeaseScope {
                 .flatten(),
             NATIVE_CANCELLATION.try_with(Clone::clone).ok(),
             crate::action_lease::current_input_route(),
+            crate::session::DISPATCH_SESSION_GUARD
+                .try_with(Clone::clone)
+                .ok()
+                .flatten(),
         )
     }
 
@@ -140,19 +148,23 @@ impl ActionLeaseScope {
 
     /// Release-only cleanup within an already admitted native worker.
     pub fn run_cleanup<R>(&self, function: impl FnOnce() -> R) -> R {
-        self.2.sync_scope(|| {
-            crate::tool::DISPATCH_ACTION_LEASE.sync_scope(self.0.clone(), || {
-                NATIVE_CANCELLATION.sync_scope(Vec::new(), function)
+        crate::session::DISPATCH_SESSION_GUARD.sync_scope(self.3.clone(), || {
+            self.2.sync_scope(|| {
+                crate::tool::DISPATCH_ACTION_LEASE.sync_scope(self.0.clone(), || {
+                    NATIVE_CANCELLATION.sync_scope(Vec::new(), function)
+                })
             })
         })
     }
 
     /// Propagate ownership to any further native continuations started here.
     pub fn run<R>(&self, function: impl FnOnce() -> R) -> R {
-        self.2.sync_scope(|| {
-            crate::tool::DISPATCH_ACTION_LEASE.sync_scope(self.0.clone(), || match &self.1 {
-                Some(cancelled) => NATIVE_CANCELLATION.sync_scope(cancelled.clone(), function),
-                None => function(),
+        crate::session::DISPATCH_SESSION_GUARD.sync_scope(self.3.clone(), || {
+            self.2.sync_scope(|| {
+                crate::tool::DISPATCH_ACTION_LEASE.sync_scope(self.0.clone(), || match &self.1 {
+                    Some(cancelled) => NATIVE_CANCELLATION.sync_scope(cancelled.clone(), function),
+                    None => function(),
+                })
             })
         })
     }

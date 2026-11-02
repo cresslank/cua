@@ -105,6 +105,48 @@ class RunnerConfigurationTests(unittest.TestCase):
         )
 
 
+class McpClientLifecycleTests(unittest.TestCase):
+    def run_client(self, source, timeout: float = 2):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            requests = root / "requests.jsonl"
+            requests.write_text('{"id":1}\n{"method":"notification"}\n{"id":"2"}\n')
+            output = root / "responses.jsonl"
+            RUNNER.run_mcp_client(
+                [sys.executable, "-c", source], env={}, timeout=timeout,
+                stdin=requests, stdout=output, stderr=root / "client.log",
+            )
+            return output.read_text()
+
+    def test_mcp_stdin_stays_live_through_every_reply_then_closes(self):
+        output = self.run_client(
+            "import json, select, sys\n"
+            "requests=[json.loads(sys.stdin.readline()) for _ in range(3)]\n"
+            "# No queued bytes remain: readable stdin now means premature EOF.\n"
+            "if select.select([sys.stdin],[],[],0.02)[0]: raise SystemExit(91)\n"
+            "for request in requests:\n"
+            " if 'id' not in request: continue\n"
+            " print(json.dumps({'id':request['id'],'result':{'data':'x'*100000}}),flush=True)\n"
+            "assert sys.stdin.read()==''\n"
+            "print(json.dumps({'closed':True}),flush=True)\n"
+        )
+        import json
+        values = [json.loads(line) for line in output.splitlines()]
+        self.assertEqual([value.get('id') for value in values[:2]], [1, '2'])
+        self.assertEqual(values[-1], {'closed': True})
+        self.assertEqual(len(values[0]['result']['data']), 100000)
+
+    def test_mcp_missing_replies_are_a_failure_not_a_partial_green(self):
+        with self.assertRaisesRegex(RUNNER.RunnerFailure, "before every smoke reply"):
+            self.run_client("print('{}',flush=True)")
+
+    def test_mcp_stalled_reply_is_bounded_and_child_reaped(self):
+        started = time.monotonic()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.run_client("import time; time.sleep(30)", timeout=0.1)
+        self.assertLess(time.monotonic() - started, 2)
+
+
 class ShutdownServerTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()

@@ -319,6 +319,54 @@ pub fn send_request(socket_path: &str, request: &DaemonRequest) -> anyhow::Resul
     }
 }
 
+/// Async, cancellation-owned variant used by MCP proxy requests. Dropping the
+/// future closes this exact per-call socket instead of detaching a blocking
+/// client that could keep remote nested actions alive after cancellation.
+pub async fn send_request_async(
+    socket_path: &str,
+    request: &DaemonRequest,
+) -> anyhow::Result<DaemonResponse> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    #[cfg(unix)]
+    let mut stream = tokio::net::UnixStream::connect(socket_path).await?;
+    #[cfg(windows)]
+    let mut stream = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            match tokio::net::windows::named_pipe::ClientOptions::new().open(socket_path) {
+                Ok(stream) => break stream,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    };
+    #[cfg(not(any(unix, windows)))]
+    anyhow::bail!("daemon client not supported on this platform (socket path: {socket_path})");
+
+    #[cfg(any(unix, windows))]
+    {
+        let line = serde_json::to_string(request)? + "\n";
+        tokio::time::timeout(REPLY_DEADLINE, async {
+            stream.write_all(line.as_bytes()).await?;
+            stream.flush().await?;
+            // Bounded even if an untrusted endpoint never terminates its reply.
+            const MAX_REPLY: u64 = 64 * 1024 * 1024;
+            let mut bytes = Vec::new();
+            let n = BufReader::new(stream)
+                .take(MAX_REPLY + 1)
+                .read_until(b'\n', &mut bytes)
+                .await?;
+            anyhow::ensure!(n > 0, "daemon closed connection without response");
+            anyhow::ensure!(n as u64 <= MAX_REPLY, "daemon response exceeds size limit");
+            Ok::<_, anyhow::Error>(serde_json::from_slice(&bytes)?)
+        })
+        .await?
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -326,6 +374,41 @@ mod tests {
         DaemonResponse, ToolObservationOrigin, DAEMON_OVERHEAD_ALLOWANCE, REPLY_DEADLINE,
     };
     use std::time::Duration;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelled_async_request_closes_the_exact_private_socket() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let client = tokio::spawn(async move {
+            let request: DaemonRequest = serde_json::from_value(serde_json::json!({
+                "method": "call", "name": "private_probe", "args": {},
+            }))
+            .unwrap();
+            super::send_request_async(path.to_str().unwrap(), &request).await
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&line).unwrap()["name"],
+            "private_probe"
+        );
+        client.abort();
+        assert!(client.await.unwrap_err().is_cancelled());
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), reader.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+            "no detached blocking client may retain the cancelled socket",
+        );
+    }
 
     #[test]
     fn the_reply_deadline_outlasts_every_tool_budget() {
