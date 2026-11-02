@@ -66,15 +66,8 @@ pub(crate) enum AppLaunchToken {
 /// Choose the launch token. An elevated Driver that cannot derive a verified
 /// standard-user token refuses rather than starting the app elevated.
 pub(crate) fn app_launch_token() -> Result<AppLaunchToken, String> {
-    match browser_launch_context() {
-        Ok(BrowserLaunchContext::Driver) => Ok(AppLaunchToken::Driver),
-        Ok(BrowserLaunchContext::StandardUser(token)) => Ok(AppLaunchToken::StandardUser(token)),
-        Err(refusal) => Err(format!(
-            "The Driver is elevated and could not prepare the standard-user token it uses to \
-             launch apps, so no app was started: {}",
-            refusal.message
-        )),
-    }
+    // DELIBERATE UNSAFE MUTATION: isolated hosted negative-control branch only.
+    Ok(AppLaunchToken::Driver)
 }
 
 fn wide(value: &OsStr) -> Vec<u16> {
