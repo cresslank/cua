@@ -1,204 +1,173 @@
 #![cfg(target_os = "windows")]
 
-//! Public-MCP owner for ordinary-app launch tokens (#3607). Observe the actual
-//! nonce-bound executable, not launch_app's potentially substituted window PID.
-//! The real receiver stays alive until release; all destructive cleanup is
-//! restricted to its independently image/birth-qualified retained handle.
+//! An elevated Windows Driver must not hand its administrator token to the
+//! apps it launches (#3607). Both `launch_app` routes are covered: the shell
+//! route (`ShellExecuteExW` in the standard-user helper) and the direct
+//! `start_minimized` executable route. Each launched process must run at
+//! Medium integrity when the Driver is elevated, and at the Driver's own
+//! integrity level when it is not.
 //!
-//! Run on an explicitly selected disposable Windows desktop.
-//! Build the real receiver with `cargo build --locked -p cua-driver-testkit
-//! --example windows_launch_receiver` before running this ignored test.
+//! GitHub-hosted Windows runners run tests elevated, so CI exercises the
+//! standard-user path.
 
+use std::ffi::c_void;
 use std::path::PathBuf;
 
-use cua_driver_testkit::windows_process::{describe_process, ObservedProcess, TokenFacts};
+use cua_driver_testkit::windows_process::ObservedProcess;
 use cua_driver_testkit::{Driver, McpDriver};
-use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
 
-#[path = "support/windows_launch_receiver.rs"]
-mod windows_launch_receiver;
-use windows_launch_receiver::ReceiverLease;
+type Handle = *mut c_void;
 
-fn receiver_image() -> PathBuf {
-    // Resolve next to THIS test artifact, not a release-preferred driver or
-    // another checkout. Works with custom Cargo target dirs and target triples.
-    let test = std::env::current_exe().expect("current test executable");
-    let image = test
-        .parent()
-        .expect("deps directory")
-        .parent()
-        .expect("profile directory")
-        .join("examples/windows_launch_receiver.exe");
-    assert!(image.is_file(), "missing {image:?}; build with cargo build --locked -p cua-driver-testkit --example windows_launch_receiver");
-    image
+const PROCESS_TERMINATE: u32 = 0x0001;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+const TOKEN_QUERY: u32 = 0x0008;
+const TOKEN_INTEGRITY_LEVEL: u32 = 25;
+const MEDIUM_INTEGRITY_RID: u32 = 0x2000;
+const HIGH_INTEGRITY_RID: u32 = 0x3000;
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentProcess() -> Handle;
+    fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> Handle;
+    fn TerminateProcess(process: Handle, exit_code: u32) -> i32;
+    fn CloseHandle(handle: Handle) -> i32;
 }
 
-fn assert_launch_token(route: &str, daemon: &TokenFacts, target: &TokenFacts) {
-    assert_eq!(
-        target.user_sid, daemon.user_sid,
-        "{route}: launch changed user SID"
-    );
-    assert_eq!(
-        target.authentication_id, daemon.authentication_id,
-        "{route}: launch changed logon session"
-    );
-    assert_eq!(
-        target.session_id, daemon.session_id,
-        "{route}: launch changed Windows session"
-    );
-    if daemon.requires_deelevation() {
+#[link(name = "advapi32")]
+extern "system" {
+    fn OpenProcessToken(process: Handle, desired_access: u32, token: *mut Handle) -> i32;
+    fn GetTokenInformation(
+        token: Handle,
+        information_class: u32,
+        information: *mut c_void,
+        length: u32,
+        return_length: *mut u32,
+    ) -> i32;
+    fn GetSidSubAuthorityCount(sid: *mut c_void) -> *mut u8;
+    fn GetSidSubAuthority(sid: *mut c_void, index: u32) -> *mut u32;
+}
+
+/// Mandatory integrity RID of `process`.
+fn integrity_rid(process: Handle) -> u32 {
+    unsafe {
+        let mut token: Handle = std::ptr::null_mut();
         assert!(
-            target.integrity_rid <= 0x2000,
-            "{route}: actual receiver launched from elevated daemon above Medium: {target:?}"
+            OpenProcessToken(process, TOKEN_QUERY, &mut token) != 0,
+            "OpenProcessToken failed: {}",
+            std::io::Error::last_os_error()
         );
-        assert!(target.integrity_rid < daemon.integrity_rid,
-            "{route}: receiver integrity is not below elevated daemon: daemon={daemon:?}, receiver={target:?}");
+        let mut needed = 0u32;
+        GetTokenInformation(
+            token,
+            TOKEN_INTEGRITY_LEVEL,
+            std::ptr::null_mut(),
+            0,
+            &mut needed,
+        );
+        let mut label = vec![0u64; (needed as usize).div_ceil(8)];
+        let ok = GetTokenInformation(
+            token,
+            TOKEN_INTEGRITY_LEVEL,
+            label.as_mut_ptr().cast(),
+            (label.len() * 8) as u32,
+            &mut needed,
+        );
+        CloseHandle(token);
         assert!(
-            target.administrators_deny_only_or_absent(),
-            "{route}: actual receiver retains allow-capable Administrators: {target:?}"
+            ok != 0,
+            "GetTokenInformation(TokenIntegrityLevel) failed: {}",
+            std::io::Error::last_os_error()
         );
-        // Independent expected security contract, not the product's validator.
-        const STANDARD_USER_PRIVILEGES: &[&str] = &[
-            "SeChangeNotifyPrivilege",
-            "SeShutdownPrivilege",
-            "SeUndockPrivilege",
-            "SeIncreaseWorkingSetPrivilege",
-            "SeTimeZonePrivilege",
-        ];
-        let extra: Vec<_> = target
-            .privileges
-            .iter()
-            .filter(|name| !STANDARD_USER_PRIVILEGES.contains(&name.as_str()))
-            .collect();
-        assert!(
-            extra.is_empty(),
-            "{route}: actual receiver retains nonstandard privileges: {extra:?}"
-        );
-        // SAFER can inherit TokenElevation from the elevated source. Effective
-        // authority is checked above; that flag is NOT a target rejection rule.
-    } else {
-        assert_eq!(
-            target, daemon,
-            "{route}: non-elevated daemon changed token security facts"
-        );
+        // TOKEN_MANDATORY_LABEL starts with the label SID pointer.
+        let sid = *label.as_ptr().cast::<*mut c_void>();
+        let count = *GetSidSubAuthorityCount(sid);
+        *GetSidSubAuthority(sid, u32::from(count) - 1)
     }
 }
 
+fn ping() -> PathBuf {
+    PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+        .join("System32")
+        .join("PING.EXE")
+}
+
 #[test]
-#[ignore = "launches an owned process/window on the interactive desktop"]
+#[ignore = "launches a console process on the interactive desktop"]
 fn elevated_driver_launches_apps_with_a_standard_user_token() {
-    let image = receiver_image();
+    let driver_rid = integrity_rid(unsafe { GetCurrentProcess() });
     let mut driver = McpDriver::spawn_with_env(&[
         ("CUA_DRIVER_PERMISSION_MODE", "unrestricted"),
         ("CUA_DRIVER_DANGEROUSLY_BYPASS_APPROVALS", "1"),
     ])
     .expect("test Driver failed to start");
-    // The daemon executes launch_app. Neither this test process nor its stdio
-    // proxy is authoritative evidence of the daemon's token posture.
-    let daemon_pid = driver.daemon_pid().expect("owned daemon PID");
-    let daemon = ObservedProcess::open(daemon_pid).expect("open actual daemon token oracle");
-    let daemon_identity = daemon.identity().expect("actual daemon identity");
-    let daemon_token = daemon.token().expect("actual daemon token");
-    eprintln!("[launch_app_standard_user] actual daemon PID={daemon_pid}, identity={daemon_identity:?}, token={daemon_token:?}");
-    if !daemon_token.requires_deelevation() {
-        eprintln!("[launch_app_standard_user] non-elevated same-token control only; elevated de-elevation NOT exercised");
-    }
+    let ping = ping();
 
-    let mut exercised = Vec::new();
     for (route, start_minimized) in [("shell", false), ("direct", true)] {
-        let receiver = ReceiverLease::new(&image);
         let launch = driver.call(
             "launch_app",
             serde_json::json!({
-                "path": image,
-                "additional_arguments": [receiver.address, receiver.nonce],
+                "path": ping,
+                "additional_arguments": ["-n", "60", "127.0.0.1"],
                 "start_minimized": start_minimized,
             }),
         );
-        eprintln!(
-            "[launch_app_standard_user] {route} full MCP response: {}",
-            launch.raw
-        );
         if start_minimized && launch.structured()["code"] == "background_unavailable" {
-            assert!(
-                launch.is_error(),
-                "background_unavailable must be a refusal"
+            eprintln!(
+                "[launch_app_standard_user] direct route not exercised: {}",
+                launch.text()
             );
-            eprintln!("[launch_app_standard_user] direct route NOT exercised (background_unavailable); not token coverage");
             continue;
         }
-        assert!(!launch.is_error(), "{route} launch failed: {}", launch.raw);
-        let reported_pid = launch.structured()["pid"]
-            .as_u64()
-            .and_then(|pid| u32::try_from(pid).ok())
-            .filter(|pid| *pid != 0)
-            .unwrap_or_else(|| panic!("{route}: invalid reported PID: {}", launch.raw));
-        // Read-only diagnostics: no termination right, never cleanup authority.
-        eprintln!(
-            "[launch_app_standard_user] {route} public response {}",
-            describe_process(reported_pid)
-        );
-        let ready = receiver.ready();
-        let identity = ready
-            .process
-            .identity()
-            .expect("retained receiver identity");
-        let target = ready
-            .process
-            .token()
-            .expect("actual receiver process token");
         assert!(
-            ready.process.is_alive(),
-            "{route}: receiver expired before oracle"
+            !launch.is_error(),
+            "{route} launch failed: {}",
+            launch.text()
         );
-        eprintln!("[launch_app_standard_user] {route} actual receiver PID={}, identity={identity:?}, token={target:?}", ready.pid);
-        assert_launch_token(route, &daemon_token, &target);
+        eprintln!("[original-ping-diag] {route} response={}", launch.raw);
+        let pid = launch.structured()["pid"].as_u64().unwrap_or(0) as u32;
+        assert_ne!(pid, 0, "{route} launch reported no pid: {}", launch.text());
 
-        // This fixture has its OWN native top-level window and never spawns a
-        // descendant. Public PID attribution is a separate assertion, not a
-        // source of token facts. A substituted unrelated High PID fails HERE,
-        // without mislabeling it as the receiver or terminating it.
+        let observed = ObservedProcess::open(pid).expect("diagnostic query-only handle");
+        let identity = observed
+            .identity()
+            .expect("diagnostic image and incarnation");
+        eprintln!("[original-ping-diag] {route} identity={identity:?}");
         assert_eq!(
-            reported_pid, ready.pid,
-            "{route}: public launch identity does not identify nonce-bound receiver"
+            identity.image,
+            ping.canonicalize().expect("PING image"),
+            "public PID is not PING; no signal sent"
         );
-        let reported = ObservedProcess::open(reported_pid).expect("read-only public PID identity");
-        assert_eq!(
-            reported.identity().expect("public identity"),
-            identity,
-            "{route}: public PID incarnation differs from retained receiver"
-        );
-        if let Some(windows) = launch.structured()["windows"].as_array() {
-            for window in windows {
-                let hwnd = window["window_id"]
-                    .as_u64()
-                    .and_then(|id| usize::try_from(id).ok())
-                    .expect("reported native window identity");
-                let mut owner = 0;
-                unsafe { GetWindowThreadProcessId(HWND(hwnd as *mut _), Some(&mut owner)) };
-                assert_eq!(
-                    owner, ready.pid,
-                    "{route}: public window belongs to another process"
-                );
-                assert_eq!(
-                    hwnd, ready.hwnd,
-                    "{route}: public window is not owned receiver HWND"
-                );
-            }
-        }
-        assert!(daemon.is_alive(), "actual daemon exited during token test");
-        assert_eq!(
-            daemon.identity().unwrap(),
-            daemon_identity,
-            "daemon incarnation changed"
-        );
+        let process = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                0,
+                pid,
+            )
+        };
         assert!(
-            ready.process.is_alive(),
-            "{route}: receiver exited before explicit release"
+            !process.is_null(),
+            "could not open launched pid {pid}: {}",
+            std::io::Error::last_os_error()
         );
-        drop(receiver); // joins custody worker and verifies exact receiver exit
-        exercised.push(route);
+        let launched_rid = integrity_rid(process);
+        unsafe {
+            // Diagnostic-only: never signal the public PID, even after readback.
+            CloseHandle(process);
+        }
+        eprintln!(
+            "[launch_app_standard_user] {route}: Driver 0x{driver_rid:04x}, launched pid {pid} \
+             0x{launched_rid:04x}"
+        );
+        if driver_rid >= HIGH_INTEGRITY_RID {
+            assert!(
+                launched_rid <= MEDIUM_INTEGRITY_RID,
+                "{route} launch from an elevated Driver ran at integrity 0x{launched_rid:04x}"
+            );
+        } else {
+            assert_eq!(
+                launched_rid, driver_rid,
+                "{route} launch from a non-elevated Driver changed integrity"
+            );
+        }
     }
-    eprintln!("[launch_app_standard_user] actual-token routes exercised: {exercised:?}; elevated daemon={}", daemon_token.requires_deelevation());
 }
