@@ -401,6 +401,11 @@ pub struct SessionDispatchGuard {
     session_id: String,
 }
 
+tokio::task_local! {
+    // Native continuations share the original admission, not a new action.
+    pub(crate) static DISPATCH_SESSION_GUARD: Option<Arc<SessionDispatchGuard>>;
+}
+
 impl Drop for SessionDispatchGuard {
     fn drop(&mut self) {
         let pending = {

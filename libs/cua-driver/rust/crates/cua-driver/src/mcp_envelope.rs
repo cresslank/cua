@@ -5,6 +5,7 @@
 //! No listener, credential issuer, action replay or runtime fallback is added.
 
 use crate::driver_service_http::{Request as ServiceRequest, Service};
+use cua_driver_core::dispatch_cancellation::{self, CancellationToken};
 use cua_driver_core::protocol::{initialize_result, Request, Response};
 use cua_driver_core::server::{
     observe_proxy_session_started, observe_proxy_tool_completed, tool_observation_timer,
@@ -12,7 +13,7 @@ use cua_driver_core::server::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{
@@ -161,7 +162,7 @@ where
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let mut line = Vec::new();
     let legacy_serial = Arc::new(tokio::sync::Mutex::new(()));
-    let mut pending = HashSet::new();
+    let mut pending: HashMap<String, CancellationToken> = HashMap::new();
     let mut reaper = tokio::time::interval(Duration::from_secs(30));
     let mut session_observed = false;
     loop {
@@ -210,8 +211,14 @@ where
                 continue;
             }
         };
-        // Typed control methods require acknowledged requests. Ordinary MCP
-        // notifications retain the legacy behavior; no cancellation is invented.
+        // Notifications address only requests active on this exact transport.
+        // Unknown/completed IDs cannot poison reuse or another connection.
+        if let Some(id) = dispatch_cancellation::cancelled_request_id(&request) {
+            if let Some(token) = pending.get(&id.to_string()) {
+                token.cancel();
+            }
+            continue;
+        }
         if request.is_notification() {
             continue;
         }
@@ -219,7 +226,10 @@ where
         let key = id.to_string();
         // Responding to a duplicate active ID would itself be ambiguous. End
         // this transport rather than miscorrelating an action or replaying it.
-        anyhow::ensure!(!pending.contains(&key), "duplicate active MCP request ID");
+        anyhow::ensure!(
+            !pending.contains_key(&key),
+            "duplicate active MCP request ID"
+        );
         if request.method == "initialize" {
             let mut result = initialize_result();
             result["capabilities"]["experimental"][CAPABILITY] = json!({"version": 1});
@@ -249,42 +259,51 @@ where
         let sdk = sdk.clone();
         let session = session.clone();
         let serial = legacy_serial.clone();
-        pending.insert(key.clone());
+        let token = CancellationToken::new();
+        pending.insert(key.clone(), token.clone());
         tasks.spawn(async move {
-            let response = if request.method.starts_with(PREFIX) {
-                typed_request(service, request).await
-            } else {
-                let _guard = serial.lock().await;
-                let mut request = request;
-                crate::proxy::apply_direct_session_identity(&mut request, &session);
-                let context = request.tool_call().ok().and_then(|call| {
-                    sdk.begin_tool_call(
-                        &call.name,
-                        &call.args,
-                        cua_driver_core::session::SessionTransport::McpStdio,
-                        cua_driver_core::session::SessionClientKind::Mcp,
+            let cancellation_id = id.clone();
+            let work = dispatch_cancellation::scope(token.clone(), async {
+                if request.method.starts_with(PREFIX) {
+                    typed_request(service, request).await
+                } else {
+                    let _guard = serial.lock().await;
+                    let mut request = request;
+                    crate::proxy::apply_direct_session_identity(&mut request, &session);
+                    let context = request.tool_call().ok().and_then(|call| {
+                        sdk.begin_tool_call(
+                            &call.name,
+                            &call.args,
+                            cua_driver_core::session::SessionTransport::McpStdio,
+                            cua_driver_core::session::SessionClientKind::Mcp,
+                        )
+                    });
+                    let timer = tool_observation_timer(
+                        &request,
+                        |name| sdk.is_known_tool(name),
+                        StdioExecutionPath::DirectDaemon,
+                    );
+                    let response = cua_driver_core::server::handle_request_with_transport_session(
+                        request,
+                        id,
+                        sdk.as_ref(),
+                        &session,
                     )
-                });
-                let timer = tool_observation_timer(
-                    &request,
-                    |name| sdk.is_known_tool(name),
-                    StdioExecutionPath::DirectDaemon,
-                );
-                let response = cua_driver_core::server::handle_request_with_transport_session(
-                    request,
-                    id,
-                    sdk.as_ref(),
-                    &session,
-                )
-                .await;
-                if let Some(timer) = timer {
-                    let outcome = timer.finish(&response);
-                    if let Some(context) = context {
-                        context.complete(&outcome);
+                    .await;
+                    if let Some(timer) = timer {
+                        let outcome = timer.finish(&response);
+                        if let Some(context) = context {
+                            context.complete(&outcome);
+                        }
+                        observe_proxy_tool_completed(outcome);
                     }
-                    observe_proxy_tool_completed(outcome);
+                    response
                 }
-                response
+            });
+            let response = tokio::select! {
+                biased;
+                _ = token.cancelled() => dispatch_cancellation::cancelled_response(cancellation_id),
+                response = work => response,
             };
             write_response(&writer, response).await?;
             Ok::<_, anyhow::Error>(key)

@@ -21,6 +21,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use cua_driver_core::dispatch_cancellation::{self, CancellationToken};
 use cua_driver_core::protocol::{Request, Response};
 use cua_driver_core::server::{
     handle_request_with_transport_session, tool_observation_timer, StdioExecutionPath,
@@ -89,7 +90,7 @@ pub fn spawn(sdk: Arc<crate::sdk_adapter::SdkAdapter>, port: u16) -> anyhow::Res
 /// single connection stay FIFO-ordered (so one agent's ordered calls are safe);
 /// parallelism comes from DISTINCT connections, each its own task.
 async fn serve_conn(
-    mut stream: TcpStream,
+    stream: TcpStream,
     sdk: Arc<crate::sdk_adapter::SdkAdapter>,
     token: Arc<str>,
 ) -> anyhow::Result<()> {
@@ -107,10 +108,23 @@ async fn serve_conn(
         sdk: sdk.clone(),
         transport_session: transport_session.clone(),
     };
+    let (reader, mut stream) = stream.into_split();
+    let closed = CancellationToken::new();
+    let (mut requests, _reader_task) = spawn_request_reader(reader, token, closed.clone());
     loop {
-        let Some(req) = read_http_request(&mut stream, &token).await? else {
-            return Ok(()); // clean EOF
+        let incoming = tokio::select! {
+            biased;
+            _ = closed.cancelled() => return Ok(()),
+            incoming = requests.recv() => incoming,
         };
+        let Some(incoming) = incoming else {
+            return Ok(());
+        };
+        let IncomingHttpRequest {
+            request: req,
+            cancellation,
+            _registration,
+        } = incoming;
         let keep_alive = req.keep_alive;
         if req.has_origin {
             write_http(
@@ -147,7 +161,20 @@ async fn serve_conn(
                 }
                 continue;
             }
-            match dispatch(&req.body, &sdk, &transport_session).await {
+            let id = serde_json::from_slice::<Request>(&req.body)
+                .ok()
+                .and_then(|req| req.id);
+            let response = dispatch_cancellation::scope(
+                cancellation.clone(),
+                dispatch(&req.body, &sdk, &transport_session),
+            );
+            let response = tokio::select! {
+                biased;
+                _ = closed.cancelled() => return Ok(()),
+                _ = cancellation.cancelled() => id.map(|id| serialize(&dispatch_cancellation::cancelled_response(id))),
+                response = response => response,
+            };
+            match response {
                 Some(resp_json) => {
                     write_http(&mut stream, 200, resp_json.as_bytes(), keep_alive).await?
                 }
@@ -162,6 +189,114 @@ async fn serve_conn(
             return Ok(());
         }
     }
+}
+
+type PendingHttp = Arc<std::sync::Mutex<std::collections::HashMap<String, CancellationToken>>>;
+
+struct HttpRequestRegistration {
+    pending: PendingHttp,
+    id: String,
+}
+
+impl Drop for HttpRequestRegistration {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.id);
+    }
+}
+
+struct IncomingHttpRequest {
+    request: HttpRequest,
+    cancellation: CancellationToken,
+    _registration: Option<HttpRequestRegistration>,
+}
+
+struct HttpReaderTask(tokio::task::JoinHandle<()>);
+impl Drop for HttpReaderTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// The parser owns all partial HTTP bytes across dispatch and response writes.
+/// Reading ahead is bounded and never dispatches a second action. Cancellation
+/// is accepted only after the same authentication/origin/protocol checks as POST.
+fn spawn_request_reader<R>(
+    mut reader: R,
+    auth: Arc<str>,
+    closed: CancellationToken,
+) -> (
+    tokio::sync::mpsc::Receiver<IncomingHttpRequest>,
+    HttpReaderTask,
+)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let (sender, receiver) = tokio::sync::mpsc::channel(32);
+    let pending: PendingHttp = Default::default();
+    let task = tokio::spawn(async move {
+        struct CloseOnDrop(CancellationToken);
+        impl Drop for CloseOnDrop {
+            fn drop(&mut self) {
+                self.0.cancel();
+            }
+        }
+        let _closed = CloseOnDrop(closed);
+        loop {
+            let request = match read_http_request(&mut reader, &auth).await {
+                Ok(Some(request)) => request,
+                Ok(None) | Err(_) => return,
+            };
+            let valid_control = request.authorized
+                && !request.has_origin
+                && request.method.eq_ignore_ascii_case("POST")
+                && unsupported_protocol_error(&request.body, request.protocol_version.as_deref())
+                    .is_none();
+            let parsed = valid_control
+                .then(|| serde_json::from_slice::<Request>(&request.body).ok())
+                .flatten();
+            let mut registration = None;
+            let cancellation = CancellationToken::new();
+            if let Some(cancel_id) = parsed
+                .as_ref()
+                .and_then(dispatch_cancellation::cancelled_request_id)
+            {
+                if let Some(token) = pending.lock().unwrap().get(&cancel_id.to_string()) {
+                    token.cancel();
+                }
+            } else if let Some(id) = parsed.as_ref().and_then(|request| request.id.as_ref()) {
+                let id = id.to_string();
+                let mut requests = pending.lock().unwrap();
+                // A second response for an active duplicate ID is ambiguous.
+                if requests.contains_key(&id) {
+                    return;
+                }
+                requests.insert(id.clone(), cancellation.clone());
+                registration = Some(HttpRequestRegistration {
+                    pending: pending.clone(),
+                    id,
+                });
+            }
+            let keep_alive = request.keep_alive;
+            if sender
+                .try_send(IncomingHttpRequest {
+                    request,
+                    cancellation,
+                    _registration: registration,
+                })
+                .is_err()
+            {
+                return;
+            }
+            if !keep_alive {
+                // Connection: close terminates after its response, not before
+                // the worker can dispatch the final request. Still observe EOF.
+                let mut byte = [0u8; 1];
+                let _ = reader.read(&mut byte).await;
+                return;
+            }
+        }
+    });
+    (receiver, HttpReaderTask(task))
 }
 
 /// Parse a JSON-RPC request body and dispatch via the shared MCP handler. Returns
@@ -288,8 +423,8 @@ struct HttpRequest {
 
 /// Read one HTTP/1.1 request, or `None` on clean EOF. Minimal: request line +
 /// headers until CRLFCRLF, then `Content-Length` bytes.
-async fn read_http_request(
-    stream: &mut TcpStream,
+async fn read_http_request<R: tokio::io::AsyncRead + Unpin>(
+    stream: &mut R,
     token: &str,
 ) -> anyhow::Result<Option<HttpRequest>> {
     let mut head = Vec::with_capacity(1024);
@@ -400,8 +535,8 @@ fn constant_time_equal(left: &str, right: &str) -> bool {
     difference == 0
 }
 
-async fn write_http(
-    stream: &mut TcpStream,
+async fn write_http<W: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut W,
     status: u16,
     body: &[u8],
     keep_alive: bool,
@@ -432,6 +567,58 @@ async fn write_http(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    async fn send_private_http(
+        peer: &mut tokio::io::DuplexStream,
+        body: serde_json::Value,
+        headers: &str,
+    ) {
+        let body = body.to_string();
+        let request = format!(
+            "POST /mcp HTTP/1.1\r\n{headers}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        peer.write_all(request.as_bytes()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancellation_reader_requires_authenticated_exact_id_and_observes_eof() {
+        let (server, mut peer) = tokio::io::duplex(8192);
+        let closed = CancellationToken::new();
+        let (mut requests, mut reader_task) =
+            spawn_request_reader(server, Arc::from("private-token"), closed.clone());
+        send_private_http(&mut peer, json!({"jsonrpc":"2.0", "id":1, "method":"tools/call", "params":{"name":"private_probe","arguments":{}}}), "Authorization: Bearer private-token\r\n").await;
+        let original = requests.recv().await.unwrap();
+        assert!(!original.cancellation.is_cancelled());
+        for (id, headers) in [
+            (json!(1), "Authorization: Bearer wrong-token\r\n"),
+            (
+                json!(1),
+                "Authorization: Bearer private-token\r\nOrigin: https://example.invalid\r\n",
+            ),
+            (json!("1"), "Authorization: Bearer private-token\r\n"),
+        ] {
+            send_private_http(&mut peer, json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":id}}), headers).await;
+            requests.recv().await.unwrap();
+            assert!(
+                !original.cancellation.is_cancelled(),
+                "untrusted/mismatched control cancelled work"
+            );
+        }
+        send_private_http(
+            &mut peer,
+            json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":1}}),
+            "Authorization: Bearer private-token\r\n",
+        )
+        .await;
+        requests.recv().await.unwrap();
+        assert!(original.cancellation.is_cancelled());
+        drop(peer);
+        tokio::time::timeout(std::time::Duration::from_secs(1), closed.cancelled())
+            .await
+            .unwrap();
+        (&mut reader_task.0).await.unwrap();
+    }
 
     async fn serve_raw_request(sdk: Arc<crate::sdk_adapter::SdkAdapter>, request: &[u8]) -> String {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();

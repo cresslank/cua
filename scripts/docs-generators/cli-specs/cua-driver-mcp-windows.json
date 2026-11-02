@@ -1,6 +1,58 @@
 {
  "tools": [
   {
+   "description": "Tighten this session's deny-only input policy. Updates atomically UNION rules; omitted/empty arrays never remove rules. Rules survive end_session/start_session revival until this driver registry exits. Text patterns use case-insensitive Rust regex search (no lookaround/backreferences). Key combos are unordered subsets with case/separator and physical modifier aliases normalized. With key rules installed, unrecognized/opaque native key spellings fail closed; use ASCII letters/digits, named keys and f1..f12 (see session-input-policy.md). Applies at common dispatch including nested run_steps/run_script. No approval bypass. Set and verify this before exposing actions; repeat after reconnect/new session. Returns only effective rule counts, never pattern/input text.",
+   "destructive": false,
+   "idempotent": true,
+   "input_schema": {
+    "additionalProperties": false,
+    "properties": {
+     "blocked_key_combos": {
+      "description": "Additional unordered key-combo subsets. Case, named-key separators, modifier aliases, order and +/- combinations normalize. Unknown key identities are invalid; opaque call spellings fail closed when key rules exist. Additive only.",
+      "items": {
+       "items": {
+        "maxLength": 64,
+        "type": "string"
+       },
+       "maxItems": 16,
+       "minItems": 1,
+       "type": "array"
+      },
+      "maxItems": 256,
+      "type": "array"
+     },
+     "blocked_text_patterns": {
+      "description": "Additional case-insensitive Rust regex search rules. Atomically unioned; empty/omitted never clears existing rules.",
+      "items": {
+       "maxLength": 4096,
+       "minLength": 1,
+       "type": "string"
+      },
+      "maxItems": 256,
+      "type": "array"
+     },
+     "denied_tools": {
+      "description": "Additional exact canonical tool names to deny. Aliases normalize; unknown future tool names are accepted. Additive only.",
+      "items": {
+       "maxLength": 128,
+       "minLength": 1,
+       "pattern": "^[a-z0-9_]+$",
+       "type": "string"
+      },
+      "maxItems": 256,
+      "type": "array"
+     },
+     "session": {
+      "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+      "type": "string"
+     }
+    },
+    "type": "object"
+   },
+   "name": "set_input_policy",
+   "read_only": false
+  },
+  {
    "description": "List Windows apps — both currently running and installed-but-not-running — with per-app state flags:\n\n- running: is a process for this app live? (pid is 0 when false)\n- active: is it the system-frontmost app? (implies running)\n- kind: `\"desktop\"` for `.exe`-backed apps (resolved from Start-Menu shortcuts) or `\"uwp\"` for packaged store apps.\n- launch_path: what `launch_app` would consume.\n* desktop: full `.exe` commandline (path + any arguments preserved from the source `.lnk`; the exe is quoted when it contains whitespace).\n* uwp: `shell:appsFolder\\{PackageFamilyName}!{AppId}` where `{AppId}` falls back to `App` when the package manifest does not expose a specific Application.Id.\n- last_used: RFC3339 mtime of the launcher (`.lnk` for desktop, package install location for UWP), when readable.\n\nRunning apps are derived from visible top-level windows + the foreground pid (mirrors NSApplicationActivationPolicyRegular's intent: background services and console processes are excluded). Installed apps are merged from Start-Menu `.lnk` enumeration and the WinRT PackageManager — running processes whose executable matches a Start-Menu target are folded into a single entry with `running: true`.\n\nUse this for \"is X installed?\" as well as \"is X running?\". For per-window state — on-screen, minimized, window titles — call list_windows instead. For just opening an app — running or not — call launch_app({path: ...}) directly; list_apps is not a prerequisite.",
    "destructive": false,
    "idempotent": true,

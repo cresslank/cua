@@ -903,6 +903,7 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "switch_window"
         | "set_window_frame"
         | "start_session"
+        | "set_input_policy"
         | "end_session"
         | "set_agent_cursor_enabled"
         | "set_agent_cursor_motion"

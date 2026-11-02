@@ -1980,6 +1980,8 @@ pub fn build_manifest() -> serde_json::Value {
         // machine-readable map to decide whether native Wayland may be
         // auto-enabled safely.
         "features": {
+            "session_input_policy_v1": true,
+            "nested_action_cancellation": true,
             "wayland_native": wayland_native,
             "portal_input": portal_input,
             "portal_capture": portal_capture,

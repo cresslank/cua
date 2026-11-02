@@ -876,8 +876,9 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "stop_recording" => &["recording.stop"],
         "get_recording_state" => &["recording.state"],
         "replay_trajectory" => &["recording.replay"],
-        "run_steps" => &["input.batch"],
-        "run_script" => &["input.script"],
+        "run_steps" => &["input.batch", crate::input_policy::CAPABILITY],
+        "run_script" => &["input.script", crate::input_policy::CAPABILITY],
+        "set_input_policy" => &[crate::input_policy::CAPABILITY],
         "install_ffmpeg" => &["recording.install_dependency"],
         "install_extension" => &["extension.install"],
 
@@ -1182,6 +1183,7 @@ pub struct ToolRegistry {
     _recording_state_readers: Vec<crate::session::RecordingStateReaderRegistration>,
     runtime_cleanups: Vec<RuntimeCleanup>,
     capture_service: Arc<crate::capture_runtime::CaptureService>,
+    input_policies: Arc<crate::input_policy::InputPolicies>,
     /// Runtime-owned protected-consent broker shared by every resource
     /// adapter. Keeping it at the canonical dispatch boundary prevents
     /// browser, desktop, and file adapters from growing independent provider
@@ -1256,6 +1258,7 @@ impl ToolRegistry {
             _recording_state_readers: vec![recording_state_reader],
             runtime_cleanups: Vec::new(),
             capture_service,
+            input_policies: Arc::new(crate::input_policy::InputPolicies::default()),
             approval_broker,
             protected_resource_grants,
             protected_resource_ownership,
@@ -1417,6 +1420,9 @@ impl ToolRegistry {
             EndSessionTool, EscalateSessionTool, GetSessionStateTool, GetSessionTool,
             ListSessionsTool, StartSessionTool,
         };
+        self.register(Box::new(crate::input_policy::SetInputPolicyTool(
+            self.input_policies.clone(),
+        )));
         self.register(Box::new(StartSessionTool));
         self.register(Box::new(EscalateSessionTool));
         self.register(Box::new(GetSessionTool));
@@ -1786,6 +1792,9 @@ impl ToolRegistry {
         // caller-forgeable here.
         crate::tool_args::sanitize_reserved_args(&mut args);
         let original_name = name;
+        if let Err(cancelled) = crate::dispatch_cancellation::check_cancelled() {
+            return crate::input_policy::refusal(cancelled.code(), &cancelled.to_string());
+        }
 
         if crate::session::is_runtime_scope_suspended(&context.runtime_scope_key()) {
             return protected_refusal(
@@ -1946,6 +1955,13 @@ impl ToolRegistry {
                 restore_public_runtime_result(&mut result, &runtime_prefix);
                 return result;
             }
+        }
+
+        if let Err(refusal) =
+            self.input_policies
+                .enforce(runtime_session.as_deref(), resolved_name, &args)
+        {
+            return refusal;
         }
 
         // Reject modality violations before reserving a recording turn. A
@@ -2382,7 +2398,7 @@ impl ToolRegistry {
                     ),
                 };
                 match admitted {
-                    Ok(guard) => Some(guard),
+                    Ok(guard) => Some(Arc::new(guard)),
                     Err(message) => {
                         return protected_refusal("session_ended", message);
                     }
@@ -2416,6 +2432,7 @@ impl ToolRegistry {
                     | "run_steps"
                     | "run_script"
                     | "start_session"
+                    | "set_input_policy"
                     | "end_session"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
@@ -2431,6 +2448,27 @@ impl ToolRegistry {
                 return refusal;
             }
         };
+        // Recheck after consent/transport/lease awaits. Tightening fences new
+        // admission, not an action which has already entered its native worker.
+        if let Err(cancelled) = crate::dispatch_cancellation::check_cancelled() {
+            return crate::input_policy::refusal(cancelled.code(), &cancelled.to_string());
+        }
+        if !matches!(resolved_name, "start_session" | "end_session")
+            && runtime_session
+                .as_deref()
+                .is_some_and(crate::session::is_session_ending)
+        {
+            return crate::input_policy::refusal(
+                "session_ended",
+                "the session is ending or has ended",
+            );
+        }
+        if let Err(refusal) =
+            self.input_policies
+                .enforce(runtime_session.as_deref(), resolved_name, &args)
+        {
+            return refusal;
+        }
         let pending_turn = should_record
             .then(|| {
                 // Use the same trusted identities the recording owner was minted from.
@@ -2472,13 +2510,34 @@ impl ToolRegistry {
         if !tool.def().read_only {
             crate::action_boundary::notify_before_mutation();
         }
-        let mut result = crate::recording::scope_dispatch_click_capture(
-            pending_turn.as_ref(),
-            input_route.scope(
-                DISPATCH_ACTION_LEASE.scope(_action_lease.clone(), tool.invoke(args.clone())),
-            ),
-        )
-        .await;
+        let mut result = crate::session::DISPATCH_SESSION_GUARD
+            .scope(
+                lifecycle_dispatch.clone(),
+                crate::recording::scope_dispatch_click_capture(
+                    pending_turn.as_ref(),
+                    input_route.scope(DISPATCH_ACTION_LEASE.scope(_action_lease.clone(), async {
+                        let invoke = async {
+                            if matches!(resolved_name, "run_script" | "run_steps") {
+                                crate::dispatch_cancellation::run_composite(
+                                    tool.invoke(args.clone()),
+                                )
+                                .await
+                            } else {
+                                tool.invoke(args.clone()).await
+                            }
+                        };
+                        if let Some(session) = runtime_session
+                            .as_deref()
+                            .filter(|_| !matches!(resolved_name, "start_session" | "end_session"))
+                        {
+                            crate::dispatch_cancellation::scope_session(session, invoke).await
+                        } else {
+                            invoke.await
+                        }
+                    })),
+                ),
+            )
+            .await;
         match resolved_name {
             "get_desktop_state" if result.is_error != Some(true) => {
                 crate::desktop_capture_scale::record_desktop_state(
@@ -3568,6 +3627,18 @@ fn namespace_runtime_args(
             "_session_idle_ttl_ms".to_owned(),
             Value::Number(idle_ttl_ms.into()),
         );
+    }
+    // Lifecycle and composites treat these legacy labels as anonymous. Resolve
+    // them through the trusted transport/implicit identity, never the shared
+    // literal "default", before deriving a private policy/ownership key.
+    for field in ["session", "_session_id"] {
+        if arguments
+            .get(field)
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.is_empty() || value == "default")
+        {
+            arguments.remove(field);
+        }
     }
     // The registry is the first boundary shared by every transport and the
     // direct SDK. Transport adapters may already have injected `_session_id`,
@@ -6903,7 +6974,7 @@ resources:
     }
 
     #[test]
-    fn anonymous_default_identity_keeps_its_legacy_process_scope() {
+    fn anonymous_default_session_resolves_implicitly_without_changing_legacy_cursor_scope() {
         let context = standard_context();
         let mut args = serde_json::json!({
             "session": "default",
@@ -6915,8 +6986,8 @@ resources:
             context.as_ref(),
             &TrustedInvocationEvidence::default(),
         );
-        assert_eq!(args["session"], "default");
-        assert_eq!(args["_session_id"], "default");
+        assert!(args.get("session").is_none());
+        assert!(args.get("_session_id").is_none());
         assert_eq!(args["cursor_id"], "default");
         assert!(args.get("_public_session_label").is_none());
     }
