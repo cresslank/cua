@@ -199,7 +199,7 @@ CUA_BUILDS[HERMES_ARM] = CuaBuild(
     "/tmp/cdb-bench-cua-hermes.sock",
     WORK / "hermes-cua-jev" / "daemon-state",
     CUA_MAIN_DIR / "skills" / "cua-driver",
-    daemon_env=(NO_SCRIPT_FLAG,),
+    daemon_env=(SCRIPT_FLAG,),
 )
 CUA_ARMS = tuple(a for a in CUA_BUILDS if a != HERMES_ARM)
 DRIVER_ARMS = tuple(CUA_BUILDS)
@@ -447,7 +447,7 @@ CODEX_ARMS = {
 CWD_ROOT = Path("/tmp/cdb-bench-cwd/work")  # outside every git checkout, same path for both arms
 
 ARM_DESCRIPTIONS = {
-    HERMES_ARM: "Claude Code + real Hermes core/cua-jev GUI-only MCP (seven tools), private main driver, run_script off, no skill",
+    HERMES_ARM: "Claude Code + real Hermes core/cua-jev GUI-only MCP (eight tools, gated cua_script), private main driver, run_script on, no skill",
     "cc-cua-driver": "Claude Code + Cua Driver 0.34.0 MCP + Cua Driver skill (0.34.0 release)",
     "cc-cua-driver-main": "Claude Code + Cua Driver built from main (pinned commit) MCP + the skill of that commit, "
     "run_script off (CUA_DRIVER_DISABLE_RUN_SCRIPT=1 from Amendment 13)",

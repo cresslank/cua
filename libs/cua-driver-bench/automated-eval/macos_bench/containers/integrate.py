@@ -132,6 +132,7 @@ def main() -> None:
             "COPY integration.json /opt/cua-container/integration.json",
             "COPY ci-cua-driver-bench.yml /opt/cua-container/ci-cua-driver-bench.yml",
             "RUN chmod 755 /usr/local/bin/bench-container-entrypoint /usr/local/bin/claude /usr/local/bin/cua-driver-local",
+            f"RUN printf '%s  %s\\n' '{receipt['driver_sha256']}' /usr/local/bin/cua-driver-local > /opt/cua-container/driver.sha256 && sha256sum -c /opt/cua-container/driver.sha256",
             "USER 1000:1000",
             "",
         ]

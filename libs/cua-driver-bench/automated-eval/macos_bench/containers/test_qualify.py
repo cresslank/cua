@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: FSL-1.1-MIT
 # Copyright (c) 2026 Cua AI, Inc.
-"""Pure cost-admission rules. Values below are test inputs, never trial results."""
+"""Cost/CLI contracts and opt-in private-desktop qualification; never paid calls."""
 
+import os
+import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -32,6 +35,36 @@ class CostTests(unittest.TestCase):
         repo = here.parents[4]
         self.assertTrue((repo / "AGENTS.md").is_file())
         self.assertEqual(here, repo / "libs/cua-driver-bench/automated-eval/macos_bench/containers")
+
+    def test_script_qualification_refuses_before_importing_native_tools_on_host(self):
+        # Execute the actual CLI guard, not an imitation of its policy.
+        env = {"PATH": "/usr/bin:/bin", "CDB_BENCH_DISPOSABLE": "0"}
+        result = subprocess.run(
+            [sys.executable, "-I", "-B", str(Path(__file__).with_name("qualify_script.py"))],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr.strip(),
+            "requires integrated disposable container; never run against a host desktop",
+        )
+
+    @unittest.skipUnless(
+        os.environ.get("CDB_TEST_SCRIPT_QUALIFICATION") == "1"
+        and os.environ.get("CDB_BENCH_DISPOSABLE") == "1"
+        and Path("/opt/cua-container/integration.json").is_file(),
+        "requires explicit integrated disposable desktop; no host fallback",
+    )
+    def test_real_script_policy_receiver_and_exact_refusals(self):
+        subprocess.run(
+            [sys.executable, "-B", str(Path(__file__).with_name("qualify_script.py"))],
+            check=True,
+            timeout=180,
+        )
 
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ never the live profile, credentials or approval bypasses. Provider credentials
 needed by Jev/cua_task are optional, explicit environment inputs, not CLI args.
 No environment is changed by this module, and importing it does not load Hermes.
 
-Only the seven names below can be listed or dispatched. Schemas come from the
+Only the eight names below can be listed or dispatched. Schemas come from the
 real core/plugin registrations, narrowed to a closed GUI surface: no target
 switch, browser file transfer/service restart, or app-launch arguments/files.
 This is a tool host, not a Hermes agent or messaging bridge: it loads ONLY
@@ -55,6 +55,7 @@ VERSION = "1.0.0"
 TOOLS = (
     "computer_use",
     "cua_steps",
+    "cua_script",
     "cua_task",
     "cua_window",
     "cua_browser",

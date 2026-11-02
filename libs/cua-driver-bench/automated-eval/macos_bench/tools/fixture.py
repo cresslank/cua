@@ -71,6 +71,8 @@ def setup(task: str, seed: int, d: Path, build: Path = DEFAULT_BUILD) -> dict[st
     meta = task_meta(task)
     (d / "brief.txt").write_text(render(task, seed), "utf-8")
     argv = desktop.bench_app_argv("BenchLab", build)
+    if task == "MB-10":
+        desktop.prepare_hover_pointer()
     env = desktop.desktop_env(home)
     proc = subprocess.Popen(
         [
