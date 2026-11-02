@@ -2104,7 +2104,10 @@ fn find_argb_visual(
 }
 
 #[cfg(target_os = "linux")]
-fn x11_compositor_present(conn: &impl x11rb::connection::Connection, screen_num: usize) -> bool {
+pub(crate) fn x11_compositor_present(
+    conn: &impl x11rb::connection::Connection,
+    screen_num: usize,
+) -> bool {
     use x11rb::protocol::xproto::ConnectionExt as XprotoConnectionExt;
 
     let selection = format!("_NET_WM_CM_S{screen_num}");

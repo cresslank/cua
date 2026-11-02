@@ -182,6 +182,79 @@ impl NativeActionDimensions {
     }
 }
 
+/// Optional native frame evidence bound to a published capture.
+///
+/// Origins and logical dimensions describe the action frame; source pixel
+/// dimensions describe the captured frame before any delivery downscaling.
+/// Pixel-to-logical scale may differ by axis. This evidence does not define
+/// the action coordinate system or replace the screenshot-to-action transform.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureFrameGeometry {
+    origin_x: i32,
+    origin_y: i32,
+    width: u32,
+    height: u32,
+    pixel_width: u32,
+    pixel_height: u32,
+    pixel_digest: Option<[u8; 32]>,
+}
+
+impl CaptureFrameGeometry {
+    /// All logical and source pixel dimensions must be non-zero.
+    pub fn new(
+        origin_x: i32,
+        origin_y: i32,
+        width: u32,
+        height: u32,
+        pixel_width: u32,
+        pixel_height: u32,
+    ) -> Result<Self, CaptureStoreError> {
+        if width == 0 || height == 0 || pixel_width == 0 || pixel_height == 0 {
+            return Err(CaptureStoreError::InvalidNativeActionDimensions);
+        }
+        Ok(Self {
+            origin_x,
+            origin_y,
+            width,
+            height,
+            pixel_width,
+            pixel_height,
+            pixel_digest: None,
+        })
+    }
+
+    /// Opt into exact source-pixel freshness in addition to geometry. Adapters
+    /// compute this over decoded pixels, not encoding timestamps or metadata.
+    pub fn with_pixel_digest(mut self, digest: [u8; 32]) -> Self {
+        self.pixel_digest = Some(digest);
+        self
+    }
+
+    pub fn origin_x(self) -> i32 {
+        self.origin_x
+    }
+
+    pub fn origin_y(self) -> i32 {
+        self.origin_y
+    }
+
+    pub fn width(self) -> u32 {
+        self.width
+    }
+
+    pub fn height(self) -> u32 {
+        self.height
+    }
+
+    pub fn pixel_width(self) -> u32 {
+        self.pixel_width
+    }
+
+    pub fn pixel_height(self) -> u32 {
+        self.pixel_height
+    }
+}
+
 /// Continuous affine mapping from screenshot pixels to action coordinates.
 ///
 /// For a screenshot point `(x, y)`, the action point is:
@@ -481,6 +554,7 @@ impl Drop for CaptureSnapshotPermit {
 
 #[derive(Debug)]
 pub struct CaptureActionAdmission {
+    frame: Option<crate::snapshot_store::ScreenshotFrameBinding>,
     /// Keeps the authoritative native generation admitted through detached work.
     pub snapshot_permit: Option<Arc<CaptureSnapshotPermit>>,
     pub capture_id: CaptureId,
@@ -488,7 +562,21 @@ pub struct CaptureActionAdmission {
     pub action_x: f64,
     pub action_y: f64,
     pub native_action_dimensions: NativeActionDimensions,
+    /// Publication-time evidence to revalidate immediately before native dispatch.
+    pub frame_geometry: Option<CaptureFrameGeometry>,
     pub digest: ContentDigest,
+}
+
+impl CaptureActionAdmission {
+    /// Recheck the screenshot revision after asynchronous work and before input.
+    /// This is not a native compositor transaction; adapters must also validate
+    /// their retained frame evidence at their delivery boundary.
+    pub fn validate_frame(&self) -> Result<(), CaptureActionError> {
+        if self.frame.as_ref().is_some_and(|frame| !frame.is_current()) {
+            return Err(CaptureLookupError::GenerationMismatch.into());
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
@@ -555,6 +643,7 @@ pub fn admission_error_code(error: &anyhow::Error) -> &'static str {
 #[derive(Clone)]
 struct StoredCapture {
     frame: Option<crate::snapshot_store::ScreenshotFrameBinding>,
+    frame_geometry: Option<CaptureFrameGeometry>,
     snapshot_identity: Option<crate::element_token::SnapshotIdentity>,
     id: CaptureId,
     png_bytes: Arc<[u8]>,
@@ -596,6 +685,7 @@ impl fmt::Debug for StoredCapture {
             .field("target", &self.target)
             .field("encoded_dimensions", &self.encoded_dimensions)
             .field("native_action_dimensions", &self.native_action_dimensions)
+            .field("frame_geometry", &self.frame_geometry)
             .field("screenshot_to_action", &self.screenshot_to_action)
             .field("binding", &self.binding)
             .field("created_at", &self.created_at)
@@ -608,6 +698,11 @@ impl fmt::Debug for StoredCapture {
 pub struct PerceptionCapture(StoredCapture);
 
 impl PerceptionCapture {
+    /// Optional native frame evidence, not a grant of action authority.
+    pub fn frame_geometry(&self) -> Option<CaptureFrameGeometry> {
+        self.0.frame_geometry
+    }
+
     pub fn id(&self) -> CaptureId {
         self.0.id
     }
@@ -680,7 +775,7 @@ impl CaptureRegistry {
 
     #[cfg(test)]
     fn store(&self, registration: CaptureRegistration) -> Result<CaptureId, CaptureStoreError> {
-        self.store_bound(registration, None, None)
+        self.store_bound(registration, None, None, None)
     }
 
     fn store_bound(
@@ -688,8 +783,15 @@ impl CaptureRegistry {
         registration: CaptureRegistration,
         snapshot_identity: Option<crate::element_token::SnapshotIdentity>,
         frame: Option<crate::snapshot_store::ScreenshotFrameBinding>,
+        frame_geometry: Option<CaptureFrameGeometry>,
     ) -> Result<CaptureId, CaptureStoreError> {
         registration.target.validate()?;
+        if frame_geometry.is_some_and(|geometry| {
+            geometry.width != registration.native_action_dimensions.width
+                || geometry.height != registration.native_action_dimensions.height
+        }) {
+            return Err(CaptureStoreError::InvalidNativeActionDimensions);
+        }
         if registration.png_bytes.len() > self.config.max_total_bytes {
             return Err(CaptureStoreError::CaptureTooLarge);
         }
@@ -747,6 +849,7 @@ impl CaptureRegistry {
         };
         let capture = StoredCapture {
             frame,
+            frame_geometry,
             snapshot_identity,
             id,
             png_bytes,
@@ -784,6 +887,7 @@ impl CaptureRegistry {
     fn admit_action(
         &self,
         request: CaptureActionRequest,
+        frame_geometry: Option<CaptureFrameGeometry>,
     ) -> Result<CaptureActionAdmission, CaptureActionError> {
         let now = self.clock.now();
         let mut inner = self.lock_inner();
@@ -792,7 +896,11 @@ impl CaptureRegistry {
             return Err(CaptureLookupError::TargetMismatch.into());
         }
         capture.validate_snapshot()?;
-        if capture.native_action_dimensions != request.current_native_action_dimensions {
+        if capture.native_action_dimensions != request.current_native_action_dimensions
+            || capture
+                .frame_geometry
+                .is_some_and(|expected| Some(expected) != frame_geometry)
+        {
             return Err(CaptureActionError::NativeActionFrameMismatch);
         }
         let max_x = f64::from(capture.encoded_dimensions.width);
@@ -813,6 +921,7 @@ impl CaptureRegistry {
             return Err(CaptureActionError::InvalidMappedPoint);
         }
         let admission = CaptureActionAdmission {
+            frame: capture.frame.clone(),
             snapshot_permit: capture
                 .snapshot_identity
                 .map(|identity| {
@@ -827,6 +936,7 @@ impl CaptureRegistry {
             action_x,
             action_y,
             native_action_dimensions: capture.native_action_dimensions,
+            frame_geometry: capture.frame_geometry,
             digest: capture.digest,
         };
         capture.validate_snapshot()?;
@@ -1050,7 +1160,7 @@ impl CaptureService {
     }
 
     pub fn publish(&self, publication: CapturePublication) -> Result<CaptureId, CaptureStoreError> {
-        self.publish_bound(publication, None, None)
+        self.publish_bound(publication, None, None, None)
     }
 
     pub fn publish_for_snapshot(
@@ -1058,7 +1168,7 @@ impl CaptureService {
         publication: CapturePublication,
         identity: crate::element_token::SnapshotIdentity,
     ) -> Result<CaptureId, CaptureStoreError> {
-        self.publish_bound(publication, Some(identity), None)
+        self.publish_bound(publication, Some(identity), None, None)
     }
 
     pub fn publish_for_frame(
@@ -1067,7 +1177,19 @@ impl CaptureService {
         identity: crate::element_token::SnapshotIdentity,
         frame: crate::snapshot_store::ScreenshotFrameBinding,
     ) -> Result<CaptureId, CaptureStoreError> {
-        self.publish_bound(publication, Some(identity), Some(frame))
+        self.publish_bound(publication, Some(identity), Some(frame), None)
+    }
+
+    /// Bind optional native geometry without changing snapshot frame contexts.
+    /// Geometry-bound captures require [`Self::admit_action_in_frame`].
+    pub fn publish_for_frame_with_geometry(
+        &self,
+        publication: CapturePublication,
+        identity: crate::element_token::SnapshotIdentity,
+        frame: crate::snapshot_store::ScreenshotFrameBinding,
+        geometry: CaptureFrameGeometry,
+    ) -> Result<CaptureId, CaptureStoreError> {
+        self.publish_bound(publication, Some(identity), Some(frame), Some(geometry))
     }
 
     fn publish_bound(
@@ -1075,6 +1197,7 @@ impl CaptureService {
         publication: CapturePublication,
         identity: Option<crate::element_token::SnapshotIdentity>,
         frame: Option<crate::snapshot_store::ScreenshotFrameBinding>,
+        frame_geometry: Option<CaptureFrameGeometry>,
     ) -> Result<CaptureId, CaptureStoreError> {
         // Serialize retirement with the complete registration, including PNG validation.
         let mut generations = self
@@ -1102,6 +1225,7 @@ impl CaptureService {
             },
             identity,
             frame,
+            frame_geometry,
         )
     }
 
@@ -1121,7 +1245,17 @@ impl CaptureService {
         &self,
         request: CaptureActionRequest,
     ) -> Result<CaptureActionAdmission, CaptureActionError> {
-        self.registry.admit_action(request)
+        self.registry.admit_action(request, None)
+    }
+
+    /// Admit against geometry observed immediately before native dispatch.
+    /// Callers must revalidate the returned geometry if dispatch is deferred.
+    pub fn admit_action_in_frame(
+        &self,
+        request: CaptureActionRequest,
+        geometry: CaptureFrameGeometry,
+    ) -> Result<CaptureActionAdmission, CaptureActionError> {
+        self.registry.admit_action(request, Some(geometry))
     }
 
     /// Predict, without consuming anything, whether a capture-bound action
@@ -1225,6 +1359,164 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
+    fn frame_geometry_binding_requires_exact_live_proof_without_consuming() {
+        crate::tool::with_runtime_scope(
+            format!("capture-geometry-{}", uuid::Uuid::new_v4()),
+            || {
+                use crate::snapshot_store::SnapshotStore;
+                use crate::snapshot_test_support::Payload;
+
+                for (width, height, pixel_width, pixel_height) in
+                    [(0, 6, 8, 18), (4, 0, 8, 18), (4, 6, 0, 18), (4, 6, 8, 0)]
+                {
+                    assert_eq!(
+                        CaptureFrameGeometry::new(
+                            -120,
+                            40,
+                            width,
+                            height,
+                            pixel_width,
+                            pixel_height
+                        ),
+                        Err(CaptureStoreError::InvalidNativeActionDimensions)
+                    );
+                }
+                let geometry = CaptureFrameGeometry::new(-120, 40, 4, 6, 8, 18)
+                    .unwrap()
+                    .with_pixel_digest([7; 32]);
+                let cache = SnapshotStore::new();
+                let pid = std::process::id() as i32;
+                let target = CaptureTarget::Window {
+                    pid: pid as u32,
+                    window_id: 82,
+                };
+                let (service, _) = clocked(config(2, 10_000));
+                let binding = service.current_binding("geometry-owner").unwrap();
+                let snapshot = cache
+                    .try_publish_for_session(
+                        pid,
+                        82,
+                        Payload(vec![]),
+                        Some(binding.session_id()),
+                        Some(1.0),
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .0;
+                let identity = cache.identity_for_snapshot(pid, snapshot).unwrap();
+                let context = cache
+                    .screenshot_context(pid, Some(82), Some(binding.session_id()))
+                    .unwrap();
+                let frame = cache
+                    .frame_binding(pid, Some(binding.session_id()), context)
+                    .unwrap();
+                let publication = || CapturePublication {
+                    native_action_dimensions: NativeActionDimensions::new(4, 6).unwrap(),
+                    screenshot_to_action: ScreenshotToActionTransform::new(
+                        2.0, 0.0, 0.0, 3.0, -120.0, 40.0,
+                    )
+                    .unwrap(),
+                    ..publication(
+                        png(2, 2, 1),
+                        target.clone(),
+                        binding.session_id(),
+                        binding.session_generation(),
+                    )
+                };
+                for (width, height) in [(5, 6), (4, 7)] {
+                    let invalid = CapturePublication {
+                        native_action_dimensions: NativeActionDimensions::new(width, height)
+                            .unwrap(),
+                        ..publication()
+                    };
+                    assert_eq!(
+                        service.publish_for_frame_with_geometry(
+                            invalid,
+                            identity,
+                            frame.clone(),
+                            geometry,
+                        ),
+                        Err(CaptureStoreError::InvalidNativeActionDimensions)
+                    );
+                }
+                let id = service
+                    .publish_for_frame_with_geometry(publication(), identity, frame, geometry)
+                    .unwrap();
+                let request = |observed: CaptureFrameGeometry| {
+                    let mut request = action_request(
+                        id,
+                        binding.clone(),
+                        target.clone(),
+                        (observed.width(), observed.height()),
+                    );
+                    request.screenshot_x = 1.25;
+                    request.screenshot_y = 1.5;
+                    request
+                };
+
+                let refusal = service.admit_action(request(geometry)).unwrap_err();
+                assert_eq!(refusal, CaptureActionError::NativeActionFrameMismatch);
+                assert_eq!(refusal.wire_code(), "capture_frame_mismatch");
+                assert!(service.read_for_perception(id, &binding).is_ok());
+
+                // Observe each axis independently: translation, logical resize,
+                // and source-scale changes all require a fresh capture.
+                for (cause, origin_x, origin_y, width, height, pixel_width, pixel_height) in [
+                    ("move x", -119, 40, 4, 6, 8, 18),
+                    ("move y", -120, 41, 4, 6, 8, 18),
+                    ("resize width", -120, 40, 5, 6, 8, 18),
+                    ("resize height", -120, 40, 4, 7, 8, 18),
+                    ("source scale x", -120, 40, 4, 6, 9, 18),
+                    ("source scale y", -120, 40, 4, 6, 8, 19),
+                ] {
+                    let observed = CaptureFrameGeometry::new(
+                        origin_x,
+                        origin_y,
+                        width,
+                        height,
+                        pixel_width,
+                        pixel_height,
+                    )
+                    .unwrap();
+                    let refusal = service
+                        .admit_action_in_frame(request(observed), observed)
+                        .unwrap_err();
+                    assert_eq!(
+                        refusal,
+                        CaptureActionError::NativeActionFrameMismatch,
+                        "{cause}"
+                    );
+                    assert_eq!(refusal.wire_code(), "capture_frame_mismatch", "{cause}");
+                    assert!(service.read_for_perception(id, &binding).is_ok(), "{cause}");
+                }
+
+                let repaint = service
+                    .admit_action_in_frame(request(geometry), geometry.with_pixel_digest([8; 32]))
+                    .unwrap_err();
+                assert_eq!(repaint.wire_code(), "capture_frame_mismatch");
+                assert!(service.read_for_perception(id, &binding).is_ok());
+                let admission = service
+                    .admit_action_in_frame(request(geometry), geometry)
+                    .unwrap();
+                assert_eq!(admission.frame_geometry, Some(geometry));
+                assert_eq!((admission.action_x, admission.action_y), (-117.5, 44.5));
+                assert_eq!(
+                    admission.native_action_dimensions,
+                    NativeActionDimensions::new(4, 6).unwrap()
+                );
+                let replay = service
+                    .admit_action_in_frame(request(geometry), geometry)
+                    .unwrap_err();
+                assert_eq!(
+                    replay,
+                    CaptureActionError::Lookup(CaptureLookupError::Unknown)
+                );
+                assert_eq!(replay.wire_code(), "capture_not_found");
+            },
+        );
+    }
+
+    #[test]
     fn refreshed_frame_rejects_old_capture_publication_and_admission() {
         crate::tool::with_runtime_scope(
             format!("capture-refresh-{}", uuid::Uuid::new_v4()),
@@ -1272,6 +1564,7 @@ mod tests {
                     screenshot_y: 1.0,
                 };
                 let admitted = service.admit_action(request(admitted_capture)).unwrap();
+                assert_eq!(admitted.validate_frame(), Ok(()));
                 let ticket = cache
                     .screenshot_refresh_ticket(pid, 81, Some("owner"))
                     .unwrap();
@@ -1279,6 +1572,10 @@ mod tests {
                     .refresh_screenshot_for_session(ticket, 1.0, None)
                     .unwrap()
                     .unwrap();
+                assert_eq!(
+                    admitted.validate_frame().unwrap_err().wire_code(),
+                    "capture_generation_mismatch"
+                );
                 assert_eq!(
                     service.read_for_perception(capture, &binding).unwrap_err(),
                     CaptureLookupError::GenerationMismatch

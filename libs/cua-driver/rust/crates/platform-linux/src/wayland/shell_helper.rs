@@ -856,12 +856,28 @@ fn require_safe_capture_helper() -> anyhow::Result<()> {
 /// Capture one exact GNOME target using the rectangle and logical display
 /// dimensions returned by the same Shell transaction as the target-only pixels.
 pub fn screenshot_window(window_id: u64) -> anyhow::Result<Vec<u8>> {
+    screenshot_window_frame(window_id, None).map(|(png, _)| png)
+}
+
+/// Preserve the atomic frame rectangle instead of reconstructing it from
+/// AT-SPI buffer bounds (which include GTK client-side shadow margins).
+pub(crate) fn screenshot_window_frame(
+    window_id: u64,
+    pid: Option<u32>,
+) -> anyhow::Result<(
+    Vec<u8>,
+    cua_driver_core::capture_runtime::CaptureFrameGeometry,
+)> {
     require_safe_capture_helper()?;
     let target = resolve_target(window_id).ok_or_else(|| {
         anyhow::anyhow!(
             "stale_target: GNOME window {window_id} belongs to another helper incarnation or no longer exists"
         )
     })?;
+    anyhow::ensure!(
+        pid.is_none_or(|pid| pid == target.pid),
+        "capture_target_mismatch: GNOME target owner changed"
+    );
     require_capture_current(
         window_id,
         target.visible,
@@ -875,7 +891,7 @@ pub fn screenshot_window(window_id: u64) -> anyhow::Result<Vec<u8>> {
         Duration::from_secs(5),
         "tool_invocation_failed",
     )?;
-    decode_capture_payload(&raw, &target.target_id)
+    decode_capture_frame(&raw, &target.target_id)
 }
 
 /// GPU preview uses the same incarnation-bound authority and atomic validation
@@ -935,6 +951,16 @@ fn strip_preview_timestamp(mut png: Vec<u8>) -> Option<Vec<u8>> {
 }
 
 fn decode_capture_payload(raw: &str, expected_target: &str) -> anyhow::Result<Vec<u8>> {
+    decode_capture_frame(raw, expected_target).map(|(png, _)| png)
+}
+
+fn decode_capture_frame(
+    raw: &str,
+    expected_target: &str,
+) -> anyhow::Result<(
+    Vec<u8>,
+    cua_driver_core::capture_runtime::CaptureFrameGeometry,
+)> {
     use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 
     let payload = extract_json_object(&raw)
@@ -995,7 +1021,16 @@ fn decode_capture_payload(raw: &str, expected_target: &str) -> anyhow::Result<Ve
             "capture_geometry_invalid: GNOME PNG dimensions do not match atomic frame metadata"
         );
     }
-    Ok(target_png)
+    let frame = cua_driver_core::capture_runtime::CaptureFrameGeometry::new(
+        payload.rect.x,
+        payload.rect.y,
+        payload.rect.width,
+        payload.rect.height,
+        full_width,
+        full_height,
+    )?;
+    let frame = crate::capture_action_frame::fingerprint_frame(&target_png, frame)?;
+    Ok((target_png, frame))
 }
 
 /// GNOME's logical desktop size. Shell screenshots are encoded in physical
@@ -2208,7 +2243,17 @@ mod tests {
             r#"{{"protocol_version":4,"target":"epoch-a:46","rect":{{"x":4,"y":5,"width":1,"height":1}},"logical_size":{{"width":100,"height":100}},"png_base64":"{png}"}}"#
         );
 
-        assert!(decode_capture_payload(&valid, "epoch-a:46").is_ok());
+        let (_, frame) = decode_capture_frame(&valid, "epoch-a:46").unwrap();
+        assert_eq!(
+            (
+                frame.origin_x(),
+                frame.origin_y(),
+                frame.width(),
+                frame.height()
+            ),
+            (4, 5, 1, 1)
+        );
+        assert_eq!((frame.pixel_width(), frame.pixel_height()), (1, 1));
         assert!(decode_capture_payload(&valid, "epoch-a:47")
             .unwrap_err()
             .to_string()
@@ -2227,7 +2272,9 @@ mod tests {
         let mut payload = serde_json::json!({"protocol_version":4,"target":"epoch:7",
             "rect":{"x":0,"y":0,"width":4,"height":4},"logical_size":{"width":100,"height":100},
             "pixel_size":{"width":8,"height":8},"image_size":{"width":1,"height":1},"png_base64":png});
-        assert!(decode_capture_payload(&payload.to_string(), "epoch:7").is_ok());
+        let (_, frame) = decode_capture_frame(&payload.to_string(), "epoch:7").unwrap();
+        assert_eq!((frame.width(), frame.height()), (4, 4));
+        assert_eq!((frame.pixel_width(), frame.pixel_height()), (8, 8));
         payload["image_size"]["width"] = 2.into();
         assert_eq!(
             decode_capture_payload(&payload.to_string(), "epoch:7")
