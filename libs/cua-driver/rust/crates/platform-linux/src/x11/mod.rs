@@ -119,6 +119,78 @@ pub fn window_belongs_to_pid(xid: u64, pid: u32) -> bool {
     window_owner_matches(OwnerResolver::new(&conn).owner_pid(xid), pid)
 }
 
+/// Read the exact drawable's action frame; never substitute a sibling window.
+pub(crate) fn capture_frame_geometry(
+    xid: u64,
+    pid: u32,
+) -> anyhow::Result<cua_driver_core::capture_runtime::CaptureFrameGeometry> {
+    let xid = u32::try_from(xid)?;
+    let (conn, screen_num) = RustConnection::connect(None)?;
+    // Unredirected XGetImage has undefined obscured-window pixels. A live
+    // compositor supplies independent window storage; without it this route
+    // cannot attest pixels, even though ordinary observation remains allowed.
+    anyhow::ensure!(
+        crate::overlay::x11_compositor_present(&conn, screen_num),
+        "capture_route_unqualified"
+    );
+    anyhow::ensure!(
+        OwnerResolver::new(&conn).owner_pid(xid) == Some(pid),
+        "capture_target_mismatch: X11 window owner changed"
+    );
+    let attributes = conn.get_window_attributes(xid)?.reply()?;
+    anyhow::ensure!(
+        attributes.map_state == MapState::VIEWABLE,
+        "capture_frame_mismatch: X11 window is not viewable"
+    );
+    let geometry = conn.get_geometry(xid)?.reply()?;
+    let origin = conn
+        .translate_coordinates(xid, conn.setup().roots[screen_num].root, 0, 0)?
+        .reply()?;
+    let (w, h) = (u32::from(geometry.width), u32::from(geometry.height));
+    Ok(cua_driver_core::capture_runtime::CaptureFrameGeometry::new(
+        i32::from(origin.dst_x),
+        i32::from(origin.dst_y),
+        w,
+        h,
+        w,
+        h,
+    )?)
+}
+
+/// A capture of a redirected drawable does not show other toplevels covering
+/// it. Unlike ordinary pointer input, a capture-bound press must never retarget
+/// to a same-process sibling or an override-redirect menu.
+pub(crate) fn require_capture_click_target(xid: u64, x: i32, y: i32) -> Result<()> {
+    let xid = u32::try_from(xid)?;
+    let (conn, screen_num) = RustConnection::connect(None)?;
+    let root = conn.setup().roots[screen_num].root;
+    let attributes = conn.get_window_attributes(xid)?.reply()?;
+    anyhow::ensure!(
+        attributes.map_state == MapState::VIEWABLE,
+        "target is not viewable"
+    );
+    let point = conn
+        .translate_coordinates(xid, root, i16::try_from(x)?, i16::try_from(y)?)?
+        .reply()?;
+    let under = conn
+        .translate_coordinates(root, root, point.dst_x, point.dst_y)?
+        .reply()?;
+    let mut frame = xid;
+    for _ in 0..64 {
+        let tree = conn.query_tree(frame)?.reply()?;
+        if tree.parent == root {
+            anyhow::ensure!(
+                under.same_screen && under.child == frame,
+                "capture click point is covered or outside the target"
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(tree.parent != 0, "target is not on this screen");
+        frame = tree.parent;
+    }
+    anyhow::bail!("target ancestry exceeds the X11 qualification bound")
+}
+
 fn window_owner_matches(owner: Option<u32>, requested_pid: u32) -> bool {
     owner == Some(requested_pid)
 }

@@ -1,6 +1,6 @@
 use cua_driver_core::capture_runtime::{
-    CaptureActionAdmission, CaptureActionRequest, CapturePublication, CaptureService,
-    CaptureTarget, EncodedScreenshotDimensions, NativeActionDimensions,
+    CaptureActionAdmission, CaptureActionRequest, CaptureFrameGeometry, CapturePublication,
+    CaptureService, CaptureTarget, EncodedScreenshotDimensions, NativeActionDimensions,
     ScreenshotToActionTransform,
 };
 use serde_json::Value;
@@ -110,26 +110,7 @@ fn scaled_transform(
     )?)
 }
 
-fn admit(
-    service: &CaptureService,
-    args: &Value,
-    capture_id: &str,
-    target: CaptureTarget,
-    screenshot_x: f64,
-    screenshot_y: f64,
-) -> anyhow::Result<CaptureActionAdmission> {
-    let current_native_action_dimensions = live_action_dimensions(&target)?;
-    admit_with_live_dimensions(
-        service,
-        args,
-        capture_id,
-        target,
-        current_native_action_dimensions,
-        screenshot_x,
-        screenshot_y,
-    )
-}
-
+#[cfg(test)]
 fn admit_with_live_dimensions(
     service: &CaptureService,
     args: &Value,
@@ -150,36 +131,6 @@ fn admit_with_live_dimensions(
         screenshot_y,
     })?;
     Ok(admission)
-}
-
-#[cfg(target_os = "linux")]
-fn live_action_dimensions(target: &CaptureTarget) -> anyhow::Result<NativeActionDimensions> {
-    let dimensions = match target {
-        CaptureTarget::Window { pid, window_id } => {
-            let identity_matches = if crate::wayland::is_wayland() {
-                crate::wayland::window_was_listed_for_pid(*pid, *window_id)
-            } else {
-                crate::x11::window_belongs_to_pid(*window_id, *pid)
-            };
-            anyhow::ensure!(
-                identity_matches,
-                "native window identity changed after capture"
-            );
-            let png = crate::wayland::screenshot_dispatch_with_pid(*window_id, *pid)?;
-            crate::capture::png_dimensions_pub(&png)?
-        }
-        CaptureTarget::PrimaryDesktop => {
-            let png = crate::capture::screenshot_display_bytes()?;
-            let native = crate::capture::png_dimensions_pub(&png)?;
-            desktop_action_dimensions(native)?
-        }
-    };
-    Ok(NativeActionDimensions::new(dimensions.0, dimensions.1)?)
-}
-
-#[cfg(not(target_os = "linux"))]
-fn live_action_dimensions(_target: &CaptureTarget) -> anyhow::Result<NativeActionDimensions> {
-    anyhow::bail!("live Linux capture validation is unavailable on this platform")
 }
 
 #[cfg(target_os = "linux")]
@@ -206,6 +157,287 @@ fn select_desktop_action_dimensions(
     Ok(dimensions)
 }
 
+/// Publish only geometry obtained with the pixels, never discovery metadata.
+pub(crate) fn publish_qualified_window(
+    service: &CaptureService,
+    args: &Value,
+    png: &[u8],
+    pid: u32,
+    window_id: u64,
+    encoded: (u32, u32),
+    geometry: CaptureFrameGeometry,
+    identity: cua_driver_core::element_token::SnapshotIdentity,
+    frame: cua_driver_core::snapshot_store::ScreenshotFrameBinding,
+) -> anyhow::Result<String> {
+    let binding = service.binding_from_args(args)?;
+    let native = (geometry.width(), geometry.height());
+    Ok(service
+        .publish_for_frame_with_geometry(
+            CapturePublication {
+                png_bytes: png.to_vec(),
+                target: window_target(pid, window_id),
+                encoded_dimensions: EncodedScreenshotDimensions::new(encoded.0, encoded.1)?,
+                native_action_dimensions: NativeActionDimensions::new(native.0, native.1)?,
+                screenshot_to_action: scaled_transform(encoded, native)?,
+                session_id: binding.session_id().into(),
+                session_generation: binding.session_generation(),
+            },
+            identity,
+            frame,
+            geometry,
+        )?
+        .to_string())
+}
+
+pub(crate) fn unqualified() -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(
+        "capture-bound clicks require a composited X11 drawable or GNOME WinRects window capture; non-composited X11, desktop, composited popup and other compositor captures remain unqualified",
+    ).with_structured(serde_json::json!({"code":"capture_route_unqualified", "effect":"refused"}))
+}
+
+/// Capture-bound clicks have one unambiguous source coordinate frame.
+pub(crate) fn validate_click(args: &Value) -> Result<(), cua_driver_core::protocol::ToolResult> {
+    if args.get("capture_id").is_none() {
+        return Ok(());
+    }
+    if !args.get("capture_id").is_some_and(Value::is_string) {
+        return Err(
+            cua_driver_core::protocol::ToolResult::error("capture_id must be a string")
+                .with_structured(
+                    serde_json::json!({"code":"capture_id_invalid", "effect":"refused"}),
+                ),
+        );
+    }
+    if args.get("scope").and_then(Value::as_str) == Some("desktop")
+        || args.get("coordinate_frame").and_then(Value::as_str) == Some("desktop")
+    {
+        return Err(unqualified());
+    }
+    if args.get("element_token").is_some()
+        || args.get("element_index").is_some()
+        || args
+            .get("from_zoom")
+            .is_some_and(|v| v != &Value::Bool(false))
+        || !args
+            .get("pid")
+            .and_then(Value::as_u64)
+            .is_some_and(|v| v > 0 && v <= u32::MAX.into())
+        || !args
+            .get("window_id")
+            .and_then(Value::as_u64)
+            .is_some_and(|v| v > 0)
+        || args.get("x").and_then(Value::as_f64).is_none()
+        || args.get("y").and_then(Value::as_f64).is_none()
+    {
+        return Err(cua_driver_core::protocol::ToolResult::error(
+            "capture-bound click requires explicit pid, window_id and screenshot x/y; element and zoom targets cannot be combined with capture_id",
+        ).with_structured(serde_json::json!({"code":"invalid_arguments", "effect":"refused"})));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn qualified_backend() -> bool {
+    crate::wayland::is_gnome_wayland_session()
+        || (!crate::wayland::is_wayland() && !crate::capture_safety::gnome_session())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn fingerprint_frame(
+    png: &[u8],
+    geometry: CaptureFrameGeometry,
+) -> anyhow::Result<CaptureFrameGeometry> {
+    use sha2::{Digest, Sha256};
+    let rgba = image::load_from_memory(png)?.to_rgba8();
+    Ok(geometry.with_pixel_digest(Sha256::digest(rgba.as_raw()).into()))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn capture_window(
+    pid: u32,
+    window_id: u64,
+) -> anyhow::Result<(Vec<u8>, CaptureFrameGeometry)> {
+    if crate::wayland::is_gnome_wayland_session() {
+        return crate::wayland::shell_helper::screenshot_window_frame(window_id, Some(pid));
+    }
+    anyhow::ensure!(qualified_backend(), "capture_route_unqualified");
+    let (captured, exclusion) = cursor_overlay::capture_exclusion::capture_excluding_overlays(
+        &crate::overlay_capture::OverlayExcluder,
+        |hidden| -> anyhow::Result<_> {
+            let before = crate::x11::capture_frame_geometry(window_id, pid)?;
+            let png = crate::capture::screenshot_window_bytes(window_id)?;
+            let after = crate::x11::capture_frame_geometry(window_id, pid)?;
+            if before != after
+                || crate::capture::png_dimensions_pub(&png)?
+                    != (after.pixel_width(), after.pixel_height())
+            {
+                return Err(
+                    cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch
+                        .into(),
+                );
+            }
+            // Residual patches use root coordinates; this PNG uses the exact
+            // client drawable. Translate before inspecting, never stage-crop.
+            let translated = hidden.cloned().map(|mut hidden| {
+                for patch in &mut hidden.residual {
+                    patch.x = patch.x.saturating_sub(after.origin_x());
+                    patch.y = patch.y.saturating_sub(after.origin_y());
+                }
+                hidden
+            });
+            let (png, residual) =
+                crate::overlay_capture::verify_hidden_capture(png, translated.as_ref());
+            // Save-under repair is adequate for observation, not evidence that
+            // the app's current pixels are unchanged. Require a clean repaint.
+            if !matches!(
+                &residual,
+                cursor_overlay::capture_exclusion::ResidualCheck::Clean
+            ) {
+                return Err(
+                    cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch
+                        .into(),
+                );
+            }
+            let proof = fingerprint_frame(&png, after)?;
+            Ok(((png, proof), residual))
+        },
+    )?;
+    if !exclusion.is_clean() {
+        return Err(
+            cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch.into(),
+        );
+    }
+    Ok(captured)
+}
+
+/// Quantize once in action units. Never truncate a half-pixel into a different
+/// recipient, and never pass Wayland's legacy (0,0) no-point sentinel.
+pub(crate) fn rounded_point(
+    x: f64,
+    y: f64,
+    geometry: CaptureFrameGeometry,
+    wayland: bool,
+) -> anyhow::Result<(i32, i32)> {
+    let (x, y) = (x.round(), y.round());
+    if !x.is_finite()
+        || !y.is_finite()
+        || x < 0.0
+        || y < 0.0
+        || x >= f64::from(geometry.width())
+        || y >= f64::from(geometry.height())
+        || (wayland
+            && x + f64::from(geometry.origin_x()) == 0.0
+            && y + f64::from(geometry.origin_y()) == 0.0)
+    {
+        return Err(
+            cua_driver_core::capture_runtime::CaptureActionError::InvalidScreenshotPoint.into(),
+        );
+    }
+    Ok((x as i32, y as i32))
+}
+
+/// Revalidate inside the native worker, after any asynchronous cursor glide.
+/// Detached work retains the admission (and therefore its generation permit).
+#[cfg(target_os = "linux")]
+pub(crate) fn revalidate_window(
+    pid: u32,
+    window_id: u64,
+    admission: &CaptureActionAdmission,
+) -> anyhow::Result<()> {
+    admission.validate_frame()?;
+    let expected = admission
+        .frame_geometry
+        .ok_or_else(|| anyhow::anyhow!("capture_route_unqualified"))?;
+    let live = capture_window(pid, window_id)
+        .map(|(_, geometry)| geometry)
+        .map_err(|error| {
+            if error.to_string() == "capture_route_unqualified" {
+                error
+            } else {
+                cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch
+                    .into()
+            }
+        })?;
+    if live != expected {
+        return Err(
+            cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch.into(),
+        );
+    }
+    Ok(())
+}
+
+/// Check the screen recipient separately from drawable freshness. Hide only
+/// Driver-owned overlays, never application popups, while querying the root
+/// child. This gate is shared by foreground, MPX and synthetic capture clicks.
+#[cfg(target_os = "linux")]
+pub(crate) fn revalidate_x11_point(window_id: u64, x: i32, y: i32) -> anyhow::Result<()> {
+    let result = cursor_overlay::capture_exclusion::capture_excluding_overlays(
+        &crate::overlay_capture::OverlayExcluder,
+        |_| -> anyhow::Result<_> {
+            crate::x11::require_capture_click_target(window_id, x, y)?;
+            Ok(((), cursor_overlay::capture_exclusion::ResidualCheck::Clean))
+        },
+    );
+    match result {
+        Ok(((), exclusion)) if exclusion.is_clean() => Ok(()),
+        _ => Err(
+            cua_driver_core::capture_runtime::CaptureActionError::NativeActionFrameMismatch.into(),
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct WindowCaptureMetadata {
+    id: cua_driver_core::capture_runtime::CaptureId,
+    binding: cua_driver_core::capture_runtime::CaptureBinding,
+    frame: CaptureFrameGeometry,
+    encoded: EncodedScreenshotDimensions,
+}
+
+#[cfg(target_os = "linux")]
+fn window_capture_metadata(
+    service: &CaptureService,
+    args: &Value,
+    capture_id: &str,
+    pid: u32,
+    window_id: u64,
+) -> anyhow::Result<WindowCaptureMetadata> {
+    use cua_driver_core::capture_runtime::{CaptureActionError, CaptureLookupError};
+    let id = service.parse_capture_id(capture_id)?;
+    let binding = service.binding_from_args(args)?;
+    let capture = service
+        .read_for_perception(id, &binding)
+        .map_err(CaptureActionError::Lookup)?;
+    if capture.target() != &window_target(pid, window_id) {
+        return Err(CaptureActionError::Lookup(CaptureLookupError::TargetMismatch).into());
+    }
+    anyhow::ensure!(
+        capture.frame_geometry().is_some() && qualified_backend(),
+        "capture_route_unqualified"
+    );
+    Ok(WindowCaptureMetadata {
+        id,
+        binding,
+        frame: capture.frame_geometry().unwrap(),
+        encoded: capture.encoded_dimensions(),
+    })
+}
+
+/// Check target/binding before any native target resolution, without consuming.
+#[cfg(target_os = "linux")]
+pub(crate) fn preflight_window_click(
+    service: &CaptureService,
+    args: &Value,
+    capture_id: &str,
+    pid: u32,
+    window_id: u64,
+) -> anyhow::Result<()> {
+    window_capture_metadata(service, args, capture_id, pid, window_id).map(|_| ())
+}
+
+// Admit on the originating dispatch task: the registry's runtime scope is
+// task/thread-local and must not be implicitly adopted by a blocking worker.
+#[cfg(target_os = "linux")]
 pub fn admit_window_click(
     service: &CaptureService,
     args: &Value,
@@ -214,32 +446,34 @@ pub fn admit_window_click(
     window_id: u64,
     screenshot_x: f64,
     screenshot_y: f64,
+    geometry: CaptureFrameGeometry,
 ) -> anyhow::Result<CaptureActionAdmission> {
-    admit(
-        service,
-        args,
-        capture_id,
-        window_target(pid, window_id),
-        screenshot_x,
-        screenshot_y,
-    )
-}
-
-pub fn admit_desktop_click(
-    service: &CaptureService,
-    args: &Value,
-    capture_id: &str,
-    screenshot_x: f64,
-    screenshot_y: f64,
-) -> anyhow::Result<CaptureActionAdmission> {
-    admit(
-        service,
-        args,
-        capture_id,
-        CaptureTarget::PrimaryDesktop,
-        screenshot_x,
-        screenshot_y,
-    )
+    use cua_driver_core::capture_runtime::CaptureActionError;
+    let capture = window_capture_metadata(service, args, capture_id, pid, window_id)?;
+    if capture.frame != geometry {
+        return Err(CaptureActionError::NativeActionFrameMismatch.into());
+    }
+    let encoded = capture.encoded;
+    rounded_point(
+        screenshot_x * f64::from(geometry.width()) / f64::from(encoded.width()),
+        screenshot_y * f64::from(geometry.height()) / f64::from(encoded.height()),
+        geometry,
+        crate::wayland::wayland_input_enabled(),
+    )?;
+    Ok(service.admit_action_in_frame(
+        CaptureActionRequest {
+            capture_id: capture.id,
+            binding: capture.binding,
+            target: window_target(pid, window_id),
+            current_native_action_dimensions: NativeActionDimensions::new(
+                geometry.width(),
+                geometry.height(),
+            )?,
+            screenshot_x,
+            screenshot_y,
+        },
+        geometry,
+    )?)
 }
 
 pub fn retire_runtime(service: &CaptureService) {
@@ -357,6 +591,84 @@ mod tests {
         let rgba = vec![value; (width * height * 4) as usize];
         cua_driver_core::image_utils::encode_rgba_to_png(&rgba, width, height)
             .expect("encode fixture")
+    }
+
+    #[test]
+    fn capture_click_shape_is_explicit_and_unsupported_is_not_stale() {
+        use serde_json::json;
+        let request = json!({"capture_id":"capture_00000000000000000000000000000001_0000000000000001",
+            "pid":7,"window_id":9,"x":1.5,"y":2.0});
+        assert!(validate_click(&request).is_ok());
+        for (field, value, code) in [
+            ("capture_id", Value::Null, "capture_id_invalid"),
+            ("pid", Value::Null, "invalid_arguments"),
+            ("window_id", Value::Null, "invalid_arguments"),
+            ("x", Value::Null, "invalid_arguments"),
+            ("y", Value::Null, "invalid_arguments"),
+            ("element_token", json!("token"), "invalid_arguments"),
+            ("element_index", json!(1), "invalid_arguments"),
+            ("from_zoom", json!(true), "invalid_arguments"),
+            ("scope", json!("desktop"), "capture_route_unqualified"),
+            (
+                "coordinate_frame",
+                json!("desktop"),
+                "capture_route_unqualified",
+            ),
+        ] {
+            let mut invalid = request.clone();
+            invalid[field] = value;
+            let error = validate_click(&invalid).unwrap_err();
+            let data = error.structured_content.unwrap();
+            assert_eq!(data["code"], code, "{field}");
+            assert_eq!(data["effect"], "refused");
+        }
+        assert!(validate_click(&json!({"element_token":"legacy"})).is_ok());
+        assert!(validate_click(&json!({"x":1,"y":2,"scope":"desktop"})).is_ok());
+    }
+
+    #[test]
+    fn capture_quantization_rounds_once_without_wayland_center_retargeting() {
+        let geometry = CaptureFrameGeometry::new(0, 0, 500, 300, 1000, 600).unwrap();
+        assert_eq!(
+            rounded_point(199.5, 134.5, geometry, true).unwrap(),
+            (200, 135)
+        );
+        assert_eq!(rounded_point(0.5, 0.75, geometry, true).unwrap(), (1, 1));
+        for point in [(0.0, 0.0), (499.75, 20.0), (20.0, 299.75)] {
+            let error = rounded_point(point.0, point.1, geometry, true).unwrap_err();
+            assert_eq!(
+                cua_driver_core::capture_runtime::admission_error_code(&error),
+                "capture_coordinate_invalid"
+            );
+        }
+        assert_eq!(rounded_point(0.0, 0.0, geometry, false).unwrap(), (0, 0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_pixel_freshness_ignores_png_metadata_but_not_repaint() {
+        let geometry = CaptureFrameGeometry::new(31, 23, 4, 3, 8, 6).unwrap();
+        let original = png(8, 6, 0x55);
+        let frame = fingerprint_frame(&original, geometry).unwrap();
+        use image::{
+            codecs::png::{CompressionType, FilterType, PngEncoder},
+            ImageEncoder,
+        };
+        let image = image::load_from_memory(&original).unwrap().to_rgba8();
+        let mut alternate = Vec::new();
+        PngEncoder::new_with_quality(
+            &mut alternate,
+            CompressionType::Uncompressed,
+            FilterType::NoFilter,
+        )
+        .write_image(image.as_raw(), 8, 6, image::ExtendedColorType::Rgba8)
+        .unwrap();
+        assert_ne!(original, alternate);
+        assert_eq!(frame, fingerprint_frame(&alternate, geometry).unwrap());
+        assert_ne!(
+            frame,
+            fingerprint_frame(&png(8, 6, 0x56), geometry).unwrap()
+        );
     }
 
     fn args(session: &str) -> Value {
