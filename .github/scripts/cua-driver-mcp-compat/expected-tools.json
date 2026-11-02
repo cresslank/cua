@@ -60,6 +60,7 @@
     "set_agent_cursor_motion",
     "set_agent_cursor_theme",
     "set_config",
+    "set_input_policy",
     "set_value",
     "set_window_frame",
     "start_recording",

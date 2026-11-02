@@ -7,7 +7,7 @@ publish = false
 
 [features]
 default = ["yaml", "rego", "script"]
-yaml = ["dep:regex"]
+yaml = []
 rego = ["dep:regorus"]
 # `run_script` tool: an embedded QuickJS engine (rquickjs and quickjs-ng,
 # both MIT). Compiled in by default on every platform, and the tool is
@@ -27,7 +27,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 async-trait = "0.1"
 serde_yaml_ng = "0.10"
-regex = { version = "1", optional = true }
+regex = "1"
 regorus = { version = "0.10.1", optional = true }
 # Used by the shared `image_utils` module — pure PNG/JPEG/resize/crosshair
 # helpers extracted from `platform-{macos,windows,linux}/src/capture.rs` so

@@ -1002,7 +1002,7 @@ pub async fn run_serve(
     socket_path: &str,
     pid_file_path: Option<&str>,
 ) -> anyhow::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
     cua_driver_core::authorization::validate_startup_authorization()?;
@@ -1079,7 +1079,7 @@ pub async fn run_serve(
 
                 connection_tasks.spawn(async move {
                     let (reader, mut writer) = stream.into_split();
-                    let mut lines = BufReader::new(reader).lines();
+                    let mut lines = cua_driver_core::dispatch_cancellation::RequestReader::new(BufReader::new(reader));
 
                     // Set ONLY by a `session_begin` on this connection — i.e.
                     // the proxy's persistent control connection. Per-call
@@ -1231,7 +1231,10 @@ pub async fn run_serve(
                                 ).await;
                             }
                             "call" => {
-                                let resp = invoke_daemon_tool(&reg, req).await;
+                                let resp = match lines.run_until_closed(invoke_daemon_tool(&reg, req)).await {
+                                    Ok(Some(resp)) => resp,
+                                    Ok(None) | Err(_) => break,
+                                };
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
@@ -1733,7 +1736,7 @@ pub async fn run_serve(
     pid_file_path: Option<&str>,
 ) -> anyhow::Result<()> {
     use std::os::windows::io::AsRawHandle as _;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncWriteExt, BufReader};
     use tokio::net::windows::named_pipe::ServerOptions;
 
     cua_driver_core::authorization::validate_startup_authorization()?;
@@ -1893,7 +1896,7 @@ pub async fn run_serve(
 
                 tokio::spawn(async move {
                     let (reader, mut writer) = tokio::io::split(server);
-                    let mut lines = BufReader::new(reader).lines();
+                    let mut lines = cua_driver_core::dispatch_cancellation::RequestReader::new(BufReader::new(reader));
 
                     // See the unix branch: set only by `session_begin` on the
                     // proxy's persistent control connection; drives the post-loop
@@ -2024,7 +2027,10 @@ pub async fn run_serve(
                                 ).await;
                             }
                             "call" => {
-                                let resp = invoke_daemon_tool(&reg, req).await;
+                                let resp = match lines.run_until_closed(invoke_daemon_tool(&reg, req)).await {
+                                    Ok(Some(resp)) => resp,
+                                    Ok(None) | Err(_) => break,
+                                };
                                 let _ = writer.write_all(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;

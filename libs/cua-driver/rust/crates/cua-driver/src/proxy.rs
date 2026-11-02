@@ -18,6 +18,7 @@
 
 use std::sync::Arc;
 
+use cua_driver_core::dispatch_cancellation::RequestReader;
 use cua_driver_core::mcp_wire::{self, ProtocolSession};
 use cua_driver_core::policy::{authorize_tool_call, validate_configured_policy};
 use cua_driver_core::protocol::{initialize_result, Request, Response};
@@ -57,9 +58,8 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
     }
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-    let mut reader = BufReader::new(stdin);
+    let mut reader = RequestReader::new(BufReader::new(stdin));
     let mut writer = tokio::io::BufWriter::new(stdout);
-    let mut line = String::new();
     let mut session_observed = false;
     let mut protocol_session = ProtocolSession::default();
     let transport_session = format!("mcp-{}", uuid::Uuid::new_v4());
@@ -78,10 +78,9 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
     };
 
     loop {
-        line.clear();
-        if reader.read_line(&mut line).await? == 0 {
+        let Some(line) = reader.next_line().await? else {
             break;
-        }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -130,13 +129,21 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
                     StdioExecutionPath::DirectDaemon,
                 );
                 let id = request.id.clone().unwrap_or(serde_json::Value::Null);
-                let response = cua_driver_core::server::handle_request_with_transport_session(
+                let cancellable = request.method == "tools/call";
+                let work = cua_driver_core::server::handle_request_with_transport_session(
                     request,
-                    id,
+                    id.clone(),
                     sdk.as_ref(),
                     &transport_session,
-                )
-                .await;
+                );
+                let response = if cancellable {
+                    reader.run(id, work).await?
+                } else {
+                    Some(work.await)
+                };
+                let Some(response) = response else {
+                    break;
+                };
                 if let Some(metadata) = initialize_metadata {
                     observe_proxy_session_started(metadata);
                     session_observed = true;
@@ -308,16 +315,14 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut line = String::new();
+    let mut reader = RequestReader::new(&mut reader);
     let mut session_observed = false;
     let mut protocol_session = ProtocolSession::default();
 
     loop {
-        line.clear();
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            break; // EOF — MCP client disconnected (stdin closed).
-        }
+        let Some(line) = reader.next_line().await? else {
+            break;
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -330,7 +335,8 @@ where
                 Response::parse_error()
             }
             Ok(req) if req.is_notification() => {
-                // Notifications are intentionally dropped by the stdio adapter.
+                // Unknown/already-completed cancellation IDs have no effect.
+                // In-flight notifications are handled by RequestReader::run.
                 continue;
             }
             Ok(req) => {
@@ -378,15 +384,23 @@ where
                     })
                     .flatten();
                 let id = req.id.clone().unwrap_or(serde_json::Value::Null);
-                let response = handle_proxy_request(
+                let cancellable = req.method == "tools/call";
+                let work = handle_proxy_request(
                     req,
-                    id,
+                    id.clone(),
                     socket_path,
                     cached_tools_list,
                     session_id,
                     daemon_observes_tool_calls,
-                )
-                .await;
+                );
+                let response = if cancellable {
+                    reader.run(id, work).await?
+                } else {
+                    Some(work.await)
+                };
+                let Some(response) = response else {
+                    break;
+                };
                 if let Some(metadata) = initialize_metadata {
                     observe_proxy_session_started(metadata);
                     session_observed = true;
@@ -933,29 +947,17 @@ async fn forward_tool_call(
         client_kind: None,
     };
 
-    // The daemon client is sync, so jump to a blocking thread to keep
-    // the tokio reactor responsive while the AX-heavy call (e.g.
-    // `screenshot`, `get_window_state`) does its thing on the daemon
-    // side.
-    let socket = socket_path.to_owned();
-    let blocking = tokio::task::spawn_blocking(move || send_request(&socket, &req)).await;
-
-    let resp = match blocking {
-        Err(join_err) => {
-            return Response::error(
-                id,
-                -32603,
-                format!("internal join error forwarding to daemon: {join_err}"),
-            );
-        }
-        Ok(Err(e)) => {
+    // Cancellation drops the exact per-call socket; the daemon observes EOF
+    // while dispatch is running and drops its own invocation future as well.
+    let resp = match cua_driver_core::daemon::send_request_async(socket_path, &req).await {
+        Err(e) => {
             return Response::error(
                 id,
                 -32603,
                 format!("daemon transport error forwarding `{name}`: {e}"),
             );
         }
-        Ok(Ok(r)) => r,
+        Ok(r) => r,
     };
 
     proxy_tool_result_response(
@@ -1018,6 +1020,68 @@ fn daemon_response_to_tool_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_notification_closes_only_its_private_daemon_request() {
+        use serde_json::json;
+        use tokio::io::AsyncReadExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cancel.sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let (server, mut peer) = tokio::io::duplex(8192);
+        let inventory =
+            Arc::new(json!({"tools":[{"name":"get_config", "inputSchema":{"type":"object"}}]}));
+        let mut output = Vec::new();
+        let work = run_proxy_io(
+            BufReader::new(server),
+            &mut output,
+            path.to_str().unwrap(),
+            &inventory,
+            "private-cancellation",
+            false,
+        );
+        let edge = async move {
+            let request = json!({"jsonrpc":"2.0", "id":7, "method":"tools/call", "params":{
+                "name":"get_config", "arguments":{},
+                "_meta": {
+                    mcp_wire::PROTOCOL_VERSION_KEY: mcp_wire::MODERN_PROTOCOL_VERSION,
+                    mcp_wire::CLIENT_CAPABILITIES_KEY: {},
+                },
+            }});
+            peer.write_all((request.to_string() + "\n").as_bytes())
+                .await
+                .unwrap();
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut daemon = BufReader::new(stream);
+            let mut line = String::new();
+            daemon.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()["name"],
+                "get_config"
+            );
+            peer.write_all((json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params":{"requestId":7}}).to_string()+"\n").as_bytes()).await.unwrap();
+            let mut byte = [0u8; 1];
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), daemon.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0
+            );
+            drop(peer);
+        };
+        let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(work, edge)
+        })
+        .await
+        .expect("private proxy cancellation must complete");
+        result.unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(response["id"], 7);
+        assert_eq!(response["error"]["code"], -32800);
+        assert_eq!(response["error"]["data"]["code"], "request_cancelled");
+    }
 
     #[tokio::test]
     async fn modern_proxy_metadata_and_rejections_need_no_daemon_call() {

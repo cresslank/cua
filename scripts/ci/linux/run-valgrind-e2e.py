@@ -6,6 +6,7 @@
 
 import json
 import os
+import selectors
 import shlex
 import shutil
 import signal
@@ -180,6 +181,66 @@ def run_client(
         for handle in (stdout_handle, stderr_handle, stdin_handle):
             if handle is not None:
                 handle.close()
+
+
+def run_mcp_client(
+    command: Sequence[str],
+    *,
+    env: dict[str, str],
+    timeout: float,
+    stdin: Path,
+    stdout: Path,
+    stderr: Path,
+) -> None:
+    """Keep the MCP control channel live until every requested reply arrives.
+
+    EOF is now a cancellation/teardown signal, not permission to continue
+    queued actions. A regular file as stdin delivers premature EOF even while
+    the fixture's client is still waiting for replies.
+    """
+    payload = stdin.read_bytes()
+    pending = {
+        json.dumps(request["id"])
+        for line in payload.splitlines()
+        if (request := json.loads(line)).get("id") is not None
+    }
+    deadline = time.monotonic() + timeout
+    with stdout.open("wb") as output, stderr.open("ab") as errors:
+        with subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=errors, env=env, bufsize=0,
+        ) as process:
+            try:
+                assert process.stdin is not None and process.stdout is not None
+                process.stdin.write(payload)
+                process.stdin.flush()
+                buffered = b""
+                with selectors.DefaultSelector() as reader:
+                    reader.register(process.stdout, selectors.EVENT_READ)
+                    while pending:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0 or not reader.select(remaining):
+                            raise subprocess.TimeoutExpired(command, timeout)
+                        chunk = os.read(process.stdout.fileno(), 65536)
+                        if not chunk:
+                            raise RunnerFailure("MCP client closed before every smoke reply arrived")
+                        output.write(chunk)
+                        buffered += chunk
+                        while b"\n" in buffered:
+                            line, buffered = buffered.split(b"\n", 1)
+                            response = json.loads(line)
+                            if "id" in response:
+                                pending.discard(json.dumps(response["id"]))
+                process.stdin.close()
+                process.stdin = None
+                trailing, _ = process.communicate(timeout=max(0.001, deadline - time.monotonic()))
+                output.write(trailing)
+                if process.returncode:
+                    raise subprocess.CalledProcessError(process.returncode, command)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
 
 
 def load_json(path: Path):
@@ -488,7 +549,7 @@ def run_e2e(driver: Path, artifact_dir: Path, smoke_dir: Path, env: dict[str, st
             + "\n",
             encoding="utf-8",
         )
-        run_client(
+        run_mcp_client(
             [str(driver), "mcp", "--socket", str(socket_path)],
             env=env,
             timeout=30,
