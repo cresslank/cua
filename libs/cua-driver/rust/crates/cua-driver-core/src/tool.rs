@@ -4,6 +4,7 @@
 //! Tool trait and registry.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -26,6 +27,10 @@ use crate::{
     },
     tool_args::ArgsExt,
 };
+
+#[cfg(test)]
+#[path = "tool_events_tests.rs"]
+mod tool_events_tests;
 
 tokio::task_local! {
     /// Authorization inherited by nested registry dispatch such as trajectory
@@ -872,7 +877,14 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
     if let Some(capabilities) = cua_driver_contract::tool_capabilities(tool_name) {
         return capabilities;
     }
-    let caps: &[&str] = match tool_name {
+    legacy_capabilities_for(tool_name)
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
+}
+
+fn legacy_capabilities_for(tool_name: &str) -> &'static [&'static str] {
+    match tool_name {
         // ── input.pointer ────────────────────────────────────────────
         //
         // Surface 6: tools that accept the opaque `element_token` arg
@@ -1017,8 +1029,49 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
 
         // ── unsupported_platform stub & anything else ────────────────
         _ => &[],
+    }
+}
+
+/// Only compiled contract names cross the local log boundary. A registered
+/// embedder extension can have an arbitrary name, so registration is not enough.
+pub(crate) fn event_tool_name(name: &str) -> &str {
+    let name = if name == "type_text_chars" {
+        "type_text"
+    } else {
+        renamed_tool(name).unwrap_or(name)
     };
-    caps.iter().map(|s| (*s).to_owned()).collect()
+    if cua_driver_contract::tool_input_fields(name).is_some()
+        || !legacy_capabilities_for(name).is_empty()
+    {
+        name
+    } else {
+        "unknown"
+    }
+}
+
+impl ToolRegistry {
+    /// Drain the optional local event exporter during runtime shutdown, even
+    /// when a host retains the closed registry or subsequently force-exits.
+    pub fn shutdown_tool_event_logs(&self) {
+        if let Some(events) = &self.tool_events {
+            events.shutdown();
+        }
+    }
+
+    async fn observe_invocation(
+        &self,
+        name: &str,
+        invocation: impl Future<Output = ToolResult>,
+    ) -> ToolResult {
+        match &self.tool_events {
+            Some(events) => {
+                events
+                    .observe(name, self.is_known_tool(name), invocation)
+                    .await
+            }
+            None => invocation.await,
+        }
+    }
 }
 
 /// Capabilities advertised by a concrete runtime tool definition.
@@ -1331,6 +1384,7 @@ pub struct ToolRegistry {
     approval_broker: Arc<crate::consent::ApprovalBroker>,
     protected_resource_grants: Arc<crate::consent::ProtectedResourceGrants>,
     protected_resource_ownership: Arc<crate::consent::ProtectedResourceOwnershipStore>,
+    tool_events: Option<crate::tool_events::ToolEvents>,
 }
 
 impl ToolRegistry {
@@ -1407,6 +1461,7 @@ impl ToolRegistry {
             approval_broker,
             protected_resource_grants,
             protected_resource_ownership,
+            tool_events: crate::tool_events::ToolEvents::configured(),
         }
     }
 
@@ -1741,6 +1796,19 @@ impl ToolRegistry {
         args: Value,
         native_window_pixels: bool,
     ) -> ToolResult {
+        self.observe_invocation(
+            name,
+            self.invoke_in_process_unobserved(name, args, native_window_pixels),
+        )
+        .await
+    }
+
+    async fn invoke_in_process_unobserved(
+        &self,
+        name: &str,
+        args: Value,
+        native_window_pixels: bool,
+    ) -> ToolResult {
         if let Ok(context) = DISPATCH_AUTHORIZATION_CONTEXT.try_with(Arc::clone) {
             let mut args = args;
             let mut evidence = DISPATCH_TRUSTED_INVOCATION_EVIDENCE
@@ -1788,7 +1856,7 @@ impl ToolRegistry {
             native_window_pixels,
             ..TrustedInvocationEvidence::default()
         };
-        self.invoke_with_context_and_evidence(name, args, context, evidence)
+        self.invoke_context_unobserved(name, args, context, evidence)
             .await
     }
 
@@ -1816,6 +1884,19 @@ impl ToolRegistry {
     async fn invoke_from_trusted_adapter_in_process(
         &self,
         name: &str,
+        args: Value,
+        native_window_pixels: bool,
+    ) -> ToolResult {
+        self.observe_invocation(
+            name,
+            self.invoke_from_trusted_adapter_unobserved(name, args, native_window_pixels),
+        )
+        .await
+    }
+
+    async fn invoke_from_trusted_adapter_unobserved(
+        &self,
+        name: &str,
         mut args: Value,
         native_window_pixels: bool,
     ) -> ToolResult {
@@ -1831,7 +1912,7 @@ impl ToolRegistry {
                 ))
             }
         };
-        self.invoke_with_context_and_evidence(name, args, context, evidence)
+        self.invoke_context_unobserved(name, args, context, evidence)
             .await
     }
 
@@ -1857,6 +1938,20 @@ impl ToolRegistry {
 
     #[doc(hidden)]
     pub async fn invoke_with_context_and_evidence(
+        &self,
+        name: &str,
+        args: Value,
+        context: Arc<crate::session_authorization::EffectiveAuthorizationContext>,
+        evidence: TrustedInvocationEvidence,
+    ) -> ToolResult {
+        self.observe_invocation(
+            name,
+            self.invoke_context_unobserved(name, args, context, evidence),
+        )
+        .await
+    }
+
+    async fn invoke_context_unobserved(
         &self,
         name: &str,
         args: Value,
@@ -1933,8 +2028,11 @@ impl ToolRegistry {
             if let Some(session) = session.as_deref() {
                 read["session"] = Value::String(session.to_owned());
             }
-            let delta =
-                Box::pin(self.invoke_authorized("get_window_state", read, context, evidence)).await;
+            let delta = Box::pin(self.observe_invocation(
+                "get_window_state",
+                self.invoke_authorized("get_window_state", read, context, evidence),
+            ))
+            .await;
             crate::fast_path::wire::attach_delta(&mut result, delta);
         }
         crate::recovery_hint::annotate(tool, &seed, &mut result);

@@ -113,6 +113,37 @@ Driver does not render its own authorization modal or banner.
 See the hosted [permission mode
 reference](https://cua.ai/docs/cua-driver/guides/permissions).
 
+## Optional local tool logs
+
+Native runtimes can export content-free tool events to an explicitly chosen
+OTLP HTTP/protobuf collector. Set `OTEL_LOGS_EXPORTER=otlp` and either
+`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` (the full logs URL) or
+`OTEL_EXPORTER_OTLP_ENDPOINT` (the base URL; `/v1/logs` is appended). The default
+is off; `OTEL_SDK_DISABLED=true` disables it. Only `http/protobuf` is supported.
+Restart the runtime after changing its environment.
+
+This sink is independent of vendor telemetry: keep `DO_NOT_TRACK=1` and
+`CUA_DRIVER_RS_TELEMETRY_ENABLED=false` to leave upstream collection disabled.
+No tracing diagnostics, arguments, results, text, URLs, screenshots, caller
+session labels, or credentials enter tool events. Each event contains a known
+tool name, outcome, fixed error class, exact monotonic elapsed nanoseconds and
+generated trace/span IDs. Nested registry calls, including `run_steps` and
+`run_script` children, share the outer trace and identify their parent span.
+Outer durations include child work; they must not be summed as disjoint work.
+Timing covers registry dispatch through the returned result, not transport
+admission, response writing, or client round-trip time.
+
+`OTEL_SERVICE_NAME` sets the service name. `OTEL_RESOURCE_ATTRIBUTES` accepts
+bounded identity fields: `service.name`, `service.namespace`,
+`service.instance.id`, `host.name`, `host.id`, `deployment.environment`,
+`deployment.environment.name`, `loghouse.project`, `loghouse.repo`, and
+`loghouse.source_unit`. Other keys are discarded. Version, build revision,
+architecture and OS identify the runtime; absent instance identity is generated.
+Endpoint credentials, query strings and fragments are refused. Collector
+requests never use ambient proxies, follow redirects or forward configured
+OTLP headers. A 256-event queue drops on saturation; exports time out after
+250 ms, and runtime shutdown allows at most 750 ms for the final flush.
+
 ## Repository Layout
 
 | Path                            | Purpose                                                                |
