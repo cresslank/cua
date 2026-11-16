@@ -1,0 +1,153 @@
+name: Kdesk Cua Driver build and publish
+run-name: kdesk-build-${{ fromJSON(inputs.request).request_key }}
+on:
+  workflow_dispatch:
+    inputs:
+      request:
+        description: Same exact JSON request accepted by prepare
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: kdesk-publish-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    if: >-
+      github.repository == 'cresslank/cua' &&
+      github.actor == 'cresslank' && github.triggering_actor == 'cresslank' &&
+      github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/kdesk-cua-driver-rs-v') &&
+      vars.KDESK_DRIVER_PIPELINE_ENABLED == 'true' && vars.CI_RUNNER == 'private-vm'
+    runs-on: private-vm
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.package.outputs.artifact-id }}
+      artifact_digest: ${{ steps.package.outputs.artifact-digest }}
+    env:
+      PIPELINE_ENABLED: ${{ vars.KDESK_DRIVER_PIPELINE_ENABLED }}
+      CI_RUNNER: ${{ vars.CI_RUNNER }}
+      BUILD_IMAGE_DIGEST: ${{ vars.KDESK_DRIVER_BUILD_IMAGE_DIGEST }}
+      REQUEST: ${{ inputs.request }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Validate source-tag dispatch
+        run: |
+          printf '%s' "$REQUEST" > "$RUNNER_TEMP/request.json"
+          python3 .github/scripts/kdesk-cua-driver.py guard-build --request "$RUNNER_TEMP/request.json" --output "$RUNNER_TEMP/package"
+      - name: Fetch exact public source evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/kdesk-cua-driver.py fetch --request "$RUNNER_TEMP/request.json" --release "$RUNNER_TEMP/upstream-release.json" --output "$RUNNER_TEMP/package"
+      - name: Reconstruct and verify the workflow source S
+        run: |
+          python3 .github/scripts/kdesk-cua-driver.py verify-source --request "$RUNNER_TEMP/request.json" --release "$RUNNER_TEMP/upstream-release.json" --output "$RUNNER_TEMP/package"
+      - name: Locked installer packaging and public process smoke (no credentials)
+        env:
+          KDESK_OUTPUT: ${{ runner.temp }}/package
+        run: bash .github/scripts/kdesk-cua-build.sh
+      - name: Upload complete immutable build transfer
+        id: package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kdesk-driver-package
+          path: ${{ runner.temp }}/package/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+  publish:
+    needs: build
+    if: >-
+      github.repository == 'cresslank/cua' &&
+      github.actor == 'cresslank' && github.triggering_actor == 'cresslank' &&
+      github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/tags/kdesk-cua-driver-rs-v') &&
+      vars.KDESK_DRIVER_PIPELINE_ENABLED == 'true' && vars.CI_RUNNER == 'private-vm'
+    runs-on: private-vm
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    env:
+      REQUEST: ${{ inputs.request }}
+      ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+      ARTIFACT_DIGEST: ${{ needs.build.outputs.artifact_digest }}
+      POLICY_OID: ${{ fromJSON(inputs.request).policy_oid }}
+      PIPELINE_ENABLED: ${{ vars.KDESK_DRIVER_PIPELINE_ENABLED }}
+      CI_RUNNER: ${{ vars.CI_RUNNER }}
+      BUILD_IMAGE_DIGEST: ${{ vars.KDESK_DRIVER_BUILD_IMAGE_DIGEST }}
+    steps:
+      # Fresh job, reviewed control checkout only. Never execute tagged package
+      # members or build-generated scripts with publishing/OIDC authority.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: ${{ fromJSON(inputs.request).policy_oid }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Guard publishing authority and freeze exact artifact ID/digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$REQUEST" > "$RUNNER_TEMP/request.json"
+          python3 .github/scripts/kdesk-cua-driver.py guard-build --request "$RUNNER_TEMP/request.json" --output "$RUNNER_TEMP/guard"
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, stat, subprocess, zipfile
+          artifact_id = os.environ['ARTIFACT_ID']
+          digest = os.environ['ARTIFACT_DIGEST']
+          assert re.fullmatch(r'[0-9]+', artifact_id)
+          assert re.fullmatch(r'[0-9a-f]{64}', digest)
+          path = 'repos/cresslank/cua/actions/artifacts/' + artifact_id
+          metadata = json.loads(subprocess.check_output(['gh', 'api', path]))
+          assert metadata['workflow_run']['id'] == int(os.environ['GITHUB_RUN_ID'])
+          assert metadata['name'] == 'kdesk-driver-package' and not metadata['expired']
+          data = subprocess.check_output(['gh', 'api', path + '/zip'])
+          assert hashlib.sha256(data).hexdigest() == digest
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          (root / 'transfer.zip').write_bytes(data)
+          output = root / 'package'
+          output.mkdir()
+          with zipfile.ZipFile(root / 'transfer.zip') as archive:
+              seen = set()
+              total = 0
+              for member in archive.infolist():
+                  assert member.filename == pathlib.PurePosixPath(member.filename).name
+                  assert member.filename not in seen and not member.is_dir()
+                  assert not stat.S_ISLNK(member.external_attr >> 16)
+                  total += member.file_size
+                  assert total <= 2 * 1024**3 and len(seen) < 200
+                  seen.add(member.filename)
+                  (output / member.filename).write_bytes(archive.read(member))
+          PY
+          python3 .github/scripts/kdesk-cua-package.py validate --output "$RUNNER_TEMP/package" --source-sha "$GITHUB_SHA"
+      - name: Attest complete package
+        id: package_attestation
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: ${{ runner.temp }}/package/cua-driver-kdesk-x86_64-linux.tar.gz
+      - name: Attest manifest
+        id: manifest_attestation
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: ${{ runner.temp }}/package/package-manifest.json
+      - name: Attest checksums
+        id: checksums_attestation
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-path: ${{ runner.temp }}/package/SHA256SUMS
+      - name: Draft, upload, verify, then publish without clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_BUNDLE: ${{ steps.package_attestation.outputs.bundle-path }}
+          MANIFEST_BUNDLE: ${{ steps.manifest_attestation.outputs.bundle-path }}
+          CHECKSUMS_BUNDLE: ${{ steps.checksums_attestation.outputs.bundle-path }}
+        run: |
+          cp "$PACKAGE_BUNDLE" "$RUNNER_TEMP/package/package.sigstore.json"
+          cp "$MANIFEST_BUNDLE" "$RUNNER_TEMP/package/manifest.sigstore.json"
+          cp "$CHECKSUMS_BUNDLE" "$RUNNER_TEMP/package/checksums.sigstore.json"
+          python3 .github/scripts/kdesk-cua-package.py publish --output "$RUNNER_TEMP/package" --source-sha "$GITHUB_SHA" --policy-oid "$POLICY_OID"

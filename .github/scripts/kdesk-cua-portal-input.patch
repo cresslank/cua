@@ -1,0 +1,11 @@
+diff --git a/libs/cua-driver/rust/crates/platform-linux/src/tools/get_config.rs b/libs/cua-driver/rust/crates/platform-linux/src/tools/get_config.rs
+--- a/libs/cua-driver/rust/crates/platform-linux/src/tools/get_config.rs
++++ b/libs/cua-driver/rust/crates/platform-linux/src/tools/get_config.rs
+@@ -36,6 +36,7 @@
+         ToolResult::text("cua-driver-rs configuration").with_structured(json!({
+             "version": env!("CARGO_PKG_VERSION"),
+             "source_sha": option_env!("CUA_DRIVER_SOURCE_SHA"),
++            "build_features": { "portal_input": cfg!(feature = "portal-input") },
+             "platform": "linux",
+             "capture_mode": cfg.capture_mode,
+             "max_image_dimension": cfg.max_image_dimension,

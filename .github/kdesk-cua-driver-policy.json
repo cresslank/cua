@@ -1,0 +1,24 @@
+{
+  "schema": 1,
+  "carry_base": "47054e8fb287457dc2bd25e09be32c3def6d515b",
+  "carry_head": "77e7659a110f1928a1cdb0f9cc40ef92832526a6",
+  "carry": [
+    {
+      "oid": "77e7659a110f1928a1cdb0f9cc40ef92832526a6",
+      "patch_sha256": "d9e89b14972922e232e33a4a8f2f88ff63943c1070a5bc7c59d98a4e94dab106"
+    }
+  ],
+  "toolchain": "1.97.1",
+  "target": "x86_64-unknown-linux-gnu",
+  "features": ["cua-driver/portal-input"],
+  "overlay_files": [
+    ".github/kdesk-cua-driver-policy.json",
+    ".github/workflows/kdesk-cua-driver-prepare.yml",
+    ".github/workflows/kdesk-cua-driver-build.yml",
+    ".github/scripts/kdesk-cua-driver.py",
+    ".github/scripts/kdesk-cua-package.py",
+    ".github/scripts/kdesk-cua-smoke.py",
+    ".github/scripts/kdesk-cua-build.sh",
+    ".github/scripts/kdesk-cua-portal-input.patch"
+  ]
+}

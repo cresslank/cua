@@ -6899,6 +6899,7 @@ impl Tool for GetConfigTool {
         ToolResult::text("cua-driver-rs configuration").with_structured(json!({
             "version": env!("CARGO_PKG_VERSION"),
             "source_sha": option_env!("CUA_DRIVER_SOURCE_SHA"),
+            "build_features": { "portal_input": cfg!(feature = "portal-input") },
             "platform": "linux",
             "capture_mode": cfg.capture_mode,
             "max_image_dimension": cfg.max_image_dimension,

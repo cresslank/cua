@@ -1,0 +1,63 @@
+name: Kdesk Cua Driver prepare
+run-name: kdesk-prepare-${{ fromJSON(inputs.request).request_key }}
+on:
+  workflow_dispatch:
+    inputs:
+      request:
+        description: Exact JSON request (request_key, upstream_tag/oid, policy_oid, carry_digest, build_image_digest)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: kdesk-prepare-${{ fromJSON(inputs.request).upstream_oid }}-${{ fromJSON(inputs.request).carry_digest }}-${{ fromJSON(inputs.request).policy_oid }}
+  cancel-in-progress: false
+jobs:
+  prepare:
+    if: >-
+      github.repository == 'cresslank/cua' &&
+      github.actor == 'cresslank' && github.triggering_actor == 'cresslank' &&
+      github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+      vars.KDESK_DRIVER_PIPELINE_ENABLED == 'true' && vars.CI_RUNNER == 'private-vm'
+    runs-on: private-vm
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      PIPELINE_ENABLED: ${{ vars.KDESK_DRIVER_PIPELINE_ENABLED }}
+      CI_RUNNER: ${{ vars.CI_RUNNER }}
+      BUILD_IMAGE_DIGEST: ${{ vars.KDESK_DRIVER_BUILD_IMAGE_DIGEST }}
+      REQUEST: ${{ inputs.request }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Validate owner, policy and exact request
+        run: |
+          printf '%s' "$REQUEST" > "$RUNNER_TEMP/request.json"
+          python3 .github/scripts/kdesk-cua-driver.py guard-prepare --request "$RUNNER_TEMP/request.json" --output "$RUNNER_TEMP/evidence"
+      - name: Freeze upstream release and exact objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 .github/scripts/kdesk-cua-driver.py fetch --request "$RUNNER_TEMP/request.json" --release "$RUNNER_TEMP/upstream-release.json" --output "$RUNNER_TEMP/evidence"
+      - name: Construct source without conflict repair
+        run: python3 .github/scripts/kdesk-cua-driver.py prepare --request "$RUNNER_TEMP/request.json" --release "$RUNNER_TEMP/upstream-release.json" --output "$RUNNER_TEMP/evidence"
+      - name: Create source tag without force
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/evidence/source.json"))["source_tag"])')
+          # gh is an ephemeral Git credential helper, not persisted checkout auth.
+          git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push origin "refs/tags/$tag:refs/tags/$tag"
+          local_oid=$(git rev-parse "refs/tags/$tag")
+          remote_oid=$(git ls-remote origin "refs/tags/$tag" | cut -f1)
+          test "$local_oid" = "$remote_oid"
+      - name: Retain source or bounded hold evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kdesk-prepare-evidence
+          path: ${{ runner.temp }}/evidence
+          if-no-files-found: error
+          retention-days: 14
