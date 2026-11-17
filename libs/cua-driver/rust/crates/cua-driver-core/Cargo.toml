@@ -66,6 +66,12 @@ jsonschema = { version = "0.46", default-features = false }
 # Private per-request working directory for the optional perception worker.
 tempfile = "3"
 rquickjs = { version = "0.14", default-features = false, features = ["std"], optional = true }
+# Dedicated content-free tool events, not a bridge for arbitrary tracing logs.
+opentelemetry = { version = "0.32", default-features = false, features = ["logs", "trace"] }
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["logs"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["logs", "http-proto"] }
+opentelemetry-http = { version = "0.32", default-features = false }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -86,6 +92,8 @@ windows = { version = "0.58", features = [
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs"] }
+prost = "0.14"
 
 # `fast_path_standalone` lets the std-only fast_path checks compile alone
 # with `rustc --test` (no workspace build needed); see fast_path/mod.rs.

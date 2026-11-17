@@ -2403,7 +2403,7 @@ pub fn run_serve_cmd(
         .build()
         .expect("tokio runtime");
 
-    let sdk = match rt.block_on(crate::sdk_adapter::SdkAdapter::load(driver)) {
+    let sdk = match rt.block_on(crate::sdk_adapter::SdkAdapter::load(driver.clone())) {
         Ok(sdk) => sdk,
         Err(error) => {
             eprintln!("cua-driver serve error: {error}");
@@ -2411,6 +2411,9 @@ pub fn run_serve_cmd(
         }
     };
     let result = rt.block_on(run_serve(sdk, &socket_path, pid_file_path.as_deref()));
+    // Also close on listener/transport errors, which can return before
+    // run_serve's ordinary shutdown. Drain local tool logs before force-exit.
+    let _ = rt.block_on(driver.shutdown());
     rt.shutdown_timeout(std::time::Duration::from_secs(30));
     cua_driver_core::session_authorization::release_configured_registry_for_shutdown();
     cua_driver_core::session::release_process_state_for_shutdown();
