@@ -132,6 +132,7 @@ pub mod timestamp;
 pub mod tool;
 pub mod tool_activity;
 pub mod tool_args;
+pub(crate) mod tool_events;
 pub mod tool_schema;
 pub mod type_pacing;
 pub mod ui_tree_revision;

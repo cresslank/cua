@@ -300,8 +300,12 @@ impl DriverRuntime {
         cua_driver_core::snapshot_store::retire_runtime_scope(
             &self.compatibility_context.runtime_scope_key(),
         );
-        let recording = self.registry.recording.clone();
-        let _ = tokio::task::spawn_blocking(move || recording.stop(StopBy::Anyone)).await;
+        let registry = self.registry.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = registry.recording.stop(StopBy::Anyone);
+            registry.shutdown_tool_event_logs();
+        })
+        .await;
     }
 
     fn stop_lifecycle_maintenance(&self) {
